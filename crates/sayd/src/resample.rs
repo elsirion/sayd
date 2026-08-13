@@ -269,6 +269,13 @@ impl ResamplingProducer {
     pub(crate) fn set_paused(&mut self, paused: bool) {
         self.producer.set_paused(paused)
     }
+
+    /// Pause is a flag on the underlying ring, not a rate-dependent
+    /// quantity, so this needs no input/device-unit conversion -- unlike
+    /// every other method above.
+    pub(crate) fn is_paused(&self) -> bool {
+        self.producer.is_paused()
+    }
 }
 
 #[cfg(test)]

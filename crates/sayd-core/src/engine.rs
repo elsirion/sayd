@@ -91,6 +91,16 @@ pub struct Engine {
     /// that changes `state` away from or into `Error` must keep this in
     /// sync in the same step; see `submit`, `dismiss_error_and_go_idle` and
     /// the pop branch of `tick`.
+    ///
+    /// Second invariant: `state != State::Paused` implies `!sink.is_paused()`.
+    /// `Command::Pause` is the only place that pauses the sink, and it always
+    /// sets `state = Paused` in the same step; every route by which `state`
+    /// can leave `Paused` (`Command::Resume`, and every call to
+    /// `dismiss_error_and_go_idle`, which is the one place that can move
+    /// `state` to `Idle` unconditionally -- including out of `Paused` --
+    /// from `Stop`, `Next`, `SkipSentence` and `SetMuted(true)`) must
+    /// unpause the sink in that same step, or a later command has no way
+    /// left to reach it: `Resume` only fires when `state == Paused`.
     error: Option<String>,
     idle_since: Option<Instant>,
     shutdown: bool,
@@ -139,10 +149,11 @@ impl Engine {
             },
             Command::Stop => {
                 // The shut-up verb: always returns to a clean slate, even
-                // from Error.
+                // from Error. `dismiss_error_and_go_idle` unpauses the sink
+                // (see the pause invariant on the `error` field's doc
+                // comment), so there is no separate `set_paused(false)` here.
                 self.queue.clear();
                 self.discard_current();
-                self.sink.set_paused(false);
                 self.dismiss_error_and_go_idle();
             }
             Command::Next => {
@@ -368,8 +379,30 @@ impl Engine {
         }
     }
 
+    /// Both call sites in `tick` reach this only once `current` is already
+    /// `None` and the queue is empty, so the one thing left to check before
+    /// announcing `Idle` is whether the sink has actually finished playing
+    /// what it was given. Without that check the engine would report `Idle`
+    /// while `sink.pending()` (and therefore `Snapshot::remaining_secs`)
+    /// still counts seconds of audio that has not been heard yet --
+    /// self-contradictory, and both M2's D-Bus `State` property and M3's
+    /// MPRIS `PlaybackStatus` read this field directly.
+    ///
+    /// Only reached with `state != State::Paused`: `tick` returns before
+    /// this point while paused, so this never has to reason about a sink
+    /// that is deliberately not draining.
     fn go_idle(&mut self) {
         if self.state != State::Error {
+            if self.sink.pending() > 0 {
+                // Nothing left to queue or synthesize, but the sink is
+                // still draining what it already has -- stay Speaking until
+                // it actually finishes, not the instant nothing is left to
+                // feed it. `idle_since` stays untouched (still `None` from
+                // when this utterance started) so `maybe_unload` keeps
+                // declining to fire; see its own guard.
+                self.state = State::Speaking;
+                return;
+            }
             self.state = State::Idle;
         }
         if self.idle_since.is_none() {
@@ -377,16 +410,26 @@ impl Engine {
         }
     }
 
-    /// Like `go_idle`, but unconditionally -- including out of `Error`.
-    /// Used by the explicit "shut up" commands (`Stop`, `Next`,
-    /// `SkipSentence`, `SetMuted`), which must be able to dismiss a stuck
-    /// error even though nothing else can. `go_idle` itself stays
-    /// Error-preserving: it is also reached from plain `tick()` when the
-    /// queue drains with no command involved at all, and an error must not
-    /// evaporate on its own just because the caller kept polling.
+    /// Like `go_idle`, but unconditionally -- including out of `Error` and
+    /// `Paused`, and without waiting on `sink.pending()`. Used by the
+    /// explicit "shut up" commands (`Stop`, `Next`, `SkipSentence`,
+    /// `SetMuted`), which must be able to dismiss a stuck error even though
+    /// nothing else can. `go_idle` itself stays Error-preserving and
+    /// pending-gated: it is also reached from plain `tick()` when the queue
+    /// drains with no command involved at all, and an error (or audio still
+    /// playing) must not evaporate on its own just because the caller kept
+    /// polling.
+    ///
+    /// Also enforces the pause invariant documented on the `error` field:
+    /// every one of this function's callers is a point where `state` can
+    /// move to `Idle` regardless of what it was before, including `Paused`,
+    /// and `Command::Resume` -- the only other place that unpauses the sink
+    /// -- is itself gated on `state == Paused`, so this is the last chance
+    /// to unpause before that guard becomes permanently unreachable.
     fn dismiss_error_and_go_idle(&mut self) {
         self.state = State::Idle;
         self.error = None;
+        self.sink.set_paused(false);
         if self.idle_since.is_none() {
             self.idle_since = Some(Instant::now());
         }
@@ -467,8 +510,10 @@ impl Engine {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use super::*;
-    use crate::audio::VecSink;
+    use crate::audio::{AudioSink, VecSink};
     use crate::config::Config;
     use crate::synth::StubSynthesizer;
 
@@ -478,6 +523,61 @@ mod tests {
             Box::new(StubSynthesizer::new()),
             Box::new(VecSink::new(24_000 * 10)),
         )
+    }
+
+    /// `Engine` owns its sink as a private `Box<dyn AudioSink>`, so a test
+    /// that wants to model *playback* -- not just accept samples -- needs a
+    /// handle it can drain from outside after handing the sink away. This
+    /// wraps `VecSink` (which already knows how to simulate playback via
+    /// `drain`) behind `Arc<Mutex<_>>` so both sides can reach it:
+    /// `AudioSink: Send` rules out `Rc<RefCell<_>>`.
+    ///
+    /// This is the "explicitly-drained sink" option from C1's two choices
+    /// (test double that reports samples as played, vs. an explicitly
+    /// drained sink) -- chosen because `VecSink::drain` already exists and
+    /// models exactly the fact the review measured: a sink that only frees
+    /// space as audio is actually played, not the instant it's pushed. A
+    /// sink that auto-drains on every `push`/`pending` call was considered
+    /// and rejected: it would make `pending() > 0` unobservable, which is
+    /// the exact condition C1's new tests need to hold under an explicit
+    /// hand.
+    #[derive(Clone)]
+    struct SharedVecSink(Arc<Mutex<VecSink>>);
+
+    impl AudioSink for SharedVecSink {
+        fn push(&mut self, samples: &[f32]) -> usize {
+            self.0.lock().unwrap().push(samples)
+        }
+        fn pending(&self) -> usize {
+            self.0.lock().unwrap().pending()
+        }
+        fn clear(&mut self) {
+            self.0.lock().unwrap().clear()
+        }
+        fn set_paused(&mut self, paused: bool) {
+            self.0.lock().unwrap().set_paused(paused)
+        }
+        fn is_paused(&self) -> bool {
+            self.0.lock().unwrap().is_paused()
+        }
+        fn capacity(&self) -> usize {
+            self.0.lock().unwrap().capacity()
+        }
+        fn total_written(&self) -> usize {
+            self.0.lock().unwrap().total_written()
+        }
+    }
+
+    /// Build an engine over a sink the test can drain (simulate playback)
+    /// from outside, plus a handle to do that draining with.
+    fn engine_with_drainable_sink(capacity: usize) -> (Engine, Arc<Mutex<VecSink>>) {
+        let sink = Arc::new(Mutex::new(VecSink::new(capacity)));
+        let e = Engine::new(
+            Config::default(),
+            Box::new(StubSynthesizer::new()),
+            Box::new(SharedVecSink(sink.clone())),
+        );
+        (e, sink)
     }
 
     fn say(text: &str) -> Command {
@@ -515,10 +615,77 @@ mod tests {
 
     #[test]
     fn returns_to_idle_when_the_queue_empties() {
-        let mut e = engine();
+        // C1: with nothing draining it, a `VecSink` never empties on its
+        // own, so reaching `Idle` here now requires modelling playback --
+        // this is what pins the original intent of this test (an emptied
+        // queue eventually leads to `Idle`) now that the engine also waits
+        // for the sink to actually finish. See
+        // `state_stays_speaking_while_audio_is_still_pending_in_the_sink`
+        // for the part of C1's behaviour this test used to (silently) not
+        // cover: that it does *not* go `Idle` before that.
+        let (mut e, sink) = engine_with_drainable_sink(24_000 * 10);
         e.handle(say("Short."));
         run(&mut e, 500);
+        sink.lock().unwrap().drain(usize::MAX);
+        e.tick();
         assert_eq!(e.snapshot().state, State::Idle);
+    }
+
+    #[test]
+    fn state_stays_speaking_while_audio_is_still_pending_in_the_sink() {
+        // C1, pinned directly: the engine must not announce Idle the instant
+        // there is nothing left to *synthesize* -- it must wait until the
+        // sink has actually finished playing what it already has.
+        let (mut e, sink) = engine_with_drainable_sink(24_000 * 10);
+        e.handle(say("Hello there. This is sayd speaking from the engine."));
+        run(&mut e, 500);
+
+        let pending = sink.lock().unwrap().pending();
+        assert!(pending > 0, "test is only meaningful with audio still buffered");
+        let s = e.snapshot();
+        assert_eq!(
+            s.state,
+            State::Speaking,
+            "must not report Idle with {pending} samples still unplayed"
+        );
+        assert!(
+            s.remaining_secs > 0.0,
+            "remaining_secs must agree with state: both say audio is still outstanding"
+        );
+
+        sink.lock().unwrap().drain(usize::MAX);
+        e.tick();
+        assert_eq!(e.snapshot().state, State::Idle, "must go Idle once the sink actually drains");
+    }
+
+    #[test]
+    fn paused_engine_with_pending_audio_does_not_go_idle_or_spin() {
+        // The interaction C1 calls out explicitly: while Paused the sink
+        // does not drain (nothing is popping it) and `tick` returns before
+        // ever reaching `go_idle`, so a paused engine with buffered audio
+        // must neither drift to Idle on its own nor loop/panic under
+        // repeated ticking.
+        let (mut e, sink) = engine_with_drainable_sink(24_000 * 10);
+        e.handle(say("Hello there. This is a reasonably long test sentence."));
+        run(&mut e, 500);
+        assert_eq!(e.snapshot().state, State::Speaking);
+        let pending_before = sink.lock().unwrap().pending();
+        assert!(pending_before > 0, "test is only meaningful with audio still buffered");
+
+        e.handle(Command::Pause);
+        assert_eq!(e.snapshot().state, State::Paused);
+
+        for _ in 0..200 {
+            e.tick();
+        }
+
+        let s = e.snapshot();
+        assert_eq!(s.state, State::Paused, "must not spuriously become Idle while paused");
+        assert_eq!(
+            sink.lock().unwrap().pending(),
+            pending_before,
+            "a paused sink must not drain, and tick must not touch it while paused"
+        );
     }
 
     #[test]
@@ -769,16 +936,27 @@ mod tests {
 
     #[test]
     fn error_state_invariant_holds_after_every_command_from_every_state() {
-        // Pin the invariant itself, not just the individual scenarios above:
-        // `error.is_some() == (state == State::Error)` after every command,
-        // from every reachable state.
-        fn assert_invariant(e: &Engine, ctx: &str) {
+        // Pin both invariants documented on `Engine::error`, not just the
+        // individual scenarios covering each of them elsewhere: `error.
+        // is_some() == (state == State::Error)`, and `state == State::Paused`
+        // whenever the sink is left paused -- both after every command, from
+        // every reachable state. (C2's bug was exactly a case where the
+        // second invariant broke while the first stayed fine: `Next`,
+        // `SkipSentence` and `SetMuted(true)` all correctly reached `Idle`
+        // with `error == None`, while quietly leaving `sink.paused == true`
+        // behind.)
+        fn assert_invariants(e: &Engine, ctx: &str) {
             let s = e.snapshot();
             assert_eq!(
                 s.error.is_some(),
                 s.state == State::Error,
                 "{ctx}: error={:?} state={:?}",
                 s.error,
+                s.state
+            );
+            assert!(
+                s.state == State::Paused || !e.sink.is_paused(),
+                "{ctx}: state={:?} but the sink is still paused",
                 s.state
             );
         }
@@ -830,9 +1008,9 @@ mod tests {
         fn check_from(name: &str, build: fn() -> Engine) {
             for cmd in all_commands() {
                 let mut e = build();
-                assert_invariant(&e, &format!("before {name} -> {cmd:?}"));
+                assert_invariants(&e, &format!("before {name} -> {cmd:?}"));
                 e.handle(cmd.clone());
-                assert_invariant(&e, &format!("after {name} -> {cmd:?}"));
+                assert_invariants(&e, &format!("after {name} -> {cmd:?}"));
             }
         }
 
@@ -926,16 +1104,26 @@ mod tests {
 
     #[test]
     fn idle_unload_drops_the_model_after_the_configured_delay() {
-        // unload as soon as idle
+        // unload as soon as idle. C1: as in `returns_to_idle_when_the_queue_
+        // empties`, actually reaching `Idle` -- the precondition this test
+        // is exercising -- now requires draining the sink first.
         let cfg = Config { idle_unload_secs: 0, ..Config::default() };
+        let sink = Arc::new(Mutex::new(VecSink::new(24_000 * 10)));
         let mut e = Engine::new(
             cfg,
             Box::new(StubSynthesizer::new()),
-            Box::new(VecSink::new(24_000 * 10)),
+            Box::new(SharedVecSink(sink.clone())),
         );
         e.handle(say("Hello."));
         run(&mut e, 500);
-        e.tick(); // one more tick past idle to trigger the unload check
+        assert_eq!(
+            e.snapshot().state,
+            State::Speaking,
+            "sanity: audio must still be pending before the drain below"
+        );
+        sink.lock().unwrap().drain(usize::MAX);
+        e.tick(); // reach Idle and trigger the unload check in the same tick
+        assert_eq!(e.snapshot().state, State::Idle);
         assert!(!e.is_model_loaded(), "expected the model to unload when idle");
     }
 

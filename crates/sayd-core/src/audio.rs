@@ -18,6 +18,12 @@ pub trait AudioSink: Send {
 
     fn set_paused(&mut self, paused: bool);
 
+    /// Whether the sink is currently paused. The counterpart to
+    /// `set_paused`, so callers (and tests pinning the `state != Paused =>
+    /// !sink.is_paused()` invariant in `engine.rs`) can observe the sink's
+    /// pause state without having to track it themselves.
+    fn is_paused(&self) -> bool;
+
     /// Total buffer size, so the engine knows how far ahead it may run.
     fn capacity(&self) -> usize;
 
@@ -64,6 +70,10 @@ impl AudioSink for VecSink {
 
     fn set_paused(&mut self, paused: bool) {
         self.paused = paused;
+    }
+
+    fn is_paused(&self) -> bool {
+        self.paused
     }
 
     fn capacity(&self) -> usize {

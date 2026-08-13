@@ -251,6 +251,12 @@ impl RingProducer {
         self.shared.paused.store(paused, Ordering::Release);
     }
 
+    /// The counterpart read to `set_paused`: a plain load of the same flag,
+    /// with no decision-making of its own to race anything.
+    pub(crate) fn is_paused(&self) -> bool {
+        self.shared.paused.load(Ordering::Acquire)
+    }
+
     pub(crate) fn capacity(&self) -> usize {
         self.capacity
     }
@@ -435,6 +441,10 @@ impl AudioSink for RingSink {
 
     fn set_paused(&mut self, paused: bool) {
         self.producer.set_paused(paused)
+    }
+
+    fn is_paused(&self) -> bool {
+        self.producer.is_paused()
     }
 
     fn capacity(&self) -> usize {

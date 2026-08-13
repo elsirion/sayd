@@ -161,3 +161,145 @@ mod models_tests {
         );
     }
 }
+
+/// I3: every `sayd-core` engine test asserts a sample *count*, never
+/// content, and `StubSynthesizer` only ever emits `vec![0.0; n]` -- so an
+/// engine that pushed all zeros, or the wrong buffer entirely, would pass
+/// every one of them. `models_tests` above proves `KokoroSynthesizer`
+/// itself produces real audio, but calls it directly, bypassing `Engine`
+/// entirely. This module closes both gaps at once: a real `Engine`, wired to
+/// the real `KokoroSynthesizer`, driven by nothing but `submit`/`tick`/
+/// `snapshot` -- the same surface the binary and every `sayd-core` test use
+/// -- checked for audio that is both non-silent and a plausible length.
+///
+/// `sayd-core` cannot depend on `kokoro`/`ort` (see the workspace
+/// constraints), so this cannot live in `engine.rs`; it lives here instead,
+/// next to the other `models`-gated tests, and reaches `Engine` purely
+/// through `sayd-core`'s public API.
+#[cfg(all(test, feature = "models"))]
+mod engine_models_tests {
+    use std::sync::{Arc, Mutex};
+
+    use sayd_core::audio::{AudioSink, VecSink};
+    use sayd_core::config::Config;
+    use sayd_core::engine::{Engine, SayOpts, State};
+
+    use super::*;
+
+    fn models_dir() -> &'static Path {
+        Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../models"))
+    }
+
+    /// `Engine` keeps its sink behind a private `Box<dyn AudioSink>`, so
+    /// this test needs a handle it can drain (simulate playback) from
+    /// outside after handing the sink away -- the same technique
+    /// `sayd-core`'s own `engine.rs` tests use for the same reason
+    /// (`SharedVecSink` there), reimplemented locally here because it
+    /// exists purely to model playback in tests, not as part of the
+    /// production `AudioSink` API `sayd-core` exports.
+    struct DrainableSink(Arc<Mutex<VecSink>>);
+
+    impl AudioSink for DrainableSink {
+        fn push(&mut self, samples: &[f32]) -> usize {
+            self.0.lock().unwrap().push(samples)
+        }
+        fn pending(&self) -> usize {
+            self.0.lock().unwrap().pending()
+        }
+        fn clear(&mut self) {
+            self.0.lock().unwrap().clear()
+        }
+        fn set_paused(&mut self, paused: bool) {
+            self.0.lock().unwrap().set_paused(paused)
+        }
+        fn is_paused(&self) -> bool {
+            self.0.lock().unwrap().is_paused()
+        }
+        fn capacity(&self) -> usize {
+            self.0.lock().unwrap().capacity()
+        }
+        fn total_written(&self) -> usize {
+            self.0.lock().unwrap().total_written()
+        }
+    }
+
+    /// End-to-end through the real `Engine`: submit real text, tick to
+    /// completion, and check the sink actually received non-silent audio of
+    /// a plausible duration -- not just a sample count.
+    ///
+    /// This also pins C1's drain gate, deliberately: a `VecSink` never
+    /// empties on its own, so if `Engine` still declared `Idle` the instant
+    /// synthesis finished (the bug C1 fixed) this test would never get to
+    /// exercise the "drain, then Idle" half below at all. Driving that
+    /// through the real synthesizer and a real (if manually driven) sink is
+    /// exactly the "exercises both" the fix's report asks for.
+    #[test]
+    fn engine_produces_non_silent_audio_of_plausible_duration() {
+        let cfg = Config::default();
+        let synth = KokoroSynthesizer::new(models_dir(), &cfg).expect("synthesizer constructs");
+        let sink = Arc::new(Mutex::new(VecSink::new(24_000 * 30)));
+        let mut e = Engine::new(cfg, Box::new(synth), Box::new(DrainableSink(sink.clone())));
+
+        let text = "Hello there. This is sayd speaking from the engine.";
+        e.submit(text.into(), SayOpts::default()).expect("well-formed text is accepted");
+
+        // Tick the real engine to completion: nothing left queued, nothing
+        // still in flight. The bound is generous because this drives real
+        // ONNX inference, not a stub -- a short sentence like this finishes
+        // in a handful of ticks in practice.
+        let mut finished = false;
+        for _ in 0..5000 {
+            e.tick();
+            let s = e.snapshot();
+            if s.queue_len == 0 && s.current_id == 0 {
+                finished = true;
+                break;
+            }
+        }
+        assert!(finished, "synthesis did not finish within the tick budget");
+
+        // C1: audio is fully synthesized and sitting in the sink, but this
+        // sink never drains on its own -- the engine must still report
+        // Speaking, not Idle, until something actually plays it.
+        let s = e.snapshot();
+        assert_eq!(
+            s.state,
+            State::Speaking,
+            "engine must stay Speaking while synthesized audio is still pending in the sink"
+        );
+
+        let written = sink.lock().unwrap().written.clone();
+        assert!(!written.is_empty(), "expected some audio to have been written");
+        assert!(
+            written.iter().any(|&x| x != 0.0),
+            "expected non-silent audio from the real synthesizer, got all zeros"
+        );
+
+        // Same sanity window as `synth_produces_plausible_length_audio_from_
+        // real_text` above, for the same sentence driven through the same
+        // model -- a wildly wrong value (silence-length garbage, or a
+        // single frame) would fall well outside it.
+        let seconds = written.len() as f64 / kokoro::SAMPLE_RATE as f64;
+        let nonzero = written.iter().filter(|&&x| x != 0.0).count();
+        eprintln!(
+            "engine_produces_non_silent_audio_of_plausible_duration: {} samples ({seconds:.3}s), \
+             {nonzero} non-zero ({:.1}%)",
+            written.len(),
+            100.0 * nonzero as f64 / written.len() as f64
+        );
+        assert!(
+            (0.5..20.0).contains(&seconds),
+            "synthesized audio duration {seconds}s is not plausible for this sentence"
+        );
+
+        // The other half of C1: drain the sink (simulate playback finishing)
+        // and confirm the engine settles to Idle.
+        sink.lock().unwrap().drain(usize::MAX);
+        e.tick();
+        assert_eq!(
+            e.snapshot().state,
+            State::Idle,
+            "engine must go Idle once the sink has actually drained"
+        );
+    }
+}
