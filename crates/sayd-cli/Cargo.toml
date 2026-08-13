@@ -1,0 +1,19 @@
+[package]
+name = "sayd-cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Control CLI for the sayd text-to-speech daemon"
+readme = "README.md"
+keywords = ["tts", "speech", "cli", "sayd", "dbus"]
+categories = ["command-line-utilities", "accessibility"]
+
+[[bin]]
+name = "say"
+path = "src/main.rs"
+
+[dependencies]
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+tokio = { version = "1", features = ["rt", "macros"] }
+clap = { version = "4", features = ["derive"] }
