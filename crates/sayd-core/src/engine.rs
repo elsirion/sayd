@@ -66,11 +66,6 @@ pub struct Snapshot {
     pub current_text: String,
     pub current_id: u64,
     pub error: Option<String>,
-    /// The most recent submission this engine refused, if any. Distinct from
-    /// `error`: a rejection that leaves an unrelated, still-valid playback
-    /// untouched does not become `state: Error` (see `submit`), but the
-    /// caller still needs a way to learn the submission was dropped.
-    pub last_rejected: Option<String>,
 }
 
 /// The utterance currently being spoken, decomposed into chunks.
@@ -97,7 +92,6 @@ pub struct Engine {
     /// sync in the same step; see `submit`, `dismiss_error_and_go_idle` and
     /// the pop branch of `tick`.
     error: Option<String>,
-    last_rejected: Option<String>,
     idle_since: Option<Instant>,
     shutdown: bool,
 }
@@ -112,7 +106,6 @@ impl Engine {
             current: None,
             state: State::Idle,
             error: None,
-            last_rejected: None,
             idle_since: Some(Instant::now()),
             shutdown: false,
         }
@@ -124,7 +117,9 @@ impl Engine {
 
     pub fn handle(&mut self, cmd: Command) {
         match cmd {
-            Command::Say { text, opts } => self.submit(text, opts),
+            Command::Say { text, opts } => {
+                let _ = self.submit(text, opts);
+            }
             Command::Pause => {
                 if self.state == State::Speaking {
                     self.state = State::Paused;
@@ -148,7 +143,6 @@ impl Engine {
                 self.queue.clear();
                 self.discard_current();
                 self.sink.set_paused(false);
-                self.last_rejected = None;
                 self.dismiss_error_and_go_idle();
             }
             Command::Next => {
@@ -167,6 +161,8 @@ impl Engine {
                             self.dismiss_error_and_go_idle();
                         }
                     }
+                } else if self.queue.is_empty() {
+                    self.dismiss_error_and_go_idle();
                 }
             }
             Command::ClearQueue => {
@@ -192,26 +188,35 @@ impl Engine {
         }
     }
 
-    fn submit(&mut self, text: String, opts: SayOpts) {
+    /// Submit text for synthesis, returning the queued utterance's id on
+    /// acceptance or the rejection reason on failure. This is the
+    /// synchronous answer a caller gets back for *its own* submission --
+    /// distinct from `error`/`state`, which describe the engine as a whole
+    /// and must not be disturbed by a rejection that has nothing to do with
+    /// whatever else is legitimately in flight (see the busy check below).
+    ///
+    /// `handle(Command::Say { .. })` calls this and discards the result, so
+    /// the existing command path is unchanged for callers that do not care.
+    /// A D-Bus `Say` method or a CLI entry point should call this directly
+    /// to learn whether its own submission was accepted.
+    pub fn submit(&mut self, text: String, opts: SayOpts) -> Result<u64, String> {
         if text.chars().count() > self.cfg.max_chars {
             let msg = format!(
                 "text is {} characters, limit is {}",
                 text.chars().count(),
                 self.cfg.max_chars
             );
-            self.last_rejected = Some(msg.clone());
             // Something unrelated is genuinely still playing (or paused):
             // this rejection must not stomp on it and report a global Error
-            // when nothing about A is actually wrong. The caller still needs
-            // to learn the submission was refused, so it goes on
-            // `last_rejected` rather than the state machine's `error`.
+            // when nothing about A is actually wrong. The caller still
+            // learns the submission was refused, via the `Err` returned
+            // here rather than a shared snapshot field.
             if self.state != State::Speaking && self.state != State::Paused {
                 self.state = State::Error;
-                self.error = Some(msg);
+                self.error = Some(msg.clone());
             }
-            return;
+            return Err(msg);
         }
-        self.last_rejected = None;
         if self.state == State::Error {
             // Error only ever arises with nothing legitimately in flight
             // (see the branch above and `tick`'s synth-failure path), so
@@ -220,12 +225,12 @@ impl Engine {
             self.error = None;
         }
         if self.cfg.muted {
-            return; // accepted and discarded
+            return Ok(0); // accepted and discarded
         }
 
         let cleaned = clean(&text, &self.cfg.cleanup);
         if cleaned.trim().is_empty() {
-            return;
+            return Ok(0);
         }
 
         let policy = opts.policy.unwrap_or_else(|| opts.source.default_policy());
@@ -248,6 +253,8 @@ impl Engine {
             self.state = State::Speaking;
             self.idle_since = None;
         }
+
+        Ok(id)
     }
 
     /// One unit of work: top up the sink, or advance the queue, or unload.
@@ -415,7 +422,6 @@ impl Engine {
             current_text: self.current.as_ref().map(|c| c.text.clone()).unwrap_or_default(),
             current_id: self.current.as_ref().map(|c| c.id).unwrap_or(0),
             error: self.error.clone(),
-            last_rejected: self.last_rejected.clone(),
         }
     }
 
@@ -708,7 +714,7 @@ mod tests {
         // Submitting an over-long text while an unrelated utterance A is
         // legitimately speaking must not flip the engine to Error: A is
         // unaffected and should play to completion. The rejection must
-        // still be observable, so it goes on `last_rejected`.
+        // still be observable -- now synchronously, as `submit`'s `Err`.
         let cfg = Config { max_chars: 5, ..Config::default() };
         let mut e = Engine::new(
             cfg,
@@ -721,18 +727,20 @@ mod tests {
         assert_eq!(before.state, State::Speaking);
         let id = before.current_id;
 
-        e.handle(say("this one is definitely too long for the limit"));
+        let result = e.submit(
+            "this one is definitely too long for the limit".into(),
+            SayOpts::default(),
+        );
 
+        assert!(
+            result.as_ref().unwrap_err().contains('5'),
+            "the rejection must still be observable: {result:?}"
+        );
         let after = e.snapshot();
         assert_eq!(after.state, State::Speaking, "A must keep playing");
         assert_eq!(after.current_id, id, "A must not be disturbed");
         assert_eq!(after.error, None, "nothing about A is actually wrong");
         assert_eq!(after.queue_len, 0, "the rejected text must not be queued");
-        assert!(
-            after.last_rejected.as_deref().unwrap_or("").contains('5'),
-            "the rejection must still be observable: {:?}",
-            after.last_rejected
-        );
     }
 
     #[test]
@@ -748,12 +756,15 @@ mod tests {
         e.handle(Command::Pause);
         assert_eq!(e.snapshot().state, State::Paused);
 
-        e.handle(say("this one is definitely too long for the limit"));
+        let result = e.submit(
+            "this one is definitely too long for the limit".into(),
+            SayOpts::default(),
+        );
 
+        assert!(result.is_err());
         let after = e.snapshot();
         assert_eq!(after.state, State::Paused);
         assert_eq!(after.error, None);
-        assert!(after.last_rejected.is_some());
     }
 
     #[test]
@@ -982,6 +993,63 @@ mod tests {
     }
 
     #[test]
+    fn skip_sentence_dismisses_a_stuck_error_from_a_rejected_submission() {
+        // `SkipSentence`'s call to `dismiss_error_and_go_idle` used to sit
+        // inside `if let Some(c) = self.current.as_mut()`, but `Error`
+        // always implies `current.is_none()` -- so the branch could never
+        // run while in `Error` and `SkipSentence` from an error state was a
+        // silent no-op, contradicting `dismiss_error_and_go_idle`'s own doc
+        // comment. This pins the rejection entry point to `Error`.
+        let cfg = Config { max_chars: 5, ..Config::default() };
+        let mut e = Engine::new(
+            cfg,
+            Box::new(StubSynthesizer::new()),
+            Box::new(VecSink::new(24_000 * 10)),
+        );
+        e.handle(say("way too long for the limit"));
+        assert_eq!(e.snapshot().state, State::Error);
+        e.handle(Command::SkipSentence);
+        let s = e.snapshot();
+        assert_eq!(s.state, State::Idle);
+        assert_eq!(s.error, None);
+    }
+
+    #[test]
+    fn skip_sentence_dismisses_a_stuck_error_from_a_synthesis_failure() {
+        // Mirror of the test above via the other entry point into `Error`.
+        struct Failing;
+        impl crate::synth::Synthesizer for Failing {
+            fn phonemize(&mut self, t: &str, _voice: &str) -> String {
+                t.into()
+            }
+            fn fits(&mut self, _: &str) -> bool {
+                true
+            }
+            fn synth(&mut self, _: &str, _: &str, _: f32) -> Result<Vec<f32>, String> {
+                Err("model exploded".into())
+            }
+            fn unload(&mut self) {}
+            fn is_loaded(&self) -> bool {
+                true
+            }
+        }
+        let mut e = Engine::new(
+            Config::default(),
+            Box::new(Failing),
+            Box::new(VecSink::new(24_000)),
+        );
+        e.handle(say("Anything."));
+        for _ in 0..20 {
+            e.tick();
+        }
+        assert_eq!(e.snapshot().state, State::Error);
+        e.handle(Command::SkipSentence);
+        let s = e.snapshot();
+        assert_eq!(s.state, State::Idle);
+        assert_eq!(s.error, None);
+    }
+
+    #[test]
     fn synth_failure_surfaces_as_error_and_does_not_wedge() {
         struct Failing;
         impl crate::synth::Synthesizer for Failing {
@@ -1020,5 +1088,59 @@ mod tests {
         run(&mut e, 50);
         assert_eq!(e.snapshot().state, State::Idle);
         assert_eq!(e.audio_written(), 0);
+    }
+
+    #[test]
+    fn submit_rejection_while_idle_returns_err_and_sets_error_state() {
+        // Nothing is legitimately in flight, so the rejection both answers
+        // the caller directly and becomes the engine-wide `Error`.
+        let cfg = Config { max_chars: 5, ..Config::default() };
+        let mut e = Engine::new(
+            cfg,
+            Box::new(StubSynthesizer::new()),
+            Box::new(VecSink::new(24_000 * 10)),
+        );
+        let result = e.submit("way too long for the limit".into(), SayOpts::default());
+        let msg = result.expect_err("over-long text must be rejected");
+        assert!(msg.contains('5'), "got {msg:?}");
+        let s = e.snapshot();
+        assert_eq!(s.state, State::Error);
+        assert_eq!(s.error.as_deref(), Some(msg.as_str()));
+    }
+
+    #[test]
+    fn submit_rejection_while_speaking_returns_err_but_leaves_state_untouched() {
+        // Same busy-vs-idle distinction as `rejection_while_speaking_leaves_
+        // playback_untouched`, but pinned directly against the new method's
+        // return value rather than only through `handle`.
+        let cfg = Config { max_chars: 5, ..Config::default() };
+        let mut e = Engine::new(
+            cfg,
+            Box::new(StubSynthesizer::new()),
+            Box::new(VecSink::new(24_000 * 10)),
+        );
+        e.handle(say("Hi."));
+        e.tick();
+        assert_eq!(e.snapshot().state, State::Speaking);
+
+        let result = e.submit(
+            "this one is definitely too long for the limit".into(),
+            SayOpts::default(),
+        );
+
+        assert!(result.is_err());
+        let s = e.snapshot();
+        assert_eq!(s.state, State::Speaking, "the unrelated playback must continue");
+        assert_eq!(s.error, None);
+    }
+
+    #[test]
+    fn submit_accepted_returns_the_id_that_later_appears_as_current_id() {
+        let mut e = engine();
+        let id = e
+            .submit("Hello there. This is a test.".into(), SayOpts::default())
+            .expect("well-formed text must be accepted");
+        e.tick();
+        assert_eq!(e.snapshot().current_id, id);
     }
 }
