@@ -7,3 +7,4 @@
 
 pub mod config;
 pub mod cleanup;
+pub mod chunk;
