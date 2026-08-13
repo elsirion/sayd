@@ -37,6 +37,39 @@
 //!   span can never contain, start with, or end with whitespace. Collapsing
 //!   whitespace runs elsewhere in the string can therefore never reach into
 //!   a URL span or merge two URL spans together.
+//!
+//! Two of the transforms that *do* run per-segment inside `clean_non_url`
+//! are anchor-based, and an anchor evaluated on an isolated segment does not
+//! necessarily correspond to a real boundary in the original, unsegmented
+//! input. Both are handled specially:
+//!
+//! - `LIST_OR_HEADING` is anchored on `^` (line start, via `(?m)`). Handing
+//!   it an isolated segment is wrong: position 0 of a segment that begins
+//!   right after a URL is *not* a line start in the original text, but `^`
+//!   would match there anyway, misreading ordinary punctuation that follows
+//!   a URL (` - `, ` # `, ` 1. `) as a bullet/heading/list marker. There is
+//!   no per-segment fix that recovers real line-start information once the
+//!   string has been cut, so this pass runs exactly once over the *whole*
+//!   input, before segmentation. This is safe with respect to URLs: the
+//!   pattern only matches immediately after a real line start, requires one
+//!   of `#`, `-`, `*`, `+`, or a digit right there, and requires trailing
+//!   whitespace before it stops — a URL always begins with `http`/`https`
+//!   (never one of those marker characters) and never contains whitespace,
+//!   so the pattern can neither start a match on URL text nor extend a
+//!   match into it. A test (`bullet_immediately_followed_by_url_is_still_stripped`)
+//!   confirms a marker is still stripped when a URL immediately follows it.
+//! - `ACRONYM` is anchored on `\b` (word boundary) at both ends. Evaluated
+//!   on an isolated segment, `\b` at position 0 or at the end of the string
+//!   is computed against "nothing" on the outside — even when the original
+//!   input actually had an alphanumeric character right there (typically
+//!   the edge of an adjacent URL), which would have suppressed the
+//!   boundary. To reproduce full-string semantics, `clean_non_url` is given
+//!   the real character that precedes and follows the segment in the
+//!   original input; if that neighbor is alphanumeric, a one-character
+//!   lowercase-letter sentinel is temporarily glued onto that side of the
+//!   segment before `ACRONYM` runs (lowercase so it can never itself match
+//!   `[A-Z]{3,}`), reproducing the same "word character on the other side"
+//!   `\b` would have seen, and is stripped back off afterward.
 
 use std::sync::LazyLock;
 
@@ -70,17 +103,29 @@ pub fn clean(text: &str, cfg: &CleanupConfig) -> String {
         s = CODE_FENCE.replace_all(&s, " ").into_owned();
     }
 
+    // Anchored on `^`; must run once over the whole string, before
+    // segmentation, so its line-start anchor sees real line starts rather
+    // than segment starts. See module doc comment.
+    if cfg.strip_markdown {
+        s = LIST_OR_HEADING.replace_all(&s, "").into_owned();
+    }
+
     // Segment into alternating non-URL / URL runs so no transform below can
     // ever see both a URL and URL-unsafe syntax at once. See the module doc
     // comment for the full reasoning.
     let mut out = String::with_capacity(s.len());
     let mut last = 0;
     for m in URL.find_iter(&s) {
-        out.push_str(&clean_non_url(&s[last..m.start()], cfg));
+        let segment = &s[last..m.start()];
+        let prev = s[..last].chars().next_back();
+        let next = s[m.start()..].chars().next();
+        out.push_str(&clean_non_url(segment, prev, next, cfg));
         out.push_str(&resolve_url(m.as_str(), cfg));
         last = m.end();
     }
-    out.push_str(&clean_non_url(&s[last..], cfg));
+    let segment = &s[last..];
+    let prev = s[..last].chars().next_back();
+    out.push_str(&clean_non_url(segment, prev, None, cfg));
     s = out;
 
     s = s
@@ -96,7 +141,18 @@ pub fn clean(text: &str, cfg: &CleanupConfig) -> String {
 }
 
 /// Apply the transforms that must never touch URL text to a non-URL segment.
-fn clean_non_url(segment: &str, cfg: &CleanupConfig) -> String {
+///
+/// `prev`/`next` are the characters that flank this segment in the
+/// *original, unsegmented* input (e.g. the last character of a preceding
+/// URL, or the first character of a following one) — `None` at the true
+/// start/end of the input. They exist solely so `ACRONYM`'s `\b` anchors can
+/// be evaluated with full-string semantics; see the module doc comment.
+fn clean_non_url(
+    segment: &str,
+    prev: Option<char>,
+    next: Option<char>,
+    cfg: &CleanupConfig,
+) -> String {
     let mut s = segment.to_string();
 
     if cfg.rejoin_hyphenation {
@@ -104,14 +160,31 @@ fn clean_non_url(segment: &str, cfg: &CleanupConfig) -> String {
     }
 
     if cfg.strip_markdown {
-        s = LIST_OR_HEADING.replace_all(&s, "").into_owned();
         s = EMPHASIS.replace_all(&s, "").into_owned();
         s = s.replace('|', " ");
     }
 
     if cfg.spell_acronyms {
-        s = ACRONYM
-            .replace_all(&s, |caps: &regex::Captures| {
+        // `\b` at position 0 / end-of-string is computed against "nothing"
+        // outside the segment, even when the real input had an alphanumeric
+        // character right there. Reproduce that character with a lowercase
+        // (never matched by `[A-Z]{3,}`) sentinel so the boundary check
+        // sees what it would have seen unsegmented, then strip it back off.
+        const SENTINEL: char = 'x';
+        let prepend = prev.is_some_and(|c| c.is_alphanumeric());
+        let append = next.is_some_and(|c| c.is_alphanumeric());
+
+        let mut padded = String::with_capacity(s.len() + 2);
+        if prepend {
+            padded.push(SENTINEL);
+        }
+        padded.push_str(&s);
+        if append {
+            padded.push(SENTINEL);
+        }
+
+        let replaced = ACRONYM
+            .replace_all(&padded, |caps: &regex::Captures| {
                 caps[0]
                     .chars()
                     .map(|c| c.to_string())
@@ -119,6 +192,10 @@ fn clean_non_url(segment: &str, cfg: &CleanupConfig) -> String {
                     .join(" ")
             })
             .into_owned();
+
+        let start = if prepend { SENTINEL.len_utf8() } else { 0 };
+        let end = replaced.len() - if append { SENTINEL.len_utf8() } else { 0 };
+        s = replaced[start..end].to_string();
     }
 
     s
@@ -434,6 +511,82 @@ mod tests {
         assert_eq!(
             clean("see https://[2001:db8::1]:8080/path now", &c),
             "see [2001]:8080/path now"
+        );
+    }
+
+    // -- Segment-boundary anchors (Finding 1: LIST_OR_HEADING's `^`) --------
+
+    #[test]
+    fn url_followed_by_punctuation_does_not_lose_its_separator() {
+        // Regression: when LIST_OR_HEADING ran per non-URL segment, the
+        // segment right after a URL started at position 0 of its own
+        // string, which `^` (a line-start anchor) matched even though that
+        // position is not a real line start in the original input. That
+        // misread ordinary punctuation after a URL as a markdown marker and
+        // silently ate it along with its whitespace, gluing words together.
+        let c = all_on();
+        assert_eq!(
+            clean("see https://example.com/x - continued sentence", &c),
+            "see link - continued sentence"
+        );
+        assert_eq!(
+            clean("see https://example.com/x # not a heading", &c),
+            "see link # not a heading"
+        );
+        assert_eq!(
+            clean("call https://example.com/x 1. not a list", &c),
+            "call link 1. not a list"
+        );
+    }
+
+    #[test]
+    fn bullet_immediately_followed_by_url_is_still_stripped() {
+        // Confirms the reasoning in the module doc comment: LIST_OR_HEADING
+        // now runs once over the whole input before segmentation, but a
+        // marker that is genuinely at a line start — even one immediately
+        // followed by a URL — must still be recognized and stripped. This
+        // guards against over-correcting Finding 1 into never stripping
+        // anything near a URL.
+        let c = all_on();
+        assert_eq!(clean("- https://example.com/x", &c), "link");
+    }
+
+    #[test]
+    fn heading_and_numbered_list_still_stripped_alongside_a_url() {
+        let c = all_on();
+        let input = "# Title\n- see https://example.com/x\n1. done";
+        assert_eq!(clean(input, &c), "Title see link done");
+    }
+
+    // -- Segment-boundary anchors (Finding 2: ACRONYM's `\b`) ----------------
+
+    #[test]
+    fn acronym_glued_directly_to_a_url_is_not_spelled_out() {
+        // Regression: an acronym with no separating whitespace before a URL
+        // has no real word boundary between them in the original text, so
+        // it must not be spelled out. Both later designs (placeholder swap,
+        // naive segmentation) regressed this by different mechanisms; the
+        // round-1 implementation got it right because it ran ACRONYM once
+        // over the whole string.
+        let c = all_on();
+        assert_eq!(clean("HTLChttps://example.com/x", &c), "HTLClink");
+    }
+
+    #[test]
+    fn acronym_separated_from_a_url_by_whitespace_is_still_spelled_out() {
+        // Guards against over-correcting Finding 2: the sentinel padding
+        // must not suppress spelling out a legitimate acronym just because
+        // a URL happens to follow later in the segment.
+        let c = all_on();
+        assert_eq!(clean("HTLC https://example.com/x", &c), "H T L C link");
+    }
+
+    #[test]
+    fn url_at_very_start_and_very_end_of_input() {
+        let c = all_on();
+        assert_eq!(
+            clean("https://example.com/a middle https://example.com/b", &c),
+            "link middle link"
         );
     }
 }
