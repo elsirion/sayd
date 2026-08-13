@@ -4,18 +4,39 @@
 //! contents, and whitespace is collapsed last so earlier removals do not
 //! leave gaps.
 //!
-//! URLs get special handling. Whatever `UrlPolicy` decides a URL should
-//! become (the literal word "link", a bare host, or the URL verbatim) is
-//! resolved up front, then the resolved text is hidden behind a placeholder
-//! built from private-use codepoints (`U+E000`/`U+E001`) while the markdown
-//! and acronym passes run. Those codepoints are not control characters, not
-//! whitespace, and not markdown syntax, so nothing in between disturbs them.
-//! The placeholder is swapped back for the resolved text after the acronym
-//! pass but before the control-character strip and whitespace collapse:
-//! after acronym spelling so a `Keep`-policy URL's uppercase letters are not
-//! read out letter by letter, and before the control-character strip and
-//! whitespace collapse so those two unconditional/default passes still see
-//! (and can act on) the real, final text.
+//! URLs get special handling. After code fences are dropped, the remaining
+//! text is segmented into alternating runs of non-URL text and URL matches.
+//! Transforms that must never touch URL text — hyphenation rejoin, markdown
+//! stripping, acronym spelling — run only on the non-URL segments; the
+//! `UrlPolicy` replacement (the literal word "link", a bare host, or the URL
+//! verbatim) is computed only for the URL segments. The results are
+//! concatenated back together in their original order.
+//!
+//! This replaces an earlier placeholder-based scheme (hide URLs behind
+//! `\u{E000}<index>\u{E001}` markers, restore after the markdown/acronym
+//! passes) that assumed those private-use codepoints never occur in real
+//! input. That assumption doesn't hold: Nerd Font and Powerline glyphs live
+//! in exactly that codepoint range, and this daemon's primary input is
+//! terminal selections, so users routinely paste text containing them.
+//! Segmentation makes no assumption about which codepoints appear anywhere
+//! in the input — URL text and non-URL text are simply never in the same
+//! string at the same time while the URL-unsafe transforms run.
+//!
+//! The two remaining passes — the control-character strip and whitespace
+//! collapse — run once, globally, on the concatenated result, and that is
+//! safe:
+//!
+//! - The control-character strip is unconditional and must stay that way:
+//!   it is the only thing standing between an embedded NUL and a downstream
+//!   FFI `CString::new` call, and a test pins that guarantee. Running it
+//!   globally cannot corrupt a URL span because it only ever *removes*
+//!   characters, and a legitimate URL cannot contain a control character in
+//!   the first place — there is nothing there to protect.
+//! - Whitespace collapse is safe to run globally because the `URL` regex's
+//!   exclusion set already excludes whitespace from a URL match, so a URL
+//!   span can never contain, start with, or end with whitespace. Collapsing
+//!   whitespace runs elsewhere in the string can therefore never reach into
+//!   a URL span or merge two URL spans together.
 
 use std::sync::LazyLock;
 
@@ -25,25 +46,22 @@ use crate::config::{CleanupConfig, UrlPolicy};
 
 static CODE_FENCE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?s)```.*?(?:```|$)").expect("static regex"));
+// Excludes whitespace and the delimiters a URL is typically wrapped in
+// (`<>()[]`), plus `*` and backtick, which are markdown emphasis/code
+// syntax rather than realistic URL content. `_` and `-` are deliberately
+// left in: both are common and legal in URLs (including hostnames).
 static URL: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"https?://[^\s<>\)\]]+").expect("static regex"));
+    LazyLock::new(|| Regex::new(r"https?://[^\s<>\)\]*`]+").expect("static regex"));
 static HYPHEN_BREAK: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(\w)-\s*\n\s*(\w)").expect("static regex"));
 static EMPHASIS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(\*\*|\*|__|_|`)").expect("static regex"));
-static LIST_OR_HEADING: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?m)^\s*(?:#{1,6}\s+|[-*+]\s+|\d+\.\s+)").expect("static regex")
-});
+static LIST_OR_HEADING: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)^\s*(?:#{1,6}\s+|[-*+]\s+|\d+\.\s+)").expect("static regex"));
 // Match only 3+ letter acronyms; two-letter words like OK and ID are left alone intentionally.
 static ACRONYM: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b[A-Z]{3,}\b").expect("static regex"));
-static WHITESPACE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\s+").expect("static regex"));
-
-/// Placeholder delimiters. Private-use codepoints: never produced by any
-/// other transform in this module, so they round-trip untouched.
-const PLACEHOLDER_START: char = '\u{E000}';
-const PLACEHOLDER_END: char = '\u{E001}';
+static WHITESPACE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").expect("static regex"));
 
 pub fn clean(text: &str, cfg: &CleanupConfig) -> String {
     let mut s = text.to_string();
@@ -52,28 +70,38 @@ pub fn clean(text: &str, cfg: &CleanupConfig) -> String {
         s = CODE_FENCE.replace_all(&s, " ").into_owned();
     }
 
+    // Segment into alternating non-URL / URL runs so no transform below can
+    // ever see both a URL and URL-unsafe syntax at once. See the module doc
+    // comment for the full reasoning.
+    let mut out = String::with_capacity(s.len());
+    let mut last = 0;
+    for m in URL.find_iter(&s) {
+        out.push_str(&clean_non_url(&s[last..m.start()], cfg));
+        out.push_str(&resolve_url(m.as_str(), cfg));
+        last = m.end();
+    }
+    out.push_str(&clean_non_url(&s[last..], cfg));
+    s = out;
+
+    s = s
+        .chars()
+        .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
+        .collect();
+
+    if cfg.collapse_whitespace {
+        s = WHITESPACE.replace_all(&s, " ").trim().to_string();
+    }
+
+    s
+}
+
+/// Apply the transforms that must never touch URL text to a non-URL segment.
+fn clean_non_url(segment: &str, cfg: &CleanupConfig) -> String {
+    let mut s = segment.to_string();
+
     if cfg.rejoin_hyphenation {
         s = HYPHEN_BREAK.replace_all(&s, "$1$2").into_owned();
     }
-
-    // Resolve URLs per policy now, then hide the resolved text behind an
-    // opaque placeholder so later transforms (markdown stripping, acronym
-    // spelling) cannot corrupt it. See the module doc comment for why the
-    // restore happens where it does.
-    let mut resolved_urls: Vec<String> = Vec::new();
-    s = URL
-        .replace_all(&s, |caps: &regex::Captures| {
-            let replacement = match cfg.urls {
-                UrlPolicy::Link => "link".to_string(),
-                UrlPolicy::Domain => host_of(&caps[0]),
-                UrlPolicy::Keep => caps[0].to_string(),
-            };
-            let placeholder =
-                format!("{PLACEHOLDER_START}{}{PLACEHOLDER_END}", resolved_urls.len());
-            resolved_urls.push(replacement);
-            placeholder
-        })
-        .into_owned();
 
     if cfg.strip_markdown {
         s = LIST_OR_HEADING.replace_all(&s, "").into_owned();
@@ -93,29 +121,32 @@ pub fn clean(text: &str, cfg: &CleanupConfig) -> String {
             .into_owned();
     }
 
-    for (i, replacement) in resolved_urls.iter().enumerate() {
-        let placeholder = format!("{PLACEHOLDER_START}{i}{PLACEHOLDER_END}");
-        s = s.replace(&placeholder, replacement);
-    }
-
-    s = s
-        .chars()
-        .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
-        .collect();
-
-    if cfg.collapse_whitespace {
-        s = WHITESPACE.replace_all(&s, " ").trim().to_string();
-    }
-
     s
+}
+
+/// Resolve a single matched URL span per `UrlPolicy`.
+fn resolve_url(url: &str, cfg: &CleanupConfig) -> String {
+    match cfg.urls {
+        UrlPolicy::Link => "link".to_string(),
+        UrlPolicy::Domain => host_of(url),
+        UrlPolicy::Keep => url.to_string(),
+    }
 }
 
 /// The host part of a URL, without scheme, port, path, query, fragment or
 /// credentials.
+///
+/// Known-wrong, deferred: this splits the authority on `:` to strip the
+/// port, which mangles IPv6 literals in brackets (e.g.
+/// `https://[2001:db8::1]:8080/path`) because they contain colons of their
+/// own. See `host_of_mangles_ipv6_literals_known_wrong_deferred` below for
+/// the pinned baseline.
 fn host_of(url: &str) -> String {
     let after_scheme = url.split("://").nth(1).unwrap_or(url);
     // The authority ends at the first path, query, or fragment delimiter.
-    let authority_end = after_scheme.find(['/', '?', '#']).unwrap_or(after_scheme.len());
+    let authority_end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
     let authority = &after_scheme[..authority_end];
     authority
         .rsplit('@')
@@ -151,33 +182,48 @@ mod tests {
     #[test]
     fn replaces_urls_with_the_word_link() {
         let c = all_on();
-        assert_eq!(clean("see https://example.com/x?y=1 now", &c), "see link now");
+        assert_eq!(
+            clean("see https://example.com/x?y=1 now", &c),
+            "see link now"
+        );
     }
 
     #[test]
     fn url_policy_domain_keeps_the_host() {
         let mut c = all_on();
         c.urls = UrlPolicy::Domain;
-        assert_eq!(clean("see https://example.com/x now", &c), "see example.com now");
+        assert_eq!(
+            clean("see https://example.com/x now", &c),
+            "see example.com now"
+        );
     }
 
     #[test]
     fn url_policy_keep_leaves_it_alone() {
         let mut c = all_on();
         c.urls = UrlPolicy::Keep;
-        assert_eq!(clean("see https://example.com now", &c), "see https://example.com now");
+        assert_eq!(
+            clean("see https://example.com now", &c),
+            "see https://example.com now"
+        );
     }
 
     #[test]
     fn strips_markdown_emphasis_and_code_ticks() {
         let c = all_on();
-        assert_eq!(clean("**bold** and `code` and _em_", &c), "bold and code and em");
+        assert_eq!(
+            clean("**bold** and `code` and _em_", &c),
+            "bold and code and em"
+        );
     }
 
     #[test]
     fn strips_heading_hashes_and_list_bullets() {
         let c = all_on();
-        assert_eq!(clean("# Title\n- one\n* two\n1. three", &c), "Title one two three");
+        assert_eq!(
+            clean("# Title\n- one\n* two\n1. three", &c),
+            "Title one two three"
+        );
     }
 
     #[test]
@@ -202,7 +248,10 @@ mod tests {
     #[test]
     fn leaves_single_letters_and_normal_words_alone() {
         let c = all_on();
-        assert_eq!(clean("I am OK with A and the DKG", &c), "I am OK with A and the D K G");
+        assert_eq!(
+            clean("I am OK with A and the DKG", &c),
+            "I am OK with A and the D K G"
+        );
     }
 
     #[test]
@@ -260,7 +309,10 @@ mod tests {
     fn url_policy_domain_strips_fragment_from_host() {
         let mut c = all_on();
         c.urls = UrlPolicy::Domain;
-        assert_eq!(clean("see https://example.com#section", &c), "see example.com");
+        assert_eq!(
+            clean("see https://example.com#section", &c),
+            "see example.com"
+        );
     }
 
     #[test]
@@ -291,6 +343,97 @@ mod tests {
         assert_eq!(
             clean("see https://user:pass@example.com:8080/path now", &c),
             "see example.com now"
+        );
+    }
+
+    // -- Placeholder-delimiter collision (Finding 1) -----------------------
+
+    #[test]
+    fn stray_placeholder_codepoints_alongside_a_real_url_are_not_swapped() {
+        // The old scheme hid URLs behind `\u{E000}<index>\u{E001}` and
+        // restored them with a whole-string `str::replace`. Input already
+        // containing those exact codepoints collided with a real
+        // placeholder of the same index and got silently overwritten with
+        // unrelated URL text. With segmentation there is no placeholder to
+        // collide with, so the stray codepoints must survive untouched and
+        // the URL must resolve independently.
+        let c = all_on();
+        let out = clean("\u{E000}0\u{E001} see https://good.example.com/x now", &c);
+        assert!(out.contains('\u{E000}') && out.contains('\u{E001}'));
+        assert!(out.contains("link"));
+        assert_ne!(out, "link see link now");
+    }
+
+    #[test]
+    fn private_use_codepoints_with_no_url_pass_through_unmolested() {
+        // Nerd Font / Powerline glyphs live in this exact private-use
+        // range, and terminal selections are this daemon's primary input,
+        // so these codepoints show up with no URL anywhere nearby. The old
+        // scheme leaked raw, unresolved placeholder codepoints into speech
+        // whenever the index didn't match a real URL; segmentation never
+        // introduces a placeholder in the first place.
+        let c = all_on();
+        let input = "prompt \u{E0B0} branch \u{E000}\u{E001} done";
+        assert_eq!(clean(input, &c), input);
+    }
+
+    // -- URL regex absorbing trailing markdown (Finding 2) ------------------
+
+    #[test]
+    fn url_policy_keep_strips_surrounding_markdown_emphasis() {
+        let mut c = all_on();
+        c.urls = UrlPolicy::Keep;
+        c.strip_markdown = true;
+        assert_eq!(
+            clean("**https://example.com/a_b**", &c),
+            "https://example.com/a_b"
+        );
+    }
+
+    #[test]
+    fn multiple_urls_domain_policy() {
+        let mut c = all_on();
+        c.urls = UrlPolicy::Domain;
+        assert_eq!(
+            clean(
+                "see https://a.example.com/x and https://b.example.com/y now",
+                &c
+            ),
+            "see a.example.com and b.example.com now"
+        );
+    }
+
+    #[test]
+    fn multiple_urls_keep_policy() {
+        let mut c = all_on();
+        c.urls = UrlPolicy::Keep;
+        assert_eq!(
+            clean(
+                "see https://a.example.com/x and https://b.example.com/y now",
+                &c
+            ),
+            "see https://a.example.com/x and https://b.example.com/y now"
+        );
+    }
+
+    // -- Deferred: IPv6 literal baseline -------------------------------------
+
+    #[test]
+    fn host_of_mangles_ipv6_literals_known_wrong_deferred() {
+        // `host_of` strips the port by splitting the authority on `:`,
+        // which is wrong for a bracketed IPv6 literal: the literal's own
+        // colons get split too, truncating the host to `[2001`. This
+        // predates both fix rounds and is intentionally left as-is; this
+        // test only pins the current (wrong) behaviour as a baseline for a
+        // later fix.
+        let mut c = all_on();
+        c.urls = UrlPolicy::Domain;
+        // The URL regex also stops at the literal's own `]` (excluded as a
+        // URL-wrapping delimiter), so only `https://[2001:db8::1` is
+        // matched as the URL; the rest becomes a trailing non-URL segment.
+        assert_eq!(
+            clean("see https://[2001:db8::1]:8080/path now", &c),
+            "see [2001]:8080/path now"
         );
     }
 }
