@@ -4,15 +4,6 @@
 //! `EngineHandle` and never blocks the engine: reads come from the published
 //! snapshot, and selection reads -- which open their own Wayland connection
 //! and block -- run on a blocking thread so they cannot stall the runtime.
-//!
-//! `main` does not construct a `SaydIface` yet -- serving it as a resident
-//! daemon on the session bus is M2 Task 7. Until then the compiler sees an
-//! unreached API in a binary crate, hence the blanket allow below; remove it
-//! once `main` wires this in. (Only tests reach this module today, which is
-//! also why `selection::read` and friends no longer need their own allow:
-//! this module is their real caller now, even if this module itself is not
-//! yet main's.)
-#![allow(dead_code)]
 
 use std::collections::HashMap;
 
@@ -81,7 +72,16 @@ impl SaydIface {
     /// interface.
     fn submit(&self, text: String, opts: SayOpts) -> fdo::Result<u32> {
         match self.engine.submit(text, opts) {
-            Ok(Some(id)) => Ok(id as u32),
+            // The queue's ids are `u64` and monotonically increasing, but the
+            // wire type is `u32` (chosen to match `CurrentId` and `Cancel`,
+            // and because a client has no use for ids beyond that range).
+            // `Queue::next_id` starts at 1 and increments by 1 per accepted
+            // utterance, so wrapping past `u32::MAX` needs over four billion
+            // accepted utterances in one process lifetime -- not reachable
+            // in practice, but truncating silently would hand a client the
+            // wrong id if it ever were. Fall back to 0 ("nothing queued")
+            // rather than lie about which utterance this is.
+            Ok(Some(id)) => Ok(u32::try_from(id).unwrap_or(0)),
             Ok(None) => Ok(0),
             Err(e) => Err(fdo::Error::Failed(e)),
         }
@@ -97,7 +97,9 @@ impl SaydIface {
         self.submit(text, say_opts_from(&opts, QueueSource::DBus))
     }
 
-    /// Speak the PRIMARY selection.
+    /// Speak the PRIMARY selection. Returns the utterance id, or 0 if
+    /// nothing was queued (muted, or empty after cleanup) -- safe, since the
+    /// queue never mints id 0 and `CurrentId` uses 0 for "nothing playing".
     async fn say_selection(&self, opts: HashMap<String, OwnedValue>) -> fdo::Result<u32> {
         let text = tokio::task::spawn_blocking(|| selection::read(selection::Source::Primary))
             .await
@@ -106,7 +108,9 @@ impl SaydIface {
         self.submit(text, say_opts_from(&opts, QueueSource::Hotkey))
     }
 
-    /// Speak the clipboard.
+    /// Speak the clipboard. Returns the utterance id, or 0 if nothing was
+    /// queued (muted, or empty after cleanup) -- safe, since the queue never
+    /// mints id 0 and `CurrentId` uses 0 for "nothing playing".
     async fn say_clipboard(&self, opts: HashMap<String, OwnedValue>) -> fdo::Result<u32> {
         let text = tokio::task::spawn_blocking(|| selection::read(selection::Source::Clipboard))
             .await

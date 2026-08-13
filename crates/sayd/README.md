@@ -21,6 +21,20 @@ The D-Bus interface, control CLI, tray icon and settings window are in progress.
 - espeak-ng, with `ESPEAK_DATA_PATH` set
 - Kokoro model weights and voice packs in `models/`
 
+## Testing without an audio device
+
+`sayd` normally opens the default audio output device (`cpal`) on startup and
+exits if that fails. On a machine with no device -- no `/dev/snd`, PulseAudio
+refusing to start, CI -- that means the D-Bus interface never comes up
+either.
+
+Setting `SAYD_NO_AUDIO=1` makes the daemon substitute a sink that accepts and
+discards every sample instead of opening a device, so `sh.sayd.Sayd1` can
+still be introspected, called, and polled over the session bus. This is a
+testing aid, not a supported way to run `sayd` -- there is no audio output in
+this mode, and utterances there finish instantly since nothing paces
+playback.
+
 ## Licence
 
 MIT, except the vendored misaki lexicons in
