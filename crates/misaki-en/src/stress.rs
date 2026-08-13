@@ -44,7 +44,7 @@ pub fn apply_stress(ps: &str, stress: Option<f32>) -> String {
         return ps.to_string();
     };
     if stress < -1.0 {
-        return ps.replace(PRIMARY_STRESS, "").replace(SECONDARY_STRESS, "");
+        return ps.replace([PRIMARY_STRESS, SECONDARY_STRESS], "");
     }
     if stress == -1.0 || ((stress == 0.0 || stress == -0.5) && ps.contains(PRIMARY_STRESS)) {
         return ps.replace(SECONDARY_STRESS, "").replace(PRIMARY_STRESS, &SECONDARY_STRESS.to_string());

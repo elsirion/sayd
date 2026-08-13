@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const TAGGED: u8 = 0x01;
 const SEP: u8 = 0x02;
@@ -34,7 +34,7 @@ fn encode(v: &serde_json::Value) -> String {
     }
 }
 
-fn build_tier(name: &str, out: &PathBuf) {
+fn build_tier(name: &str, out: &Path) {
     let src = format!("data/{name}.json");
     println!("cargo:rerun-if-changed={src}");
     let text = std::fs::read_to_string(&src).unwrap_or_else(|e| panic!("{src}: {e}"));
