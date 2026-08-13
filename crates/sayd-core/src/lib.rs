@@ -11,3 +11,4 @@ pub mod cleanup;
 pub mod chunk;
 pub mod synth;
 pub mod queue;
+pub mod engine;
