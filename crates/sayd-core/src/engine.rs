@@ -66,6 +66,11 @@ pub struct Snapshot {
     pub current_text: String,
     pub current_id: u64,
     pub error: Option<String>,
+    /// The most recent submission this engine refused, if any. Distinct from
+    /// `error`: a rejection that leaves an unrelated, still-valid playback
+    /// untouched does not become `state: Error` (see `submit`), but the
+    /// caller still needs a way to learn the submission was dropped.
+    pub last_rejected: Option<String>,
 }
 
 /// The utterance currently being spoken, decomposed into chunks.
@@ -87,7 +92,12 @@ pub struct Engine {
     queue: Queue,
     current: Option<Current>,
     state: State,
+    /// Invariant: `error.is_some() <=> state == State::Error`. Every place
+    /// that changes `state` away from or into `Error` must keep this in
+    /// sync in the same step; see `submit`, `dismiss_error_and_go_idle` and
+    /// the pop branch of `tick`.
     error: Option<String>,
+    last_rejected: Option<String>,
     idle_since: Option<Instant>,
     shutdown: bool,
 }
@@ -102,6 +112,7 @@ impl Engine {
             current: None,
             state: State::Idle,
             error: None,
+            last_rejected: None,
             idle_since: Some(Instant::now()),
             shutdown: false,
         }
@@ -132,17 +143,18 @@ impl Engine {
                 _ => {}
             },
             Command::Stop => {
+                // The shut-up verb: always returns to a clean slate, even
+                // from Error.
                 self.queue.clear();
-                self.current = None;
-                self.sink.clear();
+                self.discard_current();
                 self.sink.set_paused(false);
-                self.go_idle();
+                self.last_rejected = None;
+                self.dismiss_error_and_go_idle();
             }
             Command::Next => {
-                self.current = None;
-                self.sink.clear();
+                self.discard_current();
                 if self.queue.is_empty() {
-                    self.go_idle();
+                    self.dismiss_error_and_go_idle();
                 }
             }
             Command::SkipSentence => {
@@ -152,7 +164,7 @@ impl Engine {
                     if c.next_chunk >= c.chunks.len() {
                         self.current = None;
                         if self.queue.is_empty() {
-                            self.go_idle();
+                            self.dismiss_error_and_go_idle();
                         }
                     }
                 }
@@ -167,9 +179,8 @@ impl Engine {
                 self.cfg.muted = m;
                 if m {
                     self.queue.clear();
-                    self.current = None;
-                    self.sink.clear();
-                    self.go_idle();
+                    self.discard_current();
+                    self.dismiss_error_and_go_idle();
                 }
             }
             Command::SetVoice(v) => self.cfg.voice = v,
@@ -183,17 +194,30 @@ impl Engine {
 
     fn submit(&mut self, text: String, opts: SayOpts) {
         if text.chars().count() > self.cfg.max_chars {
-            self.state = State::Error;
-            self.error = Some(format!(
+            let msg = format!(
                 "text is {} characters, limit is {}",
                 text.chars().count(),
                 self.cfg.max_chars
-            ));
+            );
+            self.last_rejected = Some(msg.clone());
+            // Something unrelated is genuinely still playing (or paused):
+            // this rejection must not stomp on it and report a global Error
+            // when nothing about A is actually wrong. The caller still needs
+            // to learn the submission was refused, so it goes on
+            // `last_rejected` rather than the state machine's `error`.
+            if self.state != State::Speaking && self.state != State::Paused {
+                self.state = State::Error;
+                self.error = Some(msg);
+            }
             return;
         }
-        self.error = None;
+        self.last_rejected = None;
         if self.state == State::Error {
-            self.state = if self.current.is_some() { State::Speaking } else { State::Idle };
+            // Error only ever arises with nothing legitimately in flight
+            // (see the branch above and `tick`'s synth-failure path), so
+            // there is no `current` to preserve here.
+            self.state = State::Idle;
+            self.error = None;
         }
         if self.cfg.muted {
             return; // accepted and discarded
@@ -216,10 +240,7 @@ impl Engine {
         self.queue.submit(u, policy);
 
         match policy {
-            Policy::Replace | Policy::Interrupt => {
-                self.current = None;
-                self.sink.clear();
-            }
+            Policy::Replace | Policy::Interrupt => self.discard_current(),
             _ => {}
         }
 
@@ -282,6 +303,7 @@ impl Engine {
                         carry: Vec::new(),
                     });
                     self.state = State::Speaking;
+                    self.error = None;
                     self.idle_since = None;
                 }
                 None => {
@@ -295,8 +317,14 @@ impl Engine {
         }
 
         // Bound the lookahead: stop synthesizing once the sink is well fed.
+        // `lookahead_chunks` comes straight from a user-editable config file
+        // with no validation, so the `+ 1` must not be able to overflow (it
+        // would panic with overflow checks on, or silently wrap to 0 and
+        // then get masked back up to a divisor of 2 by `.max(2)` in a
+        // release build -- behaviour that must not depend on build profile).
         let headroom = self.sink.capacity().saturating_sub(self.sink.pending());
-        if headroom < self.sink.capacity() / (self.cfg.chunking.lookahead_chunks + 1).max(2) {
+        let divisor = self.cfg.chunking.lookahead_chunks.saturating_add(1).max(2);
+        if headroom < self.sink.capacity() / divisor {
             return;
         }
 
@@ -342,6 +370,30 @@ impl Engine {
         }
     }
 
+    /// Like `go_idle`, but unconditionally -- including out of `Error`.
+    /// Used by the explicit "shut up" commands (`Stop`, `Next`,
+    /// `SkipSentence`, `SetMuted`), which must be able to dismiss a stuck
+    /// error even though nothing else can. `go_idle` itself stays
+    /// Error-preserving: it is also reached from plain `tick()` when the
+    /// queue drains with no command involved at all, and an error must not
+    /// evaporate on its own just because the caller kept polling.
+    fn dismiss_error_and_go_idle(&mut self) {
+        self.state = State::Idle;
+        self.error = None;
+        if self.idle_since.is_none() {
+            self.idle_since = Some(Instant::now());
+        }
+    }
+
+    /// Discard whatever is currently speaking and drop any buffered audio.
+    /// Shared by `Stop`, `Next`, a `Replace`/`Interrupt` submission and
+    /// `SetMuted(true)` -- the four places that blow away the current
+    /// utterance.
+    fn discard_current(&mut self) {
+        self.current = None;
+        self.sink.clear();
+    }
+
     fn maybe_unload(&mut self) {
         if !self.synth.is_loaded() {
             return;
@@ -363,13 +415,18 @@ impl Engine {
             current_text: self.current.as_ref().map(|c| c.text.clone()).unwrap_or_default(),
             current_id: self.current.as_ref().map(|c| c.id).unwrap_or(0),
             error: self.error.clone(),
+            last_rejected: self.last_rejected.clone(),
         }
     }
 
-    /// Exact for audio already in the sink, estimated for text not yet spoken.
+    /// Three buckets, in decreasing order of certainty: exact for audio
+    /// already accepted by the sink, exact for audio already synthesized
+    /// but still parked in `carry` waiting for room in the sink, and
+    /// estimated (via `SECONDS_PER_WORD`) for text not yet spoken at all.
     fn remaining_secs(&self) -> f64 {
         let sr = self.synth.sample_rate() as f64;
-        let buffered = self.sink.pending() as f64 / sr;
+        let carried = self.current.as_ref().map(|c| c.carry.len()).unwrap_or(0) as f64;
+        let buffered = (self.sink.pending() as f64 + carried) / sr;
 
         let mut words = 0usize;
         if let Some(c) = self.current.as_ref() {
@@ -587,6 +644,234 @@ mod tests {
         assert_eq!(e.snapshot().state, State::Error);
         e.handle(say("ok."));
         assert_eq!(e.snapshot().error, None);
+    }
+
+    #[test]
+    fn stop_dismisses_a_stuck_error() {
+        // Stop is the daemon's designated "shut up" command: it must be able
+        // to clear Error even though nothing else naturally can.
+        let cfg = Config { max_chars: 5, ..Config::default() };
+        let mut e = Engine::new(
+            cfg,
+            Box::new(StubSynthesizer::new()),
+            Box::new(VecSink::new(24_000 * 10)),
+        );
+        e.handle(say("way too long for the limit"));
+        assert_eq!(e.snapshot().state, State::Error);
+        e.handle(Command::Stop);
+        let s = e.snapshot();
+        assert_eq!(s.state, State::Idle);
+        assert_eq!(s.error, None);
+    }
+
+    #[test]
+    fn next_dismisses_a_stuck_error_when_the_queue_is_empty() {
+        let cfg = Config { max_chars: 5, ..Config::default() };
+        let mut e = Engine::new(
+            cfg,
+            Box::new(StubSynthesizer::new()),
+            Box::new(VecSink::new(24_000 * 10)),
+        );
+        e.handle(say("way too long for the limit"));
+        assert_eq!(e.snapshot().state, State::Error);
+        e.handle(Command::Next);
+        let s = e.snapshot();
+        assert_eq!(s.state, State::Idle);
+        assert_eq!(s.error, None);
+    }
+
+    #[test]
+    fn a_stuck_error_survives_plain_ticking_with_no_command() {
+        // Mirror image of the two tests above: an error must not clear
+        // itself just because the caller kept polling `tick()` -- only an
+        // explicit command may dismiss it. `synth_failure_surfaces_as_error_
+        // and_does_not_wedge` already covers the synth-failure route to
+        // Error; this covers the rejection route.
+        let cfg = Config { max_chars: 5, ..Config::default() };
+        let mut e = Engine::new(
+            cfg,
+            Box::new(StubSynthesizer::new()),
+            Box::new(VecSink::new(24_000 * 10)),
+        );
+        e.handle(say("way too long for the limit"));
+        assert_eq!(e.snapshot().state, State::Error);
+        for _ in 0..20 {
+            e.tick();
+        }
+        let s = e.snapshot();
+        assert_eq!(s.state, State::Error, "no command was issued; the error must persist");
+        assert!(s.error.is_some());
+    }
+
+    #[test]
+    fn rejection_while_speaking_leaves_playback_untouched() {
+        // Submitting an over-long text while an unrelated utterance A is
+        // legitimately speaking must not flip the engine to Error: A is
+        // unaffected and should play to completion. The rejection must
+        // still be observable, so it goes on `last_rejected`.
+        let cfg = Config { max_chars: 5, ..Config::default() };
+        let mut e = Engine::new(
+            cfg,
+            Box::new(StubSynthesizer::new()),
+            Box::new(VecSink::new(24_000 * 10)),
+        );
+        e.handle(say("Hi.")); // 3 chars, within the limit
+        e.tick();
+        let before = e.snapshot();
+        assert_eq!(before.state, State::Speaking);
+        let id = before.current_id;
+
+        e.handle(say("this one is definitely too long for the limit"));
+
+        let after = e.snapshot();
+        assert_eq!(after.state, State::Speaking, "A must keep playing");
+        assert_eq!(after.current_id, id, "A must not be disturbed");
+        assert_eq!(after.error, None, "nothing about A is actually wrong");
+        assert_eq!(after.queue_len, 0, "the rejected text must not be queued");
+        assert!(
+            after.last_rejected.as_deref().unwrap_or("").contains('5'),
+            "the rejection must still be observable: {:?}",
+            after.last_rejected
+        );
+    }
+
+    #[test]
+    fn rejection_while_paused_leaves_playback_untouched() {
+        let cfg = Config { max_chars: 5, ..Config::default() };
+        let mut e = Engine::new(
+            cfg,
+            Box::new(StubSynthesizer::new()),
+            Box::new(VecSink::new(24_000 * 10)),
+        );
+        e.handle(say("Hi."));
+        e.tick();
+        e.handle(Command::Pause);
+        assert_eq!(e.snapshot().state, State::Paused);
+
+        e.handle(say("this one is definitely too long for the limit"));
+
+        let after = e.snapshot();
+        assert_eq!(after.state, State::Paused);
+        assert_eq!(after.error, None);
+        assert!(after.last_rejected.is_some());
+    }
+
+    #[test]
+    fn error_state_invariant_holds_after_every_command_from_every_state() {
+        // Pin the invariant itself, not just the individual scenarios above:
+        // `error.is_some() == (state == State::Error)` after every command,
+        // from every reachable state.
+        fn assert_invariant(e: &Engine, ctx: &str) {
+            let s = e.snapshot();
+            assert_eq!(
+                s.error.is_some(),
+                s.state == State::Error,
+                "{ctx}: error={:?} state={:?}",
+                s.error,
+                s.state
+            );
+        }
+
+        fn all_commands() -> Vec<Command> {
+            vec![
+                say("Something reasonably short."),
+                Command::Pause,
+                Command::Resume,
+                Command::PlayPause,
+                Command::Stop,
+                Command::Next,
+                Command::SkipSentence,
+                Command::ClearQueue,
+                Command::Cancel(1),
+                Command::SetMuted(true),
+                Command::SetMuted(false),
+                Command::SetVoice("am_fenrir".into()),
+                Command::SetSpeed(1.5),
+                Command::Shutdown,
+            ]
+        }
+
+        fn build_idle() -> Engine {
+            engine()
+        }
+        fn build_speaking() -> Engine {
+            let mut e = engine();
+            e.handle(say("Hello there. This keeps it busy for quite a while indeed."));
+            e.tick();
+            e
+        }
+        fn build_paused() -> Engine {
+            let mut e = build_speaking();
+            e.handle(Command::Pause);
+            e
+        }
+        fn build_error() -> Engine {
+            let cfg = Config { max_chars: 5, ..Config::default() };
+            let mut e = Engine::new(
+                cfg,
+                Box::new(StubSynthesizer::new()),
+                Box::new(VecSink::new(24_000 * 10)),
+            );
+            e.handle(say("way too long for the limit"));
+            e
+        }
+
+        fn check_from(name: &str, build: fn() -> Engine) {
+            for cmd in all_commands() {
+                let mut e = build();
+                assert_invariant(&e, &format!("before {name} -> {cmd:?}"));
+                e.handle(cmd.clone());
+                assert_invariant(&e, &format!("after {name} -> {cmd:?}"));
+            }
+        }
+
+        check_from("idle", build_idle);
+        check_from("speaking", build_speaking);
+        check_from("paused", build_paused);
+        check_from("error", build_error);
+    }
+
+    #[test]
+    fn huge_lookahead_chunks_does_not_overflow() {
+        // `lookahead_chunks` comes straight from a user-editable config file
+        // with no validation. A value near `usize::MAX` used to panic on
+        // `+ 1` with overflow checks on (which is how tests run), and
+        // silently wrap to a different divisor in release builds.
+        let mut cfg = Config::default();
+        cfg.chunking.lookahead_chunks = usize::MAX;
+        let mut e = Engine::new(
+            cfg,
+            Box::new(StubSynthesizer::new()),
+            Box::new(VecSink::new(24_000 * 10)),
+        );
+        e.handle(say("Hello there. This is a test."));
+        for _ in 0..10 {
+            e.tick();
+        }
+        assert!(e.audio_written() > 0, "expected samples to reach the sink");
+    }
+
+    #[test]
+    fn remaining_seconds_includes_audio_parked_in_carry() {
+        // A tiny sink forces most of the first chunk's synthesized audio
+        // into `carry` rather than the sink itself. `next_chunk` has already
+        // advanced past that chunk, so if `carry` weren't counted the
+        // estimate would understate the time left by nearly the whole chunk.
+        let mut e = Engine::new(
+            Config::default(),
+            Box::new(StubSynthesizer::new()),
+            Box::new(VecSink::new(100)),
+        );
+        e.handle(say("A reasonably long sentence to force a big carry remainder."));
+        e.tick(); // pop -> synth -> partial push -> the rest parked in carry
+        let s = e.snapshot();
+        // With only 100 samples possibly in the sink (100 / 24_000 s), any
+        // reading much larger than that must be coming from carry.
+        assert!(
+            s.remaining_secs > 1.0,
+            "carry must count toward remaining_secs, got {}",
+            s.remaining_secs
+        );
     }
 
     #[test]
