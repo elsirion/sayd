@@ -6,3 +6,4 @@
 //! through `AudioSink`, so the whole engine can be driven in a unit test.
 
 pub mod config;
+pub mod cleanup;
