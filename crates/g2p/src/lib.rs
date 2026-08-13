@@ -96,4 +96,24 @@ mod tests {
         let gb = p.phonemize("tomato", Dialect::British);
         assert_ne!(us, gb, "British output must not collapse into American");
     }
+
+    #[test]
+    fn embedded_nul_does_not_panic() {
+        let p = Phonemizer::new();
+        let out = p.phonemize("hello\u{0000}world", Dialect::American);
+        assert!(!out.is_empty(), "expected phonemes, got empty");
+    }
+
+    #[test]
+    fn a_string_of_only_nuls_yields_empty_output_without_panicking() {
+        let p = Phonemizer::new();
+        assert!(p.phonemize("\u{0000}\u{0000}", Dialect::American).trim().is_empty());
+    }
+
+    #[test]
+    fn embedded_nul_does_not_panic_on_the_british_path() {
+        let p = Phonemizer::new();
+        let out = p.phonemize("sched\u{0000}ule", Dialect::British);
+        assert!(!out.is_empty());
+    }
 }

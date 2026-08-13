@@ -72,13 +72,22 @@ fn ensure_init() {
 /// matching phonemizer's `tie='^'`, which misaki's mapping table expects.
 fn phonemize_raw(text: &str, voice: &str) -> String {
     ensure_init();
-    let _g = LOCK.lock().unwrap();
-    let cvoice = CString::new(voice).unwrap();
+    let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(cvoice) = CString::new(voice) else {
+        return String::new();
+    };
     unsafe {
         espeak_SetVoiceByName(cvoice.as_ptr());
     }
 
-    let ctext = CString::new(text).unwrap();
+    // espeak takes a C string, so an interior NUL would truncate the text --
+    // and `CString::new` panics on one. Text normally arrives via the
+    // engine's cleanup stage, which strips control characters, but this is a
+    // public entry point and must not depend on a caller's ordering.
+    let sanitized: String = text.chars().filter(|c| *c != '\u{0}').collect();
+    let Ok(ctext) = CString::new(sanitized) else {
+        return String::new();
+    };
     let mut cursor = ctext.as_ptr() as *const c_void;
     let bytes = ctext.as_bytes();
     let start = cursor as usize;
