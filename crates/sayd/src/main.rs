@@ -71,9 +71,16 @@ fn main() -> std::process::ExitCode {
     // `submit`, not `Command::Say`: a rejected submission (e.g. text longer
     // than `max_chars`) must be reported here on stderr with a non-zero
     // exit, rather than only being discoverable by polling a snapshot field.
-    if let Err(e) = engine.submit(text, SayOpts::default()) {
-        eprintln!("error: {e}");
-        return std::process::ExitCode::FAILURE;
+    match engine.submit(text, SayOpts::default()) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            eprintln!("nothing to say (muted, or empty after cleanup)");
+            return std::process::ExitCode::SUCCESS;
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
     }
 
     loop {

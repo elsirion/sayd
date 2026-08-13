@@ -200,17 +200,23 @@ impl Engine {
     }
 
     /// Submit text for synthesis, returning the queued utterance's id on
-    /// acceptance or the rejection reason on failure. This is the
-    /// synchronous answer a caller gets back for *its own* submission --
-    /// distinct from `error`/`state`, which describe the engine as a whole
-    /// and must not be disturbed by a rejection that has nothing to do with
-    /// whatever else is legitimately in flight (see the busy check below).
+    /// acceptance, `None` if accepted but not queued (muted or empty after
+    /// cleanup), or the rejection reason on failure. This is the synchronous
+    /// answer a caller gets back for *its own* submission -- distinct from
+    /// `error`/`state`, which describe the engine as a whole and must not be
+    /// disturbed by a rejection that has nothing to do with whatever else is
+    /// legitimately in flight (see the busy check below).
+    ///
+    /// Returns `Ok(Some(id))` if the text was queued for synthesis.
+    /// Returns `Ok(None)` if the submission was accepted but nothing was
+    /// queued (muted, or empty after cleanup). This is not an error.
+    /// Returns `Err(reason)` if the submission was rejected (e.g. text too long).
     ///
     /// `handle(Command::Say { .. })` calls this and discards the result, so
     /// the existing command path is unchanged for callers that do not care.
     /// A D-Bus `Say` method or a CLI entry point should call this directly
-    /// to learn whether its own submission was accepted.
-    pub fn submit(&mut self, text: String, opts: SayOpts) -> Result<u64, String> {
+    /// to learn whether its own submission was accepted and queued.
+    pub fn submit(&mut self, text: String, opts: SayOpts) -> Result<Option<u64>, String> {
         if text.chars().count() > self.cfg.max_chars {
             let msg = format!(
                 "text is {} characters, limit is {}",
@@ -236,12 +242,12 @@ impl Engine {
             self.error = None;
         }
         if self.cfg.muted {
-            return Ok(0); // accepted and discarded
+            return Ok(None); // accepted and discarded
         }
 
         let cleaned = clean(&text, &self.cfg.cleanup);
         if cleaned.trim().is_empty() {
-            return Ok(0);
+            return Ok(None);
         }
 
         let policy = opts.policy.unwrap_or_else(|| opts.source.default_policy());
@@ -265,7 +271,7 @@ impl Engine {
             self.idle_since = None;
         }
 
-        Ok(id)
+        Ok(Some(id))
     }
 
     /// One unit of work: top up the sink, or advance the queue, or unload.
@@ -1327,8 +1333,40 @@ mod tests {
         let mut e = engine();
         let id = e
             .submit("Hello there. This is a test.".into(), SayOpts::default())
-            .expect("well-formed text must be accepted");
+            .expect("well-formed text must be accepted")
+            .expect("well-formed text must be queued");
         e.tick();
         assert_eq!(e.snapshot().current_id, id);
+    }
+
+    #[test]
+    fn submit_returns_none_when_muted() {
+        let mut e = engine();
+        e.handle(Command::SetMuted(true));
+        assert_eq!(e.submit("nobody hears this".into(), SayOpts::default()), Ok(None));
+    }
+
+    #[test]
+    fn submit_returns_none_for_text_that_is_empty_after_cleanup() {
+        let mut e = engine();
+        assert_eq!(e.submit("   ".into(), SayOpts::default()), Ok(None));
+    }
+
+    #[test]
+    fn submit_returns_some_nonzero_id_when_queued() {
+        let mut e = engine();
+        let id = e.submit("hello there.".into(), SayOpts::default()).expect("accepted");
+        assert!(id.is_some());
+        assert_ne!(id, Some(0), "id 0 is the nothing-is-playing sentinel");
+    }
+
+    #[test]
+    fn submit_still_returns_err_when_rejected() {
+        let mut e = Engine::new(
+            Config { max_chars: 5, ..Config::default() },
+            Box::new(StubSynthesizer::new()),
+            Box::new(VecSink::new(24_000)),
+        );
+        assert!(e.submit("far too long".into(), SayOpts::default()).is_err());
     }
 }
