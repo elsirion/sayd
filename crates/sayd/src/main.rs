@@ -13,7 +13,7 @@ mod selection;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sayd_core::audio::AudioSink;
 use sayd_core::config::Config;
@@ -30,6 +30,26 @@ const OBJECT_PATH: &str = "/sh/sayd/Sayd";
 /// Fast enough that a tray or MPRIS client feels live, slow enough that
 /// `RemainingSeconds` ticking down does not flood the bus.
 const PUBLISH_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Minimum spacing between device-reacquisition attempts while the engine is
+/// stuck in `State::Error`.
+///
+/// The publish loop ticks every `PUBLISH_INTERVAL` (200 ms). Retrying
+/// `open_sink` -- which opens a real audio stream -- that often while the
+/// device stays gone would spin hot and, without the log-once throttling
+/// next to the retry below, flood stderr five times a second for as long as
+/// the outage lasts. A couple of seconds is generous for how quickly
+/// PulseAudio/PipeWire or a device typically comes back, while still
+/// noticing recovery promptly once it does.
+const RECOVERY_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+
+/// How long a forwarding call to an already-running daemon may block before
+/// this instance gives up and reports a timeout instead of hanging.
+///
+/// zbus's own default method-call timeout is close to 25 seconds, which
+/// reads to a user as "sayd is frozen." A couple of seconds is generous for
+/// a local session-bus round trip.
+const FORWARD_CALL_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// `AudioSink` for `SAYD_NO_AUDIO`: accepts and immediately discards every
 /// sample, reporting nothing ever pending.
@@ -159,10 +179,20 @@ async fn main() -> std::process::ExitCode {
                 }
             };
             let args: (String, HashMap<String, OwnedValue>) = (text, HashMap::new());
-            return match proxy.call_method("Say", &args).await {
-                Ok(_) => std::process::ExitCode::SUCCESS,
-                Err(e) => {
+            return match tokio::time::timeout(FORWARD_CALL_TIMEOUT, proxy.call_method("Say", &args))
+                .await
+            {
+                Ok(Ok(_)) => std::process::ExitCode::SUCCESS,
+                Ok(Err(e)) => {
                     eprintln!("error: {e}");
+                    std::process::ExitCode::FAILURE
+                }
+                Err(_) => {
+                    eprintln!(
+                        "error: the running sayd daemon did not respond within {:.0}s; \
+                         it may be stuck or unresponsive",
+                        FORWARD_CALL_TIMEOUT.as_secs_f64()
+                    );
                     std::process::ExitCode::FAILURE
                 }
             };
@@ -222,6 +252,11 @@ async fn main() -> std::process::ExitCode {
     };
 
     let mut last = engine.snapshot();
+    // Reacquisition state for the recovery branch below: `next_recovery_attempt`
+    // throttles retries while `State::Error` persists, and `recovery_failure_logged`
+    // keeps a standing failure to one line instead of one every `PUBLISH_INTERVAL`.
+    let mut next_recovery_attempt = Instant::now();
+    let mut recovery_failure_logged = false;
     let mut ticker = tokio::time::interval(PUBLISH_INTERVAL);
     let mut sigterm =
         match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
@@ -266,15 +301,51 @@ async fn main() -> std::process::ExitCode {
                     last = now;
                 }
 
-                // Recover from a device failure by reacquiring the sink.
-                if last.state == State::Error
-                    && last.error.as_deref().unwrap_or("").contains("device")
-                {
-                    if let Ok(s) = open_sink() {
-                        eprintln!("info: audio device reacquired");
-                        engine.send(sayd_core::engine::Command::Stop);
-                        engine.replace_sink(s);
+                // Recover from *any* engine error by reacquiring the sink, not
+                // just ones whose message happens to mention "device".
+                //
+                // `Engine::tick`'s two failure paths (a `take_error()` from the
+                // sink, or a synth error) both set `state = Error` only after
+                // clearing the queue and dropping `current` in the same step
+                // (see sayd-core/src/engine.rs), and `submit`'s own
+                // Error-setting branch only fires when nothing was already
+                // playing or paused, so nothing legitimate is ever in flight
+                // while `state == Error`. Handing the engine a fresh sink is
+                // therefore always safe here, regardless of which cpal
+                // `StreamError` variant (or unrelated synth failure) produced
+                // the text in `error` -- cpal 0.17.1's `StreamInvalidated` and
+                // `BufferUnderrun` messages don't contain "device" the way
+                // `DeviceNotAvailable`'s does, so matching on the string missed
+                // exactly the ordinary desktop hiccups (a PulseAudio restart,
+                // an XRUN) this loop exists to recover from.
+                if last.state == State::Error {
+                    let now_instant = Instant::now();
+                    if now_instant >= next_recovery_attempt {
+                        // Throttle to `RECOVERY_RETRY_INTERVAL` rather than
+                        // retrying every `PUBLISH_INTERVAL`: `open_sink` opens a
+                        // real audio stream, and a persistent outage must not
+                        // spin that hot.
+                        next_recovery_attempt = now_instant + RECOVERY_RETRY_INTERVAL;
+                        match open_sink() {
+                            Ok(s) => {
+                                eprintln!("info: audio device reacquired");
+                                engine.send(sayd_core::engine::Command::Stop);
+                                engine.replace_sink(s);
+                                recovery_failure_logged = false;
+                            }
+                            Err(e) => {
+                                // Log only the first failure of a standing
+                                // outage, not once per retry, so a long outage
+                                // doesn't flood stderr.
+                                if !recovery_failure_logged {
+                                    eprintln!("warning: could not reacquire audio device: {e}");
+                                    recovery_failure_logged = true;
+                                }
+                            }
+                        }
                     }
+                } else {
+                    recovery_failure_logged = false;
                 }
 
                 if engine.has_shut_down() {
