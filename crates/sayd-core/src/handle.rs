@@ -42,10 +42,12 @@ pub struct EngineHandle {
     tx: Sender<Msg>,
     latest: Arc<Mutex<Snapshot>>,
     thread: Arc<Mutex<Option<JoinHandle<()>>>>,
-    /// Set just before the engine thread's run loop returns. Lets the
-    /// daemon's main loop notice a `Command::Shutdown` that arrived over the
-    /// channel (e.g. from a D-Bus `Quit` call) without having to call
-    /// `shutdown` itself.
+    /// Set once the engine thread's run loop has exited, by any means:
+    /// a normal `break` out of the loop, or the loop body unwinding on a
+    /// panic (e.g. from a `Synthesizer` implementation). Lets the daemon's
+    /// main loop notice a `Command::Shutdown` that arrived over the channel
+    /// (e.g. from a D-Bus `Quit` call), or a crashed engine thread, without
+    /// having to call `shutdown` itself.
     shut_down: Arc<AtomicBool>,
 }
 
@@ -107,10 +109,10 @@ impl EngineHandle {
         let _ = self.tx.send(Msg::ReplaceSink(sink));
     }
 
-    /// Whether the engine thread has exited, whether because `shutdown` was
-    /// called or because a `Command::Shutdown` arrived over the channel
-    /// (e.g. from a D-Bus `Quit` call). Lets the daemon's main loop notice
-    /// the latter without having to poll `shutdown` itself.
+    /// Whether the engine thread has exited, for any reason: `shutdown` was
+    /// called, a `Command::Shutdown` arrived over the channel (e.g. from a
+    /// D-Bus `Quit` call), or the thread panicked. Lets the daemon's main
+    /// loop notice a dead engine without having to poll `shutdown` itself.
     pub fn has_shut_down(&self) -> bool {
         self.shut_down.load(Ordering::Acquire)
     }
@@ -132,12 +134,30 @@ impl EngineHandle {
     }
 }
 
+/// Marks `shut_down` true when dropped, on any exit from `run`'s loop --
+/// a normal `break` as well as a panic unwinding out of the loop body.
+/// `engine.tick()` calls into `Synthesizer::phonemize`/`synth` and
+/// `AudioSink` methods, none of which are `catch_unwind`-wrapped (and
+/// `phonemize` has no `Result` to fail through anyway), so a panic there
+/// unwinds straight past a plain `shut_down.store(true, ..)` placed after
+/// the loop. Tying the store to `Drop` instead means it runs no matter how
+/// the stack unwinds.
+struct ShutDownOnDrop(Arc<AtomicBool>);
+
+impl Drop for ShutDownOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
 fn run(
     mut engine: Engine,
     rx: Receiver<Msg>,
     published: Arc<Mutex<Snapshot>>,
     shut_down: Arc<AtomicBool>,
 ) {
+    let _guard = ShutDownOnDrop(shut_down);
+
     loop {
         match rx.recv_timeout(TICK_INTERVAL) {
             Ok(Msg::Cmd(c)) => engine.handle(c),
@@ -147,6 +167,12 @@ fn run(
                 let _ = reply.send(r);
             }
             Ok(Msg::ReplaceSink(sink)) => engine.replace_sink(sink),
+            // An explicit `Msg::Shutdown` breaks immediately, skipping the
+            // final `tick()` and publish below; a `Command::Shutdown` sent
+            // through `send()` instead falls through to `tick()` and is
+            // only caught by `is_shutdown()` afterwards. Harmless either
+            // way -- the engine and sink are dropped either way -- but the
+            // two routes are not identical.
             Ok(Msg::Shutdown) => break,
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
@@ -154,16 +180,15 @@ fn run(
 
         engine.tick();
 
-        if let Ok(mut g) = published.lock() {
-            *g = engine.snapshot();
+        match published.lock() {
+            Ok(mut g) => *g = engine.snapshot(),
+            Err(poisoned) => *poisoned.into_inner() = engine.snapshot(),
         }
 
         if engine.is_shutdown() {
             break;
         }
     }
-
-    shut_down.store(true, Ordering::Release);
 }
 
 #[cfg(test)]
@@ -338,5 +363,96 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         panic!("timed out waiting for has_shut_down() to become true");
+    }
+
+    #[test]
+    fn has_shut_down_becomes_true_when_the_engine_thread_panics() {
+        // A `Synthesizer` whose `phonemize` panics: `phonemize` runs inside
+        // `engine.tick()` on the engine thread, has no `Result` to fail
+        // through, and nothing wraps the loop body in `catch_unwind`. The
+        // panic unwinds the engine thread. `has_shut_down()` must still
+        // become true -- that is what lets a daemon loop notice a crashed
+        // engine rather than waiting on it forever.
+        struct PhonemizePanics;
+        impl crate::synth::Synthesizer for PhonemizePanics {
+            fn phonemize(&mut self, _text: &str, _voice: &str) -> String {
+                panic!("PhonemizePanics: synthesizer exploded on purpose");
+            }
+            fn fits(&mut self, _phonemes: &str) -> bool {
+                true
+            }
+            fn synth(
+                &mut self,
+                _phonemes: &str,
+                _voice: &str,
+                _speed: f32,
+            ) -> Result<Vec<f32>, String> {
+                Ok(Vec::new())
+            }
+            fn unload(&mut self) {}
+            fn is_loaded(&self) -> bool {
+                true
+            }
+        }
+
+        // The panic below is expected and its message is uninteresting; a
+        // std test binary still prints it to stderr via the default hook on
+        // every run. Swap in a no-op hook for the duration of this test so
+        // that output stays quiet, and restore the previous hook
+        // immediately after so a genuine panic elsewhere in the suite still
+        // prints normally.
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+
+        let h = EngineHandle::spawn(
+            Config::default(),
+            Box::new(PhonemizePanics),
+            Box::new(VecSink::new(24_000 * 10)),
+        );
+        // Queuing succeeds -- `submit` only enqueues the text; `phonemize`
+        // is not called until a later `tick()` picks the utterance up off
+        // the queue, on the engine thread.
+        let _ = h.submit("hello there.".into(), SayOpts::default());
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let result = loop {
+            if h.has_shut_down() {
+                break Ok(());
+            }
+            if Instant::now() >= deadline {
+                break Err(());
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+
+        std::panic::set_hook(previous_hook);
+        assert!(
+            result.is_ok(),
+            "timed out waiting for has_shut_down() to become true after a panic"
+        );
+    }
+
+    #[test]
+    fn submit_after_shutdown_returns_an_error_instead_of_hanging() {
+        // Pins the explicitly-named attack scenario: a `submit` issued after
+        // the engine thread is gone must come back with an error promptly,
+        // not block forever. Run on its own thread with a timeout so a
+        // regression fails loudly instead of hanging the test suite.
+        let h = handle();
+        h.shutdown();
+
+        let h2 = h.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done_tx.send(h2.submit("hello there.".into(), SayOpts::default()));
+        });
+
+        match done_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(r) => assert!(
+                r.is_err(),
+                "submit after shutdown should be rejected, got {r:?}"
+            ),
+            Err(_) => panic!("submit after shutdown hung instead of returning promptly"),
+        }
     }
 }
