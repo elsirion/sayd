@@ -50,12 +50,30 @@ pub fn chunk(text: &str, target_chars: usize) -> Vec<Chunk> {
 }
 
 /// Split on sentence-final punctuation, keeping the punctuation attached.
+///
+/// A run of consecutive terminal punctuation (`?!`, `!!!`, `...`) stays in
+/// the sentence it ends, rather than each character starting a new
+/// (degenerate, one-character) sentence -- the merge step in `chunk` would
+/// otherwise glue those back together with spaces that were never in the
+/// source. `\n` is excluded from the run so newline-triggered breaks are
+/// unaffected.
 fn sentences(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
-    for ch in text.chars() {
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
         cur.push(ch);
         if matches!(ch, '.' | '!' | '?' | ';' | ':' | '\n') {
+            if ch != '\n' {
+                while let Some(&next) = chars.peek() {
+                    if matches!(next, '.' | '!' | '?' | ';' | ':') {
+                        cur.push(next);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+            }
             let t = cur.trim().to_string();
             if !t.is_empty() {
                 out.push(t);
@@ -83,11 +101,19 @@ fn split_oversized(sentence: &str, target: usize) -> Vec<String> {
             None => break,
         };
         let head = &rest[..limit];
+        // Prefer a comma, then a space, inside the target window. If neither
+        // exists the window falls inside a single long word: rather than
+        // slicing mid-word, extend forward to that word's end (the next
+        // space) so the whole word survives intact -- the chunk may then
+        // exceed `target`, which is fine, since `target` is approximate and
+        // `refit` enforces the hard limit. Mirrors `halve_until`, which
+        // keeps an unsplittable word whole rather than truncating it.
         let cut = head
             .rfind(", ")
             .map(|i| i + 1)
             .or_else(|| head.rfind(' '))
-            .unwrap_or(limit);
+            .or_else(|| rest[limit..].find(' ').map(|off| limit + off))
+            .unwrap_or(rest.len());
         let (a, b) = rest.split_at(cut);
         let a = a.trim().to_string();
         if a.is_empty() {
@@ -240,5 +266,111 @@ mod tests {
         let cs = vec![Chunk { text: "supercalifragilistic".into(), starts_paragraph: false }];
         let out = refit(cs, |s| s.chars().count() <= 3);
         assert_eq!(out.len(), 1, "unsplittable input must be passed through, not looped on");
+    }
+
+    /// Every whitespace-separated piece in the chunk output must equal some
+    /// whitespace-separated word from the input (punctuation aside) -- i.e.
+    /// `chunk` never slices a word in two.
+    fn assert_no_word_is_shredded(input: &str, target: usize) {
+        let cs = chunk(input, target);
+        let input_words: std::collections::HashSet<String> = input
+            .split_whitespace()
+            .map(|w| w.trim_matches(|c: char| ",.;:!?".contains(c)).to_string())
+            .collect();
+        for c in &cs {
+            for piece in c.text.split_whitespace() {
+                let stripped = piece.trim_matches(|c: char| ",.;:!?".contains(c));
+                assert!(
+                    input_words.contains(stripped),
+                    "chunk {:?} contains fragment {:?} not present as a whole word in {:?}",
+                    c.text,
+                    stripped,
+                    input
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn split_oversized_keeps_a_long_word_whole_when_alone() {
+        let word = "supercalifragilisticexpialidocious";
+        let cs = chunk(word, 10);
+        assert_eq!(cs.len(), 1);
+        assert_eq!(cs[0].text, word, "a lone unsplittable word must come back whole");
+    }
+
+    #[test]
+    fn split_oversized_keeps_a_long_word_whole_when_embedded() {
+        // The exact fixture from the bug report: without the fix, "charlie"
+        // was sliced into "charli" + "e".
+        assert_no_word_is_shredded(
+            "alpha bravo, charlie delta, echo foxtrot golf hotel india juliet",
+            6,
+        );
+    }
+
+    #[test]
+    fn supercalifragilisticexpialidocious_is_long_at_a_small_target() {
+        let input = "supercalifragilisticexpialidocious is long";
+        assert_no_word_is_shredded(input, 20);
+        let cs = chunk(input, 20);
+        let rejoined: String = cs.iter().map(|c| c.text.as_str()).collect::<Vec<_>>().join(" ");
+        assert!(
+            rejoined.split_whitespace().any(|w| w == "supercalifragilisticexpialidocious"),
+            "the long word must survive whole: {rejoined:?}"
+        );
+    }
+
+    #[test]
+    fn word_preservation_property() {
+        let inputs = [
+            "The quick brown fox jumps over the lazy dog.",
+            "alpha bravo, charlie delta, echo foxtrot golf hotel india juliet",
+            "supercalifragilisticexpialidocious is a very long word indeed.",
+            "One. Two. Three. Four. Five. Six. Seven.",
+            "Short sentence here, followed by another, and yet another one for good measure.",
+            "Yes!!! What?! Wait... okay.",
+        ];
+        let targets = [1usize, 3, 6, 10, 20, 50, 100];
+        let strip = |w: &str| w.trim_matches(|c: char| ",.;:!?".contains(c)).to_string();
+
+        for input in inputs {
+            let expected: Vec<String> =
+                input.split_whitespace().map(strip).filter(|w| !w.is_empty()).collect();
+
+            for &target in &targets {
+                let cs = chunk(input, target);
+                let rejoined: String =
+                    cs.iter().map(|c| c.text.as_str()).collect::<Vec<_>>().join(" ");
+                let actual: Vec<String> =
+                    rejoined.split_whitespace().map(strip).filter(|w| !w.is_empty()).collect();
+                assert_eq!(
+                    actual, expected,
+                    "word sequence mismatch for {input:?} at target {target}: got chunks {cs:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sentences_keeps_runs_of_terminal_punctuation_together() {
+        assert_eq!(sentences("Yes!!!"), vec!["Yes!!!".to_string()]);
+        assert_eq!(sentences("What?!"), vec!["What?!".to_string()]);
+        assert_eq!(sentences("Wait..."), vec!["Wait...".to_string()]);
+    }
+
+    #[test]
+    fn chunk_does_not_insert_spaces_into_a_run_of_terminal_punctuation() {
+        // The exact fixture from the bug report: without the fix this
+        // produced the chunk text "... Yes! ! !".
+        let cs = chunk("... Yes!!!", 100);
+        assert_eq!(cs.len(), 1);
+        assert_eq!(cs[0].text, "... Yes!!!");
+    }
+
+    #[test]
+    fn sentences_still_breaks_at_a_newline_after_terminal_punctuation() {
+        let got = sentences("Wait...\nNext line.");
+        assert_eq!(got, vec!["Wait...".to_string(), "Next line.".to_string()]);
     }
 }
