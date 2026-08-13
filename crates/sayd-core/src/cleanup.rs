@@ -41,23 +41,43 @@
 //! Two of the transforms that *do* run per-segment inside `clean_non_url`
 //! are anchor-based, and an anchor evaluated on an isolated segment does not
 //! necessarily correspond to a real boundary in the original, unsegmented
-//! input. Both are handled specially:
+//! input. Both are handled the same way: `clean_non_url` is given the real
+//! character that precedes (and, for `ACRONYM`, follows) the segment in the
+//! original input, and a sentinel is temporarily glued onto the segment edge
+//! so the anchor sees what it would have seen unsegmented, then stripped
+//! back off before the result is used.
 //!
 //! - `LIST_OR_HEADING` is anchored on `^` (line start, via `(?m)`). Handing
 //!   it an isolated segment is wrong: position 0 of a segment that begins
 //!   right after a URL is *not* a line start in the original text, but `^`
-//!   would match there anyway, misreading ordinary punctuation that follows
-//!   a URL (` - `, ` # `, ` 1. `) as a bullet/heading/list marker. There is
-//!   no per-segment fix that recovers real line-start information once the
-//!   string has been cut, so this pass runs exactly once over the *whole*
-//!   input, before segmentation. This is safe with respect to URLs: the
-//!   pattern only matches immediately after a real line start, requires one
-//!   of `#`, `-`, `*`, `+`, or a digit right there, and requires trailing
-//!   whitespace before it stops — a URL always begins with `http`/`https`
-//!   (never one of those marker characters) and never contains whitespace,
-//!   so the pattern can neither start a match on URL text nor extend a
-//!   match into it. A test (`bullet_immediately_followed_by_url_is_still_stripped`)
-//!   confirms a marker is still stripped when a URL immediately follows it.
+//!   would match there anyway (position 0 of *any* string it is handed is a
+//!   line-start match, per `(?m)` semantics), misreading ordinary
+//!   punctuation that follows a URL (` - `, ` # `, ` 1. `) as a
+//!   bullet/heading/list marker. Position 0 of a segment is a genuine line
+//!   start only when `prev` — the character immediately preceding the
+//!   segment in the original input — is absent (segment starts at input
+//!   position 0) or is a newline. When `prev` is anything else, a sentinel
+//!   character is prepended before `LIST_OR_HEADING` runs, then stripped
+//!   back off; `(?m)^` still correctly matches after any newline *inside*
+//!   the segment, since the sentinel only occupies the position before the
+//!   segment, not any position within it. The sentinel used is `'\u{1}'`
+//!   (SOH, a C0 control character): it is not `\n`, so it never itself
+//!   becomes a line start for `^` to match after; it is not whitespace, so
+//!   `LIST_OR_HEADING`'s `\s*` cannot absorb it and then continue matching
+//!   into the segment's real leading whitespace; and it is none of `#`,
+//!   `-`, `*`, `+`, or a digit, so it can never itself begin a marker match.
+//!   No other transform runs while it is present — it is pushed and popped
+//!   within a single tightly-scoped step — so there is no window for it to
+//!   be matched or mangled by `EMPHASIS`, `HYPHEN_BREAK`, or anything else.
+//!   It also cannot leak into output even if some future bug skipped the
+//!   strip-back-off step: the global, unconditional control-character
+//!   filter at the end of `clean` removes every control character except
+//!   `\n`/`\t`, and SOH is neither. A test
+//!   (`bullet_immediately_followed_by_url_is_still_stripped`) confirms a
+//!   marker is still stripped when a URL immediately follows it, and
+//!   another (`marker_after_interior_newline_is_still_stripped`) confirms
+//!   the sentinel does not suppress a legitimate match after a newline
+//!   inside the segment.
 //! - `ACRONYM` is anchored on `\b` (word boundary) at both ends. Evaluated
 //!   on an isolated segment, `\b` at position 0 or at the end of the string
 //!   is computed against "nothing" on the outside — even when the original
@@ -70,6 +90,17 @@
 //!   segment before `ACRONYM` runs (lowercase so it can never itself match
 //!   `[A-Z]{3,}`), reproducing the same "word character on the other side"
 //!   `\b` would have seen, and is stripped back off afterward.
+//!
+//! `LIST_OR_HEADING` and `HYPHEN_BREAK` both run inside `clean_non_url`, and
+//! their relative order is load-bearing in the other direction: hyphenation
+//! rejoin must run *first*. A hyphen-wrapped word can wrap onto a line that
+//! is itself a marker line (`"machine-\n- learning"`), and `HYPHEN_BREAK`
+//! needs to see the marker's leading `-` still in place to know there is a
+//! non-word character between the two word halves and decline to touch
+//! them; if the marker were stripped first, `HYPHEN_BREAK` would see
+//! `"machine-\nlearning"` and rejoin it, silently fusing what was — genuinely
+//! ambiguously, see the test below — either a wrapped hyphenated word or a
+//! new list item.
 
 use std::sync::LazyLock;
 
@@ -101,13 +132,6 @@ pub fn clean(text: &str, cfg: &CleanupConfig) -> String {
 
     if cfg.drop_code_blocks {
         s = CODE_FENCE.replace_all(&s, " ").into_owned();
-    }
-
-    // Anchored on `^`; must run once over the whole string, before
-    // segmentation, so its line-start anchor sees real line starts rather
-    // than segment starts. See module doc comment.
-    if cfg.strip_markdown {
-        s = LIST_OR_HEADING.replace_all(&s, "").into_owned();
     }
 
     // Segment into alternating non-URL / URL runs so no transform below can
@@ -145,8 +169,9 @@ pub fn clean(text: &str, cfg: &CleanupConfig) -> String {
 /// `prev`/`next` are the characters that flank this segment in the
 /// *original, unsegmented* input (e.g. the last character of a preceding
 /// URL, or the first character of a following one) — `None` at the true
-/// start/end of the input. They exist solely so `ACRONYM`'s `\b` anchors can
-/// be evaluated with full-string semantics; see the module doc comment.
+/// start/end of the input. They exist so `LIST_OR_HEADING`'s `^` and
+/// `ACRONYM`'s `\b` anchors can be evaluated with full-string semantics; see
+/// the module doc comment.
 fn clean_non_url(
     segment: &str,
     prev: Option<char>,
@@ -160,6 +185,7 @@ fn clean_non_url(
     }
 
     if cfg.strip_markdown {
+        s = strip_list_or_heading(&s, prev);
         s = EMPHASIS.replace_all(&s, "").into_owned();
         s = s.replace('|', " ");
     }
@@ -199,6 +225,43 @@ fn clean_non_url(
     }
 
     s
+}
+
+/// Strip markdown list/heading markers from `segment`, giving `(?m)^`
+/// correct boundary knowledge about the *original, unsegmented* input.
+///
+/// Position 0 of `segment` is a genuine line start only when `prev` (the
+/// character immediately preceding this segment in the original input) is
+/// absent or is a newline; `(?m)^` cannot otherwise tell the difference
+/// between that and a segment that merely begins wherever a URL was cut out
+/// of the middle of a line. Whenever `prev` denotes anything else, a
+/// sentinel is prepended before `LIST_OR_HEADING` runs and stripped back off
+/// after. `(?m)^` still matches correctly after any newline *inside* the
+/// segment regardless, since the sentinel only ever occupies the position
+/// immediately before the segment's own text. See the module doc comment
+/// for why `'\u{1}'` was chosen as the sentinel.
+fn strip_list_or_heading(segment: &str, prev: Option<char>) -> String {
+    const SENTINEL: char = '\u{1}';
+    let needs_sentinel = !matches!(prev, None | Some('\n'));
+
+    let padded = if needs_sentinel {
+        let mut p = String::with_capacity(segment.len() + SENTINEL.len_utf8());
+        p.push(SENTINEL);
+        p.push_str(segment);
+        p
+    } else {
+        segment.to_string()
+    };
+
+    let replaced = LIST_OR_HEADING.replace_all(&padded, "").into_owned();
+
+    if needs_sentinel {
+        // The sentinel can never itself be consumed by `LIST_OR_HEADING`
+        // (see doc comment above), so it is always still there to strip.
+        replaced.strip_prefix(SENTINEL).map(str::to_string).unwrap_or(replaced)
+    } else {
+        replaced
+    }
 }
 
 /// Resolve a single matched URL span per `UrlPolicy`.
@@ -587,6 +650,75 @@ mod tests {
         assert_eq!(
             clean("https://example.com/a middle https://example.com/b", &c),
             "link middle link"
+        );
+    }
+
+    // -- Fourth round: LIST_OR_HEADING restored to per-segment, sentinel-padded ^ --
+
+    #[test]
+    fn hyphen_wrap_onto_a_marker_line_does_not_fuse_the_two_words() {
+        // "topics include machine-\n- learning models": whether this is a
+        // hyphenated word wrapped across a line that happens to start with
+        // "- learning", or a genuinely new list item reading "learning
+        // models", is not decidable from the text alone — the source is
+        // ambiguous. What matters is that HYPHEN_BREAK must not silently
+        // fuse "machine" and "learning" into "machinelearning" with the
+        // marker deleted out from under it (the bug this round fixes).
+        // Restoring hyphenation-then-markers order means HYPHEN_BREAK sees
+        // the marker character still in place and (for the non-digit
+        // markers) declines to match, so the two halves stay separated once
+        // the marker is later stripped.
+        let c = all_on();
+        assert_eq!(
+            clean("topics include machine-\n- learning models", &c),
+            "topics include machine- learning models"
+        );
+        assert_eq!(
+            clean("topics include machine-\n# learning models", &c),
+            "topics include machine- learning models"
+        );
+        assert_eq!(
+            clean("topics include machine-\n* learning models", &c),
+            "topics include machine- learning models"
+        );
+        // The numbered-list marker pins a different (also not-fused, but not
+        // identical) outcome: `\d` is itself a `\w` character, so
+        // HYPHEN_BREAK's own `(\w)` capture matches the leading digit of
+        // "1." directly, rejoining across the newline before LIST_OR_HEADING
+        // gets a chance to see a line-start "1." to strip. The digit ends up
+        // glued to "machine" with the hyphen dropped, rather than a bullet
+        // marker being stripped and a space surviving. This is pinned as
+        // observed behavior, not endorsed as "correct" — the ambiguity
+        // above applies here too, and `\d`-vs-`\w` overlap is a pre-existing
+        // property of these two regexes, not something this round's fix
+        // introduced or is scoped to change.
+        assert_eq!(
+            clean("topics include machine-\n1. learning models", &c),
+            "topics include machine1. learning models"
+        );
+    }
+
+    #[test]
+    fn genuine_bullet_heading_and_numbered_list_are_still_stripped() {
+        // Guards against under-correcting this round's fix: a real bullet
+        // list, heading, and numbered list (no URL, no ambiguity) must still
+        // be recognized and stripped exactly as before.
+        let c = all_on();
+        assert_eq!(clean("- one\n- two\n- three", &c), "one two three");
+        assert_eq!(clean("# Heading text", &c), "Heading text");
+        assert_eq!(clean("1. first\n2. second", &c), "first second");
+    }
+
+    #[test]
+    fn marker_after_interior_newline_is_still_stripped() {
+        // Proves the sentinel prepended at the *segment start* does not
+        // suppress a legitimate `(?m)^` match after a newline further inside
+        // the same segment — the sentinel only ever occupies the position
+        // immediately before the segment, never a position within it.
+        let c = all_on();
+        assert_eq!(
+            clean("intro line\n- bullet after newline", &c),
+            "intro line bullet after newline"
         );
     }
 }
