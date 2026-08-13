@@ -5,6 +5,7 @@
 //! D-Bus. Synthesis reaches it through the `Synthesizer` trait and audio
 //! through `AudioSink`, so the whole engine can be driven in a unit test.
 
+pub mod audio;
 pub mod config;
 pub mod cleanup;
 pub mod chunk;

@@ -1,0 +1,13 @@
+[package]
+name = "sayd"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Tray-resident local text-to-speech daemon"
+
+[dependencies]
+sayd-core = { path = "../sayd-core" }
+kokoro = { path = "../kokoro" }
+g2p = { path = "../g2p" }
+cpal = "0.18"
+rtrb = "0.3"
