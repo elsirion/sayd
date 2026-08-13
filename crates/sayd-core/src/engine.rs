@@ -101,6 +101,8 @@ pub struct Engine {
     /// from `Stop`, `Next`, `SkipSentence` and `SetMuted(true)`) must
     /// unpause the sink in that same step, or a later command has no way
     /// left to reach it: `Resume` only fires when `state == Paused`.
+    /// `tick`'s device-failure branch (`Paused -> Error`) is the same kind
+    /// of route and unpauses the sink for the same reason.
     error: Option<String>,
     idle_since: Option<Instant>,
     shutdown: bool,
@@ -295,6 +297,13 @@ impl Engine {
             self.error = Some(e);
             self.current = None;
             self.queue.clear();
+            // This is a route out of `Paused` (see the pause invariant on
+            // `error`'s doc comment): a device failure can arrive while
+            // paused, since this check runs before the `Paused` early
+            // return below, so it must unpause the sink in the same step
+            // rather than leaving it stranded for a `Resume` that can no
+            // longer fire.
+            self.sink.set_paused(false);
             return;
         }
 
@@ -415,6 +424,12 @@ impl Engine {
     /// utterance whose audio is gone.
     pub fn replace_sink(&mut self, sink: Box<dyn AudioSink>) {
         self.sink = sink;
+        // Enforce the pause invariant by construction rather than trusting
+        // the incoming sink to already be unpaused: both `AudioSink` impls
+        // in this codebase happen to construct unpaused, but nothing about
+        // the trait guarantees that of an arbitrary future implementation,
+        // and this method always leaves `state == Idle`.
+        self.sink.set_paused(false);
         self.current = None;
         self.error = None;
         self.state = State::Idle;
@@ -620,6 +635,63 @@ mod tests {
             Box::new(SharedVecSink(sink.clone())),
         );
         (e, sink)
+    }
+
+    /// A sink whose `take_error` can be populated from outside, independent
+    /// of `push` -- unlike `FailingSink` below, which only ever fails from
+    /// inside `push` and therefore can never be triggered while the engine
+    /// is `Paused` (`tick` never calls `push` while paused). The real
+    /// `RingSink` fails this way for real: cpal reports a dead device from
+    /// its own error-callback thread, asynchronously and independent of
+    /// whether anything is currently being pushed. This wraps `VecSink` the
+    /// same way `SharedVecSink` does, plus a second shared slot a test can
+    /// write into directly to model that asynchronous arrival.
+    #[derive(Clone)]
+    struct FaultInjectableSink {
+        inner: Arc<Mutex<VecSink>>,
+        fault: Arc<Mutex<Option<String>>>,
+    }
+
+    impl FaultInjectableSink {
+        fn new(capacity: usize) -> Self {
+            FaultInjectableSink {
+                inner: Arc::new(Mutex::new(VecSink::new(capacity))),
+                fault: Arc::new(Mutex::new(None)),
+            }
+        }
+
+        /// Simulate cpal's error callback firing on its own thread: make the
+        /// next `take_error` observe a failure, with no `push` involved.
+        fn inject_failure(&self, msg: &str) {
+            *self.fault.lock().unwrap() = Some(msg.into());
+        }
+    }
+
+    impl AudioSink for FaultInjectableSink {
+        fn push(&mut self, samples: &[f32]) -> usize {
+            self.inner.lock().unwrap().push(samples)
+        }
+        fn pending(&self) -> usize {
+            self.inner.lock().unwrap().pending()
+        }
+        fn clear(&mut self) {
+            self.inner.lock().unwrap().clear()
+        }
+        fn set_paused(&mut self, paused: bool) {
+            self.inner.lock().unwrap().set_paused(paused)
+        }
+        fn is_paused(&self) -> bool {
+            self.inner.lock().unwrap().is_paused()
+        }
+        fn capacity(&self) -> usize {
+            self.inner.lock().unwrap().capacity()
+        }
+        fn total_written(&self) -> usize {
+            self.inner.lock().unwrap().total_written()
+        }
+        fn take_error(&mut self) -> Option<String> {
+            self.fault.lock().unwrap().take()
+        }
     }
 
     fn say(text: &str) -> Command {
@@ -1046,6 +1118,28 @@ mod tests {
             e.handle(say("way too long for the limit"));
             e
         }
+        // C2/M2's device-failure branch (`tick`'s `take_error` check) is a
+        // second, independent route into `Error`, and the only one that can
+        // fire while `state == Paused` -- exactly the case Finding 1 missed.
+        // `all_commands()` has nothing that triggers `take_error` (nor could
+        // it: the real failure arrives asynchronously from cpal's callback,
+        // not from a `Command`), so a dedicated build function is the only
+        // way to get this class of failure under the same sweep as every
+        // other reachable state, rather than only the bespoke tests below.
+        fn build_error_from_device_failure_while_paused() -> Engine {
+            let sink = FaultInjectableSink::new(24_000 * 10);
+            let mut e = Engine::new(
+                Config::default(),
+                Box::new(StubSynthesizer::new()),
+                Box::new(sink.clone()),
+            );
+            e.handle(say("Hello there. This keeps it busy for quite a while indeed."));
+            e.tick();
+            e.handle(Command::Pause);
+            sink.inject_failure("audio device disappeared");
+            e.tick();
+            e
+        }
 
         fn check_from(name: &str, build: fn() -> Engine) {
             for cmd in all_commands() {
@@ -1060,6 +1154,7 @@ mod tests {
         check_from("speaking", build_speaking);
         check_from("paused", build_paused);
         check_from("error", build_error);
+        check_from("device_failed_while_paused", build_error_from_device_failure_while_paused);
     }
 
     #[test]
@@ -1499,5 +1594,79 @@ mod tests {
             e.tick();
         }
         assert!(e.audio_written() > 0, "the engine must work again after the sink is replaced");
+    }
+
+    #[test]
+    fn device_failure_while_paused_unpauses_the_sink_and_reaches_error() {
+        // Finding 1: `tick`'s device-failure branch is a route out of
+        // `Paused` (`Paused -> Error`) and must unpause the sink in the same
+        // step, exactly like `dismiss_error_and_go_idle` already does for
+        // its own routes -- otherwise a later `Resume` has no way left to
+        // fire (it's gated on `state == Paused`, which is no longer true)
+        // and the sink is stranded paused forever. `FailingSink` cannot
+        // reproduce this: it only ever fails from inside `push`, and `tick`
+        // never calls `push` while paused. `FaultInjectableSink` can, since
+        // its failure is set from outside, matching how the real `RingSink`
+        // reports a device failure asynchronously from cpal's error
+        // callback, independent of whether anything is being pushed.
+        let sink = FaultInjectableSink::new(24_000 * 10);
+        let mut e = Engine::new(
+            Config::default(),
+            Box::new(StubSynthesizer::new()),
+            Box::new(sink.clone()),
+        );
+        e.handle(say("Hello there. This keeps it busy for quite a while indeed."));
+        e.tick();
+        e.handle(Command::Pause);
+        assert_eq!(e.snapshot().state, State::Paused);
+        assert!(sink.is_paused());
+
+        sink.inject_failure("audio device disappeared");
+        e.tick();
+
+        let s = e.snapshot();
+        assert_eq!(s.state, State::Error, "a device failure must surface even while paused");
+        assert!(
+            !sink.is_paused(),
+            "leaving Paused for Error must unpause the sink in the same step"
+        );
+        assert_eq!(
+            s.error.is_some(),
+            s.state == State::Error,
+            "error={:?} state={:?}",
+            s.error,
+            s.state
+        );
+    }
+
+    #[test]
+    fn replace_sink_recovers_from_a_device_failure_that_arrived_while_paused() {
+        let sink = FaultInjectableSink::new(24_000 * 10);
+        let mut e = Engine::new(
+            Config::default(),
+            Box::new(StubSynthesizer::new()),
+            Box::new(sink.clone()),
+        );
+        e.handle(say("Hello there. This keeps it busy for quite a while indeed."));
+        e.tick();
+        e.handle(Command::Pause);
+        sink.inject_failure("audio device disappeared");
+        e.tick();
+        assert_eq!(e.snapshot().state, State::Error);
+
+        e.replace_sink(Box::new(VecSink::new(24_000 * 10)));
+        let s = e.snapshot();
+        assert_eq!(s.state, State::Idle, "a fresh sink clears the failure");
+        assert_eq!(s.error, None);
+
+        e.submit("after recovery.".into(), SayOpts::default()).expect("accepted");
+        for _ in 0..500 {
+            e.tick();
+        }
+        assert!(
+            e.audio_written() > 0,
+            "the engine must work again after the sink is replaced, even though the failure \
+             arrived while paused"
+        );
     }
 }
