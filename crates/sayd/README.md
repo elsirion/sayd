@@ -9,9 +9,15 @@ runtime.
 
 ## Status
 
-Early. The engine and audio path work: text in, chunk-streamed speech out,
-starting about a second after the keypress regardless of how much was selected.
-The D-Bus interface, control CLI, tray icon and settings window are in progress.
+M1 (engine and audio) and M2 (the `sh.sayd.Sayd1` D-Bus interface, the `say`
+control CLI, PRIMARY selection and clipboard reading, single-instance
+handling) are done. Text in, chunk-streamed speech out, starting about a
+second after the keypress regardless of how much was selected. The tray
+icon, MPRIS integration and a settings window are still to come.
+
+The workspace README (in the source repository, not shipped in this crate's
+package) has the sway keybinds, a sample systemd unit, and the full D-Bus
+surface as a table.
 
 ## Requirements
 

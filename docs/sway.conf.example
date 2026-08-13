@@ -1,0 +1,15 @@
+# sayd -- add to ~/.config/sway/config
+#
+# Note there is no $(...) anywhere: the daemon reads the selection itself
+# through wlr-data-control, so no selected text ever passes through a shell
+# and nothing can mangle the quoting.
+
+exec sayd
+
+bindsym $mod+Shift+s exec say selection
+bindsym $mod+Shift+v exec say clipboard
+bindsym $mod+Shift+x exec say stop
+bindsym $mod+Shift+p exec say play-pause
+
+# Media keys work once MPRIS lands in M3:
+# bindsym XF86AudioPlay exec playerctl -p sayd play-pause

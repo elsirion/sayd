@@ -1,0 +1,20 @@
+# Optional. sayd is normally started from the sway config with `exec sayd`,
+# which ties its lifetime to the session that it needs anyway. This unit is
+# for people who prefer systemd to manage it.
+#
+# Install to ~/.config/systemd/user/sayd.service, then:
+#   systemctl --user enable --now sayd.service
+
+[Unit]
+Description=sayd text-to-speech daemon
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/sayd
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target
