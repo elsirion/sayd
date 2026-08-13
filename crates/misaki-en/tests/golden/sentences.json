@@ -1,0 +1,57 @@
+{
+ "british": false,
+ "cases": [
+  {
+   "text": "Hello world, this is a test.",
+   "phonemes": "həlˈO wˈɜɹld, ðɪs ɪz ɐ tˈɛst."
+  },
+  {
+   "text": "I read the report yesterday, and today I will read it again.",
+   "phonemes": "ˌI ɹˈɛd ðə ɹəpˈɔɹt jˈɛstəɹdˌA, ænd tədˈA ˌI wɪl ɹˈid ɪt əɡˈɛn."
+  },
+  {
+   "text": "He will record a record for the record label.",
+   "phonemes": "hˌi wɪl ɹəkˈɔɹd ɐ ɹˈɛkəɹd fɔɹ ðə ɹˈɛkəɹd lˈAbəl."
+  },
+  {
+   "text": "The deficit rose to $1,234.56 on 03/04/2026.",
+   "phonemes": "ðə dˈɛfəsət ɹˈOz tə wˈʌn θˈWzᵊnd tˈu hˈʌndɹəd θˈɜɹTi fˈɔɹ dˈɑləɹz ænd fˈɪfti sˈɪks sˈɛnts ˌɔn θɹˈi zˈɪɹO fˈɔɹ twˈɛnti twˈɛnti sˈɪks."
+  },
+  {
+   "text": "She bought 3 apples, 21 oranges and 1/3 of a melon.",
+   "phonemes": "ʃˌi bˈɔt θɹˈi ˈæpᵊlz, twˈɛnti wˈʌn ˈɔɹᵊnʤᵻz ænd wˈʌn θɹˈi ʌv ɐ mˈɛlən."
+  },
+  {
+   "text": "It costs $5, £10, and €99.99 in total.",
+   "phonemes": "ˌɪt kˈɔsts fˈIv dˈɑləɹz, tˈɛn pˈWndz, ænd nˈIndi nˈIn jˈʊɹOz ænd nˈIndi nˈIn sˈɛnts ɪn tˈOTᵊl."
+  },
+  {
+   "text": "The 1st, 2nd, 3rd and 4th entries are 50% done.",
+   "phonemes": "ðə fˈɜɹst, sˈɛkənd, θˈɜɹd ænd fˈɔɹθ ˈɛntɹiz ɑɹ fˈɪfti pəɹsˈɛnt dˈʌn."
+  },
+  {
+   "text": "Meeting at 3:45pm, ending 9-5, dated 2026-08-10.",
+   "phonemes": "mˈiTɪŋ æt θɹˈi:fˈɔɹTi fˈIv pˌiˈɛm, ˈɛndɪŋ nˈInfˌIv, dˈATᵻd twˈɛnti twˈɛnti sˈɪkszˈɪɹO ˈAttˌɛn."
+  },
+  {
+   "text": "Dr. Smith met Prof. Jones at 12 Main St.",
+   "phonemes": "dˈɑktəɹ smˈɪθ mˈɛt pɹˈɑf ʤˈOnz æt twˈɛlv mˈAn sənt."
+  },
+  {
+   "text": "Email me at first.last@example.com or see www.example.com.",
+   "phonemes": "ˈimˌAl mˌi æt fˈɜɹst dˌɑt lˈæst æt ɪɡzˈæmpəl dˌɑt kˈɑm ɔɹ sˈi dˌʌbᵊljˌudˌʌbᵊljˌudˈʌbᵊljˌu.ɛɡzˈæmpᵊl.kˈɑm."
+  },
+  {
+   "text": "The CEO of NASA met the IEEE and W3C teams about HTTP/2.",
+   "phonemes": "ðə sˌiˌiˈO ʌv nˈæsə mˈɛt ði ˌIˌiˌiˈi ænd dˈʌbᵊlju θɹˈi sˈi tˈimz əbˈWt ˌAʧtˌitˌipˈi tˈu."
+  },
+  {
+   "text": "A B C one two three; four: five! six? seven.",
+   "phonemes": "ɐ bˈi sˈi wˈʌn tˈu θɹˈi; fˈɔɹ: fˈIv! sˈɪks? sˈɛvən."
+  },
+  {
+   "text": "so i was thinking about this whole thing yesterday and it seems like the model is basically fine but the text processing is where everything falls apart and nobody really talks about that part much",
+   "phonemes": "sˌO ˈI wʌz θˈɪŋkɪŋ əbˈWt ðɪs hˈOl θˈɪŋ jˈɛstəɹdˌA ænd ɪt sˈimz lˈIk ðə mˈɑdᵊl ɪz bˈAsəkᵊli fˈIn bˌʌt ðə tˈɛkst pɹˈɑsɛsɪŋ ɪz wˌɛɹ ˈɛvəɹiθˌɪŋ fˈɔlz əpˈɑɹt ænd nˈObˌɑdi ɹˈiᵊli tˈɔks əbˈWt ðˈæt pˈɑɹt mˈʌʧ"
+  }
+ ]
+}

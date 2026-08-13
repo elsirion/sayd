@@ -1,0 +1,8113 @@
+{
+ "british": false,
+ "cases": [
+  {
+   "word": "ASAP",
+   "phonemes": "ˈAsæp"
+  },
+  {
+   "word": "Abaxial",
+   "phonemes": "æbˈæksiəl"
+  },
+  {
+   "word": "Abhorrence",
+   "phonemes": "əbhˈɔɹəns"
+  },
+  {
+   "word": "Abrasive",
+   "phonemes": "əbɹˈAsɪv"
+  },
+  {
+   "word": "Abridged",
+   "phonemes": "əbɹˈɪʤd"
+  },
+  {
+   "word": "Abscess",
+   "phonemes": "ˈæbsˌɛs"
+  },
+  {
+   "word": "Accelerometer",
+   "phonemes": "əksˌɛləɹˈɑməTəɹ"
+  },
+  {
+   "word": "Acquaintanceship",
+   "phonemes": "əkwˈAntᵊnsʃˌɪp"
+  },
+  {
+   "word": "Additive",
+   "phonemes": "ˈædəTɪv"
+  },
+  {
+   "word": "Adenoma",
+   "phonemes": "ˌædᵊnˈOmə"
+  },
+  {
+   "word": "Adjudgment",
+   "phonemes": "əʤˈʌʤmᵊnt"
+  },
+  {
+   "word": "Admit",
+   "phonemes": "ədmˈɪt"
+  },
+  {
+   "word": "Aerophagia",
+   "phonemes": "ˌɛɹəfˈAʤiə"
+  },
+  {
+   "word": "Affectedly",
+   "phonemes": "əfˈɛktədli"
+  },
+  {
+   "word": "Affiliation",
+   "phonemes": "əfˌɪliˈAʃən"
+  },
+  {
+   "word": "Affixed",
+   "phonemes": "əfˈɪkst"
+  },
+  {
+   "word": "Aggrandizement",
+   "phonemes": "əɡɹˈændˌIzmənt"
+  },
+  {
+   "word": "Aggrupation",
+   "phonemes": "ˌæɡɹupˈAʃən"
+  },
+  {
+   "word": "Agma",
+   "phonemes": "ˈæɡmə"
+  },
+  {
+   "word": "Ahead",
+   "phonemes": "əhˈɛd"
+  },
+  {
+   "word": "Airily",
+   "phonemes": "ˈɛɹəli"
+  },
+  {
+   "word": "Albany",
+   "phonemes": "ˈɔlbəni"
+  },
+  {
+   "word": "Aldehydic",
+   "phonemes": "ˌældəhˈɪdɪk"
+  },
+  {
+   "word": "Alexandrite",
+   "phonemes": "ˌæləɡzˈændɹˌIt"
+  },
+  {
+   "word": "All-consuming",
+   "phonemes": "ˌɔlkənsˈumɪŋ"
+  },
+  {
+   "word": "Amphisbaena",
+   "phonemes": "ˌæmpfəsbˈinə"
+  },
+  {
+   "word": "Anarch",
+   "phonemes": "ˈænˌɑɹk"
+  },
+  {
+   "word": "Angioplasty",
+   "phonemes": "ˈænʤiəplˌæsti"
+  },
+  {
+   "word": "Animist",
+   "phonemes": "ˈænəmɪst"
+  },
+  {
+   "word": "Annoyer",
+   "phonemes": "ənˈYəɹ"
+  },
+  {
+   "word": "Anodizer",
+   "phonemes": "ˈænədˌIzəɹ"
+  },
+  {
+   "word": "Anshan",
+   "phonemes": "ænʃˈæn"
+  },
+  {
+   "word": "Antennal",
+   "phonemes": "æntˈɛnəl"
+  },
+  {
+   "word": "Anthropic",
+   "phonemes": "ænθɹˈɑpɪk"
+  },
+  {
+   "word": "Antiguan",
+   "phonemes": "æntˈiɡən"
+  },
+  {
+   "word": "Antitheism",
+   "phonemes": "ˌæntiθˈiˌɪzəm"
+  },
+  {
+   "word": "Antitypical",
+   "phonemes": "ˌæntˌItˈɪpɪkəl"
+  },
+  {
+   "word": "Approver",
+   "phonemes": "əpɹˈuvəɹ"
+  },
+  {
+   "word": "Approximately",
+   "phonemes": "əpɹˈɑksəmətli"
+  },
+  {
+   "word": "Arabesque",
+   "phonemes": "ˌɛɹəbˈɛsk"
+  },
+  {
+   "word": "Archduke",
+   "phonemes": "ˌɑɹʧdˈuk"
+  },
+  {
+   "word": "Archilochus",
+   "phonemes": "ˌɑɹkˈɪləkəs"
+  },
+  {
+   "word": "Archipelago",
+   "phonemes": "ˌɑɹkəpˈɛləɡˌO"
+  },
+  {
+   "word": "Arrogantly",
+   "phonemes": "ˈɛɹəɡəntli"
+  },
+  {
+   "word": "Aspermia",
+   "phonemes": "Aspˈɜɹmiə"
+  },
+  {
+   "word": "Assed",
+   "phonemes": "ˈæst"
+  },
+  {
+   "word": "Assumption",
+   "phonemes": "əsˈʌmpʃən"
+  },
+  {
+   "word": "Astuteness",
+   "phonemes": "əstˈutnəs"
+  },
+  {
+   "word": "Aswan",
+   "phonemes": "ˈæzwɑn"
+  },
+  {
+   "word": "Augment's",
+   "phonemes": "ˈɔɡmənts"
+  },
+  {
+   "word": "Augustus",
+   "phonemes": "əɡˈʌstəs"
+  },
+  {
+   "word": "Auscultation",
+   "phonemes": "ˌɔskəltˈAʃən"
+  },
+  {
+   "word": "Authority",
+   "phonemes": "əθˈɔɹəTi"
+  },
+  {
+   "word": "Autodidactic",
+   "phonemes": "ˌɔTədədˈæktɪk"
+  },
+  {
+   "word": "Babism",
+   "phonemes": "bˈɑbˌɪzəm"
+  },
+  {
+   "word": "Baggier",
+   "phonemes": "bˈæɡiəɹ"
+  },
+  {
+   "word": "Bairiki",
+   "phonemes": "bIɹˈiki"
+  },
+  {
+   "word": "Barotrauma",
+   "phonemes": "bˈɛɹətɹˌɔmə"
+  },
+  {
+   "word": "Basel",
+   "phonemes": "bˈɑzᵊl"
+  },
+  {
+   "word": "Batard",
+   "phonemes": "bətˈɑɹd"
+  },
+  {
+   "word": "Bathymeter",
+   "phonemes": "bæθˈɪməTəɹ"
+  },
+  {
+   "word": "Bayesian",
+   "phonemes": "bˈAziən"
+  },
+  {
+   "word": "Beading",
+   "phonemes": "bˈidɪŋ"
+  },
+  {
+   "word": "Beastie",
+   "phonemes": "bˈisti"
+  },
+  {
+   "word": "Beggary",
+   "phonemes": "bˈɛɡəɹi"
+  },
+  {
+   "word": "Beguiling",
+   "phonemes": "bəɡˈIlɪŋ"
+  },
+  {
+   "word": "Believability",
+   "phonemes": "bəlˌivəbˈɪləTi"
+  },
+  {
+   "word": "Bendiness",
+   "phonemes": "bˈɛndinɪs"
+  },
+  {
+   "word": "Benison",
+   "phonemes": "bˈɛnəsən"
+  },
+  {
+   "word": "Berate",
+   "phonemes": "bəɹˈAt"
+  },
+  {
+   "word": "Best-of",
+   "phonemes": "bˈɛstəv"
+  },
+  {
+   "word": "Betterment",
+   "phonemes": "bˈɛTəɹmənt"
+  },
+  {
+   "word": "Bhajan",
+   "phonemes": "bˈʌʤən"
+  },
+  {
+   "word": "Bhuna",
+   "phonemes": "bˈunə"
+  },
+  {
+   "word": "Bile",
+   "phonemes": "bˈIl"
+  },
+  {
+   "word": "Billon",
+   "phonemes": "bˈɪlən"
+  },
+  {
+   "word": "Biogeographic",
+   "phonemes": "bˌIOʤˌiəɡɹˈæfɪk"
+  },
+  {
+   "word": "Biologism",
+   "phonemes": "bˌIˈɑləʤˌɪzəm"
+  },
+  {
+   "word": "Black-on-black",
+   "phonemes": "blˌækˌɑnblˈæk"
+  },
+  {
+   "word": "Blest",
+   "phonemes": "blˈɛst"
+  },
+  {
+   "word": "Bloodmobile",
+   "phonemes": "blˈʌdməbˌil"
+  },
+  {
+   "word": "Blowsily",
+   "phonemes": "blˈWzəli"
+  },
+  {
+   "word": "Body",
+   "phonemes": "bˈɑdi"
+  },
+  {
+   "word": "Bombarding",
+   "phonemes": "bɑmbˈɑɹdɪŋ"
+  },
+  {
+   "word": "Boogieing",
+   "phonemes": "bˈʊɡiɪŋ"
+  },
+  {
+   "word": "Braconid",
+   "phonemes": "bɹˈækənˌɪd"
+  },
+  {
+   "word": "Brahmanic",
+   "phonemes": "bɹɑmˈænɪk"
+  },
+  {
+   "word": "Brassy",
+   "phonemes": "bɹˈæsi"
+  },
+  {
+   "word": "Brawniness",
+   "phonemes": "bɹˈɔninəs"
+  },
+  {
+   "word": "Braze",
+   "phonemes": "bɹˈAz"
+  },
+  {
+   "word": "Brazenly",
+   "phonemes": "bɹˈAzənli"
+  },
+  {
+   "word": "Brickyard",
+   "phonemes": "bɹˈɪkjˌɑɹd"
+  },
+  {
+   "word": "Brierwood",
+   "phonemes": "bɹˈIəɹwˌʊd"
+  },
+  {
+   "word": "Brislings",
+   "phonemes": "bɹˈɪzlɪŋz"
+  },
+  {
+   "word": "Brit",
+   "phonemes": "bɹˈɪt"
+  },
+  {
+   "word": "Bromate",
+   "phonemes": "bɹˈOmˌAt"
+  },
+  {
+   "word": "Brook",
+   "phonemes": "bɹˈʊk"
+  },
+  {
+   "word": "Brooklynite",
+   "phonemes": "bɹˈʊklənˌIt"
+  },
+  {
+   "word": "Bruise",
+   "phonemes": "bɹˈuz"
+  },
+  {
+   "word": "Budwood",
+   "phonemes": "bˈʌdwʊd"
+  },
+  {
+   "word": "Bullshot",
+   "phonemes": "bˈʊlʃˌɑt"
+  },
+  {
+   "word": "Bumbershoot",
+   "phonemes": "bˈʌmbəɹʃˌut"
+  },
+  {
+   "word": "Burgle",
+   "phonemes": "bˈɜɹɡᵊl"
+  },
+  {
+   "word": "Burlesques",
+   "phonemes": "bˌɜɹlˈɛsks"
+  },
+  {
+   "word": "Bury",
+   "phonemes": "bˈɛɹi"
+  },
+  {
+   "word": "Businesslike",
+   "phonemes": "bˈɪznəslˌIk"
+  },
+  {
+   "word": "Bytownite",
+   "phonemes": "bItˈWnIt"
+  },
+  {
+   "word": "CALM",
+   "phonemes": "kˈɑlm"
+  },
+  {
+   "word": "CAMRA",
+   "phonemes": "kˈæmɹə"
+  },
+  {
+   "word": "CEO",
+   "phonemes": "sˌiˌiˈO"
+  },
+  {
+   "word": "Cachepot",
+   "phonemes": "kˈæʃpˌɑt"
+  },
+  {
+   "word": "Calzone",
+   "phonemes": "kælzˈOni"
+  },
+  {
+   "word": "Camden",
+   "phonemes": "kˈæmdən"
+  },
+  {
+   "word": "Canaanite",
+   "phonemes": "kˈAnənˌIt"
+  },
+  {
+   "word": "Candlemas",
+   "phonemes": "kˈændᵊlməs"
+  },
+  {
+   "word": "Canoness",
+   "phonemes": "kˈænənəs"
+  },
+  {
+   "word": "Canter",
+   "phonemes": "kˈæntəɹ"
+  },
+  {
+   "word": "Capful",
+   "phonemes": "kˈæpfˌʊl"
+  },
+  {
+   "word": "Carbonated",
+   "phonemes": "kˈɑɹbənˌATᵻd"
+  },
+  {
+   "word": "Carbonation",
+   "phonemes": "kˌɑɹbənˈAʃən"
+  },
+  {
+   "word": "Carotid",
+   "phonemes": "kəɹˈɑTɪd"
+  },
+  {
+   "word": "Catfish",
+   "phonemes": "kˈætfˌɪʃ"
+  },
+  {
+   "word": "Catfishing",
+   "phonemes": "kˈætfˌɪʃɪŋ"
+  },
+  {
+   "word": "Caulk",
+   "phonemes": "kˈɔk"
+  },
+  {
+   "word": "Cayuse",
+   "phonemes": "kIjˈus"
+  },
+  {
+   "word": "Cercopithecine",
+   "phonemes": "sˌɜɹkOpˈɪθəsin"
+  },
+  {
+   "word": "Challengeable",
+   "phonemes": "ʧˈælənʤəbᵊl"
+  },
+  {
+   "word": "Chancroid",
+   "phonemes": "kˈæŋkɹˌYd"
+  },
+  {
+   "word": "Chewiest",
+   "phonemes": "ʧˈuiᵻst"
+  },
+  {
+   "word": "Chicano",
+   "phonemes": "ʧɪkˈɑnO"
+  },
+  {
+   "word": "Chichewa",
+   "phonemes": "ʧəʧˈAwə"
+  },
+  {
+   "word": "Chloroform",
+   "phonemes": "klˈɔɹəfˌɔɹm"
+  },
+  {
+   "word": "Choleraic",
+   "phonemes": "kˌɑləɹˈAɪk"
+  },
+  {
+   "word": "Chordophone",
+   "phonemes": "kˈɔɹdəfˌOn"
+  },
+  {
+   "word": "Choriambus",
+   "phonemes": "kˌɔɹiˈæmbəs"
+  },
+  {
+   "word": "Cine",
+   "phonemes": "sˈɪni"
+  },
+  {
+   "word": "Citrin",
+   "phonemes": "sˈɪtɹən"
+  },
+  {
+   "word": "Claymore",
+   "phonemes": "klˈAmˌɔɹ"
+  },
+  {
+   "word": "Climbing",
+   "phonemes": "klˈImɪŋ"
+  },
+  {
+   "word": "Clingy",
+   "phonemes": "klˈɪŋi"
+  },
+  {
+   "word": "Cliticize",
+   "phonemes": "klˈɪTəsˌIz"
+  },
+  {
+   "word": "Clitoral",
+   "phonemes": "klˈɪTəɹəl"
+  },
+  {
+   "word": "Cloudlet",
+   "phonemes": "klˈWdlət"
+  },
+  {
+   "word": "Co",
+   "phonemes": "kˈO"
+  },
+  {
+   "word": "Coagulator",
+   "phonemes": "kOˈæɡjəlˌATəɹ"
+  },
+  {
+   "word": "Cochin",
+   "phonemes": "kˈOʧɪn"
+  },
+  {
+   "word": "Cod",
+   "phonemes": "kˈɑd"
+  },
+  {
+   "word": "Coextensive",
+   "phonemes": "kˌOəkstˈɛnsɪv"
+  },
+  {
+   "word": "Colleague",
+   "phonemes": "kˈɑliɡ"
+  },
+  {
+   "word": "Coloristically",
+   "phonemes": "kˌʌləɹˈɪstəkᵊli"
+  },
+  {
+   "word": "Colton",
+   "phonemes": "kˈOltᵊn"
+  },
+  {
+   "word": "Comatose",
+   "phonemes": "kˈOmətˌOs"
+  },
+  {
+   "word": "Comice",
+   "phonemes": "kˈɑməs"
+  },
+  {
+   "word": "Commercialism",
+   "phonemes": "kəmˈɜɹʃəlˌɪzəm"
+  },
+  {
+   "word": "Conceptualist",
+   "phonemes": "kənsˈɛpʧəwəlɪst"
+  },
+  {
+   "word": "Conceptually",
+   "phonemes": "kənsˈɛpʧəwəli"
+  },
+  {
+   "word": "Conclude",
+   "phonemes": "kənklˈud"
+  },
+  {
+   "word": "Conducive",
+   "phonemes": "kəndˈusɪv"
+  },
+  {
+   "word": "Conducti",
+   "phonemes": "kəndˈʌktˌI"
+  },
+  {
+   "word": "Confect",
+   "phonemes": "kənfˈɛkt"
+  },
+  {
+   "word": "Confucian",
+   "phonemes": "kənfjˈuʃən"
+  },
+  {
+   "word": "Confucianism",
+   "phonemes": "kənfjˈuʃənˌɪzəm"
+  },
+  {
+   "word": "Congratulator",
+   "phonemes": "kənɡɹˈæʧəlˌATəɹ"
+  },
+  {
+   "word": "Conscientious",
+   "phonemes": "kˌɑnʧiˈɛnʧəs"
+  },
+  {
+   "word": "Consiglieri",
+   "phonemes": "kˌɔnsəliˈɛɹi"
+  },
+  {
+   "word": "Consociational",
+   "phonemes": "kˌɑnsˌOsiˈAʃᵊnᵊl"
+  },
+  {
+   "word": "Contemporaneously",
+   "phonemes": "kəntˌɛmpəɹˈAniəsli"
+  },
+  {
+   "word": "Conversation",
+   "phonemes": "kˌɑnvəɹsˈAʃən"
+  },
+  {
+   "word": "Convicts",
+   "phonemes": "kˈɑnvˌɪkts"
+  },
+  {
+   "word": "Convince",
+   "phonemes": "kənvˈɪns"
+  },
+  {
+   "word": "Convocational",
+   "phonemes": "kˌɑnvəkˈAʃᵊnəl"
+  },
+  {
+   "word": "Corn",
+   "phonemes": "kˈɔɹn"
+  },
+  {
+   "word": "Cornrows",
+   "phonemes": "kˈɔɹnɹˌOz"
+  },
+  {
+   "word": "Cosmologist",
+   "phonemes": "kɑzmˈɑləʤɪst"
+  },
+  {
+   "word": "Cranachan",
+   "phonemes": "kɹˈænəkən"
+  },
+  {
+   "word": "Crawly",
+   "phonemes": "kɹˈɔli"
+  },
+  {
+   "word": "Creakiest",
+   "phonemes": "kɹˈikiᵻst"
+  },
+  {
+   "word": "Creationism",
+   "phonemes": "kɹiˈAʃənˌɪzəm"
+  },
+  {
+   "word": "Credo",
+   "phonemes": "kɹˈidˌO"
+  },
+  {
+   "word": "Crepuscle",
+   "phonemes": "kɹˈɛpəsəl"
+  },
+  {
+   "word": "Cross-assembler",
+   "phonemes": "kɹɔsəsˈɛmbləɹ"
+  },
+  {
+   "word": "Cross-sell",
+   "phonemes": "kɹˌɔssˈɛl"
+  },
+  {
+   "word": "Cruelest",
+   "phonemes": "kɹˈuᵊlᵻst"
+  },
+  {
+   "word": "Cryosurgery",
+   "phonemes": "kɹˌIOsˈɜɹʤəɹi"
+  },
+  {
+   "word": "Cryptic",
+   "phonemes": "kɹˈɪptɪk"
+  },
+  {
+   "word": "Cryptobiosis",
+   "phonemes": "kɹˌɪptəbˌIˈOsɪs"
+  },
+  {
+   "word": "Cud",
+   "phonemes": "kˈʌd"
+  },
+  {
+   "word": "Cuddlier",
+   "phonemes": "kˈʌdᵊliəɹ"
+  },
+  {
+   "word": "Curbside",
+   "phonemes": "kˈɜɹbsˌId"
+  },
+  {
+   "word": "Curry",
+   "phonemes": "kˈɜɹi"
+  },
+  {
+   "word": "Curst",
+   "phonemes": "kˈɜɹst"
+  },
+  {
+   "word": "Cushaw",
+   "phonemes": "kˈuʃˌɔ"
+  },
+  {
+   "word": "Cussed",
+   "phonemes": "kˈʌsəd"
+  },
+  {
+   "word": "Cutlass",
+   "phonemes": "kˈʌtləs"
+  },
+  {
+   "word": "Cwm",
+   "phonemes": "kˈʊm"
+  },
+  {
+   "word": "Cyberpunk",
+   "phonemes": "sˈIbəɹpˌʌŋk"
+  },
+  {
+   "word": "Cymose",
+   "phonemes": "sˈImˌOs"
+  },
+  {
+   "word": "Cynically",
+   "phonemes": "sˈɪnəkᵊli"
+  },
+  {
+   "word": "Cytoskeleton",
+   "phonemes": "sˈITəskˌɛlətᵊn"
+  },
+  {
+   "word": "DIP",
+   "phonemes": "dˌiˌIpˈi"
+  },
+  {
+   "word": "DPhil",
+   "phonemes": "difˈɪl"
+  },
+  {
+   "word": "Dabber",
+   "phonemes": "dˈæbəɹ"
+  },
+  {
+   "word": "Dakar",
+   "phonemes": "dɑkˈɑɹ"
+  },
+  {
+   "word": "Danube",
+   "phonemes": "dˈænjˌub"
+  },
+  {
+   "word": "Darshan",
+   "phonemes": "dˈɑɹʃˌɑn"
+  },
+  {
+   "word": "Dassie",
+   "phonemes": "dˈæsi"
+  },
+  {
+   "word": "Datura",
+   "phonemes": "dətˈʊɹə"
+  },
+  {
+   "word": "David",
+   "phonemes": "dˈAvəd"
+  },
+  {
+   "word": "Deadeye",
+   "phonemes": "dˈɛdˌI"
+  },
+  {
+   "word": "Deductibility",
+   "phonemes": "dᵻdˌʌktəbˈɪləTi"
+  },
+  {
+   "word": "Defeasibility",
+   "phonemes": "dəfˌizəbˈɪləTi"
+  },
+  {
+   "word": "Delegitimate",
+   "phonemes": "dˌiləʤˈɪTəmˌAt"
+  },
+  {
+   "word": "Deleveraging",
+   "phonemes": "dˌilˈɛvəɹɪʤɪŋ"
+  },
+  {
+   "word": "Delimiter",
+   "phonemes": "dəlˈɪmɪTəɹ"
+  },
+  {
+   "word": "Delphini",
+   "phonemes": "dɛlfˈIni"
+  },
+  {
+   "word": "Delusory",
+   "phonemes": "dəlˈusəɹi"
+  },
+  {
+   "word": "Denaturalization",
+   "phonemes": "dinˌæʧəɹələzˈAʃən"
+  },
+  {
+   "word": "Denisovan",
+   "phonemes": "dənˈisəvən"
+  },
+  {
+   "word": "Densify",
+   "phonemes": "dˈɛnsəfˌI"
+  },
+  {
+   "word": "Deoxycorticosterone",
+   "phonemes": "diˌɑksikˌɔɹTɪkˈɑstəɹˌOn"
+  },
+  {
+   "word": "Derivation",
+   "phonemes": "dˌɛɹəvˈAʃən"
+  },
+  {
+   "word": "Descension",
+   "phonemes": "dəsˈɛnʃᵊn"
+  },
+  {
+   "word": "Desexualization",
+   "phonemes": "diɪsɛkʃəwələzˈAʃən"
+  },
+  {
+   "word": "Destruction",
+   "phonemes": "dəstɹˈʌkʃən"
+  },
+  {
+   "word": "Detonator",
+   "phonemes": "dˈɛtᵊnˌATəɹ"
+  },
+  {
+   "word": "Deviant",
+   "phonemes": "dˈiviənt"
+  },
+  {
+   "word": "Diabolist",
+   "phonemes": "dIˈæbəlɪst"
+  },
+  {
+   "word": "Diagnosable",
+   "phonemes": "dˈIəɡnˌOsəbəl"
+  },
+  {
+   "word": "Dialectology",
+   "phonemes": "dˌIəlɛktˈɑləʤi"
+  },
+  {
+   "word": "Dichotomize",
+   "phonemes": "dIkˈɑTəmˌIz"
+  },
+  {
+   "word": "Diciest",
+   "phonemes": "dˈIsiᵻst"
+  },
+  {
+   "word": "Dicky",
+   "phonemes": "dˈɪki"
+  },
+  {
+   "word": "Diction",
+   "phonemes": "dˈɪkʃən"
+  },
+  {
+   "word": "Diesis",
+   "phonemes": "dˈIəsɪs"
+  },
+  {
+   "word": "Directory",
+   "phonemes": "dəɹˈɛktəɹi"
+  },
+  {
+   "word": "Disambiguate",
+   "phonemes": "dˌɪsæmbˈɪɡjəwˌAt"
+  },
+  {
+   "word": "Discipline",
+   "phonemes": "dˈɪsəplən"
+  },
+  {
+   "word": "Discretional",
+   "phonemes": "dəskɹˈɛʃənᵊl"
+  },
+  {
+   "word": "Disillusion",
+   "phonemes": "dˌɪsəlˈuʒən"
+  },
+  {
+   "word": "Disordered",
+   "phonemes": "dɪsˈɔɹdəɹd"
+  },
+  {
+   "word": "Disparateness",
+   "phonemes": "dˈɪspəɹətnəs"
+  },
+  {
+   "word": "Diverging",
+   "phonemes": "dəvˈɜɹʤɪŋ"
+  },
+  {
+   "word": "Divinize",
+   "phonemes": "dˈɪvənˌIz"
+  },
+  {
+   "word": "Dnipropetrovsk",
+   "phonemes": "dənˌipɹOpətɹˈɔfsk"
+  },
+  {
+   "word": "Dobsonfly",
+   "phonemes": "dˈɑbsənflˌI"
+  },
+  {
+   "word": "Document's",
+   "phonemes": "dˈɑkjəmənts"
+  },
+  {
+   "word": "Dogginess",
+   "phonemes": "dˈɔɡinɪs"
+  },
+  {
+   "word": "Doggy",
+   "phonemes": "dˈɔɡi"
+  },
+  {
+   "word": "Dolor",
+   "phonemes": "dˈOləɹ"
+  },
+  {
+   "word": "Double-knit",
+   "phonemes": "dˈʌbəlnɪt"
+  },
+  {
+   "word": "Doubt",
+   "phonemes": "dˈWt"
+  },
+  {
+   "word": "Doula",
+   "phonemes": "dˈulə"
+  },
+  {
+   "word": "Downhearted",
+   "phonemes": "dˌWnhˈɑɹTᵻd"
+  },
+  {
+   "word": "Dozy",
+   "phonemes": "dˈOzi"
+  },
+  {
+   "word": "Drearily",
+   "phonemes": "dɹˈɪɹəli"
+  },
+  {
+   "word": "Dresser",
+   "phonemes": "dɹˈɛsəɹ"
+  },
+  {
+   "word": "Drillstock",
+   "phonemes": "dɹˈɪlstɑk"
+  },
+  {
+   "word": "Driveler",
+   "phonemes": "dɹˈɪvələɹ"
+  },
+  {
+   "word": "Drizzly",
+   "phonemes": "dɹˈɪzli"
+  },
+  {
+   "word": "Drowsiness",
+   "phonemes": "dɹˈWzinəs"
+  },
+  {
+   "word": "Drudge",
+   "phonemes": "dɹˈʌʤ"
+  },
+  {
+   "word": "Dunce",
+   "phonemes": "dˈʌns"
+  },
+  {
+   "word": "Duologue",
+   "phonemes": "dˈuəlˌɔɡ"
+  },
+  {
+   "word": "Dustiest",
+   "phonemes": "dˈʌstiᵻst"
+  },
+  {
+   "word": "Dysenteric",
+   "phonemes": "dˌɪsᵊntˈɛɹɪk"
+  },
+  {
+   "word": "Edmond",
+   "phonemes": "ˈɛdmənd"
+  },
+  {
+   "word": "Edmonds",
+   "phonemes": "ˈɛdməndz"
+  },
+  {
+   "word": "Eephus",
+   "phonemes": "ˈifəs"
+  },
+  {
+   "word": "Egomania",
+   "phonemes": "ˌiɡOmˈAniə"
+  },
+  {
+   "word": "Electrocardiographic",
+   "phonemes": "əlˌɛktɹOkˌɑɹdiOɡɹˈæfɪk"
+  },
+  {
+   "word": "Electrolyze",
+   "phonemes": "əlˈɛktɹəlˌIz"
+  },
+  {
+   "word": "Elocutionist",
+   "phonemes": "ˌɛləkjˈuʃᵊnɪst"
+  },
+  {
+   "word": "Elzevir",
+   "phonemes": "ˈɛlzəvˌɪɹ"
+  },
+  {
+   "word": "Embedment",
+   "phonemes": "əmbˈɛdmənt"
+  },
+  {
+   "word": "Embryologically",
+   "phonemes": "ˌɛmbɹiəlˈɑʤəkᵊli"
+  },
+  {
+   "word": "Empathic",
+   "phonemes": "ɛmpˈæθɪk"
+  },
+  {
+   "word": "Endoscope",
+   "phonemes": "ˈɛndəskˌOp"
+  },
+  {
+   "word": "Ends",
+   "phonemes": "ˈɛndz"
+  },
+  {
+   "word": "Enduing",
+   "phonemes": "ɪndjˈuɪŋ"
+  },
+  {
+   "word": "Enneagram",
+   "phonemes": "ˈɛniəɡɹˌæm"
+  },
+  {
+   "word": "Entrepreneur",
+   "phonemes": "ˌɑntɹəpɹənˈʊɹ"
+  },
+  {
+   "word": "Eolian",
+   "phonemes": "iˈOljən"
+  },
+  {
+   "word": "Epithelialize",
+   "phonemes": "ˌɛpəθˈiliəlIz"
+  },
+  {
+   "word": "Equaliser",
+   "phonemes": "ˈikwəlˌIzəɹ"
+  },
+  {
+   "word": "Erechtheum",
+   "phonemes": "ɛɹˈʌkθiəm"
+  },
+  {
+   "word": "Eula",
+   "phonemes": "jˈulə"
+  },
+  {
+   "word": "Euthanasia",
+   "phonemes": "jˌuθənˈAʒiə"
+  },
+  {
+   "word": "Evocation",
+   "phonemes": "ˌivOkˈAʃən"
+  },
+  {
+   "word": "Examinee",
+   "phonemes": "ɪɡzˌæmənˈi"
+  },
+  {
+   "word": "Excavate",
+   "phonemes": "ˈɛkskəvˌAt"
+  },
+  {
+   "word": "Excelling",
+   "phonemes": "ɪksˈɛlɪŋ"
+  },
+  {
+   "word": "Exciton",
+   "phonemes": "ˈɛksətˌɑn"
+  },
+  {
+   "word": "Excusable",
+   "phonemes": "ɪkskjˈuzəbᵊl"
+  },
+  {
+   "word": "Exegete",
+   "phonemes": "ˈɛksəʤˌit"
+  },
+  {
+   "word": "Exemplary",
+   "phonemes": "ɪɡzˈɛmpləɹi"
+  },
+  {
+   "word": "Exercise",
+   "phonemes": "ˈɛksəɹsˌIz"
+  },
+  {
+   "word": "Exorbitance",
+   "phonemes": "ɪɡzˈɔɹbəTəns"
+  },
+  {
+   "word": "Exordial",
+   "phonemes": "ɪɡzˈɔɹdiəl"
+  },
+  {
+   "word": "Expiator",
+   "phonemes": "ˈɛkspiˌATəɹ"
+  },
+  {
+   "word": "Explosion",
+   "phonemes": "ɪksplˈOʒᵊn"
+  },
+  {
+   "word": "Extravehicular",
+   "phonemes": "ˌɛkstɹəvihˈɪkjələɹ"
+  },
+  {
+   "word": "Eyeball",
+   "phonemes": "ˈIbˌɔl"
+  },
+  {
+   "word": "FSAT",
+   "phonemes": "ˈɛfsˌæt"
+  },
+  {
+   "word": "Facilitation",
+   "phonemes": "fəsˌɪlətˈAʃən"
+  },
+  {
+   "word": "Fangless",
+   "phonemes": "fˈæŋləs"
+  },
+  {
+   "word": "Fanny",
+   "phonemes": "fˈæni"
+  },
+  {
+   "word": "Fatiguability",
+   "phonemes": "fətˌiɡəbˈɪləTi"
+  },
+  {
+   "word": "Ferrimagnetism",
+   "phonemes": "fˌɛɹimˈæɡnətˌɪzəm"
+  },
+  {
+   "word": "Festival",
+   "phonemes": "fˈɛstəvᵊl"
+  },
+  {
+   "word": "Feued",
+   "phonemes": "fjˈud"
+  },
+  {
+   "word": "Fidgeting",
+   "phonemes": "fˈɪʤɪTɪŋ"
+  },
+  {
+   "word": "Fiendish",
+   "phonemes": "fˈindɪʃ"
+  },
+  {
+   "word": "Fiesta",
+   "phonemes": "fiˈɛstə"
+  },
+  {
+   "word": "Filmstrip",
+   "phonemes": "fˈɪlmstɹˌɪp"
+  },
+  {
+   "word": "Fine-tune",
+   "phonemes": "fˌIntˈun"
+  },
+  {
+   "word": "Fireballer",
+   "phonemes": "fˈIəɹbˌɔləɹ"
+  },
+  {
+   "word": "Firehouse",
+   "phonemes": "fˈIəɹhˌWs"
+  },
+  {
+   "word": "Fishwife",
+   "phonemes": "fˈɪʃwˌIf"
+  },
+  {
+   "word": "Fizzier",
+   "phonemes": "fˈɪziəɹ"
+  },
+  {
+   "word": "Flexwing",
+   "phonemes": "flˈɛkswˌɪŋ"
+  },
+  {
+   "word": "Flour",
+   "phonemes": "flˈWəɹ"
+  },
+  {
+   "word": "Fluid",
+   "phonemes": "flˈuɪd"
+  },
+  {
+   "word": "Fluvial",
+   "phonemes": "flˈuviəl"
+  },
+  {
+   "word": "Fly-in",
+   "phonemes": "flˈIˌɪn"
+  },
+  {
+   "word": "Flyboarding",
+   "phonemes": "flˈIbˌɔɹdɪŋ"
+  },
+  {
+   "word": "Foothill",
+   "phonemes": "fˈʊthˌɪl"
+  },
+  {
+   "word": "Forb",
+   "phonemes": "fˈɔɹb"
+  },
+  {
+   "word": "Forbye",
+   "phonemes": "fɔɹbˈI"
+  },
+  {
+   "word": "Forewarner",
+   "phonemes": "fəɹwˈɔɹnəɹ"
+  },
+  {
+   "word": "Forsaker",
+   "phonemes": "fəɹsˈAkəɹ"
+  },
+  {
+   "word": "Fountainhead",
+   "phonemes": "fˈWntᵊnhˌɛd"
+  },
+  {
+   "word": "Foxwoods",
+   "phonemes": "fˈɑkswʊdz"
+  },
+  {
+   "word": "Fragile",
+   "phonemes": "fɹˈæʤəl"
+  },
+  {
+   "word": "Frigidly",
+   "phonemes": "fɹˈɪʤədli"
+  },
+  {
+   "word": "Frostbite",
+   "phonemes": "fɹˈɔstbˌIt"
+  },
+  {
+   "word": "Frosted",
+   "phonemes": "fɹˈɔstᵻd"
+  },
+  {
+   "word": "Fructuous",
+   "phonemes": "fɹˈʌkʧəwəs"
+  },
+  {
+   "word": "Frug",
+   "phonemes": "fɹˈʊɡ"
+  },
+  {
+   "word": "Fruitful",
+   "phonemes": "fɹˈutfᵊl"
+  },
+  {
+   "word": "Frustratedly",
+   "phonemes": "fɹˈʌstɹˌATɪdli"
+  },
+  {
+   "word": "Fuckhead",
+   "phonemes": "fˈʌkhˌɛd"
+  },
+  {
+   "word": "Fugaciousness",
+   "phonemes": "fjuɡˈAʃəsnəs"
+  },
+  {
+   "word": "Fulcrums",
+   "phonemes": "fˈʊlkɹəmz"
+  },
+  {
+   "word": "Fully",
+   "phonemes": "fˈʊli"
+  },
+  {
+   "word": "Funfair",
+   "phonemes": "fˈʌnfˌɛɹ"
+  },
+  {
+   "word": "Furless",
+   "phonemes": "fˈɜɹləs"
+  },
+  {
+   "word": "GJ",
+   "phonemes": "ʤˈiʤˌA"
+  },
+  {
+   "word": "Gagging",
+   "phonemes": "ɡˈæɡɪŋ"
+  },
+  {
+   "word": "Gaily",
+   "phonemes": "ɡˈAli"
+  },
+  {
+   "word": "Galibi",
+   "phonemes": "ɡəlˈibi"
+  },
+  {
+   "word": "Ganges",
+   "phonemes": "ɡˈænʤˌiz"
+  },
+  {
+   "word": "Gangsta",
+   "phonemes": "ɡˈæŋstə"
+  },
+  {
+   "word": "Gaoler",
+   "phonemes": "ʤˈAləɹ"
+  },
+  {
+   "word": "Garlicky",
+   "phonemes": "ɡˈɑɹlɪki"
+  },
+  {
+   "word": "Gastroscope",
+   "phonemes": "ɡˈæstɹəskˌOp"
+  },
+  {
+   "word": "Gavial",
+   "phonemes": "ɡˈAviəl"
+  },
+  {
+   "word": "Gear",
+   "phonemes": "ɡˈɪɹ"
+  },
+  {
+   "word": "Genitival",
+   "phonemes": "ʤˌɛnətˈIvəl"
+  },
+  {
+   "word": "Geochemical",
+   "phonemes": "ʤˌiOkˈɛməkᵊl"
+  },
+  {
+   "word": "Geology",
+   "phonemes": "ʤiˈɑləʤi"
+  },
+  {
+   "word": "Germinator",
+   "phonemes": "ʤˈɜɹmənˌATəɹ"
+  },
+  {
+   "word": "Giantess",
+   "phonemes": "ʤˈIəntəs"
+  },
+  {
+   "word": "Glancingly",
+   "phonemes": "ɡlˈænsɪŋli"
+  },
+  {
+   "word": "Glim",
+   "phonemes": "ɡlˈɪm"
+  },
+  {
+   "word": "Gloatingly",
+   "phonemes": "ɡlˈOTɪŋli"
+  },
+  {
+   "word": "Gloriously",
+   "phonemes": "ɡlˈɔɹiəsli"
+  },
+  {
+   "word": "Glugging",
+   "phonemes": "ɡlˈʌɡɪŋ"
+  },
+  {
+   "word": "Goalless",
+   "phonemes": "ɡˈOlləs"
+  },
+  {
+   "word": "Goat",
+   "phonemes": "ɡˈOt"
+  },
+  {
+   "word": "Goldsmith",
+   "phonemes": "ɡˈOldsmˌɪθ"
+  },
+  {
+   "word": "Gopak",
+   "phonemes": "ɡˈOpæk"
+  },
+  {
+   "word": "Gorget",
+   "phonemes": "ɡˈɔɹʤət"
+  },
+  {
+   "word": "Governmentally",
+   "phonemes": "ɡˌʌvəɹnmˈɛntəli"
+  },
+  {
+   "word": "Grandiosity",
+   "phonemes": "ɡɹˌændiˈɑsəTi"
+  },
+  {
+   "word": "Graphically",
+   "phonemes": "ɡɹˈæfəkᵊli"
+  },
+  {
+   "word": "Gravity",
+   "phonemes": "ɡɹˈævəTi"
+  },
+  {
+   "word": "Grey",
+   "phonemes": "ɡɹˈA"
+  },
+  {
+   "word": "Griot",
+   "phonemes": "ɡɹˈiO"
+  },
+  {
+   "word": "Guest",
+   "phonemes": "ɡˈɛst"
+  },
+  {
+   "word": "Gurney",
+   "phonemes": "ɡˈɜɹni"
+  },
+  {
+   "word": "Gustily",
+   "phonemes": "ɡˈʌstəli"
+  },
+  {
+   "word": "Gutful",
+   "phonemes": "ɡˈʌtfəl"
+  },
+  {
+   "word": "Gutsiest",
+   "phonemes": "ɡˈʌtsiᵻst"
+  },
+  {
+   "word": "Guzzle",
+   "phonemes": "ɡˈʌzᵊl"
+  },
+  {
+   "word": "Gymnasiums",
+   "phonemes": "ʤɪmnˈAziəmz"
+  },
+  {
+   "word": "Gynaecological",
+   "phonemes": "ɡˌInəkəlˈɑʤəkᵊl"
+  },
+  {
+   "word": "H",
+   "phonemes": "ˈAʧ"
+  },
+  {
+   "word": "HI",
+   "phonemes": "ˌAʧˈI"
+  },
+  {
+   "word": "Hacking",
+   "phonemes": "hˈækɪŋ"
+  },
+  {
+   "word": "Hafiz",
+   "phonemes": "hˈɑfəz"
+  },
+  {
+   "word": "Hairily",
+   "phonemes": "hˈɛɹəli"
+  },
+  {
+   "word": "Half-baked",
+   "phonemes": "hˌæfbˈAkt"
+  },
+  {
+   "word": "Ham-handed",
+   "phonemes": "hˌæmhˈændᵻd"
+  },
+  {
+   "word": "Hangrier",
+   "phonemes": "hˈæŋɡɹiəɹ"
+  },
+  {
+   "word": "Haptoglobin",
+   "phonemes": "hˈæptəɡlˌObən"
+  },
+  {
+   "word": "Hard-hearted",
+   "phonemes": "hˌɑɹdhˈɑɹTᵻd"
+  },
+  {
+   "word": "Head",
+   "phonemes": "hˈɛd"
+  },
+  {
+   "word": "Heartthrob",
+   "phonemes": "hˈɑɹtθɹˌɑb"
+  },
+  {
+   "word": "Heathenish",
+   "phonemes": "hˈiðənɪʃ"
+  },
+  {
+   "word": "Heck",
+   "phonemes": "hˈɛk"
+  },
+  {
+   "word": "Helena",
+   "phonemes": "hˈɛlənə"
+  },
+  {
+   "word": "Helipad",
+   "phonemes": "hˈɛləpˌæd"
+  },
+  {
+   "word": "Hemispheric",
+   "phonemes": "hˌɛməsfˈɪɹɪk"
+  },
+  {
+   "word": "Hermit-like",
+   "phonemes": "hˈɜɹmɪtlˌIk"
+  },
+  {
+   "word": "Hexagon",
+   "phonemes": "hˈɛksəɡˌɑn"
+  },
+  {
+   "word": "Hickey",
+   "phonemes": "hˈɪki"
+  },
+  {
+   "word": "Hippocrates",
+   "phonemes": "hɪpˈɑkɹəTiz"
+  },
+  {
+   "word": "Hireable",
+   "phonemes": "hˈIɹəbᵊl"
+  },
+  {
+   "word": "Hmong",
+   "phonemes": "hmˈɔŋ"
+  },
+  {
+   "word": "Homel",
+   "phonemes": "hɔmjˈɛl"
+  },
+  {
+   "word": "Homeosis",
+   "phonemes": "hˌOmiˈOsɪs"
+  },
+  {
+   "word": "Honoree",
+   "phonemes": "ˌɑnəɹˈi"
+  },
+  {
+   "word": "Horrendously",
+   "phonemes": "həɹˈɛndəsli"
+  },
+  {
+   "word": "Host",
+   "phonemes": "hˈOst"
+  },
+  {
+   "word": "Hosta",
+   "phonemes": "hˈOstə"
+  },
+  {
+   "word": "Huguenot",
+   "phonemes": "hjˈuɡənˌɑt"
+  },
+  {
+   "word": "Humanity",
+   "phonemes": "hjumˈænəTi"
+  },
+  {
+   "word": "Husbander",
+   "phonemes": "hˈʌzbᵊndəɹ"
+  },
+  {
+   "word": "Hydrophobia",
+   "phonemes": "hˌIdɹəfˈObiə"
+  },
+  {
+   "word": "Hymenopterous",
+   "phonemes": "hˌImənˈɑptəɹəs"
+  },
+  {
+   "word": "Iceberg",
+   "phonemes": "ˈIsbˌɜɹɡ"
+  },
+  {
+   "word": "Icequake",
+   "phonemes": "ˈIskwˌAk"
+  },
+  {
+   "word": "Ichthus",
+   "phonemes": "ˈɪkθəs"
+  },
+  {
+   "word": "Ideologically",
+   "phonemes": "ˌɪdiəlˈɑʤəkᵊli"
+  },
+  {
+   "word": "Ignoramuses",
+   "phonemes": "ˌɪɡnəɹˈAməsᵻz"
+  },
+  {
+   "word": "Ignorer",
+   "phonemes": "ɪɡnˈɔɹəɹ"
+  },
+  {
+   "word": "Imbues",
+   "phonemes": "ɪmbjˈuz"
+  },
+  {
+   "word": "Immanentism",
+   "phonemes": "ˈɪmənəntˌɪzəm"
+  },
+  {
+   "word": "Immersion",
+   "phonemes": "ɪmˈɜɹʒən"
+  },
+  {
+   "word": "Immunochemistry",
+   "phonemes": "ˌɪmjənOkˈɛməstɹi"
+  },
+  {
+   "word": "Impishness",
+   "phonemes": "ˈɪmpɪʃnəs"
+  },
+  {
+   "word": "Inceptor",
+   "phonemes": "ɪnsˈɛptəɹ"
+  },
+  {
+   "word": "Inclusion",
+   "phonemes": "ɪnklˈuʒᵊn"
+  },
+  {
+   "word": "Inconsistent",
+   "phonemes": "ˌɪnkənsˈɪstᵊnt"
+  },
+  {
+   "word": "Incorruptible",
+   "phonemes": "ˌɪnkəɹˈʌptəbᵊl"
+  },
+  {
+   "word": "Incus",
+   "phonemes": "ˈɪŋkəs"
+  },
+  {
+   "word": "Indissoluble",
+   "phonemes": "ˌɪndəsˈɑljəbᵊl"
+  },
+  {
+   "word": "Indo",
+   "phonemes": "ˈɪndO"
+  },
+  {
+   "word": "Ineffectuality",
+   "phonemes": "ˌɪnəfˈɛkʧəwˈæləTi"
+  },
+  {
+   "word": "Inertial",
+   "phonemes": "ɪnˈɜɹʃəl"
+  },
+  {
+   "word": "Inexplicably",
+   "phonemes": "ˌɪnɛksplˈɪkəbli"
+  },
+  {
+   "word": "Infighting",
+   "phonemes": "ˈɪnfˌITɪŋ"
+  },
+  {
+   "word": "Infographic",
+   "phonemes": "ˌɪnfOɡɹˈæfɪk"
+  },
+  {
+   "word": "Infringement",
+   "phonemes": "ɪnfɹˈɪnʤmənt"
+  },
+  {
+   "word": "Ingenuousness",
+   "phonemes": "ɪnʤˈɛnjuəsnəs"
+  },
+  {
+   "word": "Inguinally",
+   "phonemes": "ˈɪŋɡwənəli"
+  },
+  {
+   "word": "Insatiate",
+   "phonemes": "ɪnsˈAʃiət"
+  },
+  {
+   "word": "Inspection",
+   "phonemes": "ɪnspˈɛkʃən"
+  },
+  {
+   "word": "Inspirational",
+   "phonemes": "ˌɪnspəɹˈAʃᵊnəl"
+  },
+  {
+   "word": "Insulator",
+   "phonemes": "ˈɪnsəlˌATəɹ"
+  },
+  {
+   "word": "Intact",
+   "phonemes": "ɪntˈækt"
+  },
+  {
+   "word": "Intercommunication",
+   "phonemes": "ˌɪntəɹkəmjˌunəkˈAʃən"
+  },
+  {
+   "word": "Internationalization",
+   "phonemes": "ˌɪntəɹnˌæʃᵊnələzˈAʃən"
+  },
+  {
+   "word": "Interrogational",
+   "phonemes": "ɪntˌɛɹəɡˈAʃənᵊl"
+  },
+  {
+   "word": "Interruptible",
+   "phonemes": "ˌɪntəɹˈʌptəbəl"
+  },
+  {
+   "word": "Intersegmental",
+   "phonemes": "ˌɪntəɹsɛɡmˈɛntᵊl"
+  },
+  {
+   "word": "Introgression",
+   "phonemes": "ˌɪntɹəɡɹˈɛʃən"
+  },
+  {
+   "word": "Inviolately",
+   "phonemes": "ɪnvˈIələtli"
+  },
+  {
+   "word": "Isomerism",
+   "phonemes": "Isˈɑməɹˌɪzəm"
+  },
+  {
+   "word": "Isopleth",
+   "phonemes": "ˈIsəplɛθ"
+  },
+  {
+   "word": "Iteration",
+   "phonemes": "ˌɪTəɹˈAʃən"
+  },
+  {
+   "word": "Jack",
+   "phonemes": "ʤˈæk"
+  },
+  {
+   "word": "James'",
+   "phonemes": "ʤˈAmz”"
+  },
+  {
+   "word": "Jay",
+   "phonemes": "ʤˈA"
+  },
+  {
+   "word": "Jest",
+   "phonemes": "ʤˈɛst"
+  },
+  {
+   "word": "Jibe",
+   "phonemes": "ʤˈIb"
+  },
+  {
+   "word": "Joke",
+   "phonemes": "ʤˈOk"
+  },
+  {
+   "word": "Jongleur",
+   "phonemes": "ʒɔŋɡlˈɜɹ"
+  },
+  {
+   "word": "Joyously",
+   "phonemes": "ʤˈYəsli"
+  },
+  {
+   "word": "Juicer",
+   "phonemes": "ʤˈusəɹ"
+  },
+  {
+   "word": "Juneberry",
+   "phonemes": "ʤˈunbˌɛɹi"
+  },
+  {
+   "word": "Juror",
+   "phonemes": "ʤˈʊɹəɹ"
+  },
+  {
+   "word": "Kampuchea",
+   "phonemes": "kˌɑmpəʧˈiə"
+  },
+  {
+   "word": "Karris",
+   "phonemes": "kˈɛɹiz"
+  },
+  {
+   "word": "Katzenjammer",
+   "phonemes": "kˈætsənʤˌæməɹ"
+  },
+  {
+   "word": "Kaunas",
+   "phonemes": "kˈWnəs"
+  },
+  {
+   "word": "Kerosene",
+   "phonemes": "kˈɛɹəsˌin"
+  },
+  {
+   "word": "Kettering",
+   "phonemes": "kˈɛTəɹɪŋ"
+  },
+  {
+   "word": "Kilted",
+   "phonemes": "kˈɪltᵻd"
+  },
+  {
+   "word": "Kindling",
+   "phonemes": "kˈɪndlɪŋ"
+  },
+  {
+   "word": "Kinematics",
+   "phonemes": "kˌɪnəmˈæTɪks"
+  },
+  {
+   "word": "Kisangani",
+   "phonemes": "kˌisɑŋɡˈɑni"
+  },
+  {
+   "word": "Kleptocratic",
+   "phonemes": "klˌɛptəkɹˈæTɪk"
+  },
+  {
+   "word": "Kleptomaniac",
+   "phonemes": "klˌɛptəmˈAniˌæk"
+  },
+  {
+   "word": "Knavishly",
+   "phonemes": "nˈAvɪʃli"
+  },
+  {
+   "word": "Knocker",
+   "phonemes": "nˈɑkəɹ"
+  },
+  {
+   "word": "Labuan",
+   "phonemes": "ləbˈuən"
+  },
+  {
+   "word": "Laconic",
+   "phonemes": "ləkˈɑnɪk"
+  },
+  {
+   "word": "Lactic",
+   "phonemes": "lˈæktɪk"
+  },
+  {
+   "word": "Lamelliform",
+   "phonemes": "ləmˈɛləfˌɔɹm"
+  },
+  {
+   "word": "Laundered",
+   "phonemes": "lˈɔndəɹd"
+  },
+  {
+   "word": "Leak",
+   "phonemes": "lˈik"
+  },
+  {
+   "word": "Leave-taking",
+   "phonemes": "lˈivtˌAkɪŋ"
+  },
+  {
+   "word": "Legion",
+   "phonemes": "lˈiʤən"
+  },
+  {
+   "word": "Leisure",
+   "phonemes": "lˈiʒəɹ"
+  },
+  {
+   "word": "Lengthier",
+   "phonemes": "lˈɛŋθiəɹ"
+  },
+  {
+   "word": "Lien",
+   "phonemes": "lˈiᵊn"
+  },
+  {
+   "word": "Lifer",
+   "phonemes": "lˈIfəɹ"
+  },
+  {
+   "word": "Limulus",
+   "phonemes": "lˈɪmjələs"
+  },
+  {
+   "word": "Liquidate",
+   "phonemes": "lˈɪkwədˌAt"
+  },
+  {
+   "word": "Liturgiology",
+   "phonemes": "lətˌɜɹʤiˈɑlɑʤi"
+  },
+  {
+   "word": "Llewelyn",
+   "phonemes": "lˌʊˈɛlən"
+  },
+  {
+   "word": "Lobopodia",
+   "phonemes": "lˌObəpˈOdiə"
+  },
+  {
+   "word": "Lorain",
+   "phonemes": "lɔɹˈAn"
+  },
+  {
+   "word": "Lorikeet",
+   "phonemes": "lˈɔɹəkˌit"
+  },
+  {
+   "word": "Ludology",
+   "phonemes": "ludˈɑləʤi"
+  },
+  {
+   "word": "Lunation",
+   "phonemes": "lunˈAʃən"
+  },
+  {
+   "word": "Lustfully",
+   "phonemes": "lˈʌstfəli"
+  },
+  {
+   "word": "Mafioso",
+   "phonemes": "mˌɑfiˈOzO"
+  },
+  {
+   "word": "Magnate",
+   "phonemes": "mˈæɡnˌAt"
+  },
+  {
+   "word": "Malayo-Polynesian",
+   "phonemes": "məlˌAOpˌɑlənˈiʒᵊn"
+  },
+  {
+   "word": "Malden",
+   "phonemes": "mˈɔldən"
+  },
+  {
+   "word": "Mallow",
+   "phonemes": "mˈælO"
+  },
+  {
+   "word": "Maltodextrin",
+   "phonemes": "mˌɔltOdˈɛkstɹɪn"
+  },
+  {
+   "word": "Mammoth",
+   "phonemes": "mˈæməθ"
+  },
+  {
+   "word": "Man-day",
+   "phonemes": "mˈændˌA"
+  },
+  {
+   "word": "Manipulatively",
+   "phonemes": "mənˈɪpjəlATɪvli"
+  },
+  {
+   "word": "Manoeuvring",
+   "phonemes": "mənjˈuvəɹɪŋ"
+  },
+  {
+   "word": "Marge",
+   "phonemes": "mˈɑɹʤ"
+  },
+  {
+   "word": "Marinara",
+   "phonemes": "mˌɛɹənˈɛɹə"
+  },
+  {
+   "word": "Markedly",
+   "phonemes": "mˈɑɹkədli"
+  },
+  {
+   "word": "Marten",
+   "phonemes": "mˈɑɹtn"
+  },
+  {
+   "word": "Matrilocal",
+   "phonemes": "mˌætɹəlˈOkᵊl"
+  },
+  {
+   "word": "Maven",
+   "phonemes": "mˈAvᵊn"
+  },
+  {
+   "word": "Mazuma",
+   "phonemes": "məzˈumə"
+  },
+  {
+   "word": "McDonald",
+   "phonemes": "məkdˈɑnəld"
+  },
+  {
+   "word": "Meagerness",
+   "phonemes": "mˈiɡəɹnəs"
+  },
+  {
+   "word": "Meed",
+   "phonemes": "mˈid"
+  },
+  {
+   "word": "Melodrama",
+   "phonemes": "mˈɛlədɹˌɑmə"
+  },
+  {
+   "word": "Memorize",
+   "phonemes": "mˈɛməɹˌIz"
+  },
+  {
+   "word": "Mentalist",
+   "phonemes": "mˈɛntəlɪst"
+  },
+  {
+   "word": "Mercifully",
+   "phonemes": "mˈɜɹsəfᵊli"
+  },
+  {
+   "word": "Mercuric",
+   "phonemes": "məɹkjˈʊɹɪk"
+  },
+  {
+   "word": "Merely",
+   "phonemes": "mˈɪɹli"
+  },
+  {
+   "word": "Merrymaker",
+   "phonemes": "mˈɛɹimˌAkəɹ"
+  },
+  {
+   "word": "Mess",
+   "phonemes": "mˈɛs"
+  },
+  {
+   "word": "Messenger",
+   "phonemes": "mˈɛsᵊnʤəɹ"
+  },
+  {
+   "word": "Metacenter",
+   "phonemes": "mˈɛTəsˌɛntəɹ"
+  },
+  {
+   "word": "Metameric",
+   "phonemes": "mˌɛTəmˈɛɹɪk"
+  },
+  {
+   "word": "Meteorite",
+   "phonemes": "mˈiTiəɹˌIt"
+  },
+  {
+   "word": "Miasmata",
+   "phonemes": "mIˈæzməTə"
+  },
+  {
+   "word": "Miasmic",
+   "phonemes": "mIˈæzmɪk"
+  },
+  {
+   "word": "Micrometer",
+   "phonemes": "mˈIkɹOmˌiTəɹ"
+  },
+  {
+   "word": "Midland",
+   "phonemes": "mˈɪdlənd"
+  },
+  {
+   "word": "Millboard",
+   "phonemes": "mˈɪlbˌɔɹd"
+  },
+  {
+   "word": "Mille-feuille",
+   "phonemes": "mˌilfˈʌi"
+  },
+  {
+   "word": "Millilitre",
+   "phonemes": "mˈɪləlˌiTəɹ"
+  },
+  {
+   "word": "Mincemeat",
+   "phonemes": "mˈɪnsmˌit"
+  },
+  {
+   "word": "Mire",
+   "phonemes": "mˈIəɹ"
+  },
+  {
+   "word": "Mirthfully",
+   "phonemes": "mˈɜɹθfᵊli"
+  },
+  {
+   "word": "Mischievously",
+   "phonemes": "mˈɪsʧəvəsli"
+  },
+  {
+   "word": "Miscibility",
+   "phonemes": "mˌɪsəbˈɪləTi"
+  },
+  {
+   "word": "Misfeed",
+   "phonemes": "mˌɪsfˈid"
+  },
+  {
+   "word": "Misspelled",
+   "phonemes": "mˌɪsspˈɛld"
+  },
+  {
+   "word": "Modernist",
+   "phonemes": "mˈɑdəɹnɪst"
+  },
+  {
+   "word": "Mohawk",
+   "phonemes": "mˈOhˌɔk"
+  },
+  {
+   "word": "Moist",
+   "phonemes": "mˈYst"
+  },
+  {
+   "word": "Monandrous",
+   "phonemes": "mənˈændɹəs"
+  },
+  {
+   "word": "Monarchal",
+   "phonemes": "mənˈɑɹkᵊl"
+  },
+  {
+   "word": "Mono",
+   "phonemes": "mˈɑnO"
+  },
+  {
+   "word": "Montage",
+   "phonemes": "mɑntˈɑʒ"
+  },
+  {
+   "word": "Morainal",
+   "phonemes": "məɹˈAnᵊl"
+  },
+  {
+   "word": "Moralization",
+   "phonemes": "mˌɔɹələzˈAʃən"
+  },
+  {
+   "word": "Morpholine",
+   "phonemes": "mˈɔɹfəlˌin"
+  },
+  {
+   "word": "Mossed",
+   "phonemes": "mˈɔst"
+  },
+  {
+   "word": "Moth-eaten",
+   "phonemes": "mˈɔθˌitn"
+  },
+  {
+   "word": "Msat",
+   "phonemes": "ˈɛmsˌæt"
+  },
+  {
+   "word": "Muhammadan",
+   "phonemes": "mʊhˈɑmədən"
+  },
+  {
+   "word": "Muhammadanism",
+   "phonemes": "məhˈɑmədᵊnˌɪzəm"
+  },
+  {
+   "word": "Multimedia",
+   "phonemes": "mˌʌltimˈidiə"
+  },
+  {
+   "word": "Multivalent",
+   "phonemes": "mˌʌltivˈAlᵊnt"
+  },
+  {
+   "word": "Mycelial",
+   "phonemes": "mIsˈiliəl"
+  },
+  {
+   "word": "Mythology",
+   "phonemes": "məθˈɑləʤi"
+  },
+  {
+   "word": "NASA",
+   "phonemes": "nˈæsə"
+  },
+  {
+   "word": "NEXRAD",
+   "phonemes": "nˈɛksɹˌæd"
+  },
+  {
+   "word": "Nanogram",
+   "phonemes": "nˈænOɡɹˌæm"
+  },
+  {
+   "word": "Nappy",
+   "phonemes": "nˈæpi"
+  },
+  {
+   "word": "Nazis",
+   "phonemes": "nˈɑtsiz"
+  },
+  {
+   "word": "Nebraska",
+   "phonemes": "nəbɹˈæskə"
+  },
+  {
+   "word": "Neem",
+   "phonemes": "nˈim"
+  },
+  {
+   "word": "Nenes",
+   "phonemes": "nˈAnˌAz"
+  },
+  {
+   "word": "Neomycin",
+   "phonemes": "nˌiOmˈIsᵊn"
+  },
+  {
+   "word": "Newsmaker",
+   "phonemes": "nˈuzmˌAkəɹ"
+  },
+  {
+   "word": "Nibble",
+   "phonemes": "nˈɪbᵊl"
+  },
+  {
+   "word": "Nihilistic",
+   "phonemes": "nˌIəlˈɪstɪk"
+  },
+  {
+   "word": "Nitrogenous",
+   "phonemes": "nItɹˈɑʤənəs"
+  },
+  {
+   "word": "Nola",
+   "phonemes": "nˈOlə"
+  },
+  {
+   "word": "Non-fungible",
+   "phonemes": "nˌɑnfˈʌnʤəbᵊl"
+  },
+  {
+   "word": "Nonlogical",
+   "phonemes": "nɑnlˈɑʤəkᵊl"
+  },
+  {
+   "word": "Nonviral",
+   "phonemes": "nˌɑnvˈIɹəl"
+  },
+  {
+   "word": "Nori",
+   "phonemes": "nˈɑɹi"
+  },
+  {
+   "word": "Noticeable",
+   "phonemes": "nˈOTəsəbᵊl"
+  },
+  {
+   "word": "Nutted",
+   "phonemes": "nˈʌTᵻd"
+  },
+  {
+   "word": "Oaf",
+   "phonemes": "ˈOf"
+  },
+  {
+   "word": "Oberon",
+   "phonemes": "ˈObəɹˌɑn"
+  },
+  {
+   "word": "Obliterative",
+   "phonemes": "əblˈɪTəɹˌATɪv"
+  },
+  {
+   "word": "Occupationally",
+   "phonemes": "ˌɑkjəpˈAʃənᵊli"
+  },
+  {
+   "word": "Octane",
+   "phonemes": "ˈɑktˌAn"
+  },
+  {
+   "word": "Odorous",
+   "phonemes": "ˈOdəɹəs"
+  },
+  {
+   "word": "Off-center",
+   "phonemes": "ˌɔfsˈɛntəɹ"
+  },
+  {
+   "word": "Ogden",
+   "phonemes": "ˈɑɡdən"
+  },
+  {
+   "word": "Oleochemical",
+   "phonemes": "ˌOliOkˈɛməkᵊl"
+  },
+  {
+   "word": "Olfactometry",
+   "phonemes": "ɑlfæktˈɑmətɹi"
+  },
+  {
+   "word": "Onomastics",
+   "phonemes": "ˌɑnəmˈæstɪks"
+  },
+  {
+   "word": "Onrushing",
+   "phonemes": "ˈɑnɹˌʌʃɪŋ"
+  },
+  {
+   "word": "Oooooh",
+   "phonemes": "ˈuuuu"
+  },
+  {
+   "word": "Openness",
+   "phonemes": "ˈOpənnəs"
+  },
+  {
+   "word": "Optician",
+   "phonemes": "ɑptˈɪʃən"
+  },
+  {
+   "word": "Optimize",
+   "phonemes": "ˈɑptəmˌIz"
+  },
+  {
+   "word": "Orangey",
+   "phonemes": "ˈɔɹᵊnʤi"
+  },
+  {
+   "word": "Orchil",
+   "phonemes": "ˈɔɹkᵊl"
+  },
+  {
+   "word": "Orebody",
+   "phonemes": "ˈɔɹbˌɑdi"
+  },
+  {
+   "word": "Orpheus",
+   "phonemes": "ˈɔɹfiəs"
+  },
+  {
+   "word": "Orson",
+   "phonemes": "ˈɔɹsən"
+  },
+  {
+   "word": "Ort",
+   "phonemes": "ˈɔɹt"
+  },
+  {
+   "word": "Otomi",
+   "phonemes": "ˌOTəmˈi"
+  },
+  {
+   "word": "Ouster",
+   "phonemes": "ˈWstəɹ"
+  },
+  {
+   "word": "Outbreak",
+   "phonemes": "ˈWtbɹˌAk"
+  },
+  {
+   "word": "Outdatedness",
+   "phonemes": "ˈWtdˌATɪdnɪs"
+  },
+  {
+   "word": "Outrebound",
+   "phonemes": "ˌWtɹˈibWnd"
+  },
+  {
+   "word": "Ovaritis",
+   "phonemes": "ˌOvəɹˈITəs"
+  },
+  {
+   "word": "Overbalance",
+   "phonemes": "ˌOvəɹbˈælᵊns"
+  },
+  {
+   "word": "Overproof",
+   "phonemes": "ˌOvəɹpɹˈuf"
+  },
+  {
+   "word": "Overshoot",
+   "phonemes": "ˈOvəɹʃˌut"
+  },
+  {
+   "word": "Oversteering",
+   "phonemes": "ˌOvəɹstˈɪɹɪŋ"
+  },
+  {
+   "word": "Overthrew",
+   "phonemes": "ˌOvəɹθɹˈu"
+  },
+  {
+   "word": "Overtire",
+   "phonemes": "ˌOvəɹtˈIəɹ"
+  },
+  {
+   "word": "Oxy",
+   "phonemes": "ˈɑksi"
+  },
+  {
+   "word": "PMAT",
+   "phonemes": "pˈimˌæt"
+  },
+  {
+   "word": "Padrones",
+   "phonemes": "pədɹˈOnz"
+  },
+  {
+   "word": "Paleoanthropologist",
+   "phonemes": "pˌAliOˌænθɹəpˈɑləʤɪst"
+  },
+  {
+   "word": "Paleocurrent",
+   "phonemes": "pˈAliOkˌɜɹənt"
+  },
+  {
+   "word": "Paleopathologist",
+   "phonemes": "pˌAliOpəθˈɑləʤɪst"
+  },
+  {
+   "word": "Pan-fry",
+   "phonemes": "pˈænfɹˌI"
+  },
+  {
+   "word": "Panmunjom",
+   "phonemes": "pˌænmˌʊnʤˈɔm"
+  },
+  {
+   "word": "Parabellum",
+   "phonemes": "pˌɛɹəbˈɛləm"
+  },
+  {
+   "word": "Parerga",
+   "phonemes": "pəɹˈɜɹɡə"
+  },
+  {
+   "word": "Park",
+   "phonemes": "pˈɑɹk"
+  },
+  {
+   "word": "Parlormaid",
+   "phonemes": "pˈɑɹləɹmˌAd"
+  },
+  {
+   "word": "Parochially",
+   "phonemes": "pəɹˈOkiəli"
+  },
+  {
+   "word": "Partite",
+   "phonemes": "pˈɑɹtˌIt"
+  },
+  {
+   "word": "Passeggiata",
+   "phonemes": "pˌɑsəʤˈɑTə"
+  },
+  {
+   "word": "Password",
+   "phonemes": "pˈæswˌɜɹd"
+  },
+  {
+   "word": "Patriarchal",
+   "phonemes": "pˌAtɹiˈɑɹkᵊl"
+  },
+  {
+   "word": "Pauropod",
+   "phonemes": "pˈɔɹəpˌɑd"
+  },
+  {
+   "word": "Pawtucket",
+   "phonemes": "pətˈʌkət"
+  },
+  {
+   "word": "Payoff",
+   "phonemes": "pˈAˌɔf"
+  },
+  {
+   "word": "Peace",
+   "phonemes": "pˈis"
+  },
+  {
+   "word": "Pear-shaped",
+   "phonemes": "pˈɛɹʃˌApt"
+  },
+  {
+   "word": "Pearlite",
+   "phonemes": "pˈɜɹlˌIt"
+  },
+  {
+   "word": "Peculation",
+   "phonemes": "pˌɛkjəlˈAʃən"
+  },
+  {
+   "word": "Pederastic",
+   "phonemes": "pˌɛdəɹˈæstɪk"
+  },
+  {
+   "word": "Pedology",
+   "phonemes": "pədˈɑləʤi"
+  },
+  {
+   "word": "Penang",
+   "phonemes": "pənˈæŋ"
+  },
+  {
+   "word": "Pentane",
+   "phonemes": "pˈɛntˌAn"
+  },
+  {
+   "word": "Percid",
+   "phonemes": "pˈɜɹsɪd"
+  },
+  {
+   "word": "Perplexed",
+   "phonemes": "pəɹplˈɛkst"
+  },
+  {
+   "word": "Perplexity",
+   "phonemes": "pəɹplˈɛksəTi"
+  },
+  {
+   "word": "Personalize",
+   "phonemes": "pˈɜɹsᵊnəlˌIz"
+  },
+  {
+   "word": "Petropavlovsk",
+   "phonemes": "pˌɛtɹəpˈævlɔfsk"
+  },
+  {
+   "word": "Petrosal",
+   "phonemes": "pɛtɹˈOsᵊl"
+  },
+  {
+   "word": "Phagosome",
+   "phonemes": "fˈæɡəsˌOm"
+  },
+  {
+   "word": "Phenological",
+   "phonemes": "fˌinəlˈɑʤəkəl"
+  },
+  {
+   "word": "Phlegmy",
+   "phonemes": "flˈɛmi"
+  },
+  {
+   "word": "Photolithographically",
+   "phonemes": "fˌOTəlˌɪθəɡɹˈæfəkᵊli"
+  },
+  {
+   "word": "Physics",
+   "phonemes": "fˈɪzɪks"
+  },
+  {
+   "word": "Pi",
+   "phonemes": "pˈI"
+  },
+  {
+   "word": "Piassava",
+   "phonemes": "pˌiəsˈɑvə"
+  },
+  {
+   "word": "Picornavirus",
+   "phonemes": "pəkˈɔɹnəvˌIɹəs"
+  },
+  {
+   "word": "Pineal",
+   "phonemes": "pˈIniəl"
+  },
+  {
+   "word": "Pisolite",
+   "phonemes": "pˈIsəlˌIt"
+  },
+  {
+   "word": "Pivotability",
+   "phonemes": "pˌɪvəTəbˈɪləTi"
+  },
+  {
+   "word": "Plaguing",
+   "phonemes": "plˈAɡɪŋ"
+  },
+  {
+   "word": "Plasmic",
+   "phonemes": "plˈæzmɪk"
+  },
+  {
+   "word": "Plasmonics",
+   "phonemes": "plˌæzmˈɑnɪks"
+  },
+  {
+   "word": "Plastery",
+   "phonemes": "plˈæstəɹi"
+  },
+  {
+   "word": "Plate",
+   "phonemes": "plˈAt"
+  },
+  {
+   "word": "Platen",
+   "phonemes": "plˈætn"
+  },
+  {
+   "word": "Pneumonia",
+   "phonemes": "numˈOnjə"
+  },
+  {
+   "word": "Podolsk",
+   "phonemes": "pədˈɔlsk"
+  },
+  {
+   "word": "Political",
+   "phonemes": "pəlˈɪTəkᵊl"
+  },
+  {
+   "word": "Politics",
+   "phonemes": "pˈɑlətˌɪks"
+  },
+  {
+   "word": "Pollack",
+   "phonemes": "pˈɑlək"
+  },
+  {
+   "word": "Pollution",
+   "phonemes": "pəlˈuʃən"
+  },
+  {
+   "word": "Pool",
+   "phonemes": "pˈul"
+  },
+  {
+   "word": "Poolroom",
+   "phonemes": "pˈulɹˌum"
+  },
+  {
+   "word": "Portmanteaux",
+   "phonemes": "pɔɹtmˈæntOz"
+  },
+  {
+   "word": "Portobello",
+   "phonemes": "pˌɔɹTəbˈɛlO"
+  },
+  {
+   "word": "Portolans",
+   "phonemes": "pˈɔɹTᵊlənz"
+  },
+  {
+   "word": "Portraitist",
+   "phonemes": "pˈɔɹtɹəTɪst"
+  },
+  {
+   "word": "Posh",
+   "phonemes": "pˈɑʃ"
+  },
+  {
+   "word": "Postcolonial",
+   "phonemes": "pˌOstkəlˈOnjəl"
+  },
+  {
+   "word": "Postindustrialism",
+   "phonemes": "pˌOstəndˈʌstɹiəlˌɪzəm"
+  },
+  {
+   "word": "Potsdam",
+   "phonemes": "pˈɑtsdæm"
+  },
+  {
+   "word": "Pouter",
+   "phonemes": "pˈWTəɹ"
+  },
+  {
+   "word": "Prayerfulness",
+   "phonemes": "pɹˈɛɹfəlnəs"
+  },
+  {
+   "word": "Precooked",
+   "phonemes": "pɹˌikˈʊkt"
+  },
+  {
+   "word": "Predation",
+   "phonemes": "pɹədˈAʃən"
+  },
+  {
+   "word": "Predrink",
+   "phonemes": "pɹˈidɹˌɪŋk"
+  },
+  {
+   "word": "Prepare",
+   "phonemes": "pɹipˈɛɹ"
+  },
+  {
+   "word": "Presumptive",
+   "phonemes": "pɹizˈʌmptɪv"
+  },
+  {
+   "word": "Primitivism",
+   "phonemes": "pɹˈɪməTəvˌɪzəm"
+  },
+  {
+   "word": "Principally",
+   "phonemes": "pɹˈɪnsəpᵊli"
+  },
+  {
+   "word": "Prioritization",
+   "phonemes": "pɹˌIˌɔɹəTəzˈAʃən"
+  },
+  {
+   "word": "Probity",
+   "phonemes": "pɹˈObəTi"
+  },
+  {
+   "word": "Proctitis",
+   "phonemes": "pɹɑktˈITəs"
+  },
+  {
+   "word": "Proenzyme",
+   "phonemes": "pɹOˈɛnzˌIm"
+  },
+  {
+   "word": "Profaneness",
+   "phonemes": "pɹəfˈAnnəs"
+  },
+  {
+   "word": "Profoundness",
+   "phonemes": "pɹəfˈWndnəs"
+  },
+  {
+   "word": "Prohibit",
+   "phonemes": "pɹəhˈɪbət"
+  },
+  {
+   "word": "Prohibitor",
+   "phonemes": "pɹəhˈɪbəTəɹ"
+  },
+  {
+   "word": "Prolonger",
+   "phonemes": "pɹəlˈɔŋəɹ"
+  },
+  {
+   "word": "Prong",
+   "phonemes": "pɹˈɔŋ"
+  },
+  {
+   "word": "Props",
+   "phonemes": "pɹˈɑps"
+  },
+  {
+   "word": "Prosthesis",
+   "phonemes": "pɹɑsθˈisɪs"
+  },
+  {
+   "word": "Protract",
+   "phonemes": "pɹətɹˈækt"
+  },
+  {
+   "word": "Prove",
+   "phonemes": "pɹˈuv"
+  },
+  {
+   "word": "Provoker",
+   "phonemes": "pɹəvˈOkəɹ"
+  },
+  {
+   "word": "Prudence",
+   "phonemes": "pɹˈudᵊns"
+  },
+  {
+   "word": "Psychohistory",
+   "phonemes": "sˌIkOhˈɪstəɹi"
+  },
+  {
+   "word": "Pterobranch",
+   "phonemes": "tˈɛɹəbɹˌæŋk"
+  },
+  {
+   "word": "Pudendal",
+   "phonemes": "pjudˈɛndᵊl"
+  },
+  {
+   "word": "Puke",
+   "phonemes": "pjˈuk"
+  },
+  {
+   "word": "Punjabi",
+   "phonemes": "pənʤˈɑbi"
+  },
+  {
+   "word": "Purposelessness",
+   "phonemes": "pˈɜɹpəsləsnəs"
+  },
+  {
+   "word": "Putto",
+   "phonemes": "pˈuTO"
+  },
+  {
+   "word": "Pyelogram",
+   "phonemes": "pˈIəlOɡɹˌæm"
+  },
+  {
+   "word": "Q",
+   "phonemes": "kjˈu"
+  },
+  {
+   "word": "Qing",
+   "phonemes": "ʧˈɪŋ"
+  },
+  {
+   "word": "Quantification",
+   "phonemes": "kwˌɑntəfəkˈAʃən"
+  },
+  {
+   "word": "Querida",
+   "phonemes": "kɛɹˈidə"
+  },
+  {
+   "word": "Quivery",
+   "phonemes": "kwˈɪvəɹi"
+  },
+  {
+   "word": "Rabbeting",
+   "phonemes": "ɹˈæbəTɪŋ"
+  },
+  {
+   "word": "Rabbitfish",
+   "phonemes": "ɹˈæbətfˌɪʃ"
+  },
+  {
+   "word": "Raceme",
+   "phonemes": "ɹˈæsˌim"
+  },
+  {
+   "word": "Racemization",
+   "phonemes": "ɹˌæsəmIzˈAʃən"
+  },
+  {
+   "word": "Rarotonga",
+   "phonemes": "ɹˌæɹətˈɑŋɡə"
+  },
+  {
+   "word": "Re-mix",
+   "phonemes": "ɹimˈɪks"
+  },
+  {
+   "word": "Realm",
+   "phonemes": "ɹˈɛlm"
+  },
+  {
+   "word": "Reamer",
+   "phonemes": "ɹˈiməɹ"
+  },
+  {
+   "word": "Reassortment",
+   "phonemes": "ɹˌiəsˈɔɹtmᵊnt"
+  },
+  {
+   "word": "Reblochon",
+   "phonemes": "ɹˌɛbləʃˈɔn"
+  },
+  {
+   "word": "Rebored",
+   "phonemes": "ɹˌibˈɔɹd"
+  },
+  {
+   "word": "Rebuild",
+   "phonemes": "ɹibˈɪld"
+  },
+  {
+   "word": "Rebutting",
+   "phonemes": "ɹəbˈʌTɪŋ"
+  },
+  {
+   "word": "Reclassify",
+   "phonemes": "ɹəklˈæsəfˌI"
+  },
+  {
+   "word": "Recoil",
+   "phonemes": "ɹˈikˌYl"
+  },
+  {
+   "word": "Recomposition",
+   "phonemes": "ɹikˌɑmpəzˈɪʃən"
+  },
+  {
+   "word": "Recorder",
+   "phonemes": "ɹəkˈɔɹdəɹ"
+  },
+  {
+   "word": "Rectifiable",
+   "phonemes": "ɹˈɛktəfˌIəbᵊl"
+  },
+  {
+   "word": "Reduction",
+   "phonemes": "ɹədˈʌkʃən"
+  },
+  {
+   "word": "Reeler",
+   "phonemes": "ɹˈiləɹ"
+  },
+  {
+   "word": "Reface",
+   "phonemes": "ɹifˈAs"
+  },
+  {
+   "word": "Refection",
+   "phonemes": "ɹəfˈɛkʃən"
+  },
+  {
+   "word": "Reforest",
+   "phonemes": "ɹˌifˈɔɹəst"
+  },
+  {
+   "word": "Refraction",
+   "phonemes": "ɹəfɹˈækʃən"
+  },
+  {
+   "word": "Regift's",
+   "phonemes": "ɹˈiɡˌɪfts"
+  },
+  {
+   "word": "Rehangs",
+   "phonemes": "ɹˈihæŋz"
+  },
+  {
+   "word": "Reimagine",
+   "phonemes": "ɹˌiəmˈæʤən"
+  },
+  {
+   "word": "Reinfection",
+   "phonemes": "ɹˌiənfˈɛkʃən"
+  },
+  {
+   "word": "Rejig",
+   "phonemes": "ɹiʤˈɪɡ"
+  },
+  {
+   "word": "Relets",
+   "phonemes": "ɹˈilˌɛts"
+  },
+  {
+   "word": "Relleno",
+   "phonemes": "ɹɛjˈAnO"
+  },
+  {
+   "word": "Remodelling",
+   "phonemes": "ɹimˈɑdlɪŋ"
+  },
+  {
+   "word": "Renowned",
+   "phonemes": "ɹənˈWnd"
+  },
+  {
+   "word": "Reposefully",
+   "phonemes": "ɹəpˈOzfᵊli"
+  },
+  {
+   "word": "Resinoid",
+   "phonemes": "ɹˈɛzənˌYd"
+  },
+  {
+   "word": "Retributive",
+   "phonemes": "ɹətɹˈɪbjəTɪv"
+  },
+  {
+   "word": "Retrospective",
+   "phonemes": "ɹˌɛtɹəspˈɛktɪv"
+  },
+  {
+   "word": "Rewrites",
+   "phonemes": "ɹˈiɹˌIts"
+  },
+  {
+   "word": "Rezoning",
+   "phonemes": "ɹizˈOnɪŋ"
+  },
+  {
+   "word": "Rhizobium",
+   "phonemes": "ɹIzˈObiəm"
+  },
+  {
+   "word": "Rhodamine",
+   "phonemes": "ɹˈOdəmˌin"
+  },
+  {
+   "word": "Rhomboid",
+   "phonemes": "ɹˈɑmbˌYd"
+  },
+  {
+   "word": "Rickettsias",
+   "phonemes": "ɹəkˈɛtsiəz"
+  },
+  {
+   "word": "Ritalin",
+   "phonemes": "ɹˈɪTəlɪn"
+  },
+  {
+   "word": "Rival",
+   "phonemes": "ɹˈIvᵊl"
+  },
+  {
+   "word": "Roanoke",
+   "phonemes": "ɹˈOənˌOk"
+  },
+  {
+   "word": "Roily",
+   "phonemes": "ɹˈYli"
+  },
+  {
+   "word": "Rolfing",
+   "phonemes": "ɹˈɔlfɪŋ"
+  },
+  {
+   "word": "Ronde",
+   "phonemes": "ɹˈɑnd"
+  },
+  {
+   "word": "Rosary",
+   "phonemes": "ɹˈOzəɹi"
+  },
+  {
+   "word": "Roustabout",
+   "phonemes": "ɹˈWstəbˌWt"
+  },
+  {
+   "word": "Royalist",
+   "phonemes": "ɹˈYəlɪst"
+  },
+  {
+   "word": "Rubato",
+   "phonemes": "ɹubˈɑTO"
+  },
+  {
+   "word": "Ruching",
+   "phonemes": "ɹˈuʃɪŋ"
+  },
+  {
+   "word": "Ruritanian",
+   "phonemes": "ɹˌʊɹətˈAniən"
+  },
+  {
+   "word": "Rush",
+   "phonemes": "ɹˈʌʃ"
+  },
+  {
+   "word": "Russify",
+   "phonemes": "ɹˈʌsəfˌI"
+  },
+  {
+   "word": "Rustiness",
+   "phonemes": "ɹˈʌstinəs"
+  },
+  {
+   "word": "SEM",
+   "phonemes": "sˈɛm"
+  },
+  {
+   "word": "SIDS",
+   "phonemes": "sˈɪdz"
+  },
+  {
+   "word": "SQL",
+   "phonemes": "sˈikwəl"
+  },
+  {
+   "word": "Saccular",
+   "phonemes": "sˈækjələɹ"
+  },
+  {
+   "word": "Saltatory",
+   "phonemes": "sˈæltətˌɔɹi"
+  },
+  {
+   "word": "Salvific",
+   "phonemes": "sælvˈɪfɪk"
+  },
+  {
+   "word": "Sanatoria",
+   "phonemes": "sˌænətˈɔɹiə"
+  },
+  {
+   "word": "Sandwich",
+   "phonemes": "sˈændwˌɪʧ"
+  },
+  {
+   "word": "Sanitize",
+   "phonemes": "sˈænətˌIz"
+  },
+  {
+   "word": "Scabies",
+   "phonemes": "skˈAbiz"
+  },
+  {
+   "word": "Schlub",
+   "phonemes": "ʃlˈʌb"
+  },
+  {
+   "word": "Scintillant",
+   "phonemes": "sˈɪntᵊlənt"
+  },
+  {
+   "word": "Sclerosed",
+   "phonemes": "sklˈɛɹOst"
+  },
+  {
+   "word": "Scrapheap",
+   "phonemes": "skɹˈæphˌip"
+  },
+  {
+   "word": "Scrutinise",
+   "phonemes": "skɹˈutᵊnˌIz"
+  },
+  {
+   "word": "Scutch",
+   "phonemes": "skˈʌʧ"
+  },
+  {
+   "word": "Seamanship",
+   "phonemes": "sˈimənʃˌɪp"
+  },
+  {
+   "word": "Seasickness",
+   "phonemes": "sˈisˌɪknəs"
+  },
+  {
+   "word": "Seated",
+   "phonemes": "sˈiTᵻd"
+  },
+  {
+   "word": "Secernentea",
+   "phonemes": "sˌɛsəɹnˈɛntiə"
+  },
+  {
+   "word": "Sectarianism",
+   "phonemes": "sɛktˈɛɹiənˌɪzəm"
+  },
+  {
+   "word": "Sector",
+   "phonemes": "sˈɛktəɹ"
+  },
+  {
+   "word": "Seemliness",
+   "phonemes": "sˈimlinəs"
+  },
+  {
+   "word": "Segment",
+   "phonemes": "sˈɛɡmᵊnt"
+  },
+  {
+   "word": "Segregated",
+   "phonemes": "sˈɛɡɹəɡˌATᵻd"
+  },
+  {
+   "word": "Self-absorbed",
+   "phonemes": "sˌɛlfəbzˈɔɹbd"
+  },
+  {
+   "word": "Self-assembly",
+   "phonemes": "sˌɛlfəsˈɛmbli"
+  },
+  {
+   "word": "Self-referential",
+   "phonemes": "sˌɛlfɹˌɛfəɹˈɛnʧᵊl"
+  },
+  {
+   "word": "Self-sow",
+   "phonemes": "sˌɛlfsˈO"
+  },
+  {
+   "word": "Sensei",
+   "phonemes": "sˈɛnsˌA"
+  },
+  {
+   "word": "Sephardic",
+   "phonemes": "səfˈɑɹdɪk"
+  },
+  {
+   "word": "Serendipitous",
+   "phonemes": "sˌɛɹəndˈɪpəTəs"
+  },
+  {
+   "word": "Serendipity",
+   "phonemes": "sˌɛɹəndˈɪpəTi"
+  },
+  {
+   "word": "Sewn",
+   "phonemes": "sˈOn"
+  },
+  {
+   "word": "Sextuplet",
+   "phonemes": "sɛkstˈʌplət"
+  },
+  {
+   "word": "Shaggiest",
+   "phonemes": "ʃˈæɡiᵻst"
+  },
+  {
+   "word": "Shamus",
+   "phonemes": "ʃˈAməs"
+  },
+  {
+   "word": "Shanghai",
+   "phonemes": "ʃæŋhˈI"
+  },
+  {
+   "word": "Shoah",
+   "phonemes": "ʃˈOə"
+  },
+  {
+   "word": "Shocking",
+   "phonemes": "ʃˈɑkɪŋ"
+  },
+  {
+   "word": "Shoegaze",
+   "phonemes": "ʃˈuɡˌAz"
+  },
+  {
+   "word": "Shroff",
+   "phonemes": "ʃɹˈɔf"
+  },
+  {
+   "word": "Sib",
+   "phonemes": "sˈɪb"
+  },
+  {
+   "word": "Sideward",
+   "phonemes": "sˈIdwəɹd"
+  },
+  {
+   "word": "Sigmoidoscopic",
+   "phonemes": "sɪɡmˌYdəskˈɑpɪk"
+  },
+  {
+   "word": "Silk-stocking",
+   "phonemes": "sɪlkstˈɑkɪŋ"
+  },
+  {
+   "word": "Silverweed",
+   "phonemes": "sˈɪlvəɹwˌid"
+  },
+  {
+   "word": "Singspiel",
+   "phonemes": "sˈɪŋspˌil"
+  },
+  {
+   "word": "Sister-german",
+   "phonemes": "sˌɪstəɹʤˈɜɹmən"
+  },
+  {
+   "word": "Sixteen",
+   "phonemes": "sˌɪkstˈin"
+  },
+  {
+   "word": "Skink",
+   "phonemes": "skˈɪŋk"
+  },
+  {
+   "word": "Skittishly",
+   "phonemes": "skˈɪTəʃli"
+  },
+  {
+   "word": "Sleek",
+   "phonemes": "slˈik"
+  },
+  {
+   "word": "Slob",
+   "phonemes": "slˈɑb"
+  },
+  {
+   "word": "Smaller",
+   "phonemes": "smˈɔləɹ"
+  },
+  {
+   "word": "Smarty-pants",
+   "phonemes": "smˈɑɹTipˌænts"
+  },
+  {
+   "word": "Smattering",
+   "phonemes": "smˈæTəɹɪŋ"
+  },
+  {
+   "word": "Snail",
+   "phonemes": "snˈAl"
+  },
+  {
+   "word": "Sniggerer",
+   "phonemes": "snˈɪɡəɹəɹ"
+  },
+  {
+   "word": "Snivel",
+   "phonemes": "snˈɪvᵊl"
+  },
+  {
+   "word": "Snowmaking",
+   "phonemes": "snˈOmˌAkɪŋ"
+  },
+  {
+   "word": "Sociableness",
+   "phonemes": "sˈOʃəbəlnəs"
+  },
+  {
+   "word": "Socialising",
+   "phonemes": "sˈOʃəlˌIzɪŋ"
+  },
+  {
+   "word": "Socketed",
+   "phonemes": "sˈɑkəTᵻd"
+  },
+  {
+   "word": "Solvation",
+   "phonemes": "sɑlvˈAʃən"
+  },
+  {
+   "word": "Somatotype",
+   "phonemes": "səmˈæTətˌIp"
+  },
+  {
+   "word": "Sorcerous",
+   "phonemes": "sˈɔɹsəɹəs"
+  },
+  {
+   "word": "Sortie",
+   "phonemes": "sˈɔɹTi"
+  },
+  {
+   "word": "Sou'wester",
+   "phonemes": "sˌWwˈɛstəɹ"
+  },
+  {
+   "word": "Soubriquet",
+   "phonemes": "sˈubɹəkˌA"
+  },
+  {
+   "word": "Spasm",
+   "phonemes": "spˈæzəm"
+  },
+  {
+   "word": "Spastically",
+   "phonemes": "spˈæstəkᵊli"
+  },
+  {
+   "word": "Speakerphone",
+   "phonemes": "spˈikəɹfˌOn"
+  },
+  {
+   "word": "Specula",
+   "phonemes": "spˈʌkjələ"
+  },
+  {
+   "word": "Speculative",
+   "phonemes": "spˈɛkjələTɪv"
+  },
+  {
+   "word": "Speleologist",
+   "phonemes": "spˌiliˈɑləʤɪst"
+  },
+  {
+   "word": "Spellbinding",
+   "phonemes": "spˈɛlbˌIndɪŋ"
+  },
+  {
+   "word": "Sporozoite",
+   "phonemes": "spˌɔɹəzˈOˌIt"
+  },
+  {
+   "word": "Sprier",
+   "phonemes": "spɹˈIəɹ"
+  },
+  {
+   "word": "Sri",
+   "phonemes": "sɹˌi"
+  },
+  {
+   "word": "Staidness",
+   "phonemes": "stˈAdnəs"
+  },
+  {
+   "word": "Stallion",
+   "phonemes": "stˈæljən"
+  },
+  {
+   "word": "Stamboul",
+   "phonemes": "stæmbˈul"
+  },
+  {
+   "word": "Stamford",
+   "phonemes": "stˈæmfəɹd"
+  },
+  {
+   "word": "Stargazer",
+   "phonemes": "stˈɑɹɡˌAzəɹ"
+  },
+  {
+   "word": "Starring",
+   "phonemes": "stˈɑɹɪŋ"
+  },
+  {
+   "word": "Steadicam",
+   "phonemes": "stˈɛdikæm"
+  },
+  {
+   "word": "Stealthing",
+   "phonemes": "stˈɛlθɪŋ"
+  },
+  {
+   "word": "Steamed",
+   "phonemes": "stˈimd"
+  },
+  {
+   "word": "Stepson",
+   "phonemes": "stˈɛpsˌʌn"
+  },
+  {
+   "word": "Stern",
+   "phonemes": "stˈɜɹn"
+  },
+  {
+   "word": "Stiff",
+   "phonemes": "stˈɪf"
+  },
+  {
+   "word": "Stoma",
+   "phonemes": "stˈOmə"
+  },
+  {
+   "word": "Stonewashed",
+   "phonemes": "stˈOnwˌɔʃt"
+  },
+  {
+   "word": "Stoneworker",
+   "phonemes": "stˈOnwˌɜɹkəɹ"
+  },
+  {
+   "word": "Straightaway",
+   "phonemes": "stɹˌATəwˈA"
+  },
+  {
+   "word": "Strappy",
+   "phonemes": "stɹˈæpi"
+  },
+  {
+   "word": "Stream",
+   "phonemes": "stɹˈim"
+  },
+  {
+   "word": "Streamer",
+   "phonemes": "stɹˈiməɹ"
+  },
+  {
+   "word": "Strep",
+   "phonemes": "stɹˈɛp"
+  },
+  {
+   "word": "Stringhalt",
+   "phonemes": "stɹˈɪŋhˌɔlt"
+  },
+  {
+   "word": "Stroller",
+   "phonemes": "stɹˈOləɹ"
+  },
+  {
+   "word": "Strung",
+   "phonemes": "stɹˈʌŋ"
+  },
+  {
+   "word": "Stubby",
+   "phonemes": "stˈʌbi"
+  },
+  {
+   "word": "Stucco",
+   "phonemes": "stˈʌkO"
+  },
+  {
+   "word": "Subaudition",
+   "phonemes": "sˌʌbɔdˈɪʃən"
+  },
+  {
+   "word": "Subdeacon",
+   "phonemes": "sˌʌbdˈikən"
+  },
+  {
+   "word": "Subpoenas",
+   "phonemes": "səpˈinəz"
+  },
+  {
+   "word": "Succubi",
+   "phonemes": "sˈʌkjəbˌI"
+  },
+  {
+   "word": "Suck",
+   "phonemes": "sˈʌk"
+  },
+  {
+   "word": "Suckerfish",
+   "phonemes": "sˈʌkəɹfˌɪʃ"
+  },
+  {
+   "word": "Sulfuric",
+   "phonemes": "səlfjˈuɹɪk"
+  },
+  {
+   "word": "Sulfurous",
+   "phonemes": "sˈʌlfəɹəs"
+  },
+  {
+   "word": "Summarise",
+   "phonemes": "sˈʌməɹˌIz"
+  },
+  {
+   "word": "Sumpter",
+   "phonemes": "sˈʌmptəɹ"
+  },
+  {
+   "word": "Sunrise",
+   "phonemes": "sˈʌnɹˌIz"
+  },
+  {
+   "word": "Superannuated",
+   "phonemes": "sˌupəɹˈænjəwˌATᵻd"
+  },
+  {
+   "word": "Supportable",
+   "phonemes": "səpˈɔɹTəbəl"
+  },
+  {
+   "word": "Svizzera",
+   "phonemes": "zvˈitsəɹˌɑ"
+  },
+  {
+   "word": "Synecdochic",
+   "phonemes": "sənˈɛkdəkɪk"
+  },
+  {
+   "word": "Tablier",
+   "phonemes": "tˌɑbliˈA"
+  },
+  {
+   "word": "Tactfulness",
+   "phonemes": "tˈæktfəlnəs"
+  },
+  {
+   "word": "Tag",
+   "phonemes": "tˈæɡ"
+  },
+  {
+   "word": "Talkback",
+   "phonemes": "tˈɔkbˌæk"
+  },
+  {
+   "word": "Tanglefoot",
+   "phonemes": "tˈæŋɡəlfˌʊt"
+  },
+  {
+   "word": "Tapestried",
+   "phonemes": "tˈæpəstɹid"
+  },
+  {
+   "word": "Tarpan",
+   "phonemes": "tˈɑɹpˌæn"
+  },
+  {
+   "word": "Tartrazine",
+   "phonemes": "tˈɑɹtɹəzᵊn"
+  },
+  {
+   "word": "Tat",
+   "phonemes": "tˈæt"
+  },
+  {
+   "word": "Tecumseh",
+   "phonemes": "təkˈʌmsə"
+  },
+  {
+   "word": "Telegraphese",
+   "phonemes": "tˌɛləɡɹæfˈiz"
+  },
+  {
+   "word": "Teleology",
+   "phonemes": "tˌɛliˈɑləʤi"
+  },
+  {
+   "word": "Teleport",
+   "phonemes": "tˈɛləpˌɔɹt"
+  },
+  {
+   "word": "Tend",
+   "phonemes": "tˈɛnd"
+  },
+  {
+   "word": "Teratoma",
+   "phonemes": "tˌɛɹətˈOmə"
+  },
+  {
+   "word": "Tessera",
+   "phonemes": "tˈɛsəɹə"
+  },
+  {
+   "word": "Testable",
+   "phonemes": "tˈɛstəbᵊl"
+  },
+  {
+   "word": "Thematize",
+   "phonemes": "θˈimətˌIz"
+  },
+  {
+   "word": "Thermite",
+   "phonemes": "θˈɜɹmˌIt"
+  },
+  {
+   "word": "Thickheadedness",
+   "phonemes": "θˌɪkhˈɛdᵻdnəs"
+  },
+  {
+   "word": "Thrasher",
+   "phonemes": "θɹˈæʃəɹ"
+  },
+  {
+   "word": "Threnodial",
+   "phonemes": "θɹənˈOdiəl"
+  },
+  {
+   "word": "Thumbprint",
+   "phonemes": "θˈʌmpɹˌɪnt"
+  },
+  {
+   "word": "Thunderbird",
+   "phonemes": "θˈʌndəɹbˌɜɹd"
+  },
+  {
+   "word": "Tiff",
+   "phonemes": "tˈɪf"
+  },
+  {
+   "word": "Timescale",
+   "phonemes": "tˈImskˌAl"
+  },
+  {
+   "word": "Tip-top",
+   "phonemes": "tˈɪptˌɑp"
+  },
+  {
+   "word": "Tita",
+   "phonemes": "tˈitə"
+  },
+  {
+   "word": "Titillatingly",
+   "phonemes": "tˈɪTəlˌATɪŋli"
+  },
+  {
+   "word": "Toccata",
+   "phonemes": "təkˈɑTə"
+  },
+  {
+   "word": "Tolerantly",
+   "phonemes": "tˈɑləɹəntli"
+  },
+  {
+   "word": "Topiarist",
+   "phonemes": "tˈOpiəɹɪst"
+  },
+  {
+   "word": "Topiary",
+   "phonemes": "tˈOpiˌɛɹi"
+  },
+  {
+   "word": "Touchiness",
+   "phonemes": "tˈʌʧinəs"
+  },
+  {
+   "word": "Tough",
+   "phonemes": "tˈʌf"
+  },
+  {
+   "word": "Toxically",
+   "phonemes": "tˈɑksəkᵊli"
+  },
+  {
+   "word": "Toxicologist",
+   "phonemes": "tˌɑksəkˈɑləʤɪst"
+  },
+  {
+   "word": "Transness",
+   "phonemes": "tɹˈænznəs"
+  },
+  {
+   "word": "Trashily",
+   "phonemes": "tɹˈæʃəli"
+  },
+  {
+   "word": "Trepanned",
+   "phonemes": "tɹəpˈænd"
+  },
+  {
+   "word": "Triage",
+   "phonemes": "tɹˌiˈɑʒ"
+  },
+  {
+   "word": "Triptyque",
+   "phonemes": "tɹɪptˈik"
+  },
+  {
+   "word": "Trodden",
+   "phonemes": "tɹˈɑdᵊn"
+  },
+  {
+   "word": "Trow",
+   "phonemes": "tɹˈO"
+  },
+  {
+   "word": "Truro",
+   "phonemes": "tɹˈʊɹˌO"
+  },
+  {
+   "word": "Trusty",
+   "phonemes": "tɹˈʌsti"
+  },
+  {
+   "word": "Tucking",
+   "phonemes": "tˈʌkɪŋ"
+  },
+  {
+   "word": "Tumbril",
+   "phonemes": "tˈʌmbɹəl"
+  },
+  {
+   "word": "Twinspot",
+   "phonemes": "twˈɪnspɑt"
+  },
+  {
+   "word": "Ultracrepidarian",
+   "phonemes": "ˌʌltɹəkɹɛpədˈɛɹiən"
+  },
+  {
+   "word": "Unadventurously",
+   "phonemes": "ˌʌnædvˈɛnʧəɹəsli"
+  },
+  {
+   "word": "Unbend",
+   "phonemes": "ˌʌnbˈɛnd"
+  },
+  {
+   "word": "Unchanging",
+   "phonemes": "ˌʌnʧˈAnʤɪŋ"
+  },
+  {
+   "word": "Unchastity",
+   "phonemes": "ˌʌnʧˈæstəTi"
+  },
+  {
+   "word": "Uncinariasis",
+   "phonemes": "ˌʌntsənəɹˈIəsɪs"
+  },
+  {
+   "word": "Uncomment",
+   "phonemes": "ˌʌnkˈɑmɛnt"
+  },
+  {
+   "word": "Unconfident",
+   "phonemes": "ˌʌnkˈɑnfədᵊnt"
+  },
+  {
+   "word": "Uncrown",
+   "phonemes": "ˌʌnkɹˈWn"
+  },
+  {
+   "word": "Undefinably",
+   "phonemes": "ˌʌndəfˈInəbli"
+  },
+  {
+   "word": "Undercharge's",
+   "phonemes": "ˈʌndəɹʧˌɑɹʤᵻz"
+  },
+  {
+   "word": "Undercoat",
+   "phonemes": "ˈʌndəɹkˌOt"
+  },
+  {
+   "word": "Undercounted",
+   "phonemes": "ˌʌndəɹkˈWntᵻd"
+  },
+  {
+   "word": "Underinvest",
+   "phonemes": "ˌʌndəɹɪnvˈɛst"
+  },
+  {
+   "word": "Understatement",
+   "phonemes": "ˈʌndəɹstˌAtmənt"
+  },
+  {
+   "word": "Undersupply",
+   "phonemes": "ˈʌndəɹsəplˌI"
+  },
+  {
+   "word": "Undertaker",
+   "phonemes": "ˈʌndəɹtˌAkəɹ"
+  },
+  {
+   "word": "Underuse",
+   "phonemes": "ˌʌndəɹjˈus"
+  },
+  {
+   "word": "Undivided",
+   "phonemes": "ˌʌndəvˈIdᵻd"
+  },
+  {
+   "word": "Undying",
+   "phonemes": "ˌʌndˈIɪŋ"
+  },
+  {
+   "word": "Unenthused",
+   "phonemes": "ˌʌnənθˈuzd"
+  },
+  {
+   "word": "Unequal",
+   "phonemes": "ˌʌnˈikwəl"
+  },
+  {
+   "word": "Unfulfillable",
+   "phonemes": "ˌʌnfʊlfˈɪləbəl"
+  },
+  {
+   "word": "Ungracefully",
+   "phonemes": "ˌʌnɡɹˈAsfəli"
+  },
+  {
+   "word": "Unhesitatingly",
+   "phonemes": "ˌʌnhˈɛzətˌATɪŋli"
+  },
+  {
+   "word": "Unhygienic",
+   "phonemes": "ˌʌnhˌIʤˈinɪk"
+  },
+  {
+   "word": "Unlimitedness",
+   "phonemes": "ˌʌnlˈɪməTədnəs"
+  },
+  {
+   "word": "Unlucky",
+   "phonemes": "ˌʌnlˈʌki"
+  },
+  {
+   "word": "Unmatchable",
+   "phonemes": "ˌʌnmˈæʧəbᵊl"
+  },
+  {
+   "word": "Unofficially",
+   "phonemes": "ˌʌnəfˈɪʃəli"
+  },
+  {
+   "word": "Unpatterned",
+   "phonemes": "ˌʌnpˈæTəɹnd"
+  },
+  {
+   "word": "Unravelling",
+   "phonemes": "ˌʌnɹˈævᵊlɪŋ"
+  },
+  {
+   "word": "Unreciprocated",
+   "phonemes": "ˌʌnɹəsˈɪpɹəkˌATᵻd"
+  },
+  {
+   "word": "Unreliable",
+   "phonemes": "ˌʌnɹəlˈIəbᵊl"
+  },
+  {
+   "word": "Unresting",
+   "phonemes": "ˌʌnɹˈɛstɪŋ"
+  },
+  {
+   "word": "Unstarched",
+   "phonemes": "ˌʌnstˈɑɹʧt"
+  },
+  {
+   "word": "Unthanked",
+   "phonemes": "ˌʌnθˈæŋkt"
+  },
+  {
+   "word": "Untidier",
+   "phonemes": "ˌʌntˈIdiəɹ"
+  },
+  {
+   "word": "Untold",
+   "phonemes": "ˌʌntˈOld"
+  },
+  {
+   "word": "Unwashed",
+   "phonemes": "ˌʌnwˈɔʃt"
+  },
+  {
+   "word": "Unwatered",
+   "phonemes": "ˌʌnwˈɔTəɹd"
+  },
+  {
+   "word": "Usumbura",
+   "phonemes": "ˌusəmbˈʊɹə"
+  },
+  {
+   "word": "Uterine",
+   "phonemes": "jˈuTəɹən"
+  },
+  {
+   "word": "Utilise",
+   "phonemes": "jˈuTᵊlˌIz"
+  },
+  {
+   "word": "Vane",
+   "phonemes": "vˈAn"
+  },
+  {
+   "word": "Vaping",
+   "phonemes": "vˈApɪŋ"
+  },
+  {
+   "word": "Vascularize",
+   "phonemes": "vˈæskjələɹˌIz"
+  },
+  {
+   "word": "Vassalage",
+   "phonemes": "vˈæsəlɪʤ"
+  },
+  {
+   "word": "Vedette",
+   "phonemes": "vədˈɛt"
+  },
+  {
+   "word": "Vegetal",
+   "phonemes": "vˈɛʤəTᵊl"
+  },
+  {
+   "word": "Verderer",
+   "phonemes": "vˈɜɹdəɹəɹ"
+  },
+  {
+   "word": "Vernacularity",
+   "phonemes": "vəɹnˌækjəlˈɛɹəTi"
+  },
+  {
+   "word": "Veronique",
+   "phonemes": "vˌɛɹənˈik"
+  },
+  {
+   "word": "Viceroyalty",
+   "phonemes": "vˌIsɹˈYəlti"
+  },
+  {
+   "word": "Vignette",
+   "phonemes": "vɪnjˈɛt"
+  },
+  {
+   "word": "Violent",
+   "phonemes": "vˈIᵊlənt"
+  },
+  {
+   "word": "Virga",
+   "phonemes": "vˈɜɹɡə"
+  },
+  {
+   "word": "Virility",
+   "phonemes": "vəɹˈɪləTi"
+  },
+  {
+   "word": "Vitriolic",
+   "phonemes": "vˌɪtɹiˈɑlɪk"
+  },
+  {
+   "word": "Vladivostok",
+   "phonemes": "vlˌædəvˈɑstɑk"
+  },
+  {
+   "word": "Voluminous",
+   "phonemes": "vəlˈumənəs"
+  },
+  {
+   "word": "Vying",
+   "phonemes": "vˈIɪŋ"
+  },
+  {
+   "word": "WORM",
+   "phonemes": "wˈɜɹm"
+  },
+  {
+   "word": "Wagonload",
+   "phonemes": "wˈæɡənlˌOd"
+  },
+  {
+   "word": "Wah-wah",
+   "phonemes": "wˈɑwˌɑ"
+  },
+  {
+   "word": "Waitress",
+   "phonemes": "wˈAtɹəs"
+  },
+  {
+   "word": "Walkathon",
+   "phonemes": "wˈɔkəθˌɑn"
+  },
+  {
+   "word": "Wallachian",
+   "phonemes": "wɑlˈAkiən"
+  },
+  {
+   "word": "Wassail",
+   "phonemes": "wˈɑsəl"
+  },
+  {
+   "word": "Wavefront",
+   "phonemes": "wˈAvfɹˌʌnt"
+  },
+  {
+   "word": "Welfarism",
+   "phonemes": "wˈɛlfˌɛɹˌɪzəm"
+  },
+  {
+   "word": "Wetware",
+   "phonemes": "wˈɛtwˌɛɹ"
+  },
+  {
+   "word": "Weymouth",
+   "phonemes": "wˈAməθ"
+  },
+  {
+   "word": "Whitewood",
+   "phonemes": "wˈItwˌʊd"
+  },
+  {
+   "word": "Whitlow",
+   "phonemes": "wˈɪtlO"
+  },
+  {
+   "word": "Willies",
+   "phonemes": "wˈɪliz"
+  },
+  {
+   "word": "Wind-pollinated",
+   "phonemes": "wˌɪndpˈɑlənATᵻd"
+  },
+  {
+   "word": "Windgall",
+   "phonemes": "wˈɪndɡɔl"
+  },
+  {
+   "word": "Wired",
+   "phonemes": "wˈIəɹd"
+  },
+  {
+   "word": "Witching",
+   "phonemes": "wˈɪʧɪŋ"
+  },
+  {
+   "word": "Woodrush",
+   "phonemes": "wˈʊdɹˌʌʃ"
+  },
+  {
+   "word": "Woos",
+   "phonemes": "wˈuz"
+  },
+  {
+   "word": "Workman",
+   "phonemes": "wˈɜɹkmən"
+  },
+  {
+   "word": "Wrns",
+   "phonemes": "ɹˈɛnz"
+  },
+  {
+   "word": "X-height",
+   "phonemes": "ˈɛkshIt"
+  },
+  {
+   "word": "Yappy",
+   "phonemes": "jˈæpi"
+  },
+  {
+   "word": "Yardbird",
+   "phonemes": "jˈɑɹdbˌɜɹd"
+  },
+  {
+   "word": "Yautia",
+   "phonemes": "jWtˈiə"
+  },
+  {
+   "word": "Yeasayer",
+   "phonemes": "jˈAsˌAəɹ"
+  },
+  {
+   "word": "Yeastiness",
+   "phonemes": "jˈistinɪs"
+  },
+  {
+   "word": "Yellowback",
+   "phonemes": "jˈɛlObˌæk"
+  },
+  {
+   "word": "Yellowed",
+   "phonemes": "jˈɛlOd"
+  },
+  {
+   "word": "Yiddishkeit",
+   "phonemes": "jˈɪdɪʃkˌIt"
+  },
+  {
+   "word": "ZSAT",
+   "phonemes": "zˈisˌæt"
+  },
+  {
+   "word": "Zonule",
+   "phonemes": "zˈOnjul"
+  },
+  {
+   "word": "a",
+   "phonemes": "ɐ"
+  },
+  {
+   "word": "a's",
+   "phonemes": "ˈAz"
+  },
+  {
+   "word": "aaron",
+   "phonemes": "ˈɛɹən"
+  },
+  {
+   "word": "abeokuta",
+   "phonemes": "ˌɑbAˈOkʊtˌɑ"
+  },
+  {
+   "word": "abortive",
+   "phonemes": "əbˈɔɹTɪv"
+  },
+  {
+   "word": "abscissae",
+   "phonemes": "æbsˈɪsi"
+  },
+  {
+   "word": "absorptiometric",
+   "phonemes": "æbzˌɔɹptiəmˈɛtɹɪk"
+  },
+  {
+   "word": "abta",
+   "phonemes": "ˈæbtə"
+  },
+  {
+   "word": "accolade",
+   "phonemes": "ˈækəlˌAd"
+  },
+  {
+   "word": "achaean",
+   "phonemes": "əkˈiən"
+  },
+  {
+   "word": "ache",
+   "phonemes": "ˈAk"
+  },
+  {
+   "word": "acquihire",
+   "phonemes": "ˈækwəhˌIəɹ"
+  },
+  {
+   "word": "adhibition",
+   "phonemes": "ˌædhəbˈɪʃən"
+  },
+  {
+   "word": "adjacent",
+   "phonemes": "əʤˈAsᵊnt"
+  },
+  {
+   "word": "adjuratory",
+   "phonemes": "əʤˈʊɹətˌɔɹi"
+  },
+  {
+   "word": "administrative",
+   "phonemes": "ədmˈɪnəstɹˌATɪv"
+  },
+  {
+   "word": "adsorbable",
+   "phonemes": "ædzˈɔɹbəbəl"
+  },
+  {
+   "word": "aeromagnetic",
+   "phonemes": "ˌɛɹOmæɡnˈɛTɪk"
+  },
+  {
+   "word": "aeroplane",
+   "phonemes": "ˈɛɹəplˌAn"
+  },
+  {
+   "word": "aeschines",
+   "phonemes": "ˈɛskəniz"
+  },
+  {
+   "word": "afforestation",
+   "phonemes": "əfˌɔɹəstˈAʃən"
+  },
+  {
+   "word": "agama",
+   "phonemes": "əɡˈAmə"
+  },
+  {
+   "word": "age-long",
+   "phonemes": "ˈAʤlˌɔŋ"
+  },
+  {
+   "word": "agraphia",
+   "phonemes": "əɡɹˈæfiə"
+  },
+  {
+   "word": "ahoy",
+   "phonemes": "əhˈY"
+  },
+  {
+   "word": "aim",
+   "phonemes": "ˈAm"
+  },
+  {
+   "word": "airplane",
+   "phonemes": "ˈɛɹplˌAn"
+  },
+  {
+   "word": "aizawl",
+   "phonemes": "IzˈWl"
+  },
+  {
+   "word": "akin",
+   "phonemes": "əkˈɪn"
+  },
+  {
+   "word": "alizarin",
+   "phonemes": "əlˈɪzəɹən"
+  },
+  {
+   "word": "allude",
+   "phonemes": "əlˈud"
+  },
+  {
+   "word": "allure",
+   "phonemes": "əlˈʊɹ"
+  },
+  {
+   "word": "alone",
+   "phonemes": "əlˈOn"
+  },
+  {
+   "word": "alpacas",
+   "phonemes": "ælpˈækəz"
+  },
+  {
+   "word": "alway",
+   "phonemes": "ˈɔlwˌA"
+  },
+  {
+   "word": "ampakine",
+   "phonemes": "ˈæmpəkˌIn"
+  },
+  {
+   "word": "amylopectin",
+   "phonemes": "ˌæməlOpˈɛktᵊn"
+  },
+  {
+   "word": "anal",
+   "phonemes": "ˈAnᵊl"
+  },
+  {
+   "word": "analogous",
+   "phonemes": "ənˈæləɡəs"
+  },
+  {
+   "word": "andorran",
+   "phonemes": "ændˈɔɹən"
+  },
+  {
+   "word": "anionic",
+   "phonemes": "ˌænIˈɑnɪk"
+  },
+  {
+   "word": "anisogamy",
+   "phonemes": "ˌænˌIsˈɑɡəmi"
+  },
+  {
+   "word": "annul",
+   "phonemes": "ənˈʌl"
+  },
+  {
+   "word": "anorthite",
+   "phonemes": "ənˈɔɹθˌIt"
+  },
+  {
+   "word": "antemortem",
+   "phonemes": "ˌæntəmˈɔɹTəm"
+  },
+  {
+   "word": "antigovernment",
+   "phonemes": "ˌæntiɡˈʌvəɹnmənt"
+  },
+  {
+   "word": "antimony",
+   "phonemes": "ˈæntəmˌOni"
+  },
+  {
+   "word": "antisubmarine",
+   "phonemes": "ˌæntisˌʌbməɹˈin"
+  },
+  {
+   "word": "apocarpous",
+   "phonemes": "ˌæpəkˈɑɹpəs"
+  },
+  {
+   "word": "apperception",
+   "phonemes": "ˌæpəɹsˈɛpʃən"
+  },
+  {
+   "word": "appreciative",
+   "phonemes": "əpɹˈiʃiəTɪv"
+  },
+  {
+   "word": "archaeology",
+   "phonemes": "ˌɑɹkiˈɑləʤi"
+  },
+  {
+   "word": "argufy",
+   "phonemes": "ˈɑɹɡjəfˌI"
+  },
+  {
+   "word": "assembly",
+   "phonemes": "əsˈɛmbli"
+  },
+  {
+   "word": "assistive",
+   "phonemes": "əsˈɪstɪv"
+  },
+  {
+   "word": "astrocompass",
+   "phonemes": "ˈæstɹOkˌʌmpəs"
+  },
+  {
+   "word": "ataraxic",
+   "phonemes": "ˌæTəɹˈæksɪk"
+  },
+  {
+   "word": "atop",
+   "phonemes": "ətˈɑp"
+  },
+  {
+   "word": "attention",
+   "phonemes": "ətˈɛnʧən"
+  },
+  {
+   "word": "attu",
+   "phonemes": "ˈætu"
+  },
+  {
+   "word": "automize",
+   "phonemes": "ˈɔTOmˌIz"
+  },
+  {
+   "word": "awfulness",
+   "phonemes": "ˈɔfəlnəs"
+  },
+  {
+   "word": "aww",
+   "phonemes": "ˈɔɔ"
+  },
+  {
+   "word": "babyishly",
+   "phonemes": "bˈAbiɪʃli"
+  },
+  {
+   "word": "bacitracin",
+   "phonemes": "bˌæsɪtɹˈAsɪn"
+  },
+  {
+   "word": "back-to-nature",
+   "phonemes": "bˌæktənˈAʧəɹ"
+  },
+  {
+   "word": "bactericidal",
+   "phonemes": "bæktˌɪɹəsˈIdᵊl"
+  },
+  {
+   "word": "bagoong",
+   "phonemes": "bˈæɡəwɔŋ"
+  },
+  {
+   "word": "bairn",
+   "phonemes": "bˈɛɹn"
+  },
+  {
+   "word": "balletomane",
+   "phonemes": "bəlˈɛTəmˌAn"
+  },
+  {
+   "word": "banderole",
+   "phonemes": "bˈændəɹˌOl"
+  },
+  {
+   "word": "barrister",
+   "phonemes": "bˈɛɹəstəɹ"
+  },
+  {
+   "word": "baryte",
+   "phonemes": "bˌɛɹˈIt"
+  },
+  {
+   "word": "basel",
+   "phonemes": "bˈɑzᵊl"
+  },
+  {
+   "word": "bashkiria",
+   "phonemes": "bæʃkˈɪɹiə"
+  },
+  {
+   "word": "basilectal",
+   "phonemes": "bˌæzəlˈɛktəl"
+  },
+  {
+   "word": "basket",
+   "phonemes": "bˈæskət"
+  },
+  {
+   "word": "beagle",
+   "phonemes": "bˈiɡᵊl"
+  },
+  {
+   "word": "because",
+   "phonemes": "bəkˈʌz"
+  },
+  {
+   "word": "belizean",
+   "phonemes": "bəlˈiziən"
+  },
+  {
+   "word": "bellows",
+   "phonemes": "bˈɛlOz"
+  },
+  {
+   "word": "benin",
+   "phonemes": "bənˈin"
+  },
+  {
+   "word": "beverly",
+   "phonemes": "bˈɛvəɹli"
+  },
+  {
+   "word": "bezzie",
+   "phonemes": "bˈɛzi"
+  },
+  {
+   "word": "biassed",
+   "phonemes": "bˈIəst"
+  },
+  {
+   "word": "biddeford",
+   "phonemes": "bˈɪdəfəɹd"
+  },
+  {
+   "word": "bigamist",
+   "phonemes": "bˈɪɡəmɪst"
+  },
+  {
+   "word": "bigly",
+   "phonemes": "bˈɪɡli"
+  },
+  {
+   "word": "bijouterie",
+   "phonemes": "biʒˈuTəɹi"
+  },
+  {
+   "word": "billet-doux",
+   "phonemes": "bˌɪlAdˈu"
+  },
+  {
+   "word": "bimini",
+   "phonemes": "bˈɪməni"
+  },
+  {
+   "word": "bitchfest",
+   "phonemes": "bˈɪʧfˌɛst"
+  },
+  {
+   "word": "bleat",
+   "phonemes": "blˈit"
+  },
+  {
+   "word": "blockhouse",
+   "phonemes": "blˈɑkhˌWs"
+  },
+  {
+   "word": "blocking",
+   "phonemes": "blˈɑkɪŋ"
+  },
+  {
+   "word": "bloody-mindedness",
+   "phonemes": "blˌʌdimˈIndᵻdnəs"
+  },
+  {
+   "word": "bluegill",
+   "phonemes": "blˈuɡˌɪl"
+  },
+  {
+   "word": "boatload",
+   "phonemes": "bˈOtlˌOd"
+  },
+  {
+   "word": "bobblehead",
+   "phonemes": "bˈɑbəlhˌɛd"
+  },
+  {
+   "word": "bodyboard",
+   "phonemes": "bˈɑdibˌɔɹd"
+  },
+  {
+   "word": "bogland",
+   "phonemes": "bˈɑɡlˌænd"
+  },
+  {
+   "word": "boilerplate",
+   "phonemes": "bˈYləɹplˌAt"
+  },
+  {
+   "word": "bone",
+   "phonemes": "bˈOn"
+  },
+  {
+   "word": "bookplate",
+   "phonemes": "bˈʊkplˌAt"
+  },
+  {
+   "word": "boozily",
+   "phonemes": "bˈuzəli"
+  },
+  {
+   "word": "borgesian",
+   "phonemes": "bˌɔɹɡˈɛziən"
+  },
+  {
+   "word": "borough",
+   "phonemes": "bˈɜɹO"
+  },
+  {
+   "word": "bossy",
+   "phonemes": "bˈɔsi"
+  },
+  {
+   "word": "bottomry",
+   "phonemes": "bˈɑTəmɹi"
+  },
+  {
+   "word": "bracken",
+   "phonemes": "bɹˈækən"
+  },
+  {
+   "word": "breathier",
+   "phonemes": "bɹˈɛθiəɹ"
+  },
+  {
+   "word": "broad-minded",
+   "phonemes": "bɹˌɔdmˈIndᵻd"
+  },
+  {
+   "word": "brother-in-law",
+   "phonemes": "bɹˈʌðəɹənlˌɔ"
+  },
+  {
+   "word": "brotherly",
+   "phonemes": "bɹˈʌðəɹli"
+  },
+  {
+   "word": "built",
+   "phonemes": "bˈɪlt"
+  },
+  {
+   "word": "bund",
+   "phonemes": "bˈʌnd"
+  },
+  {
+   "word": "burgrave",
+   "phonemes": "bˈɜɹɡɹˌAv"
+  },
+  {
+   "word": "buses",
+   "phonemes": "bˈʌsᵻz"
+  },
+  {
+   "word": "cabrales",
+   "phonemes": "kəbɹˈɑlAz"
+  },
+  {
+   "word": "calcanei",
+   "phonemes": "kælkˈAniˌI"
+  },
+  {
+   "word": "candleberry",
+   "phonemes": "kˈændᵊlbˌɛɹi"
+  },
+  {
+   "word": "candour",
+   "phonemes": "kˈændəɹ"
+  },
+  {
+   "word": "capitano",
+   "phonemes": "kˌæpətˈɑnˌO"
+  },
+  {
+   "word": "capitulator",
+   "phonemes": "kəpˌɪʧəlˈATəɹ"
+  },
+  {
+   "word": "carbolated",
+   "phonemes": "kˈɑɹbəlˌATᵻd"
+  },
+  {
+   "word": "cash-rich",
+   "phonemes": "kæʃɹˈɪʧ"
+  },
+  {
+   "word": "cats",
+   "phonemes": "kˈæts"
+  },
+  {
+   "word": "cautionary",
+   "phonemes": "kˈɔʃənˌɛɹi"
+  },
+  {
+   "word": "centrifugation",
+   "phonemes": "sɛntɹˌɪfjəɡˈAʃən"
+  },
+  {
+   "word": "cephalopod",
+   "phonemes": "sˈɛfələpˌɑd"
+  },
+  {
+   "word": "ceramicist",
+   "phonemes": "səɹˈæməsɪst"
+  },
+  {
+   "word": "ceres",
+   "phonemes": "sˈɪɹiz"
+  },
+  {
+   "word": "chafer",
+   "phonemes": "ʧˈAfəɹ"
+  },
+  {
+   "word": "chamomile",
+   "phonemes": "kˈæməmˌil"
+  },
+  {
+   "word": "chaplain",
+   "phonemes": "ʧˈæplən"
+  },
+  {
+   "word": "characterization",
+   "phonemes": "kˌɛɹəktəɹˌIzˈAʃən"
+  },
+  {
+   "word": "children's",
+   "phonemes": "ʧˈɪldɹᵊnz"
+  },
+  {
+   "word": "chine",
+   "phonemes": "ʧˈIn"
+  },
+  {
+   "word": "chinois",
+   "phonemes": "ʃinwˈɑ"
+  },
+  {
+   "word": "christian",
+   "phonemes": "kɹˈɪsʧən"
+  },
+  {
+   "word": "chromaticity",
+   "phonemes": "kɹˌOmətˈɪsəTi"
+  },
+  {
+   "word": "chromosomal",
+   "phonemes": "kɹˌOməsˈOmᵊl"
+  },
+  {
+   "word": "churchy",
+   "phonemes": "ʧˈɜɹʧi"
+  },
+  {
+   "word": "civilised",
+   "phonemes": "sˈɪvəlˌIzd"
+  },
+  {
+   "word": "classless",
+   "phonemes": "klˈæsləs"
+  },
+  {
+   "word": "cloddishness",
+   "phonemes": "klˈɑdɪʃnɪs"
+  },
+  {
+   "word": "clubman",
+   "phonemes": "klˈʌbmən"
+  },
+  {
+   "word": "coatis",
+   "phonemes": "kOˈɑTiz"
+  },
+  {
+   "word": "cohune",
+   "phonemes": "kOhˈun"
+  },
+  {
+   "word": "coking",
+   "phonemes": "kˈOkɪŋ"
+  },
+  {
+   "word": "cold-work",
+   "phonemes": "kˈOldwˌɜɹk"
+  },
+  {
+   "word": "collaboration",
+   "phonemes": "kəlˌæbəɹˈAʃən"
+  },
+  {
+   "word": "coloma",
+   "phonemes": "kəlˈOmə"
+  },
+  {
+   "word": "comeback",
+   "phonemes": "kˈʌmbˌæk"
+  },
+  {
+   "word": "comfit",
+   "phonemes": "kˈʌmfət"
+  },
+  {
+   "word": "committal",
+   "phonemes": "kəmˈɪTᵊl"
+  },
+  {
+   "word": "commoditize",
+   "phonemes": "kəmˈɑdətˌIz"
+  },
+  {
+   "word": "compare",
+   "phonemes": "kəmpˈɛɹ"
+  },
+  {
+   "word": "compartmentalization",
+   "phonemes": "kəmpˌɑɹtmˌɛntələzˈAʃən"
+  },
+  {
+   "word": "concern",
+   "phonemes": "kənsˈɜɹn"
+  },
+  {
+   "word": "concession",
+   "phonemes": "kənsˈɛʃən"
+  },
+  {
+   "word": "confederates",
+   "phonemes": "kənfˈɛdəɹˌAts"
+  },
+  {
+   "word": "confining",
+   "phonemes": "kənfˈInɪŋ"
+  },
+  {
+   "word": "confiscation",
+   "phonemes": "kˌɑnfəskˈAʃən"
+  },
+  {
+   "word": "conjuncture",
+   "phonemes": "kənʤˈʌŋkʧəɹ"
+  },
+  {
+   "word": "consequently",
+   "phonemes": "kˈɑnsəkwəntli"
+  },
+  {
+   "word": "conservatism",
+   "phonemes": "kənsˈɜɹvəTɪzəm"
+  },
+  {
+   "word": "conservatory",
+   "phonemes": "kənsˈɜɹvətˌɔɹi"
+  },
+  {
+   "word": "consoled",
+   "phonemes": "kənsˈOld"
+  },
+  {
+   "word": "constrictive",
+   "phonemes": "kənstɹˈɪktɪv"
+  },
+  {
+   "word": "contentious",
+   "phonemes": "kəntˈɛnʧəs"
+  },
+  {
+   "word": "contraception",
+   "phonemes": "kˌɑntɹəsˈɛpʃən"
+  },
+  {
+   "word": "controllability",
+   "phonemes": "kəntɹˌOləbˈɪləTi"
+  },
+  {
+   "word": "contusion",
+   "phonemes": "kəntˈuʒən"
+  },
+  {
+   "word": "convenience",
+   "phonemes": "kənvˈinjəns"
+  },
+  {
+   "word": "cooperage",
+   "phonemes": "kˈupəɹɪʤ"
+  },
+  {
+   "word": "cope",
+   "phonemes": "kˈOp"
+  },
+  {
+   "word": "copulation",
+   "phonemes": "kˌɑpjəlˈAʃən"
+  },
+  {
+   "word": "coqui",
+   "phonemes": "kˈOki"
+  },
+  {
+   "word": "corpse",
+   "phonemes": "kˈɔɹps"
+  },
+  {
+   "word": "corticoid",
+   "phonemes": "kˈɔɹtəkˌYd"
+  },
+  {
+   "word": "cosmological",
+   "phonemes": "kˌɑzməlˈɑʤəkᵊl"
+  },
+  {
+   "word": "cote",
+   "phonemes": "kˈOt"
+  },
+  {
+   "word": "counterposition",
+   "phonemes": "kˌWntəɹpəzˈɪʃən"
+  },
+  {
+   "word": "coupla",
+   "phonemes": "kˈʌplə"
+  },
+  {
+   "word": "cousinly",
+   "phonemes": "kˈʌzᵊnli"
+  },
+  {
+   "word": "cowardice",
+   "phonemes": "kˈWəɹdəs"
+  },
+  {
+   "word": "cower",
+   "phonemes": "kˈWəɹ"
+  },
+  {
+   "word": "crassly",
+   "phonemes": "kɹˈæsli"
+  },
+  {
+   "word": "cremains",
+   "phonemes": "kɹəmˈAnz"
+  },
+  {
+   "word": "criollo",
+   "phonemes": "kɹiˈOlˌO"
+  },
+  {
+   "word": "crookneck",
+   "phonemes": "kɹˈʊknˌɛk"
+  },
+  {
+   "word": "crossfire",
+   "phonemes": "kɹˈɔsfˌIəɹ"
+  },
+  {
+   "word": "crosswind",
+   "phonemes": "kɹˈɔswˌɪnd"
+  },
+  {
+   "word": "crushable",
+   "phonemes": "kɹˈʌʃəbəl"
+  },
+  {
+   "word": "crybaby",
+   "phonemes": "kɹˈIbˌAbi"
+  },
+  {
+   "word": "cryptogram",
+   "phonemes": "kɹˈɪptəɡɹˌæm"
+  },
+  {
+   "word": "culmination",
+   "phonemes": "kˌʌlmənˈAʃən"
+  },
+  {
+   "word": "cupcakery",
+   "phonemes": "kˈʌpkˌAkəɹi"
+  },
+  {
+   "word": "curser",
+   "phonemes": "kˈɜɹsəɹ"
+  },
+  {
+   "word": "cutin",
+   "phonemes": "kjˈutᵊn"
+  },
+  {
+   "word": "cycliophora",
+   "phonemes": "sˌɪkliˈɑfəɹə"
+  },
+  {
+   "word": "cyclonically",
+   "phonemes": "sIklˈɑnəkᵊli"
+  },
+  {
+   "word": "cytopathic",
+   "phonemes": "sˌITəpˈæθɪk"
+  },
+  {
+   "word": "dacite",
+   "phonemes": "dˈAsˌIt"
+  },
+  {
+   "word": "dandong",
+   "phonemes": "dˌɑndˈʊŋ"
+  },
+  {
+   "word": "darnel",
+   "phonemes": "dˈɑɹnᵊl"
+  },
+  {
+   "word": "de-identification",
+   "phonemes": "dˌiIdˌɛntəfəkˈAʃən"
+  },
+  {
+   "word": "deathlessness",
+   "phonemes": "dˈɛθləsnəs"
+  },
+  {
+   "word": "decerebrate",
+   "phonemes": "dˌisˈɛɹəbɹˌAt"
+  },
+  {
+   "word": "dedicated",
+   "phonemes": "dˈɛdəkˌATᵻd"
+  },
+  {
+   "word": "dedicatee",
+   "phonemes": "dˌɛdəkAtˈi"
+  },
+  {
+   "word": "deem",
+   "phonemes": "dˈim"
+  },
+  {
+   "word": "defacement",
+   "phonemes": "dəfˈAsmənt"
+  },
+  {
+   "word": "defiler",
+   "phonemes": "dəfˈIləɹ"
+  },
+  {
+   "word": "definitionally",
+   "phonemes": "dˌɛfənˈɪʃᵊnəli"
+  },
+  {
+   "word": "dehydrogenase",
+   "phonemes": "dˌihˈIdɹəʤənAz"
+  },
+  {
+   "word": "delicacy",
+   "phonemes": "dˈɛləkəsi"
+  },
+  {
+   "word": "delish",
+   "phonemes": "dəlˈɪʃ"
+  },
+  {
+   "word": "denseness",
+   "phonemes": "dˈɛnsnəs"
+  },
+  {
+   "word": "deodorization",
+   "phonemes": "diˌOdəɹəzˈAʃən"
+  },
+  {
+   "word": "deontological",
+   "phonemes": "diˌɑntəlˈɑʤəkəl"
+  },
+  {
+   "word": "deputize",
+   "phonemes": "dˈɛpjətˌIz"
+  },
+  {
+   "word": "derbyshire",
+   "phonemes": "dˈɜɹbiʃˌɪɹ"
+  },
+  {
+   "word": "desist",
+   "phonemes": "dəsˈɪst"
+  },
+  {
+   "word": "detect",
+   "phonemes": "dətˈɛkt"
+  },
+  {
+   "word": "devastatingly",
+   "phonemes": "dˈɛvəstˌATɪŋli"
+  },
+  {
+   "word": "dhyana",
+   "phonemes": "diˈɑnə"
+  },
+  {
+   "word": "diablerie",
+   "phonemes": "diˈɑbləɹi"
+  },
+  {
+   "word": "diacritical",
+   "phonemes": "dˌIəkɹˈɪTəkᵊl"
+  },
+  {
+   "word": "diagram",
+   "phonemes": "dˈIəɡɹˌæm"
+  },
+  {
+   "word": "diatomaceous",
+   "phonemes": "dˌIəTəmˈAʃəs"
+  },
+  {
+   "word": "dielectric",
+   "phonemes": "dˌIəlˈɛktɹɪk"
+  },
+  {
+   "word": "dietetic",
+   "phonemes": "dˌIətˈɛTɪk"
+  },
+  {
+   "word": "diffusely",
+   "phonemes": "dəfjˈusli"
+  },
+  {
+   "word": "diffusion",
+   "phonemes": "dəfjˈuʒən"
+  },
+  {
+   "word": "digresser",
+   "phonemes": "dIɡɹˈɛsəɹ"
+  },
+  {
+   "word": "diplont",
+   "phonemes": "dˈɪplˌɑnt"
+  },
+  {
+   "word": "discomforting",
+   "phonemes": "dɪskˈʌmfəɹTɪŋ"
+  },
+  {
+   "word": "discord",
+   "phonemes": "dˈɪskˌɔɹd"
+  },
+  {
+   "word": "disgustingness",
+   "phonemes": "dəskˈʌstɪŋnɪs"
+  },
+  {
+   "word": "distasteful",
+   "phonemes": "dɪstˈAstfᵊl"
+  },
+  {
+   "word": "divemaster",
+   "phonemes": "dˈIvmˌæstəɹ"
+  },
+  {
+   "word": "divertingly",
+   "phonemes": "dəvˈɜɹTɪŋli"
+  },
+  {
+   "word": "dogs",
+   "phonemes": "dˈɔɡz"
+  },
+  {
+   "word": "dogs'",
+   "phonemes": "dˈɔɡz”"
+  },
+  {
+   "word": "dome-like",
+   "phonemes": "dˈOmlˌIk"
+  },
+  {
+   "word": "dortmund",
+   "phonemes": "dˈɔɹtmənd"
+  },
+  {
+   "word": "dreaded",
+   "phonemes": "dɹˈɛdᵻd"
+  },
+  {
+   "word": "drugging",
+   "phonemes": "dɹˈʌɡɪŋ"
+  },
+  {
+   "word": "drugstore",
+   "phonemes": "dɹˈʌɡstˌɔɹ"
+  },
+  {
+   "word": "dum",
+   "phonemes": "dˈʌm"
+  },
+  {
+   "word": "dumbstruck",
+   "phonemes": "dˈʌmstɹˌʌk"
+  },
+  {
+   "word": "dynamics",
+   "phonemes": "dInˈæmɪks"
+  },
+  {
+   "word": "dystonic",
+   "phonemes": "dɪstˈɑnɪk"
+  },
+  {
+   "word": "earache",
+   "phonemes": "ˈɪɹˌAk"
+  },
+  {
+   "word": "ecofeminism",
+   "phonemes": "ˌikOfˈɛmənˌɪzəm"
+  },
+  {
+   "word": "ectoplasm",
+   "phonemes": "ˈɛktəplˌæzəm"
+  },
+  {
+   "word": "ecus",
+   "phonemes": "Akjˈuz"
+  },
+  {
+   "word": "efferent",
+   "phonemes": "ˈɛfəɹənt"
+  },
+  {
+   "word": "egghead",
+   "phonemes": "ˈɛɡhˌɛd"
+  },
+  {
+   "word": "el-Uqsur",
+   "phonemes": "ɛlˈʊksˌʊɹ"
+  },
+  {
+   "word": "elegiacally",
+   "phonemes": "ˌɛləʤˈIəkᵊli"
+  },
+  {
+   "word": "eli",
+   "phonemes": "ˈilˌI"
+  },
+  {
+   "word": "elitist",
+   "phonemes": "əlˈiTɪst"
+  },
+  {
+   "word": "elongation",
+   "phonemes": "əlˌɔŋɡˈAʃən"
+  },
+  {
+   "word": "embryologic",
+   "phonemes": "ˌɛmbɹiəlˈɑʤɪk"
+  },
+  {
+   "word": "emmet",
+   "phonemes": "ˈɛmət"
+  },
+  {
+   "word": "emo",
+   "phonemes": "ˈimO"
+  },
+  {
+   "word": "emollience",
+   "phonemes": "əmˈɑljəns"
+  },
+  {
+   "word": "employable",
+   "phonemes": "ɪmplˈYəbᵊl"
+  },
+  {
+   "word": "enabled",
+   "phonemes": "ɪnˈAbᵊld"
+  },
+  {
+   "word": "encage",
+   "phonemes": "ɪnkˈAʤ"
+  },
+  {
+   "word": "encephalogram",
+   "phonemes": "ɪnsˈɛfələɡɹˌæm"
+  },
+  {
+   "word": "enchiridia",
+   "phonemes": "ˌɛŋkəɹˈɪdiə"
+  },
+  {
+   "word": "enjambed",
+   "phonemes": "ɛnʤˈæmd"
+  },
+  {
+   "word": "enlister",
+   "phonemes": "ɪnlˈɪstəɹ"
+  },
+  {
+   "word": "ensued",
+   "phonemes": "ɪnsˈud"
+  },
+  {
+   "word": "entertain",
+   "phonemes": "ˌɛntəɹtˈAn"
+  },
+  {
+   "word": "entrancingly",
+   "phonemes": "ɪntɹˈænsɪŋli"
+  },
+  {
+   "word": "entropion",
+   "phonemes": "ɛntɹˈOpiən"
+  },
+  {
+   "word": "ephesus",
+   "phonemes": "ˈɛfəsəs"
+  },
+  {
+   "word": "epicontinental",
+   "phonemes": "ˌɛpəkˌɑntənˈɛntəl"
+  },
+  {
+   "word": "epidiascope",
+   "phonemes": "ˌɛpədˈIəskˌOp"
+  },
+  {
+   "word": "epifauna",
+   "phonemes": "ˈɛpəfˌɔnə"
+  },
+  {
+   "word": "epigraphical",
+   "phonemes": "ˌɛpəɡɹˈæfəkəl"
+  },
+  {
+   "word": "equaliser",
+   "phonemes": "ˈikwəlˌIzəɹ"
+  },
+  {
+   "word": "error",
+   "phonemes": "ˈɛɹəɹ"
+  },
+  {
+   "word": "eskimo",
+   "phonemes": "ˈɛskəmˌO"
+  },
+  {
+   "word": "estancia",
+   "phonemes": "ɛstˈænsiə"
+  },
+  {
+   "word": "ethnicity",
+   "phonemes": "ɛθnˈɪsəTi"
+  },
+  {
+   "word": "ethnohistoric",
+   "phonemes": "ˌɛθnOhɪstˈɔɹɪk"
+  },
+  {
+   "word": "etrurian",
+   "phonemes": "ətɹˈʊɹiən"
+  },
+  {
+   "word": "evanescence",
+   "phonemes": "ˌɛvənˈɛsᵊns"
+  },
+  {
+   "word": "evocatively",
+   "phonemes": "əvˈɑkəTəvli"
+  },
+  {
+   "word": "examinable",
+   "phonemes": "ɪɡzˈæmənəbᵊl"
+  },
+  {
+   "word": "excessive",
+   "phonemes": "ɪksˈɛsɪv"
+  },
+  {
+   "word": "excommunicated",
+   "phonemes": "ˌɛkskəmjˈunəkˌATᵻd"
+  },
+  {
+   "word": "exemplary",
+   "phonemes": "ɪɡzˈɛmpləɹi"
+  },
+  {
+   "word": "exquisitely",
+   "phonemes": "ɛkskwˈɪzətli"
+  },
+  {
+   "word": "extraterrestrial",
+   "phonemes": "ˌɛkstɹətəɹˈɛstɹiəl"
+  },
+  {
+   "word": "eyebolt",
+   "phonemes": "ˈIbˌOlt"
+  },
+  {
+   "word": "faceprint",
+   "phonemes": "fˈAspɹˌɪnt"
+  },
+  {
+   "word": "fad",
+   "phonemes": "fˈæd"
+  },
+  {
+   "word": "fangless",
+   "phonemes": "fˈæŋləs"
+  },
+  {
+   "word": "farthing",
+   "phonemes": "fˈɑɹðɪŋ"
+  },
+  {
+   "word": "fatherlike",
+   "phonemes": "fˈɑðəɹlˌIk"
+  },
+  {
+   "word": "fatuity",
+   "phonemes": "fətˈuəTi"
+  },
+  {
+   "word": "felonious",
+   "phonemes": "fəlˈOniəs"
+  },
+  {
+   "word": "festal",
+   "phonemes": "fˈɛstᵊl"
+  },
+  {
+   "word": "festally",
+   "phonemes": "fˈɛstəli"
+  },
+  {
+   "word": "fiery",
+   "phonemes": "fˈIəɹi"
+  },
+  {
+   "word": "fire-eater",
+   "phonemes": "fˈIəɹˌiTəɹ"
+  },
+  {
+   "word": "fissility",
+   "phonemes": "fəsˈɪləTi"
+  },
+  {
+   "word": "fissiparous",
+   "phonemes": "fəsˈɪpəɹəs"
+  },
+  {
+   "word": "fjord",
+   "phonemes": "fiˈɔɹd"
+  },
+  {
+   "word": "flatness",
+   "phonemes": "flˈætnəs"
+  },
+  {
+   "word": "fleer",
+   "phonemes": "flˈɪɹ"
+  },
+  {
+   "word": "folklife",
+   "phonemes": "fˈOklˌIf"
+  },
+  {
+   "word": "fonda",
+   "phonemes": "fˈɑndə"
+  },
+  {
+   "word": "footbrake",
+   "phonemes": "fˈʊtbɹˌAk"
+  },
+  {
+   "word": "forbade",
+   "phonemes": "fəɹbˈæd"
+  },
+  {
+   "word": "forestay",
+   "phonemes": "fˈɔɹstˌA"
+  },
+  {
+   "word": "forester",
+   "phonemes": "fˈɔɹəstəɹ"
+  },
+  {
+   "word": "forge",
+   "phonemes": "fˈɔɹʤ"
+  },
+  {
+   "word": "formulable",
+   "phonemes": "fˈɔɹmjələbəl"
+  },
+  {
+   "word": "fortification",
+   "phonemes": "fˌɔɹTəfəkˈAʃən"
+  },
+  {
+   "word": "fragmentarily",
+   "phonemes": "fɹˌæɡməntˈɛɹəli"
+  },
+  {
+   "word": "frass",
+   "phonemes": "fɹˈæs"
+  },
+  {
+   "word": "frater",
+   "phonemes": "fɹˈATəɹ"
+  },
+  {
+   "word": "frightfulness",
+   "phonemes": "fɹˈItfəlnəs"
+  },
+  {
+   "word": "frizziness",
+   "phonemes": "fɹˈɪzinəs"
+  },
+  {
+   "word": "frolicsome",
+   "phonemes": "fɹˈɑləksəm"
+  },
+  {
+   "word": "frowstiest",
+   "phonemes": "fɹˈWstiᵻst"
+  },
+  {
+   "word": "fruitarianism",
+   "phonemes": "fɹˌutˈɛɹiənˌɪzəm"
+  },
+  {
+   "word": "fuckhead",
+   "phonemes": "fˈʌkhˌɛd"
+  },
+  {
+   "word": "galen",
+   "phonemes": "ɡˈAlən"
+  },
+  {
+   "word": "galvanize",
+   "phonemes": "ɡˈælvənˌIz"
+  },
+  {
+   "word": "gametic",
+   "phonemes": "ɡəmˈɛTɪk"
+  },
+  {
+   "word": "gamin",
+   "phonemes": "ɡˈæmən"
+  },
+  {
+   "word": "garb",
+   "phonemes": "ɡˈɑɹb"
+  },
+  {
+   "word": "gas-guzzling",
+   "phonemes": "ɡˈæsɡˌʌzᵊlɪŋ"
+  },
+  {
+   "word": "gavage",
+   "phonemes": "ɡəvˈɑʒ"
+  },
+  {
+   "word": "genomics",
+   "phonemes": "ʤənˈOmɪks"
+  },
+  {
+   "word": "geyser",
+   "phonemes": "ɡˈIzəɹ"
+  },
+  {
+   "word": "glade",
+   "phonemes": "ɡlˈAd"
+  },
+  {
+   "word": "glaucophane",
+   "phonemes": "ɡlˈɔkəfˌAn"
+  },
+  {
+   "word": "glazier",
+   "phonemes": "ɡlˈAʒəɹ"
+  },
+  {
+   "word": "glitzier",
+   "phonemes": "ɡlˈɪtsiəɹ"
+  },
+  {
+   "word": "glossarial",
+   "phonemes": "ɡlɔsˈɛɹiəl"
+  },
+  {
+   "word": "godavari",
+   "phonemes": "ɡədˈɑvəɹi"
+  },
+  {
+   "word": "goldfinch",
+   "phonemes": "ɡˈOldfˌɪnʧ"
+  },
+  {
+   "word": "gooiest",
+   "phonemes": "ɡˈuiᵻst"
+  },
+  {
+   "word": "goral",
+   "phonemes": "ɡˈOɹəl"
+  },
+  {
+   "word": "gorsy",
+   "phonemes": "ɡˈɔɹsi"
+  },
+  {
+   "word": "gotland",
+   "phonemes": "ɡˈɑtlænd"
+  },
+  {
+   "word": "gouramis",
+   "phonemes": "ɡəɹˈɑmiz"
+  },
+  {
+   "word": "goyish",
+   "phonemes": "ɡˈYɪʃ"
+  },
+  {
+   "word": "grammarian",
+   "phonemes": "ɡɹəmˈɛɹiən"
+  },
+  {
+   "word": "grave",
+   "phonemes": "ɡɹˈAv"
+  },
+  {
+   "word": "griminess",
+   "phonemes": "ɡɹˈIminəs"
+  },
+  {
+   "word": "grooviest",
+   "phonemes": "ɡɹˈuviᵻst"
+  },
+  {
+   "word": "grozny",
+   "phonemes": "ɡɹˈɔzni"
+  },
+  {
+   "word": "gulden",
+   "phonemes": "ɡˈuldən"
+  },
+  {
+   "word": "gutlessness",
+   "phonemes": "ɡˈʌtləsnəs"
+  },
+  {
+   "word": "hakodate",
+   "phonemes": "hˌɑkOdˈɑtA"
+  },
+  {
+   "word": "hamate",
+   "phonemes": "hˈAmAt"
+  },
+  {
+   "word": "hammerless",
+   "phonemes": "hˈæməɹləs"
+  },
+  {
+   "word": "hanoi",
+   "phonemes": "hɑnˈY"
+  },
+  {
+   "word": "happy",
+   "phonemes": "hˈæpi"
+  },
+  {
+   "word": "harpoon",
+   "phonemes": "hˌɑɹpˈun"
+  },
+  {
+   "word": "heliopolis",
+   "phonemes": "hˌiliˈɑpələs"
+  },
+  {
+   "word": "heliozoa",
+   "phonemes": "hˌiliəzˈOə"
+  },
+  {
+   "word": "hello",
+   "phonemes": "həlˈO"
+  },
+  {
+   "word": "hemipenis",
+   "phonemes": "hˈɛməpˌinəs"
+  },
+  {
+   "word": "herby",
+   "phonemes": "hˈɜɹbi"
+  },
+  {
+   "word": "heteroecious",
+   "phonemes": "hˌɛTəɹˈiʃəs"
+  },
+  {
+   "word": "heteropterous",
+   "phonemes": "hˌɛTəɹˈɑptəɹəs"
+  },
+  {
+   "word": "hexane",
+   "phonemes": "hˈɛksˌAn"
+  },
+  {
+   "word": "hibachi",
+   "phonemes": "həbˈɑʧi"
+  },
+  {
+   "word": "hibernation",
+   "phonemes": "hˌIbəɹnˈAʃən"
+  },
+  {
+   "word": "high-spirited",
+   "phonemes": "hˌIspˈɪɹəTᵻd"
+  },
+  {
+   "word": "high-ticket",
+   "phonemes": "hˌItˈɪkɪt"
+  },
+  {
+   "word": "hilsa",
+   "phonemes": "hˈɪlsə"
+  },
+  {
+   "word": "hinder",
+   "phonemes": "hˈɪndəɹ"
+  },
+  {
+   "word": "hipped",
+   "phonemes": "hˈɪpt"
+  },
+  {
+   "word": "hippiedom",
+   "phonemes": "hˈɪpidəm"
+  },
+  {
+   "word": "hogmanay",
+   "phonemes": "hˈɑɡmənˌA"
+  },
+  {
+   "word": "hoping",
+   "phonemes": "hˈOpɪŋ"
+  },
+  {
+   "word": "hormonally",
+   "phonemes": "hɔɹmˈOnəli"
+  },
+  {
+   "word": "houri",
+   "phonemes": "hˈuɹi"
+  },
+  {
+   "word": "hue",
+   "phonemes": "hjˈu"
+  },
+  {
+   "word": "humbler",
+   "phonemes": "hˈʌmbləɹ"
+  },
+  {
+   "word": "hussitism",
+   "phonemes": "hˈʌsˌITɪzəm"
+  },
+  {
+   "word": "hydroponically",
+   "phonemes": "hˌIdɹəpˈɑnɪkli"
+  },
+  {
+   "word": "hypnobirth",
+   "phonemes": "hˈɪpnObˌɜɹθ"
+  },
+  {
+   "word": "i",
+   "phonemes": "ˈI"
+  },
+  {
+   "word": "iPhone",
+   "phonemes": "ˈIfˌOn"
+  },
+  {
+   "word": "icky",
+   "phonemes": "ˈɪki"
+  },
+  {
+   "word": "idly",
+   "phonemes": "ˈIdli"
+  },
+  {
+   "word": "imbecile",
+   "phonemes": "ˈɪmbəsᵊl"
+  },
+  {
+   "word": "imitative",
+   "phonemes": "ˈɪmətˌATɪv"
+  },
+  {
+   "word": "impetrate",
+   "phonemes": "ˈɪmpətɹˌAt"
+  },
+  {
+   "word": "impressionist",
+   "phonemes": "ɪmpɹˈɛʃᵊnɪst"
+  },
+  {
+   "word": "inactive",
+   "phonemes": "ɪnˈæktɪv"
+  },
+  {
+   "word": "inauguration",
+   "phonemes": "ɪnˌɔɡjəɹˈAʃən"
+  },
+  {
+   "word": "incommodiousness",
+   "phonemes": "ˌɪnkəmˈOdiəsnəs"
+  },
+  {
+   "word": "incorruptibility",
+   "phonemes": "ˌɪnkəɹˌʌptəbˈɪləTi"
+  },
+  {
+   "word": "indivisible",
+   "phonemes": "ˌɪndəvˈɪzəbᵊl"
+  },
+  {
+   "word": "industriously",
+   "phonemes": "ɪndˈʌstɹiəsli"
+  },
+  {
+   "word": "inestimable",
+   "phonemes": "ɪnˈɛstəməbᵊl"
+  },
+  {
+   "word": "infect",
+   "phonemes": "ɪnfˈɛkt"
+  },
+  {
+   "word": "infelicity",
+   "phonemes": "ˌɪnfəlˈɪsəTi"
+  },
+  {
+   "word": "infolding",
+   "phonemes": "ˈɪnfˌOldɪŋ"
+  },
+  {
+   "word": "inhabitancy",
+   "phonemes": "ɪnhˈæbəTənsi"
+  },
+  {
+   "word": "inhabitant",
+   "phonemes": "ɪnhˈæbəTənt"
+  },
+  {
+   "word": "inhospitality",
+   "phonemes": "ɪnhˌɑspətˈæləTi"
+  },
+  {
+   "word": "innumerably",
+   "phonemes": "ɪnˈuməɹəbli"
+  },
+  {
+   "word": "inspire",
+   "phonemes": "ɪnspˈIəɹ"
+  },
+  {
+   "word": "intake",
+   "phonemes": "ˈɪntˌAk"
+  },
+  {
+   "word": "interdigital",
+   "phonemes": "ˌɪntəɹdˈɪʤəTᵊl"
+  },
+  {
+   "word": "interested",
+   "phonemes": "ˈɪntɹəstᵻd"
+  },
+  {
+   "word": "interlining",
+   "phonemes": "ˈɪntəɹlˌInɪŋ"
+  },
+  {
+   "word": "internecine",
+   "phonemes": "ˌɪntəɹnˈɛsˌin"
+  },
+  {
+   "word": "intinction",
+   "phonemes": "ɪntˈɪŋkʃən"
+  },
+  {
+   "word": "introductory",
+   "phonemes": "ˌɪntɹədˈʌktəɹi"
+  },
+  {
+   "word": "introspection",
+   "phonemes": "ˌɪntɹəspˈɛkʃən"
+  },
+  {
+   "word": "introspectively",
+   "phonemes": "ˌɪntɹəspˈɛktəvli"
+  },
+  {
+   "word": "intumescent",
+   "phonemes": "ˌɪntumˈɛsᵊnt"
+  },
+  {
+   "word": "invited",
+   "phonemes": "ɪnvˈITᵻd"
+  },
+  {
+   "word": "iquitos",
+   "phonemes": "ikˈitɔs"
+  },
+  {
+   "word": "irishness",
+   "phonemes": "ˈIɹɪʃnɪs"
+  },
+  {
+   "word": "irrepressibly",
+   "phonemes": "ˌɪɹɹəpɹˈɛsəbli"
+  },
+  {
+   "word": "isocheim",
+   "phonemes": "ˈIsəkˌIm"
+  },
+  {
+   "word": "isolate's",
+   "phonemes": "ˈIsələts"
+  },
+  {
+   "word": "issued",
+   "phonemes": "ˈɪʃjud"
+  },
+  {
+   "word": "italianize",
+   "phonemes": "ɪtˈæljənIz"
+  },
+  {
+   "word": "izmir",
+   "phonemes": "ɪzmˈɪɹ"
+  },
+  {
+   "word": "jargonized",
+   "phonemes": "ʤˈɑɹɡənˌIzd"
+  },
+  {
+   "word": "jaw",
+   "phonemes": "ʤˈɔ"
+  },
+  {
+   "word": "jelly",
+   "phonemes": "ʤˈɛli"
+  },
+  {
+   "word": "jesuitical",
+   "phonemes": "ʤˌɛzʊˈɪTəkᵊl"
+  },
+  {
+   "word": "jockey",
+   "phonemes": "ʤˈɑki"
+  },
+  {
+   "word": "josher",
+   "phonemes": "ʤˈɑʃəɹ"
+  },
+  {
+   "word": "jugum",
+   "phonemes": "ʤˈuɡəm"
+  },
+  {
+   "word": "juliet",
+   "phonemes": "ʤˌuliˈɛt"
+  },
+  {
+   "word": "junkerdom",
+   "phonemes": "jˈʊŋkəɹdəm"
+  },
+  {
+   "word": "kandyan",
+   "phonemes": "kˈændiən"
+  },
+  {
+   "word": "karaite",
+   "phonemes": "kˈɛɹəˌIt"
+  },
+  {
+   "word": "kaunas",
+   "phonemes": "kˈWnəs"
+  },
+  {
+   "word": "ketchikan",
+   "phonemes": "kˈɛʧɪkˌæn"
+  },
+  {
+   "word": "kickstand",
+   "phonemes": "kˈɪkstˌænd"
+  },
+  {
+   "word": "kidskin",
+   "phonemes": "kˈɪdskˌɪn"
+  },
+  {
+   "word": "klong",
+   "phonemes": "klˈɔŋ"
+  },
+  {
+   "word": "knightsbridge",
+   "phonemes": "nˈItsbɹˌɪʤ"
+  },
+  {
+   "word": "knockabout",
+   "phonemes": "nˈɑkəbˌWt"
+  },
+  {
+   "word": "known",
+   "phonemes": "nˈOn"
+  },
+  {
+   "word": "laboriously",
+   "phonemes": "ləbˈɔɹiəsli"
+  },
+  {
+   "word": "labourer",
+   "phonemes": "lˈAbəɹəɹ"
+  },
+  {
+   "word": "lachlan",
+   "phonemes": "lˈɑklən"
+  },
+  {
+   "word": "lahar",
+   "phonemes": "lˈɑhɑɹ"
+  },
+  {
+   "word": "lampless",
+   "phonemes": "lˈæmpləs"
+  },
+  {
+   "word": "landscapist",
+   "phonemes": "lˈændskApɪst"
+  },
+  {
+   "word": "lass",
+   "phonemes": "lˈæs"
+  },
+  {
+   "word": "latchet",
+   "phonemes": "lˈæʧət"
+  },
+  {
+   "word": "lawrentian",
+   "phonemes": "lˌɔɹˈɛnʃən"
+  },
+  {
+   "word": "leaflike",
+   "phonemes": "lˈiflˌIk"
+  },
+  {
+   "word": "legacy",
+   "phonemes": "lˈɛɡəsi"
+  },
+  {
+   "word": "leggier",
+   "phonemes": "lˈɛɡiəɹ"
+  },
+  {
+   "word": "leisurely",
+   "phonemes": "lˈiʒəɹli"
+  },
+  {
+   "word": "lemma",
+   "phonemes": "lˈɛmə"
+  },
+  {
+   "word": "leper",
+   "phonemes": "lˈɛpəɹ"
+  },
+  {
+   "word": "lewdly",
+   "phonemes": "lˈudli"
+  },
+  {
+   "word": "liberating",
+   "phonemes": "lˈɪbəɹˌATɪŋ"
+  },
+  {
+   "word": "lightless",
+   "phonemes": "lˈItləs"
+  },
+  {
+   "word": "limpidly",
+   "phonemes": "lˈɪmpədli"
+  },
+  {
+   "word": "linnaean",
+   "phonemes": "lɪnˈiən"
+  },
+  {
+   "word": "lizard",
+   "phonemes": "lˈɪzəɹd"
+  },
+  {
+   "word": "logarithmically",
+   "phonemes": "lˌɔɡəɹˈɪθmɪkᵊli"
+  },
+  {
+   "word": "longline",
+   "phonemes": "lˈɔŋlˌIn"
+  },
+  {
+   "word": "lovebird",
+   "phonemes": "lˈʌvbˌɜɹd"
+  },
+  {
+   "word": "lowlily",
+   "phonemes": "lˈOlɪli"
+  },
+  {
+   "word": "lucky",
+   "phonemes": "lˈʌki"
+  },
+  {
+   "word": "lyophilic",
+   "phonemes": "lˌIəfˈɪlɪk"
+  },
+  {
+   "word": "lyre",
+   "phonemes": "lˈIəɹ"
+  },
+  {
+   "word": "lysenkoism",
+   "phonemes": "lIsˈɛŋkOˌɪzəm"
+  },
+  {
+   "word": "macaronic",
+   "phonemes": "mˌækəɹˈɑnɪk"
+  },
+  {
+   "word": "mace",
+   "phonemes": "mˈAs"
+  },
+  {
+   "word": "macrocarpa",
+   "phonemes": "mˈækɹəkˌɑɹpə"
+  },
+  {
+   "word": "macrocephalic",
+   "phonemes": "mˌækɹOsəfˈælɪk"
+  },
+  {
+   "word": "madder",
+   "phonemes": "mˈædəɹ"
+  },
+  {
+   "word": "magnanimously",
+   "phonemes": "mæɡnˈænəməsli"
+  },
+  {
+   "word": "magnetise",
+   "phonemes": "mˈæɡnətˌIz"
+  },
+  {
+   "word": "magneto",
+   "phonemes": "mæɡnˈiTO"
+  },
+  {
+   "word": "magnetoresistance",
+   "phonemes": "mæɡnˈɛTOɹəzˌɪstəns"
+  },
+  {
+   "word": "mahayana",
+   "phonemes": "mˌɑhəjˈɑnə"
+  },
+  {
+   "word": "mahonia",
+   "phonemes": "məhˈOniə"
+  },
+  {
+   "word": "maintainer",
+   "phonemes": "mAntˈAnəɹ"
+  },
+  {
+   "word": "making",
+   "phonemes": "mˈAkɪŋ"
+  },
+  {
+   "word": "mandible",
+   "phonemes": "mˈændəbəl"
+  },
+  {
+   "word": "manitoban",
+   "phonemes": "mˌænətˈObən"
+  },
+  {
+   "word": "manpower",
+   "phonemes": "mˈænpˌWəɹ"
+  },
+  {
+   "word": "mantelletta",
+   "phonemes": "mˌæntəlˈɛTə"
+  },
+  {
+   "word": "manufacturer",
+   "phonemes": "mˌænjəfˈækʧəɹəɹ"
+  },
+  {
+   "word": "maribor",
+   "phonemes": "mˈɑɹəbˌɔɹ"
+  },
+  {
+   "word": "marmoset",
+   "phonemes": "mˈɑɹməsˌɛt"
+  },
+  {
+   "word": "massif",
+   "phonemes": "mæsˈif"
+  },
+  {
+   "word": "master",
+   "phonemes": "mˈæstəɹ"
+  },
+  {
+   "word": "matins",
+   "phonemes": "mˈætᵊnz"
+  },
+  {
+   "word": "maudlin",
+   "phonemes": "mˈɔdlᵊn"
+  },
+  {
+   "word": "mazer",
+   "phonemes": "mˈAzəɹ"
+  },
+  {
+   "word": "mediatory",
+   "phonemes": "mˈidiətˌɔɹi"
+  },
+  {
+   "word": "meditative",
+   "phonemes": "mˈɛdətˌATɪv"
+  },
+  {
+   "word": "megalodon",
+   "phonemes": "mˈɛɡələdˌɑn"
+  },
+  {
+   "word": "mentalist",
+   "phonemes": "mˈɛntəlɪst"
+  },
+  {
+   "word": "merlot",
+   "phonemes": "məɹlˈO"
+  },
+  {
+   "word": "meshwork",
+   "phonemes": "mˈɛʃwˌɜɹk"
+  },
+  {
+   "word": "metamorphism",
+   "phonemes": "mˌɛTəmˈɔɹfˌɪzəm"
+  },
+  {
+   "word": "metastases",
+   "phonemes": "mətˈæstəsiz"
+  },
+  {
+   "word": "microbiology",
+   "phonemes": "mˌIkɹObˌIˈɑləʤi"
+  },
+  {
+   "word": "microgram",
+   "phonemes": "mˈIkɹOɡɹˌæm"
+  },
+  {
+   "word": "micronutrient",
+   "phonemes": "mˌIkɹOnˈutɹiənt"
+  },
+  {
+   "word": "midinette",
+   "phonemes": "mˌɪdᵊnˈɛt"
+  },
+  {
+   "word": "midrash",
+   "phonemes": "mˈɪdɹˌɑʃ"
+  },
+  {
+   "word": "miesian",
+   "phonemes": "mˈiziən"
+  },
+  {
+   "word": "miniaturist",
+   "phonemes": "mˈɪniəʧˌʊɹɪst"
+  },
+  {
+   "word": "mirthless",
+   "phonemes": "mˈɜɹθləs"
+  },
+  {
+   "word": "misbehavior",
+   "phonemes": "mˌɪsbəhˈAvjəɹ"
+  },
+  {
+   "word": "mistress",
+   "phonemes": "mˈɪstɹəs"
+  },
+  {
+   "word": "miter",
+   "phonemes": "mˈITəɹ"
+  },
+  {
+   "word": "mocking",
+   "phonemes": "mˈɑkɪŋ"
+  },
+  {
+   "word": "monadnock",
+   "phonemes": "mənˈædnˌɑk"
+  },
+  {
+   "word": "monkishness",
+   "phonemes": "mˈʌŋkəʃnəs"
+  },
+  {
+   "word": "monochrome",
+   "phonemes": "mˈɑnəkɹˌOm"
+  },
+  {
+   "word": "monogyne",
+   "phonemes": "mˈɑnəʤˌIn"
+  },
+  {
+   "word": "mooc",
+   "phonemes": "mˈuk"
+  },
+  {
+   "word": "morbific",
+   "phonemes": "mɔɹbˈɪfɪk"
+  },
+  {
+   "word": "morphine",
+   "phonemes": "mˈɔɹfˌin"
+  },
+  {
+   "word": "mothball",
+   "phonemes": "mˈɔθbˌɔl"
+  },
+  {
+   "word": "moulding",
+   "phonemes": "mˈOldɪŋ"
+  },
+  {
+   "word": "mountainboarder",
+   "phonemes": "mˈWntᵊnbˌɔɹdəɹ"
+  },
+  {
+   "word": "mow",
+   "phonemes": "mˈO"
+  },
+  {
+   "word": "muleteer",
+   "phonemes": "mjˌulətˈɪɹ"
+  },
+  {
+   "word": "multidirectional",
+   "phonemes": "mˌʌltidəɹˈɛkʃᵊnəl"
+  },
+  {
+   "word": "multifetal",
+   "phonemes": "mˌʌltifˈitᵊl"
+  },
+  {
+   "word": "multilateralist",
+   "phonemes": "mˌʌltilˈæTəɹəlɪst"
+  },
+  {
+   "word": "multiracialist",
+   "phonemes": "mˌʌltiɹˈAʃəlɪst"
+  },
+  {
+   "word": "mundas",
+   "phonemes": "mˈʊndəz"
+  },
+  {
+   "word": "muskogee",
+   "phonemes": "məskˈOɡi"
+  },
+  {
+   "word": "mut",
+   "phonemes": "mˈut"
+  },
+  {
+   "word": "muttonbirding",
+   "phonemes": "mˈʌtnbˌɜɹdɪŋ"
+  },
+  {
+   "word": "nattily",
+   "phonemes": "nˈæTəli"
+  },
+  {
+   "word": "negligence",
+   "phonemes": "nˈɛɡləʤᵊns"
+  },
+  {
+   "word": "neper",
+   "phonemes": "nˈipəɹ"
+  },
+  {
+   "word": "nervelessness",
+   "phonemes": "nˈɜɹvləsnəs"
+  },
+  {
+   "word": "neurosis",
+   "phonemes": "nʊɹˈOsɪs"
+  },
+  {
+   "word": "nightlife",
+   "phonemes": "nˈItlˌIf"
+  },
+  {
+   "word": "ninthly",
+   "phonemes": "nˈInθli"
+  },
+  {
+   "word": "no-load",
+   "phonemes": "nˌOlˈOd"
+  },
+  {
+   "word": "non-net",
+   "phonemes": "nˌɑnnˈɛt"
+  },
+  {
+   "word": "nonentity",
+   "phonemes": "nɑnˈɛntəTi"
+  },
+  {
+   "word": "nonexistent",
+   "phonemes": "nˌɑnəɡzˈɪstᵊnt"
+  },
+  {
+   "word": "nonfat",
+   "phonemes": "nˌɑnfˈæt"
+  },
+  {
+   "word": "nonfiction",
+   "phonemes": "nɑnfˈɪkʃən"
+  },
+  {
+   "word": "nonlogically",
+   "phonemes": "nˌɑnlˈɑʤəkᵊli"
+  },
+  {
+   "word": "nonorganic",
+   "phonemes": "nˌɑnɔɹɡˈænɪk"
+  },
+  {
+   "word": "nostril",
+   "phonemes": "nˈɑstɹᵊl"
+  },
+  {
+   "word": "nullipara",
+   "phonemes": "nəlˈɪpəɹə"
+  },
+  {
+   "word": "nuncio",
+   "phonemes": "nˈʌnsiˌO"
+  },
+  {
+   "word": "oafishness",
+   "phonemes": "ˈOfəʃnəs"
+  },
+  {
+   "word": "objectivize",
+   "phonemes": "əbʤˈɛktəvˌIz"
+  },
+  {
+   "word": "observe",
+   "phonemes": "əbzˈɜɹv"
+  },
+  {
+   "word": "obstruct",
+   "phonemes": "əbstɹˈʌkt"
+  },
+  {
+   "word": "obstructor",
+   "phonemes": "əbstɹˈʌktəɹ"
+  },
+  {
+   "word": "occupation",
+   "phonemes": "ˌɑkjəpˈAʃən"
+  },
+  {
+   "word": "oesophagus",
+   "phonemes": "əsˈɑfəɡəs"
+  },
+  {
+   "word": "one-dimensional",
+   "phonemes": "wˌʌndəmˈɛnʃənᵊl"
+  },
+  {
+   "word": "ophthalmology",
+   "phonemes": "ˌɑpθəlmˈɑləʤi"
+  },
+  {
+   "word": "ophthalmoscope",
+   "phonemes": "ɑpθˈælməskˌOp"
+  },
+  {
+   "word": "orchestrion",
+   "phonemes": "ɔɹkˈɛstɹiən"
+  },
+  {
+   "word": "orients",
+   "phonemes": "ˈɔɹiənts"
+  },
+  {
+   "word": "oromo",
+   "phonemes": "ɔɹˈOmO"
+  },
+  {
+   "word": "orthopyroxene",
+   "phonemes": "ˌɔɹθOpˌIɹˈɑksˌin"
+  },
+  {
+   "word": "orthorhombic",
+   "phonemes": "ˌɔɹθOɹˈɑmbɪk"
+  },
+  {
+   "word": "oscillograph",
+   "phonemes": "əsˈɪləɡɹˌæf"
+  },
+  {
+   "word": "ottomans",
+   "phonemes": "ˈɑTəmənz"
+  },
+  {
+   "word": "outraise",
+   "phonemes": "ˌWtɹˈAz"
+  },
+  {
+   "word": "outstation",
+   "phonemes": "ˈWtstˌAʃən"
+  },
+  {
+   "word": "ovate",
+   "phonemes": "ˈOvˌAt"
+  },
+  {
+   "word": "overawe",
+   "phonemes": "ˌOvəɹˈɔ"
+  },
+  {
+   "word": "overgeneralization",
+   "phonemes": "ˌOvəɹʤˌɛnəɹələzˈAʃən"
+  },
+  {
+   "word": "overleaf",
+   "phonemes": "ˈOvəɹlˌif"
+  },
+  {
+   "word": "oversee",
+   "phonemes": "ˌOvəɹsˈi"
+  },
+  {
+   "word": "overstudied",
+   "phonemes": "ˌOvəɹstˈʌdid"
+  },
+  {
+   "word": "owlet-nightjar",
+   "phonemes": "ˌWlətnˈItʤˌɑɹ"
+  },
+  {
+   "word": "padang",
+   "phonemes": "pˈædæŋ"
+  },
+  {
+   "word": "padre",
+   "phonemes": "pˈɑdɹˌA"
+  },
+  {
+   "word": "palatal",
+   "phonemes": "pˈæləTᵊl"
+  },
+  {
+   "word": "panchakarma",
+   "phonemes": "pˈɑnʧəkˌɑɹmə"
+  },
+  {
+   "word": "pantograph",
+   "phonemes": "pˈæntOɡɹˌæf"
+  },
+  {
+   "word": "pappus",
+   "phonemes": "pˈæpəs"
+  },
+  {
+   "word": "paranthropus",
+   "phonemes": "pɛɹˈænθɹəpəs"
+  },
+  {
+   "word": "parasympathetic",
+   "phonemes": "pˌɛɹəsˌɪmpəθˈɛTɪk"
+  },
+  {
+   "word": "parred",
+   "phonemes": "pˈɑɹd"
+  },
+  {
+   "word": "parsec",
+   "phonemes": "pˈɑɹsˌɛk"
+  },
+  {
+   "word": "passeggiata",
+   "phonemes": "pˌɑsəʤˈɑTə"
+  },
+  {
+   "word": "pasteurize",
+   "phonemes": "pˈæsʧəɹˌIz"
+  },
+  {
+   "word": "pastoral",
+   "phonemes": "pˈæstəɹᵊl"
+  },
+  {
+   "word": "patcher",
+   "phonemes": "pˈæʧəɹ"
+  },
+  {
+   "word": "peaky",
+   "phonemes": "pˈiki"
+  },
+  {
+   "word": "pectoral",
+   "phonemes": "pˈɛktəɹəl"
+  },
+  {
+   "word": "pedalboard",
+   "phonemes": "pˈɛdᵊlbˌɔɹd"
+  },
+  {
+   "word": "pedophiliac",
+   "phonemes": "pˌidəfˈɪliˌæk"
+  },
+  {
+   "word": "penguin",
+   "phonemes": "pˈɛŋɡwᵊn"
+  },
+  {
+   "word": "penitentially",
+   "phonemes": "pˌɛnətˈɛnʧəli"
+  },
+  {
+   "word": "perceptually",
+   "phonemes": "pəɹsˈɛpʧəwəli"
+  },
+  {
+   "word": "pericope",
+   "phonemes": "pəɹˈɪkəpi"
+  },
+  {
+   "word": "perl",
+   "phonemes": "pˈɜɹl"
+  },
+  {
+   "word": "perseids",
+   "phonemes": "pˈɜɹsiədz"
+  },
+  {
+   "word": "pfui",
+   "phonemes": "pfˈui"
+  },
+  {
+   "word": "phasing",
+   "phonemes": "fˈAzɪŋ"
+  },
+  {
+   "word": "phenolic",
+   "phonemes": "fənˈɑlɪk"
+  },
+  {
+   "word": "phthisis",
+   "phonemes": "θˈIsɪs"
+  },
+  {
+   "word": "physics",
+   "phonemes": "fˈɪzɪks"
+  },
+  {
+   "word": "piaffe",
+   "phonemes": "piˈæf"
+  },
+  {
+   "word": "pipewort",
+   "phonemes": "pˈIpwˌɜɹt"
+  },
+  {
+   "word": "piratically",
+   "phonemes": "pIɹˈæTəkᵊli"
+  },
+  {
+   "word": "pit-a-pat",
+   "phonemes": "pˌɪTəpˈæt"
+  },
+  {
+   "word": "platonism",
+   "phonemes": "plˈAtᵊnˌɪzəm"
+  },
+  {
+   "word": "played",
+   "phonemes": "plˈAd"
+  },
+  {
+   "word": "pleasance",
+   "phonemes": "plˈɛzᵊns"
+  },
+  {
+   "word": "plebeian",
+   "phonemes": "pləbˈiən"
+  },
+  {
+   "word": "plenteous",
+   "phonemes": "plˈɛntiəs"
+  },
+  {
+   "word": "plexus",
+   "phonemes": "plˈɛksəs"
+  },
+  {
+   "word": "pochards",
+   "phonemes": "pˈOʧəɹdz"
+  },
+  {
+   "word": "pogo",
+   "phonemes": "pˈOɡO"
+  },
+  {
+   "word": "polarimeter",
+   "phonemes": "pˌOləɹˈɪməTəɹ"
+  },
+  {
+   "word": "poliomyelitis",
+   "phonemes": "pˌOliOmˌIəlˈITəs"
+  },
+  {
+   "word": "polluted",
+   "phonemes": "pəlˈuTᵻd"
+  },
+  {
+   "word": "polyculture",
+   "phonemes": "pˈɑlikˌʌlʧəɹ"
+  },
+  {
+   "word": "pomander",
+   "phonemes": "pOmˈændəɹ"
+  },
+  {
+   "word": "pony",
+   "phonemes": "pˈOni"
+  },
+  {
+   "word": "popemobile",
+   "phonemes": "pˈOpmObˌil"
+  },
+  {
+   "word": "popery",
+   "phonemes": "pˈOpəɹi"
+  },
+  {
+   "word": "porgy",
+   "phonemes": "pˈɔɹɡi"
+  },
+  {
+   "word": "pork",
+   "phonemes": "pˈɔɹk"
+  },
+  {
+   "word": "portolanos",
+   "phonemes": "pˌɔɹTᵊlˈɑnˌOz"
+  },
+  {
+   "word": "postface",
+   "phonemes": "pˈOstfAs"
+  },
+  {
+   "word": "postpone",
+   "phonemes": "pˌOstpˈOn"
+  },
+  {
+   "word": "prandial",
+   "phonemes": "pɹˈændiəl"
+  },
+  {
+   "word": "precipitance",
+   "phonemes": "pɹisˈɪpəTəns"
+  },
+  {
+   "word": "predestined",
+   "phonemes": "pɹidˈɛstᵊnd"
+  },
+  {
+   "word": "preemie",
+   "phonemes": "pɹˈimi"
+  },
+  {
+   "word": "prefixation",
+   "phonemes": "pɹˌifɪksˈAʃən"
+  },
+  {
+   "word": "premedical",
+   "phonemes": "pɹimˈɛdəkəl"
+  },
+  {
+   "word": "premenstrual",
+   "phonemes": "pɹimˈɛnztɹəwəl"
+  },
+  {
+   "word": "presbytery",
+   "phonemes": "pɹˈɛzbətˌɛɹi"
+  },
+  {
+   "word": "present",
+   "phonemes": "pɹˈɛzᵊnt"
+  },
+  {
+   "word": "pressingly",
+   "phonemes": "pɹˈɛsɪŋli"
+  },
+  {
+   "word": "presume",
+   "phonemes": "pɹizˈum"
+  },
+  {
+   "word": "pretextual",
+   "phonemes": "pɹitˈɛksʧəwəl"
+  },
+  {
+   "word": "primordiality",
+   "phonemes": "pɹˌImˌɔɹdiˈæləTi"
+  },
+  {
+   "word": "principality",
+   "phonemes": "pɹˌɪnsəpˈæləTi"
+  },
+  {
+   "word": "probity",
+   "phonemes": "pɹˈObəTi"
+  },
+  {
+   "word": "progressional",
+   "phonemes": "pɹəɡɹˈɛʃənᵊl"
+  },
+  {
+   "word": "pronaos",
+   "phonemes": "pɹOnˈAəs"
+  },
+  {
+   "word": "proportionally",
+   "phonemes": "pɹəpˈɔɹʃᵊnəli"
+  },
+  {
+   "word": "props",
+   "phonemes": "pɹˈɑps"
+  },
+  {
+   "word": "protagonist",
+   "phonemes": "pɹətˈæɡənɪst"
+  },
+  {
+   "word": "proverb",
+   "phonemes": "pɹˈɑvˌɜɹb"
+  },
+  {
+   "word": "puddingy",
+   "phonemes": "pˈʊdɪŋɡi"
+  },
+  {
+   "word": "purblind",
+   "phonemes": "pˈɜɹblˌInd"
+  },
+  {
+   "word": "purveyance",
+   "phonemes": "pəɹvˈAəns"
+  },
+  {
+   "word": "pyromania",
+   "phonemes": "pˌIɹOmˈAniə"
+  },
+  {
+   "word": "quake",
+   "phonemes": "kwˈAk"
+  },
+  {
+   "word": "quantifiable",
+   "phonemes": "kwˈɑntəfˌIəbᵊl"
+  },
+  {
+   "word": "quarrelsomeness",
+   "phonemes": "kwˈɔɹᵊlsəmnəs"
+  },
+  {
+   "word": "queasier",
+   "phonemes": "kwˈiziəɹ"
+  },
+  {
+   "word": "queenliest",
+   "phonemes": "kwˈinliᵻst"
+  },
+  {
+   "word": "quirkish",
+   "phonemes": "kwˈɜɹkɪʃ"
+  },
+  {
+   "word": "rabbit",
+   "phonemes": "ɹˈæbət"
+  },
+  {
+   "word": "racino",
+   "phonemes": "ɹəsˈinO"
+  },
+  {
+   "word": "rapeseed",
+   "phonemes": "ɹˈApsˌid"
+  },
+  {
+   "word": "read",
+   "phonemes": "ɹˈid"
+  },
+  {
+   "word": "rechristen",
+   "phonemes": "ɹikɹˈɪsᵊn"
+  },
+  {
+   "word": "recommend",
+   "phonemes": "ɹˌɛkəmˈɛnd"
+  },
+  {
+   "word": "reconnoitre",
+   "phonemes": "ɹˌɛkənˈYTəɹ"
+  },
+  {
+   "word": "record",
+   "phonemes": "ɹˈɛkəɹd"
+  },
+  {
+   "word": "recurved",
+   "phonemes": "ɹəkˈɜɹvd"
+  },
+  {
+   "word": "redface",
+   "phonemes": "ɹˈɛdfˌAs"
+  },
+  {
+   "word": "redirected",
+   "phonemes": "ɹˌidəɹˈɛktᵻd"
+  },
+  {
+   "word": "reformatted",
+   "phonemes": "ɹifˈɔɹmˌæTᵻd"
+  },
+  {
+   "word": "regard",
+   "phonemes": "ɹəɡˈɑɹd"
+  },
+  {
+   "word": "relocation",
+   "phonemes": "ɹˌilOkˈAʃən"
+  },
+  {
+   "word": "remakes",
+   "phonemes": "ɹimˈAks"
+  },
+  {
+   "word": "remex",
+   "phonemes": "ɹˈimˌɛks"
+  },
+  {
+   "word": "rendezvousing",
+   "phonemes": "ɹˈɑndəvˌuɪŋ"
+  },
+  {
+   "word": "rendova",
+   "phonemes": "ɹɛndˈOvə"
+  },
+  {
+   "word": "reparable",
+   "phonemes": "ɹˈɛpəɹəbᵊl"
+  },
+  {
+   "word": "replacer",
+   "phonemes": "ɹəplˈAsəɹ"
+  },
+  {
+   "word": "reportable",
+   "phonemes": "ɹəpˈɔɹTəbᵊl"
+  },
+  {
+   "word": "requite",
+   "phonemes": "ɹəkwˈIt"
+  },
+  {
+   "word": "reuben",
+   "phonemes": "ɹˈubən"
+  },
+  {
+   "word": "revamp",
+   "phonemes": "ɹˈivˌæmp"
+  },
+  {
+   "word": "revenant",
+   "phonemes": "ɹˈɛvənənt"
+  },
+  {
+   "word": "revisable",
+   "phonemes": "ɹəvˈIzəbᵊl"
+  },
+  {
+   "word": "rhyming",
+   "phonemes": "ɹˈImɪŋ"
+  },
+  {
+   "word": "ricksha",
+   "phonemes": "ɹˈɪkʃˌɔ"
+  },
+  {
+   "word": "rightism",
+   "phonemes": "ɹˈItˌɪzəm"
+  },
+  {
+   "word": "riptide",
+   "phonemes": "ɹˈɪptId"
+  },
+  {
+   "word": "ritziest",
+   "phonemes": "ɹˈɪtsiᵻst"
+  },
+  {
+   "word": "riyal",
+   "phonemes": "ɹijˈɔl"
+  },
+  {
+   "word": "roguishness",
+   "phonemes": "ɹˈOɡɪʃnəs"
+  },
+  {
+   "word": "roll-neck",
+   "phonemes": "ɹˈOlnˌɛk"
+  },
+  {
+   "word": "rosary",
+   "phonemes": "ɹˈOzəɹi"
+  },
+  {
+   "word": "roseola",
+   "phonemes": "ɹˌOziˈOlə"
+  },
+  {
+   "word": "rudist",
+   "phonemes": "ɹˈudɪst"
+  },
+  {
+   "word": "ruffianism",
+   "phonemes": "ɹˈʌfiənɪzəm"
+  },
+  {
+   "word": "rune",
+   "phonemes": "ɹˈun"
+  },
+  {
+   "word": "running",
+   "phonemes": "ɹˈʌnɪŋ"
+  },
+  {
+   "word": "russian",
+   "phonemes": "ɹˈʌʃən"
+  },
+  {
+   "word": "rusty",
+   "phonemes": "ɹˈʌsti"
+  },
+  {
+   "word": "sageness",
+   "phonemes": "sˈAʤnɪs"
+  },
+  {
+   "word": "saltillo",
+   "phonemes": "sˌɑltˈijO"
+  },
+  {
+   "word": "sam",
+   "phonemes": "sˈæm"
+  },
+  {
+   "word": "samos",
+   "phonemes": "sˈAmɔs"
+  },
+  {
+   "word": "sandbar",
+   "phonemes": "sˈændbˌɑɹ"
+  },
+  {
+   "word": "santorini",
+   "phonemes": "sˌæntəɹˈini"
+  },
+  {
+   "word": "sapping",
+   "phonemes": "sˈæpɪŋ"
+  },
+  {
+   "word": "sardine",
+   "phonemes": "sɑɹdˈin"
+  },
+  {
+   "word": "satirically",
+   "phonemes": "sətˈɪɹəkᵊli"
+  },
+  {
+   "word": "savoury",
+   "phonemes": "sˈAvəɹi"
+  },
+  {
+   "word": "sayer",
+   "phonemes": "sˈAəɹ"
+  },
+  {
+   "word": "scandalise",
+   "phonemes": "skˈændᵊlˌIz"
+  },
+  {
+   "word": "scantily",
+   "phonemes": "skˈæntəli"
+  },
+  {
+   "word": "scheherazade",
+   "phonemes": "ʃəhˌɛɹəzˈɑd"
+  },
+  {
+   "word": "scherzos",
+   "phonemes": "skˈɛɹtsOz"
+  },
+  {
+   "word": "schnook",
+   "phonemes": "ʃnˈʊk"
+  },
+  {
+   "word": "scott",
+   "phonemes": "skˈɑt"
+  },
+  {
+   "word": "seasonable",
+   "phonemes": "sˈizənəbᵊl"
+  },
+  {
+   "word": "seborrheic",
+   "phonemes": "sˌɛbəɹˈiɪk"
+  },
+  {
+   "word": "secretarial",
+   "phonemes": "sˌɛkɹətˈɛɹiəl"
+  },
+  {
+   "word": "sedentary",
+   "phonemes": "sˈɛdᵊntˌɛɹi"
+  },
+  {
+   "word": "selenodont",
+   "phonemes": "səlˈinədˌɑnt"
+  },
+  {
+   "word": "self-propagating",
+   "phonemes": "sˌɛlfpɹˈɑpəɡˌATɪŋ"
+  },
+  {
+   "word": "self-sow",
+   "phonemes": "sˌɛlfsˈO"
+  },
+  {
+   "word": "semiautobiographical",
+   "phonemes": "sˌɛmˌIˌɔTəbˌIəɡɹˈæfəkᵊl"
+  },
+  {
+   "word": "sempiternity",
+   "phonemes": "sˌɛmpətˈɜɹnəTi"
+  },
+  {
+   "word": "sent",
+   "phonemes": "sˈɛnt"
+  },
+  {
+   "word": "sepedi",
+   "phonemes": "səpˈɛdi"
+  },
+  {
+   "word": "sequela",
+   "phonemes": "sikwˈɛlə"
+  },
+  {
+   "word": "session",
+   "phonemes": "sˈɛʃən"
+  },
+  {
+   "word": "set-off",
+   "phonemes": "sˈɛTˌɔf"
+  },
+  {
+   "word": "sev",
+   "phonemes": "sˈAv"
+  },
+  {
+   "word": "shadoof",
+   "phonemes": "ʃədˈuf"
+  },
+  {
+   "word": "sheerlegs",
+   "phonemes": "ʃˈɪɹlˌɛɡz"
+  },
+  {
+   "word": "sheesh",
+   "phonemes": "ʃˈiʃ"
+  },
+  {
+   "word": "sheitel",
+   "phonemes": "ʃˈATᵊl"
+  },
+  {
+   "word": "shindig",
+   "phonemes": "ʃˈɪndˌɪɡ"
+  },
+  {
+   "word": "shitepoke",
+   "phonemes": "ʃˈItpˌOk"
+  },
+  {
+   "word": "shivaji",
+   "phonemes": "ʃˈɪvəʤi"
+  },
+  {
+   "word": "shoot-'em-up",
+   "phonemes": "ʃˈutˈɛmˌʌp"
+  },
+  {
+   "word": "showtime",
+   "phonemes": "ʃˈOtˌIm"
+  },
+  {
+   "word": "shredder",
+   "phonemes": "ʃɹˈɛdəɹ"
+  },
+  {
+   "word": "shunter",
+   "phonemes": "ʃˈʌntəɹ"
+  },
+  {
+   "word": "siberia",
+   "phonemes": "sIbˈɪɹiə"
+  },
+  {
+   "word": "signage",
+   "phonemes": "sˈInɪʤ"
+  },
+  {
+   "word": "sikhism",
+   "phonemes": "sˈikˌɪzəm"
+  },
+  {
+   "word": "silliest",
+   "phonemes": "sˈɪliᵻst"
+  },
+  {
+   "word": "sinistrality",
+   "phonemes": "sˌɪnəstɹˈæləTi"
+  },
+  {
+   "word": "sipuncula",
+   "phonemes": "sˌIpˈʌŋkjələ"
+  },
+  {
+   "word": "sipunculid",
+   "phonemes": "sIpˈʌŋkjələd"
+  },
+  {
+   "word": "sitar",
+   "phonemes": "sətˈɑɹ"
+  },
+  {
+   "word": "skinniness",
+   "phonemes": "skˈɪninəs"
+  },
+  {
+   "word": "skinning",
+   "phonemes": "skˈɪnɪŋ"
+  },
+  {
+   "word": "slide",
+   "phonemes": "slˈId"
+  },
+  {
+   "word": "slipway",
+   "phonemes": "slˈɪpwˌA"
+  },
+  {
+   "word": "slope",
+   "phonemes": "slˈOp"
+  },
+  {
+   "word": "slugged",
+   "phonemes": "slˈʌɡd"
+  },
+  {
+   "word": "slype",
+   "phonemes": "slˈIp"
+  },
+  {
+   "word": "snackable",
+   "phonemes": "snˈækəbəl"
+  },
+  {
+   "word": "sneezy",
+   "phonemes": "snˈizi"
+  },
+  {
+   "word": "snouted",
+   "phonemes": "snˈWTᵻd"
+  },
+  {
+   "word": "socioecology",
+   "phonemes": "sˌOsiOikˈɑləʤi"
+  },
+  {
+   "word": "solidify",
+   "phonemes": "səlˈɪdəfˌI"
+  },
+  {
+   "word": "son",
+   "phonemes": "sˈʌn"
+  },
+  {
+   "word": "sonofabitch",
+   "phonemes": "sˈʌnəvəbˌɪʧ"
+  },
+  {
+   "word": "sophism",
+   "phonemes": "sˈɑfˌɪzəm"
+  },
+  {
+   "word": "sourpuss",
+   "phonemes": "sˈWəɹpˌʊs"
+  },
+  {
+   "word": "southerly",
+   "phonemes": "sˈʌðəɹli"
+  },
+  {
+   "word": "spacier",
+   "phonemes": "spˈAsiəɹ"
+  },
+  {
+   "word": "speculum",
+   "phonemes": "spˈʌkjələm"
+  },
+  {
+   "word": "speedrunner",
+   "phonemes": "spˈidɹˌʌnəɹ"
+  },
+  {
+   "word": "spermatic",
+   "phonemes": "spəɹmˈæTɪk"
+  },
+  {
+   "word": "spermatogonia",
+   "phonemes": "spˌɜɹmæTəɡˈOniə"
+  },
+  {
+   "word": "splay-footed",
+   "phonemes": "splˌAfˈʊTᵻd"
+  },
+  {
+   "word": "spleenful",
+   "phonemes": "splˈinfᵊl"
+  },
+  {
+   "word": "sponger",
+   "phonemes": "spˈʌnʤəɹ"
+  },
+  {
+   "word": "sportsman",
+   "phonemes": "spˈɔɹtsmən"
+  },
+  {
+   "word": "springfield",
+   "phonemes": "spɹˈɪŋfˌild"
+  },
+  {
+   "word": "squirmer",
+   "phonemes": "skwˈɜɹməɹ"
+  },
+  {
+   "word": "stabilisation",
+   "phonemes": "stˌAbələzˈAʃən"
+  },
+  {
+   "word": "statice",
+   "phonemes": "stˈæTəsi"
+  },
+  {
+   "word": "steamily",
+   "phonemes": "stˈimɪli"
+  },
+  {
+   "word": "stipe",
+   "phonemes": "stˈIp"
+  },
+  {
+   "word": "stock-in-trade",
+   "phonemes": "stˌɑkəntɹˈAd"
+  },
+  {
+   "word": "stot",
+   "phonemes": "stˈɑt"
+  },
+  {
+   "word": "stove",
+   "phonemes": "stˈOv"
+  },
+  {
+   "word": "stratovolcano",
+   "phonemes": "stɹˌæTOvˌɑlkˈAnO"
+  },
+  {
+   "word": "strauss",
+   "phonemes": "stɹˈWs"
+  },
+  {
+   "word": "streamlet",
+   "phonemes": "stɹˈimlət"
+  },
+  {
+   "word": "stressful",
+   "phonemes": "stɹˈɛsfᵊl"
+  },
+  {
+   "word": "subcontract",
+   "phonemes": "sˌʌbkˈɑntɹˌækt"
+  },
+  {
+   "word": "subcontrary",
+   "phonemes": "sˌʌbkˈɑntɹˌɛɹi"
+  },
+  {
+   "word": "subornation",
+   "phonemes": "sˌʌbɔɹnˈAʃən"
+  },
+  {
+   "word": "subrogate",
+   "phonemes": "sˈʌbɹəɡˌAt"
+  },
+  {
+   "word": "subtitle",
+   "phonemes": "sˈʌbtˌITᵊl"
+  },
+  {
+   "word": "sukiyaki",
+   "phonemes": "sˌukijˈɑki"
+  },
+  {
+   "word": "sullage",
+   "phonemes": "sˈʌlɪʤ"
+  },
+  {
+   "word": "sumac",
+   "phonemes": "sˈumˌæk"
+  },
+  {
+   "word": "superimposed",
+   "phonemes": "sˌupəɹəmpˈOzd"
+  },
+  {
+   "word": "supernaturalist",
+   "phonemes": "sˌupəɹnˈæʧəɹəlɪst"
+  },
+  {
+   "word": "surfy",
+   "phonemes": "sˈɜɹfi"
+  },
+  {
+   "word": "svalbard",
+   "phonemes": "svˈɑlbɑɹd"
+  },
+  {
+   "word": "swabia",
+   "phonemes": "swˈAbiə"
+  },
+  {
+   "word": "sweaty",
+   "phonemes": "swˈɛTi"
+  },
+  {
+   "word": "symbol",
+   "phonemes": "sˈɪmbᵊl"
+  },
+  {
+   "word": "symphyses",
+   "phonemes": "sˈɪmfəsˌiz"
+  },
+  {
+   "word": "symptomize",
+   "phonemes": "sˈɪmptəmˌIz"
+  },
+  {
+   "word": "syphon",
+   "phonemes": "sˈIfən"
+  },
+  {
+   "word": "tajik",
+   "phonemes": "tɑʤˈɪk"
+  },
+  {
+   "word": "talaq",
+   "phonemes": "tælˈɑk"
+  },
+  {
+   "word": "talent",
+   "phonemes": "tˈælənt"
+  },
+  {
+   "word": "talismanic",
+   "phonemes": "tˌæləzmˈænɪk"
+  },
+  {
+   "word": "talkie",
+   "phonemes": "tˈɔki"
+  },
+  {
+   "word": "tanistry",
+   "phonemes": "tˈænəstɹi"
+  },
+  {
+   "word": "tankless",
+   "phonemes": "tˈæŋkləs"
+  },
+  {
+   "word": "tarrasa",
+   "phonemes": "təɹˈɑsə"
+  },
+  {
+   "word": "tartlet",
+   "phonemes": "tˈɑɹtlət"
+  },
+  {
+   "word": "tautologous",
+   "phonemes": "tɔtˈɑləɡəs"
+  },
+  {
+   "word": "taxidermy",
+   "phonemes": "tˈæksədˌɜɹmi"
+  },
+  {
+   "word": "teak",
+   "phonemes": "tˈik"
+  },
+  {
+   "word": "technologized",
+   "phonemes": "tɛknˈɑləʤˌIzd"
+  },
+  {
+   "word": "telegraphy",
+   "phonemes": "təlˈɛɡɹəfi"
+  },
+  {
+   "word": "temerarious",
+   "phonemes": "tˌɛməɹˈɛɹiəs"
+  },
+  {
+   "word": "temporary",
+   "phonemes": "tˈɛmpəɹˌɛɹi"
+  },
+  {
+   "word": "tetchily",
+   "phonemes": "tˈɛʧəli"
+  },
+  {
+   "word": "thaler",
+   "phonemes": "tˈɑləɹ"
+  },
+  {
+   "word": "the",
+   "phonemes": "ðə"
+  },
+  {
+   "word": "therian",
+   "phonemes": "θˈɪɹiən"
+  },
+  {
+   "word": "thermite",
+   "phonemes": "θˈɜɹmˌIt"
+  },
+  {
+   "word": "thermoelectrically",
+   "phonemes": "θˌɜɹmOəlˈɛktɹəkᵊli"
+  },
+  {
+   "word": "thermometrical",
+   "phonemes": "θˌɜɹməmˈɛtɹəkəl"
+  },
+  {
+   "word": "thermoplastic",
+   "phonemes": "θˌɜɹmOplˈæstɪk"
+  },
+  {
+   "word": "thermoset",
+   "phonemes": "θˈɜɹmOsˌɛt"
+  },
+  {
+   "word": "third-rate",
+   "phonemes": "θˌɜɹdɹˈAt"
+  },
+  {
+   "word": "throated",
+   "phonemes": "θɹˈOTᵻd"
+  },
+  {
+   "word": "tidally",
+   "phonemes": "tˈIdᵊli"
+  },
+  {
+   "word": "tideless",
+   "phonemes": "tˈIdləs"
+  },
+  {
+   "word": "tillering",
+   "phonemes": "tˈɪləɹɪŋ"
+  },
+  {
+   "word": "timbal",
+   "phonemes": "tˈɪmbᵊl"
+  },
+  {
+   "word": "tinpot",
+   "phonemes": "tˈɪnpˌɑt"
+  },
+  {
+   "word": "tired",
+   "phonemes": "tˈIəɹd"
+  },
+  {
+   "word": "tool",
+   "phonemes": "tˈul"
+  },
+  {
+   "word": "toothier",
+   "phonemes": "tˈuθiəɹ"
+  },
+  {
+   "word": "topmost",
+   "phonemes": "tˈɑpmˌOst"
+  },
+  {
+   "word": "torrential",
+   "phonemes": "tɔɹˈɛnʧᵊl"
+  },
+  {
+   "word": "touch-up",
+   "phonemes": "tˈʌʧəp"
+  },
+  {
+   "word": "townhome",
+   "phonemes": "tˈWnhˌOm"
+  },
+  {
+   "word": "transferable",
+   "phonemes": "tɹænsfˈɜɹəbᵊl"
+  },
+  {
+   "word": "transparently",
+   "phonemes": "tɹænspˈɛɹəntli"
+  },
+  {
+   "word": "trichomoniasis",
+   "phonemes": "tɹˌɪkəmənˈIəsɪs"
+  },
+  {
+   "word": "trickier",
+   "phonemes": "tɹˈɪkiəɹ"
+  },
+  {
+   "word": "triclinic",
+   "phonemes": "tɹIklˈɪnɪk"
+  },
+  {
+   "word": "trinitrotoluene",
+   "phonemes": "tɹˌInˌItɹOtˈɑljuˌin"
+  },
+  {
+   "word": "trivial",
+   "phonemes": "tɹˈɪviəl"
+  },
+  {
+   "word": "trivially",
+   "phonemes": "tɹˈɪviəli"
+  },
+  {
+   "word": "truest",
+   "phonemes": "tɹˈuᵻst"
+  },
+  {
+   "word": "tupi",
+   "phonemes": "tˈupˌi"
+  },
+  {
+   "word": "turbidity",
+   "phonemes": "təɹbˈɪdəTi"
+  },
+  {
+   "word": "turku",
+   "phonemes": "tˈʊɹkˌu"
+  },
+  {
+   "word": "tux",
+   "phonemes": "tˈʌks"
+  },
+  {
+   "word": "twistor",
+   "phonemes": "twˈɪstəɹ"
+  },
+  {
+   "word": "tyrannise",
+   "phonemes": "tˈɪɹənˌIz"
+  },
+  {
+   "word": "ulcered",
+   "phonemes": "ˈʌlsəɹd"
+  },
+  {
+   "word": "unaccountability",
+   "phonemes": "ˌʌnəkˌWntəbˈɪləTi"
+  },
+  {
+   "word": "unbeaten",
+   "phonemes": "ˌʌnbˈitn"
+  },
+  {
+   "word": "unbridgeable",
+   "phonemes": "ˌʌnbɹˈɪʤəbᵊl"
+  },
+  {
+   "word": "unbridled",
+   "phonemes": "ˌʌnbɹˈIdᵊld"
+  },
+  {
+   "word": "unconditionally",
+   "phonemes": "ˌʌnkəndˈɪʃᵊnəli"
+  },
+  {
+   "word": "uncoordinated",
+   "phonemes": "ˌʌnkOˈɔɹdənˌATᵻd"
+  },
+  {
+   "word": "undecidability",
+   "phonemes": "ˌʌndəsˌIdəbˈɪləTi"
+  },
+  {
+   "word": "undefined",
+   "phonemes": "ˌʌndəfˈInd"
+  },
+  {
+   "word": "underdone",
+   "phonemes": "ˌʌndəɹdˈʌn"
+  },
+  {
+   "word": "underglaze",
+   "phonemes": "ˈʌndəɹɡlˌAz"
+  },
+  {
+   "word": "undernutrition",
+   "phonemes": "ˌʌndəɹnˌutɹˈɪʃən"
+  },
+  {
+   "word": "understandable",
+   "phonemes": "ˌʌndəɹstˈændəbᵊl"
+  },
+  {
+   "word": "undine",
+   "phonemes": "ˈʌndˌin"
+  },
+  {
+   "word": "unequalled",
+   "phonemes": "ˌʌnˈikwəld"
+  },
+  {
+   "word": "unequally",
+   "phonemes": "ˌʌnˈikwəli"
+  },
+  {
+   "word": "unfairly",
+   "phonemes": "ˌʌnfˈɛɹli"
+  },
+  {
+   "word": "unfashioned",
+   "phonemes": "ˌʌnfˈæʃənd"
+  },
+  {
+   "word": "unguiculate",
+   "phonemes": "ˌʌnɡwˈɪkjəlˌAt"
+  },
+  {
+   "word": "unhasp",
+   "phonemes": "ˌʌnhˈæsp"
+  },
+  {
+   "word": "unheeded",
+   "phonemes": "ˌʌnhˈidᵻd"
+  },
+  {
+   "word": "unidirectional",
+   "phonemes": "jˌunədəɹˈɛkʃᵊnəl"
+  },
+  {
+   "word": "uninitiated",
+   "phonemes": "ˌʌnənˈɪʃiˌATᵻd"
+  },
+  {
+   "word": "unless",
+   "phonemes": "ənlˈɛs"
+  },
+  {
+   "word": "unmeaningly",
+   "phonemes": "ˌʌnmˈinɪŋli"
+  },
+  {
+   "word": "unoriginality",
+   "phonemes": "ˌʌnəɹˌɪʤənˈæləTi"
+  },
+  {
+   "word": "unrighteously",
+   "phonemes": "ˌʌnɹˈIʧəsli"
+  },
+  {
+   "word": "unspeakableness",
+   "phonemes": "ˌʌnspˈikəbəlnəs"
+  },
+  {
+   "word": "unspecified",
+   "phonemes": "ˌʌnspˈɛsəfˌId"
+  },
+  {
+   "word": "unstrung",
+   "phonemes": "ˌʌnstɹˈʌŋ"
+  },
+  {
+   "word": "unsustainable",
+   "phonemes": "ˌʌnsəstˈAnəbᵊl"
+  },
+  {
+   "word": "unwary",
+   "phonemes": "ˌʌnwˈɛɹi"
+  },
+  {
+   "word": "update",
+   "phonemes": "ˈʌpdˌAt"
+  },
+  {
+   "word": "upturns",
+   "phonemes": "ˈʌptˌɜɹnz"
+  },
+  {
+   "word": "urease",
+   "phonemes": "jˈʊɹiAz"
+  },
+  {
+   "word": "vajrayana",
+   "phonemes": "vˌɑʤɹəjˈɑnə"
+  },
+  {
+   "word": "valid",
+   "phonemes": "vˈælɪd"
+  },
+  {
+   "word": "valuable",
+   "phonemes": "vˈæljəwəbᵊl"
+  },
+  {
+   "word": "vandalise",
+   "phonemes": "vˈændᵊlˌIz"
+  },
+  {
+   "word": "varnish",
+   "phonemes": "vˈɑɹnɪʃ"
+  },
+  {
+   "word": "varus",
+   "phonemes": "vˈɛɹəs"
+  },
+  {
+   "word": "vegetated",
+   "phonemes": "vˈɛʤətˌATᵻd"
+  },
+  {
+   "word": "vehemently",
+   "phonemes": "vˈiəməntli"
+  },
+  {
+   "word": "verbalism",
+   "phonemes": "vˈɜɹbəlˌɪzəm"
+  },
+  {
+   "word": "verditer",
+   "phonemes": "vˈɜɹdəTəɹ"
+  },
+  {
+   "word": "vexillologist",
+   "phonemes": "vˌɛksəlˈɑləʤɪst"
+  },
+  {
+   "word": "virility",
+   "phonemes": "vəɹˈɪləTi"
+  },
+  {
+   "word": "vishnu",
+   "phonemes": "vˈɪʃnu"
+  },
+  {
+   "word": "visible",
+   "phonemes": "vˈɪzəbᵊl"
+  },
+  {
+   "word": "vitaminized",
+   "phonemes": "vˈITəmənˌIzd"
+  },
+  {
+   "word": "vizierial",
+   "phonemes": "vəzˈɪɹiəl"
+  },
+  {
+   "word": "vocalism",
+   "phonemes": "vˈOkəlˌɪzəm"
+  },
+  {
+   "word": "volatility",
+   "phonemes": "vˌɑlətˈɪləTi"
+  },
+  {
+   "word": "vom",
+   "phonemes": "vˈɑm"
+  },
+  {
+   "word": "voteless",
+   "phonemes": "vˈOtləs"
+  },
+  {
+   "word": "wOBA",
+   "phonemes": "wˈObə"
+  },
+  {
+   "word": "wadded",
+   "phonemes": "wˈɑdᵻd"
+  },
+  {
+   "word": "walked",
+   "phonemes": "wˈɔkt"
+  },
+  {
+   "word": "walkout",
+   "phonemes": "wˈɔkˌWt"
+  },
+  {
+   "word": "walloon",
+   "phonemes": "wɑlˈun"
+  },
+  {
+   "word": "wanted",
+   "phonemes": "wˈɑntᵻd"
+  },
+  {
+   "word": "warmly",
+   "phonemes": "wˈɔɹmli"
+  },
+  {
+   "word": "watches",
+   "phonemes": "wˈɑʧᵻz"
+  },
+  {
+   "word": "waterlog",
+   "phonemes": "wˈɔTəɹlˌɔɡ"
+  },
+  {
+   "word": "wed",
+   "phonemes": "wˈɛd"
+  },
+  {
+   "word": "well-known",
+   "phonemes": "wˌɛlnˈOn"
+  },
+  {
+   "word": "westwood",
+   "phonemes": "wˈɛstwʊd"
+  },
+  {
+   "word": "whacking",
+   "phonemes": "wˈækɪŋ"
+  },
+  {
+   "word": "whatsherface",
+   "phonemes": "wˈʌtsəɹfˌAs"
+  },
+  {
+   "word": "white-collar",
+   "phonemes": "wˈItkˌɑləɹ"
+  },
+  {
+   "word": "whiteboard",
+   "phonemes": "wˈItbˌɔɹd"
+  },
+  {
+   "word": "whoonga",
+   "phonemes": "wˈʊŋɡə"
+  },
+  {
+   "word": "wildfowl",
+   "phonemes": "wˈIldfˌWl"
+  },
+  {
+   "word": "wind",
+   "phonemes": "wˈɪnd"
+  },
+  {
+   "word": "wirier",
+   "phonemes": "wˈIɹiəɹ"
+  },
+  {
+   "word": "wisent",
+   "phonemes": "vˈizɛnt"
+  },
+  {
+   "word": "womxn",
+   "phonemes": "wˈʊmən"
+  },
+  {
+   "word": "wool",
+   "phonemes": "wˈʊl"
+  },
+  {
+   "word": "wooster",
+   "phonemes": "wˈʊstəɹ"
+  },
+  {
+   "word": "world",
+   "phonemes": "wˈɜɹld"
+  },
+  {
+   "word": "writ",
+   "phonemes": "ɹˈɪt"
+  },
+  {
+   "word": "wry",
+   "phonemes": "ɹˈI"
+  },
+  {
+   "word": "wye",
+   "phonemes": "wˈI"
+  },
+  {
+   "word": "yip",
+   "phonemes": "jˈɪp"
+  },
+  {
+   "word": "yishuv",
+   "phonemes": "jɪʃˈuv"
+  },
+  {
+   "word": "you-all",
+   "phonemes": "ju—ˈɔl"
+  },
+  {
+   "word": "yuppiedom",
+   "phonemes": "jˈʌpidˌɔm"
+  },
+  {
+   "word": "zayin",
+   "phonemes": "zˈɑjɪn"
+  },
+  {
+   "word": "zoo",
+   "phonemes": "zˈu"
+  }
+ ]
+}
