@@ -3,6 +3,7 @@
 //! No D-Bus, no tray, no UI -- those are M2-M4. This exists to prove the
 //! engine, the real synthesizer and the real audio sink work together.
 
+mod dbus;
 mod kokoro_synth;
 mod resample;
 mod ring;

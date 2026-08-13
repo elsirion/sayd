@@ -8,11 +8,6 @@
 //!
 //! These calls open their own short-lived Wayland connection and block, so
 //! callers on an async runtime must run them on a blocking thread.
-//!
-//! Nothing in `main` calls this yet -- the D-Bus interface and the `say`
-//! CLI that will invoke `read` land in later tasks. Until then the compiler
-//! sees an unreached public API in a binary crate, hence the blanket allow
-//! below; remove it once a caller exists.
 
 use std::fmt;
 use std::io::Read;
@@ -20,7 +15,6 @@ use std::io::Read;
 use wl_clipboard_rs::paste::{get_contents, ClipboardType, Error, MimeType, Seat};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum Source {
     /// The mouse-selection buffer. Set by simply selecting text.
     Primary,
@@ -45,7 +39,6 @@ impl fmt::Display for Source {
 /// The cut is lossy at byte boundaries: if a multi-byte UTF-8 character
 /// straddles the limit, it is replaced with U+FFFD (replacement character).
 /// Invalid UTF-8 elsewhere in the selection is also replaced lossily.
-#[allow(dead_code)]
 const MAX_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Convert raw bytes to a String, replacing invalid UTF-8 sequences lossily.
@@ -53,10 +46,6 @@ fn bytes_to_string(bytes: Vec<u8>) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
-/// Nothing in `main` calls this yet -- the D-Bus interface and the `say`
-/// CLI that will invoke `read` land in later tasks. Until then the compiler
-/// sees an unreached public API in a binary crate; remove once a caller exists.
-#[allow(dead_code)]
 pub fn read(source: Source) -> Result<String, String> {
     let clipboard = match source {
         Source::Primary => ClipboardType::Primary,
