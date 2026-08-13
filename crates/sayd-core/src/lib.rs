@@ -1,0 +1,8 @@
+//! sayd's engine: queue, chunking, text cleanup, config and the state
+//! machine that drives them.
+//!
+//! This crate deliberately depends on neither ONNX nor an audio backend nor
+//! D-Bus. Synthesis reaches it through the `Synthesizer` trait and audio
+//! through `AudioSink`, so the whole engine can be driven in a unit test.
+
+pub mod config;
