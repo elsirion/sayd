@@ -1,14 +1,18 @@
 [package]
 name = "sayd"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Tray-resident local text-to-speech daemon"
+rust-version.workspace = true
+description = "Local text-to-speech daemon for Wayland: speaks the selection on a keybind"
+readme = "README.md"
+keywords = ["tts", "speech", "wayland", "sway", "daemon"]
+categories = ["multimedia::audio", "accessibility", "command-line-utilities"]
 
 [dependencies]
-sayd-core = { path = "../sayd-core" }
-kokoro = { path = "../kokoro" }
-g2p = { path = "../g2p" }
+sayd-core = { path = "../sayd-core", version = "0.1.0" }
+sayd-kokoro = { path = "../sayd-kokoro", version = "0.1.0" }
+sayd-g2p = { path = "../sayd-g2p", version = "0.1.0" }
 cpal = "0.18"
 rtrb = "0.3"
 wl-clipboard-rs = { version = "0.9", default-features = false, features = ["dlopen"] }

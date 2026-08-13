@@ -1,0 +1,24 @@
+[package]
+name = "sayd-misaki-en"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+# NOT the workspace's MIT: this crate vendors misaki's lexicons, which are
+# Apache-2.0. See data/PROVENANCE.md.
+license = "Apache-2.0"
+description = "English grapheme-to-phoneme for Kokoro TTS, ported from misaki"
+readme = "README.md"
+keywords = ["tts", "g2p", "phonemes", "kokoro", "speech"]
+categories = ["text-processing", "accessibility"]
+
+[dependencies]
+fst = "0.4"
+regex = "1"
+
+[build-dependencies]
+fst = "0.4"
+serde_json = "1"
+
+# Test-only. The runtime crate must stay free of serde_json.
+[dev-dependencies]
+serde_json = "1"

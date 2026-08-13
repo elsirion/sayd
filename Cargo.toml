@@ -3,8 +3,12 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
+version = "0.1.0"
 edition = "2021"
 license = "MIT"
+# Highest floor across the workspace's dependency graph (zbus 5 requires 1.87);
+# the leaf crates need less, but one number is easier to keep honest.
+rust-version = "1.87"
 
 [profile.release]
 opt-level = 3

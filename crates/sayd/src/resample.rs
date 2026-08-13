@@ -1,7 +1,7 @@
 //! A streaming linear resampler for converting Kokoro's fixed 24 kHz mono
 //! output to whatever rate the audio device actually accepted.
 //!
-//! `kokoro::audio::resample_linear` (the existing linear resampler) is
+//! `sayd_kokoro::audio::resample_linear` (the existing linear resampler) is
 //! stateless: every call restarts interpolation at input index 0, and its
 //! tail flattens to a repeated sample instead of interpolating into whatever
 //! comes next. That's fine for one-shot use, but [`sayd_core::audio::AudioSink::push`]

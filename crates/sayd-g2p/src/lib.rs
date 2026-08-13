@@ -19,13 +19,13 @@ pub enum Dialect {
 }
 
 pub struct Phonemizer {
-    us: misaki_en::G2p,
+    us: sayd_misaki_en::G2p,
 }
 
 impl Phonemizer {
     pub fn new() -> Self {
         Phonemizer {
-            us: misaki_en::G2p::with_fallback(
+            us: sayd_misaki_en::G2p::with_fallback(
                 false,
                 Box::new(|w| espeak::phonemize_word(w, false)),
             ),

@@ -23,11 +23,11 @@ fn load(name: &str, key_field: &str) -> Vec<(String, String)> {
 
 #[test]
 fn word_level_parity_is_high() {
-    let g = misaki_en::G2p::new(false);
+    let g = sayd_misaki_en::G2p::new(false);
     let cases = load("words.json", "word");
     assert!(cases.len() > 1000, "corpus too small: {}", cases.len());
 
-    let lex = misaki_en::Lexicon::new(false); // hoisted: building it per word is wasteful
+    let lex = sayd_misaki_en::Lexicon::new(false); // hoisted: building it per word is wasteful
     let mut hit = 0usize;
     let mut compared = 0usize;
     let mut failures: Vec<(String, String, String)> = Vec::new();
@@ -69,7 +69,7 @@ fn word_level_parity_is_high() {
 // to this crate's scope, so we test only number-heavy cases here instead.
 #[test]
 fn number_heavy_sentences_normalize_correctly() {
-    let g = misaki_en::G2p::new(false);
+    let g = sayd_misaki_en::G2p::new(false);
     let expectations: HashMap<&str, &str> = [
         ("$1,234.56", "dˈɑləɹz"),
         ("50%", "pəɹsˈɛnt"),

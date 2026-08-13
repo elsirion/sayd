@@ -1,9 +1,13 @@
 [package]
 name = "sayd-core"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "sayd engine: queue, chunking, cleanup, config"
+rust-version.workspace = true
+description = "Engine for the sayd speech daemon: queue, chunking, text cleanup, config"
+readme = "README.md"
+keywords = ["tts", "speech", "queue", "text-processing"]
+categories = ["multimedia::audio", "accessibility"]
 
 [dependencies]
 regex = "1"

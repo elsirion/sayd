@@ -5,8 +5,8 @@
 
 use std::path::{Path, PathBuf};
 
-use g2p::{Dialect, Phonemizer};
-use kokoro::Kokoro;
+use sayd_g2p::{Dialect, Phonemizer};
+use sayd_kokoro::Kokoro;
 use sayd_core::config::Config;
 use sayd_core::synth::Synthesizer;
 
@@ -70,10 +70,10 @@ impl Synthesizer for KokoroSynthesizer {
 
     fn fits(&mut self, phonemes: &str) -> bool {
         match self.ensure_session() {
-            Ok(k) => k.tokenize(phonemes).len() < kokoro::MAX_TOKENS,
+            Ok(k) => k.tokenize(phonemes).len() < sayd_kokoro::MAX_TOKENS,
             // If the model will not load, do not also block chunking; the
             // failure surfaces from `synth`.
-            Err(_) => phonemes.chars().count() <= kokoro::MAX_TOKENS,
+            Err(_) => phonemes.chars().count() <= sayd_kokoro::MAX_TOKENS,
         }
     }
 
@@ -96,7 +96,7 @@ impl Synthesizer for KokoroSynthesizer {
     }
 
     fn sample_rate(&self) -> u32 {
-        kokoro::SAMPLE_RATE
+        sayd_kokoro::SAMPLE_RATE
     }
 
     fn unload(&mut self) {
@@ -136,7 +136,7 @@ mod models_tests {
         // between roughly half a second and 20 seconds of audio at 24 kHz.
         // A wildly wrong value (e.g. one frame, or silence-length garbage)
         // would fall well outside this window.
-        let seconds = audio.len() as f64 / kokoro::SAMPLE_RATE as f64;
+        let seconds = audio.len() as f64 / sayd_kokoro::SAMPLE_RATE as f64;
         assert!(
             (0.5..20.0).contains(&seconds),
             "synthesized audio duration {seconds}s is not plausible for this text"
@@ -279,7 +279,7 @@ mod engine_models_tests {
         // real_text` above, for the same sentence driven through the same
         // model -- a wildly wrong value (silence-length garbage, or a
         // single frame) would fall well outside it.
-        let seconds = written.len() as f64 / kokoro::SAMPLE_RATE as f64;
+        let seconds = written.len() as f64 / sayd_kokoro::SAMPLE_RATE as f64;
         let nonzero = written.iter().filter(|&&x| x != 0.0).count();
         eprintln!(
             "engine_produces_non_silent_audio_of_plausible_duration: {} samples ({seconds:.3}s), \

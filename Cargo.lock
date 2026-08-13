@@ -238,13 +238,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "g2p"
-version = "0.1.0"
-dependencies = [
- "misaki-en",
-]
-
-[[package]]
 name = "getrandom"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -356,14 +349,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kokoro"
-version = "0.1.0"
-dependencies = [
- "ort",
- "serde_json",
-]
-
-[[package]]
 name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -430,15 +415,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
 dependencies = [
  "autocfg",
-]
-
-[[package]]
-name = "misaki-en"
-version = "0.1.0"
-dependencies = [
- "fst",
- "regex",
- "serde_json",
 ]
 
 [[package]]
@@ -842,10 +818,10 @@ name = "sayd"
 version = "0.1.0"
 dependencies = [
  "cpal",
- "g2p",
- "kokoro",
  "rtrb",
  "sayd-core",
+ "sayd-g2p",
+ "sayd-kokoro",
  "wl-clipboard-rs",
 ]
 
@@ -857,6 +833,30 @@ dependencies = [
  "serde",
  "tempfile",
  "toml",
+]
+
+[[package]]
+name = "sayd-g2p"
+version = "0.1.0"
+dependencies = [
+ "sayd-misaki-en",
+]
+
+[[package]]
+name = "sayd-kokoro"
+version = "0.1.0"
+dependencies = [
+ "ort",
+ "serde_json",
+]
+
+[[package]]
+name = "sayd-misaki-en"
+version = "0.1.0"
+dependencies = [
+ "fst",
+ "regex",
+ "serde_json",
 ]
 
 [[package]]

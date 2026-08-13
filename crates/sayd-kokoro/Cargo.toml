@@ -1,0 +1,19 @@
+[package]
+name = "sayd-kokoro"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Kokoro-82M text-to-speech inference via ONNX Runtime"
+readme = "README.md"
+keywords = ["tts", "kokoro", "onnx", "speech", "audio"]
+categories = ["multimedia::audio", "science"]
+
+[dependencies]
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["load-dynamic"] }
+serde_json = "1"
+
+[features]
+# Tests that need real Kokoro weights in ./models. Off by default so a plain
+# `cargo test` needs no downloads.
+models = []

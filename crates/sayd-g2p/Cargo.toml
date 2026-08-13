@@ -1,0 +1,13 @@
+[package]
+name = "sayd-g2p"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "English G2P for Kokoro: the misaki lexicon with an espeak-ng fallback"
+readme = "README.md"
+keywords = ["tts", "g2p", "espeak", "phonemes", "speech"]
+categories = ["text-processing", "accessibility"]
+
+[dependencies]
+sayd-misaki-en = { path = "../sayd-misaki-en", version = "0.1.0" }
