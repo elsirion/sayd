@@ -1,6 +1,6 @@
 [package]
 name = "sayd-cli"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -15,5 +15,5 @@ path = "src/main.rs"
 
 [dependencies]
 zbus = { version = "5", default-features = false, features = ["tokio"] }
-tokio = { version = "1", features = ["rt", "macros"] }
+tokio = { version = "1", features = ["rt", "macros", "time"] }
 clap = { version = "4", features = ["derive"] }
