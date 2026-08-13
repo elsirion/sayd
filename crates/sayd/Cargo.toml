@@ -11,6 +11,7 @@ kokoro = { path = "../kokoro" }
 g2p = { path = "../g2p" }
 cpal = "0.18"
 rtrb = "0.3"
+wl-clipboard-rs = { version = "0.9", default-features = false, features = ["dlopen"] }
 
 [features]
 models = []

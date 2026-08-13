@@ -6,6 +6,7 @@
 mod kokoro_synth;
 mod resample;
 mod ring;
+mod selection;
 
 use std::path::PathBuf;
 use std::time::Duration;
