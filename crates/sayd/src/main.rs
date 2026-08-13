@@ -4,6 +4,7 @@
 //! engine, the real synthesizer and the real audio sink work together.
 
 mod kokoro_synth;
+mod resample;
 mod ring;
 
 use std::path::PathBuf;
@@ -54,12 +55,12 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
-    // M1 does not resample: if the device refused our rate, warn rather
-    // than silently play audio at the wrong pitch/speed.
+    // If the device refused the synthesizer's native rate, `RingSink`
+    // resamples transparently (see `resample.rs`) -- this is informational,
+    // not a warning: playback is correct either way.
     if sink.device_sample_rate != sayd_core::synth::SAMPLE_RATE {
         eprintln!(
-            "warning: audio device uses {} Hz, not the synthesizer's {} Hz; \
-             playback will be mis-pitched (no resampler in M1)",
+            "info: audio device uses {} Hz; resampling from the synthesizer's {} Hz",
             sink.device_sample_rate,
             sayd_core::synth::SAMPLE_RATE
         );

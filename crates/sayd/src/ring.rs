@@ -77,6 +77,8 @@ use std::sync::Arc;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use sayd_core::audio::AudioSink;
 
+use crate::resample::ResamplingProducer;
+
 /// Ten seconds of buffer at 24 kHz is ~1 MB and far more than the two-chunk
 /// lookahead needs; it exists to absorb scheduling jitter, not to run ahead.
 const BUFFER_SECONDS: usize = 10;
@@ -336,7 +338,7 @@ impl RingConsumer {
 /// [`RingConsumer`] pair to it. All device-specific setup lives here; the
 /// ring logic above is unaware cpal exists.
 pub struct RingSink {
-    producer: RingProducer,
+    producer: ResamplingProducer,
     /// Held to keep the stream alive; dropping it stops playback.
     _stream: cpal::Stream,
     /// Device rate, which may differ from the synthesizer's.
@@ -359,8 +361,11 @@ const _: fn() = || {
 impl RingSink {
     /// Open the default output device, preferring `sample_rate` mono.
     ///
-    /// If the device refuses that rate, its default is used and
-    /// `device_sample_rate` reports it; the caller must resample.
+    /// If the device refuses that rate, its default is used instead and
+    /// `device_sample_rate` reports it -- but this is transparent to
+    /// callers: every `push`/`pending`/`total_written`/`capacity` value
+    /// still speaks `sample_rate`-Hz (input) sample units, via a streaming
+    /// resampler (see `resample.rs`) wired into the producer half.
     pub fn new(sample_rate: u32) -> Result<Self, String> {
         let host = cpal::default_host();
         let device = host
@@ -390,8 +395,13 @@ impl RingSink {
         let device_sample_rate = config.sample_rate();
         let channels = config.channels() as usize;
 
-        let capacity = sample_rate as usize * BUFFER_SECONDS;
-        let (producer, mut consumer) = ring(capacity);
+        // Sized in *device*-rate samples so the ring holds `BUFFER_SECONDS`
+        // of real audio time regardless of the resampling ratio -- sizing
+        // this by `sample_rate` (the input rate) instead would, on a
+        // resampling device, buffer less wall-clock time than intended.
+        let capacity = device_sample_rate as usize * BUFFER_SECONDS;
+        let (raw_producer, mut consumer) = ring(capacity);
+        let producer = ResamplingProducer::new(raw_producer, sample_rate, device_sample_rate);
 
         let stream = device
             .build_output_stream(
