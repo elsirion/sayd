@@ -276,6 +276,28 @@ impl Engine {
 
     /// One unit of work: top up the sink, or advance the queue, or unload.
     pub fn tick(&mut self) {
+        // Checked before the `Paused` early-return, not after: the failure
+        // this reports comes from cpal's stream error callback, which fires
+        // on its own thread whenever the device dies, independent of
+        // whether playback is paused. `push` cannot detect it -- it only
+        // ever writes into the in-process ring, which keeps accepting
+        // samples whether or not anything is left to drain them -- so this
+        // poll is the only place a lost device is ever noticed. Deferring
+        // it until a later `Resume` would leave a paused user believing
+        // their queued speech is intact for however long they stay paused,
+        // only to discover otherwise (and only then) on the next `tick`
+        // after resuming; checking here surfaces it as soon as it happens
+        // instead. The clear-the-queue behaviour is the same either way, so
+        // this does not special-case `Paused` versus `Speaking` -- it just
+        // stops the special-casing from mattering.
+        if let Some(e) = self.sink.take_error() {
+            self.state = State::Error;
+            self.error = Some(e);
+            self.current = None;
+            self.queue.clear();
+            return;
+        }
+
         if self.state == State::Paused {
             return;
         }
@@ -383,6 +405,20 @@ impl Engine {
                 self.queue.clear();
             }
         }
+    }
+
+    /// Swap in a fresh sink after a device failure, clearing the error.
+    ///
+    /// The daemon calls this when it manages to reacquire the audio device.
+    /// The queue was cleared when the failure surfaced, so this returns the
+    /// engine to a clean idle state rather than resuming a half-played
+    /// utterance whose audio is gone.
+    pub fn replace_sink(&mut self, sink: Box<dyn AudioSink>) {
+        self.sink = sink;
+        self.current = None;
+        self.error = None;
+        self.state = State::Idle;
+        self.idle_since = Some(Instant::now());
     }
 
     /// Both call sites in `tick` reach this only once `current` is already
@@ -1368,5 +1404,100 @@ mod tests {
             Box::new(VecSink::new(24_000)),
         );
         assert!(e.submit("far too long".into(), SayOpts::default()).is_err());
+    }
+
+    /// A sink that reports a device failure after accepting one push.
+    struct FailingSink {
+        accepted_once: bool,
+        err: Option<String>,
+        paused: bool,
+    }
+
+    impl FailingSink {
+        fn new() -> Self {
+            FailingSink { accepted_once: false, err: None, paused: false }
+        }
+    }
+
+    impl crate::audio::AudioSink for FailingSink {
+        fn push(&mut self, samples: &[f32]) -> usize {
+            if self.accepted_once {
+                self.err = Some("audio device disappeared".into());
+                return 0;
+            }
+            self.accepted_once = true;
+            samples.len()
+        }
+        fn pending(&self) -> usize {
+            0
+        }
+        fn clear(&mut self) {}
+        fn set_paused(&mut self, p: bool) {
+            self.paused = p
+        }
+        fn is_paused(&self) -> bool {
+            self.paused
+        }
+        fn capacity(&self) -> usize {
+            24_000
+        }
+        fn total_written(&self) -> usize {
+            0
+        }
+        fn take_error(&mut self) -> Option<String> {
+            self.err.take()
+        }
+    }
+
+    /// `FailingSink` accepts exactly one `push` and fails every one after
+    /// that, so the engine needs at least two synthesis chunks to ever see
+    /// the failure -- one to consume the free pass, one to hit it. `chunk()`
+    /// merges short multi-sentence input (like "one. two. three.") into a
+    /// single chunk under the default 400-char `target_chars`, which would
+    /// only ever call `push` once and never trigger the failure at all.
+    /// This text is long enough to force a second chunk.
+    fn text_spanning_multiple_chunks() -> String {
+        "This is one sentence in a long batch of text. ".repeat(15)
+    }
+
+    #[test]
+    fn a_device_failure_surfaces_as_error_rather_than_wedging() {
+        let mut e = Engine::new(
+            Config::default(),
+            Box::new(StubSynthesizer::new()),
+            Box::new(FailingSink::new()),
+        );
+        e.submit(text_spanning_multiple_chunks(), SayOpts::default()).expect("accepted");
+        for _ in 0..200 {
+            e.tick();
+        }
+        let s = e.snapshot();
+        assert_eq!(s.state, State::Error, "a dead device must not leave the engine Speaking");
+        assert!(s.error.as_deref().unwrap_or("").contains("device"));
+    }
+
+    #[test]
+    fn replace_sink_clears_the_error_and_accepts_new_work() {
+        let mut e = Engine::new(
+            Config::default(),
+            Box::new(StubSynthesizer::new()),
+            Box::new(FailingSink::new()),
+        );
+        e.submit(text_spanning_multiple_chunks(), SayOpts::default()).expect("accepted");
+        for _ in 0..200 {
+            e.tick();
+        }
+        assert_eq!(e.snapshot().state, State::Error);
+
+        e.replace_sink(Box::new(VecSink::new(24_000 * 10)));
+        let s = e.snapshot();
+        assert_eq!(s.state, State::Idle, "a fresh sink clears the failure");
+        assert_eq!(s.error, None);
+
+        e.submit("after recovery.".into(), SayOpts::default()).expect("accepted");
+        for _ in 0..500 {
+            e.tick();
+        }
+        assert!(e.audio_written() > 0, "the engine must work again after the sink is replaced");
     }
 }

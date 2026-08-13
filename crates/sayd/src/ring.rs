@@ -72,7 +72,7 @@
 //! by argument alone.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use sayd_core::audio::AudioSink;
@@ -349,6 +349,13 @@ pub struct RingSink {
     _stream: cpal::Stream,
     /// Device rate, which may differ from the synthesizer's.
     pub device_sample_rate: u32,
+    /// Set by cpal's error callback (a different thread) when the stream
+    /// dies; taken by `take_error`. This is the only way a lost device is
+    /// ever noticed -- see the module doc's synchronization design for why
+    /// nothing else in this file may gain a lock, but this field is never
+    /// touched from the realtime `fill` callback, only from the error
+    /// callback and from `take_error`, so a `Mutex` here is fine.
+    error: Arc<Mutex<Option<String>>>,
 }
 
 // No `unsafe impl Send` here. `AudioSink: Send` is a supertrait bound, so
@@ -409,20 +416,25 @@ impl RingSink {
         let (raw_producer, mut consumer) = ring(capacity);
         let producer = ResamplingProducer::new(raw_producer, sample_rate, device_sample_rate);
 
+        let error = Arc::new(Mutex::new(None));
+        let error_writer = error.clone();
         let stream = device
             .build_output_stream(
                 config.config(),
                 move |out: &mut [f32], _: &cpal::OutputCallbackInfo| {
                     consumer.fill(out, channels);
                 },
-                move |e| eprintln!("audio stream error: {e}"),
+                move |e| {
+                    eprintln!("audio stream error: {e}");
+                    *error_writer.lock().unwrap_or_else(|e| e.into_inner()) = Some(e.to_string());
+                },
                 None,
             )
             .map_err(|e| format!("could not build output stream: {e}"))?;
 
         stream.play().map_err(|e| format!("could not start stream: {e}"))?;
 
-        Ok(RingSink { producer, _stream: stream, device_sample_rate })
+        Ok(RingSink { producer, _stream: stream, device_sample_rate, error })
     }
 }
 
@@ -453,6 +465,10 @@ impl AudioSink for RingSink {
 
     fn total_written(&self) -> usize {
         self.producer.total_written()
+    }
+
+    fn take_error(&mut self) -> Option<String> {
+        self.error.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
 }
 

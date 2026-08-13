@@ -29,6 +29,15 @@ pub trait AudioSink: Send {
 
     /// Total samples ever accepted, for tests and diagnostics.
     fn total_written(&self) -> usize;
+
+    /// A device-level failure, returned once and then cleared.
+    ///
+    /// Distinguishes "the device is gone" from `push` returning a short count
+    /// because the ring is momentarily full. Sinks with no device (test
+    /// doubles) never fail, so the default body returns `None`.
+    fn take_error(&mut self) -> Option<String> {
+        None
+    }
 }
 
 /// Test double. Records every sample ever pushed in `written` while modelling
