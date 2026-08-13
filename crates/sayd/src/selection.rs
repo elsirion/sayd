@@ -13,7 +13,6 @@
 //! CLI that will invoke `read` land in later tasks. Until then the compiler
 //! sees an unreached public API in a binary crate, hence the blanket allow
 //! below; remove it once a caller exists.
-#![allow(dead_code)]
 
 use std::fmt;
 use std::io::Read;
@@ -21,6 +20,7 @@ use std::io::Read;
 use wl_clipboard_rs::paste::{get_contents, ClipboardType, Error, MimeType, Seat};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum Source {
     /// The mouse-selection buffer. Set by simply selecting text.
     Primary,
@@ -41,8 +41,22 @@ impl fmt::Display for Source {
 ///
 /// A guard against a runaway paste; the engine applies its own `max_chars`
 /// limit afterwards, which is the one the user configures.
+///
+/// The cut is lossy at byte boundaries: if a multi-byte UTF-8 character
+/// straddles the limit, it is replaced with U+FFFD (replacement character).
+/// Invalid UTF-8 elsewhere in the selection is also replaced lossily.
+#[allow(dead_code)]
 const MAX_BYTES: u64 = 4 * 1024 * 1024;
 
+/// Convert raw bytes to a String, replacing invalid UTF-8 sequences lossily.
+fn bytes_to_string(bytes: Vec<u8>) -> String {
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// Nothing in `main` calls this yet -- the D-Bus interface and the `say`
+/// CLI that will invoke `read` land in later tasks. Until then the compiler
+/// sees an unreached public API in a binary crate; remove once a caller exists.
+#[allow(dead_code)]
 pub fn read(source: Source) -> Result<String, String> {
     let clipboard = match source {
         Source::Primary => ClipboardType::Primary,
@@ -65,15 +79,25 @@ pub fn read(source: Source) -> Result<String, String> {
                  sway 1.9 or newer is required for the primary selection"
             ))
         }
-        Err(e) => return Err(format!("could not read the {source}: {e}")),
+        Err(e) => {
+            let msg = e.to_string();
+            let lowercase_msg = if let Some(first_char) = msg.chars().next() {
+                format!("{}{}", first_char.to_lowercase(), &msg[first_char.len_utf8()..])
+            } else {
+                msg
+            };
+            return Err(format!("could not read the {source}: {lowercase_msg}"));
+        }
     };
 
-    let mut buf = String::new();
+    let mut bytes = Vec::new();
     reader
         .by_ref()
         .take(MAX_BYTES)
-        .read_to_string(&mut buf)
+        .read_to_end(&mut bytes)
         .map_err(|e| format!("could not read the {source}: {e}"))?;
+
+    let buf = bytes_to_string(bytes);
 
     if buf.trim().is_empty() {
         return Err(format!("the {source} is empty"));
@@ -104,5 +128,44 @@ mod tests {
             msg.chars().next().map(|c| c.is_lowercase() || c.is_numeric()).unwrap_or(false),
             "error messages are sentence fragments, not capitalised: {msg:?}"
         );
+    }
+
+    #[test]
+    fn bytes_to_string_handles_valid_utf8() {
+        let bytes = b"hello world".to_vec();
+        let s = bytes_to_string(bytes);
+        assert_eq!(s, "hello world");
+    }
+
+    #[test]
+    fn bytes_to_string_handles_multibyte_character_cut_at_boundary() {
+        // UTF-8 emoji "🦀" is bytes [0xF0, 0xA4, 0xAD, 0x80].
+        // Cut after the first two bytes, leaving an incomplete sequence.
+        let mut bytes = b"hello ".to_vec();
+        bytes.extend_from_slice(&[0xF0, 0xA4]); // Incomplete emoji
+        let s = bytes_to_string(bytes);
+        // Should contain the valid prefix and a replacement character for the incomplete sequence.
+        assert!(s.contains("hello "));
+        assert!(s.contains('\u{FFFD}')); // U+FFFD replacement character
+    }
+
+    #[test]
+    fn bytes_to_string_handles_invalid_utf8_in_middle() {
+        // Mix of valid UTF-8 with an invalid byte sequence in the middle.
+        let mut bytes = b"hello ".to_vec();
+        bytes.extend_from_slice(&[0xFF, 0xFE]); // Invalid UTF-8
+        bytes.extend_from_slice(b" world");
+        let s = bytes_to_string(bytes);
+        // Should contain the valid parts with replacement characters for invalid bytes.
+        assert!(s.contains("hello"));
+        assert!(s.contains("world"));
+        assert!(s.contains('\u{FFFD}')); // Replacement characters for invalid bytes
+    }
+
+    #[test]
+    fn bytes_to_string_handles_empty_input() {
+        let bytes = Vec::new();
+        let s = bytes_to_string(bytes);
+        assert_eq!(s, "");
     }
 }
