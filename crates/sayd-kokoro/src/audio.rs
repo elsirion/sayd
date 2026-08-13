@@ -132,7 +132,12 @@ mod tests {
     fn time_stretch_shortens_when_speeding_up() {
         let a: Vec<f32> = (0..48_000).map(|i| (i as f32 / 50.0).sin()).collect();
         let out = time_stretch(&a, 1.5);
-        assert!(out.len() < a.len(), "expected shorter, got {} vs {}", out.len(), a.len());
+        assert!(
+            out.len() < a.len(),
+            "expected shorter, got {} vs {}",
+            out.len(),
+            a.len()
+        );
         assert!(out.len() > a.len() / 3, "unreasonably short: {}", out.len());
     }
 

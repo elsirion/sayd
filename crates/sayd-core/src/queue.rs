@@ -59,7 +59,10 @@ pub struct Queue {
 
 impl Queue {
     pub fn new() -> Self {
-        Queue { items: VecDeque::new(), next_id: 1 }
+        Queue {
+            items: VecDeque::new(),
+            next_id: 1,
+        }
     }
 
     pub fn next_id(&mut self) -> u64 {
@@ -159,7 +162,10 @@ mod tests {
         let mut q = Queue::new();
         q.submit(utt(1, "a"), Policy::Enqueue);
         let dropped = q.submit(utt(2, "now"), Policy::Interrupt);
-        assert!(dropped.is_empty(), "interrupt drops the *current* utterance, not the queue");
+        assert!(
+            dropped.is_empty(),
+            "interrupt drops the *current* utterance, not the queue"
+        );
         assert_eq!(texts(&q), vec!["now", "a"]);
     }
 
@@ -224,7 +230,13 @@ mod tests {
         let mut q_new = Queue::new();
         let id_default = q_default.next_id();
         let id_new = q_new.next_id();
-        assert_eq!(id_default, id_new, "Queue::default() and Queue::new() should produce same first id");
-        assert_ne!(id_default, 0, "first id must not be 0 (sentinel for no utterance)");
+        assert_eq!(
+            id_default, id_new,
+            "Queue::default() and Queue::new() should produce same first id"
+        );
+        assert_ne!(
+            id_default, 0,
+            "first id must not be 0 (sentinel for no utterance)"
+        );
     }
 }

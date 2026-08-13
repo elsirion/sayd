@@ -26,7 +26,11 @@ pub enum Error {
     Ort(ort::Error),
     Io(std::io::Error),
     VoiceNotLoaded(String),
-    BadVoicePack { name: String, floats: usize, expected: usize },
+    BadVoicePack {
+        name: String,
+        floats: usize,
+        expected: usize,
+    },
     Vocab(String),
     NoOutput,
 }
@@ -37,7 +41,11 @@ impl fmt::Display for Error {
             Error::Ort(e) => write!(f, "onnxruntime: {e}"),
             Error::Io(e) => write!(f, "io: {e}"),
             Error::VoiceNotLoaded(v) => write!(f, "voice {v} is not loaded"),
-            Error::BadVoicePack { name, floats, expected } => write!(
+            Error::BadVoicePack {
+                name,
+                floats,
+                expected,
+            } => write!(
                 f,
                 "voice pack {name} has {floats} floats, expected {expected}"
             ),
@@ -217,7 +225,11 @@ mod tests {
     fn bad_voice_pack_error_formats_with_name_and_counts() {
         // Display-string pin only; behaviour coverage is in the
         // `decode_pack_rejects_*` tests below.
-        let e = Error::BadVoicePack { name: "af_heart".into(), floats: 1024, expected: 130_560 };
+        let e = Error::BadVoicePack {
+            name: "af_heart".into(),
+            floats: 1024,
+            expected: 130_560,
+        };
         let msg = e.to_string();
         assert!(msg.contains("af_heart"));
         assert!(msg.contains("1024"));
@@ -252,7 +264,11 @@ mod tests {
     fn decode_pack_rejects_a_truncated_buffer() {
         let raw = vec![0u8; 1024 * 4]; // 1024 floats, far short of expected
         match decode_pack(&raw, "af_heart") {
-            Err(Error::BadVoicePack { name, floats, expected }) => {
+            Err(Error::BadVoicePack {
+                name,
+                floats,
+                expected,
+            }) => {
                 assert_eq!(name, "af_heart");
                 assert_eq!(floats, 1024);
                 assert_eq!(expected, STYLE_ROWS * STYLE_DIM);
@@ -271,7 +287,11 @@ mod tests {
         let expected = STYLE_ROWS * STYLE_DIM;
         let raw = vec![0u8; expected * 4 + 3];
         match decode_pack(&raw, "af_heart") {
-            Err(Error::BadVoicePack { name, floats, expected: exp }) => {
+            Err(Error::BadVoicePack {
+                name,
+                floats,
+                expected: exp,
+            }) => {
                 assert_eq!(name, "af_heart");
                 assert_eq!(floats, expected);
                 assert_eq!(exp, expected);

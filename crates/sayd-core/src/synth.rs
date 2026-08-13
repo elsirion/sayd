@@ -43,7 +43,12 @@ impl StubSynthesizer {
     }
 
     pub fn with_token_budget(token_budget: usize) -> Self {
-        StubSynthesizer { token_budget, loaded: false, synth_calls: 0, unload_calls: 0 }
+        StubSynthesizer {
+            token_budget,
+            loaded: false,
+            synth_calls: 0,
+            unload_calls: 0,
+        }
     }
 }
 

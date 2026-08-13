@@ -217,7 +217,10 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(5));
         }
-        panic!("timed out waiting for {label}; snapshot = {:?}", h.snapshot());
+        panic!(
+            "timed out waiting for {label}; snapshot = {:?}",
+            h.snapshot()
+        );
     }
 
     #[test]
@@ -230,7 +233,9 @@ mod tests {
     #[test]
     fn submit_returns_the_engines_answer() {
         let h = handle();
-        let id = h.submit("hello there.".into(), SayOpts::default()).expect("accepted");
+        let id = h
+            .submit("hello there.".into(), SayOpts::default())
+            .expect("accepted");
         assert!(id.is_some());
         h.shutdown();
     }
@@ -238,18 +243,24 @@ mod tests {
     #[test]
     fn submit_propagates_a_rejection() {
         let h = EngineHandle::spawn(
-            Config { max_chars: 5, ..Config::default() },
+            Config {
+                max_chars: 5,
+                ..Config::default()
+            },
             Box::new(StubSynthesizer::new()),
             Box::new(VecSink::new(24_000)),
         );
-        assert!(h.submit("much too long".into(), SayOpts::default()).is_err());
+        assert!(h
+            .submit("much too long".into(), SayOpts::default())
+            .is_err());
         h.shutdown();
     }
 
     #[test]
     fn the_engine_ticks_on_its_own_thread() {
         let h = handle();
-        h.submit("hello there. this is a test.".into(), SayOpts::default()).expect("accepted");
+        h.submit("hello there. this is a test.".into(), SayOpts::default())
+            .expect("accepted");
         wait_for(&h, "speaking", |s| s.state == State::Speaking);
         h.shutdown();
     }
@@ -257,10 +268,13 @@ mod tests {
     #[test]
     fn commands_reach_the_engine() {
         let h = handle();
-        h.submit("hello there. this is a test.".into(), SayOpts::default()).expect("accepted");
+        h.submit("hello there. this is a test.".into(), SayOpts::default())
+            .expect("accepted");
         wait_for(&h, "speaking", |s| s.state == State::Speaking);
         h.send(Command::Stop);
-        wait_for(&h, "idle after stop", |s| s.state == State::Idle && s.queue_len == 0);
+        wait_for(&h, "idle after stop", |s| {
+            s.state == State::Idle && s.queue_len == 0
+        });
         h.shutdown();
     }
 
@@ -299,7 +313,10 @@ mod tests {
         h.shutdown();
         let start = Instant::now();
         h.shutdown();
-        assert!(start.elapsed() < Duration::from_secs(5), "second shutdown hung");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "second shutdown hung"
+        );
     }
 
     #[test]
@@ -324,19 +341,26 @@ mod tests {
         // A failed sink should be swappable for a fresh one without
         // restarting the engine thread.
         let h = EngineHandle::spawn(
-            Config { max_chars: 5, ..Config::default() },
+            Config {
+                max_chars: 5,
+                ..Config::default()
+            },
             Box::new(StubSynthesizer::new()),
             Box::new(VecSink::new(24_000)),
         );
         // Push the engine into Error via a rejection.
-        assert!(h.submit("much too long".into(), SayOpts::default()).is_err());
+        assert!(h
+            .submit("much too long".into(), SayOpts::default())
+            .is_err());
         wait_for(&h, "error", |s| s.state == State::Error);
 
         h.replace_sink(Box::new(VecSink::new(24_000 * 10)));
         wait_for(&h, "idle after replace_sink", |s| s.state == State::Idle);
 
         // max_chars is still 5, so keep this within the limit.
-        let id = h.submit("hi.".into(), SayOpts::default()).expect("accepted");
+        let id = h
+            .submit("hi.".into(), SayOpts::default())
+            .expect("accepted");
         assert!(id.is_some());
         h.shutdown();
     }

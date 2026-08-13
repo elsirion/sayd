@@ -6,10 +6,10 @@
 //! through `AudioSink`, so the whole engine can be driven in a unit test.
 
 pub mod audio;
-pub mod config;
-pub mod cleanup;
 pub mod chunk;
-pub mod synth;
-pub mod queue;
+pub mod cleanup;
+pub mod config;
 pub mod engine;
 pub mod handle;
+pub mod queue;
+pub mod synth;

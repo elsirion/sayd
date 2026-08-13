@@ -62,7 +62,10 @@ mod tests {
         let p = Phonemizer::new();
         // A nonsense word the lexicon and stemmer both miss.
         let out = p.phonemize("zorbleflux", Dialect::American);
-        assert!(!out.is_empty(), "expected espeak fallback output, got empty");
+        assert!(
+            !out.is_empty(),
+            "expected espeak fallback output, got empty"
+        );
     }
 
     #[test]
@@ -107,7 +110,10 @@ mod tests {
     #[test]
     fn a_string_of_only_nuls_yields_empty_output_without_panicking() {
         let p = Phonemizer::new();
-        assert!(p.phonemize("\u{0000}\u{0000}", Dialect::American).trim().is_empty());
+        assert!(p
+            .phonemize("\u{0000}\u{0000}", Dialect::American)
+            .trim()
+            .is_empty());
     }
 
     #[test]

@@ -160,7 +160,10 @@ pub fn phonemize_en(text: &str, british: bool) -> String {
     // syllabic consonant -> schwa + consonant
     ps = ps.replace('\u{0329}', "");
     if british {
-        ps = ps.replace("e^ə", "ɛː").replace("iə", "ɪə").replace("ə^ʊ", "Q");
+        ps = ps
+            .replace("e^ə", "ɛː")
+            .replace("iə", "ɪə")
+            .replace("ə^ʊ", "Q");
     } else {
         ps = ps
             .replace("o^ʊ", "O")
@@ -178,5 +181,9 @@ pub fn phonemize_en(text: &str, british: bool) -> String {
 /// `phonemize_en`, but callers treat an empty result as "no pronunciation".
 pub fn phonemize_word(word: &str, british: bool) -> Option<String> {
     let ps = phonemize_en(word, british);
-    if ps.trim().is_empty() { None } else { Some(ps) }
+    if ps.trim().is_empty() {
+        None
+    } else {
+        Some(ps)
+    }
 }

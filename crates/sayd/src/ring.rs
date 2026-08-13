@@ -144,8 +144,16 @@ pub(crate) fn ring(capacity: usize) -> (RingProducer, RingConsumer) {
         paused: AtomicBool::new(false),
     });
     (
-        RingProducer { producer, shared: shared.clone(), capacity },
-        RingConsumer { consumer, shared, resolved: 0 },
+        RingProducer {
+            producer,
+            shared: shared.clone(),
+            capacity,
+        },
+        RingConsumer {
+            consumer,
+            shared,
+            resolved: 0,
+        },
     )
 }
 
@@ -269,8 +277,11 @@ impl RingConsumer {
     #[cfg(test)]
     pub(crate) fn debug_pending(&self) -> usize {
         let total = self.shared.total_written.load(Ordering::Acquire);
-        let effectively_resolved =
-            self.shared.resolved.load(Ordering::Acquire).max(self.shared.discard_until.load(Ordering::Acquire));
+        let effectively_resolved = self
+            .shared
+            .resolved
+            .load(Ordering::Acquire)
+            .max(self.shared.discard_until.load(Ordering::Acquire));
         total.saturating_sub(effectively_resolved)
     }
 
@@ -432,9 +443,16 @@ impl RingSink {
             )
             .map_err(|e| format!("could not build output stream: {e}"))?;
 
-        stream.play().map_err(|e| format!("could not start stream: {e}"))?;
+        stream
+            .play()
+            .map_err(|e| format!("could not start stream: {e}"))?;
 
-        Ok(RingSink { producer, _stream: stream, device_sample_rate, error })
+        Ok(RingSink {
+            producer,
+            _stream: stream,
+            device_sample_rate,
+            error,
+        })
     }
 }
 
@@ -524,7 +542,11 @@ mod tests {
         prod.set_paused(false);
         let mut out2 = [9.9; 2];
         cons.fill(&mut out2, 1);
-        assert_eq!(out2, [1.0, 2.0], "resume plays what was buffered before the pause");
+        assert_eq!(
+            out2,
+            [1.0, 2.0],
+            "resume plays what was buffered before the pause"
+        );
     }
 
     #[test]
@@ -545,7 +567,11 @@ mod tests {
         prod.push(&[1.0, 2.0]);
         prod.clear();
         prod.push(&[9.0, 9.0]);
-        assert_eq!(prod.pending(), 2, "only the post-clear push counts as pending");
+        assert_eq!(
+            prod.pending(),
+            2,
+            "only the post-clear push counts as pending"
+        );
 
         // The first fill after a clear discards the stale generation's worth
         // (2 samples) and emits silence for this callback; the fresh samples
@@ -556,7 +582,11 @@ mod tests {
 
         let mut out2 = [0.0; 2];
         cons.fill(&mut out2, 1);
-        assert_eq!(out2, [9.0, 9.0], "fresh post-clear samples must survive the discard");
+        assert_eq!(
+            out2,
+            [9.0, 9.0],
+            "fresh post-clear samples must survive the discard"
+        );
     }
 
     #[test]
@@ -773,6 +803,10 @@ mod tests {
             prod.total_written() - played_count,
             "pending must equal total_written - samples actually played, with no drift",
         );
-        assert_eq!(prod.pending(), 0, "everything pushed was eventually drained");
+        assert_eq!(
+            prod.pending(),
+            0,
+            "everything pushed was eventually drained"
+        );
     }
 }

@@ -57,7 +57,13 @@ pub(crate) struct StreamingResampler {
 
 impl StreamingResampler {
     pub(crate) fn new(from_hz: u32, to_hz: u32) -> Self {
-        StreamingResampler { from_hz, to_hz, factor: from_hz as f64 / to_hz as f64, pos: 0.0, tail: None }
+        StreamingResampler {
+            from_hz,
+            to_hz,
+            factor: from_hz as f64 / to_hz as f64,
+            pos: 0.0,
+            tail: None,
+        }
     }
 
     /// `from_hz / to_hz`, exposed so [`ResamplingProducer`] can convert
@@ -142,7 +148,11 @@ impl StreamingResampler {
         let max_local_idx = base + n - 1;
         let value_at = |idx: usize| -> f32 {
             let idx = idx.min(max_local_idx);
-            if base == 1 && idx == 0 { self.tail.unwrap_or(0.0) } else { input[idx - base] }
+            if base == 1 && idx == 0 {
+                self.tail.unwrap_or(0.0)
+            } else {
+                input[idx - base]
+            }
         };
 
         let count = self.output_len_for(n);
@@ -197,7 +207,11 @@ pub(crate) struct ResamplingProducer {
 impl ResamplingProducer {
     pub(crate) fn new(producer: RingProducer, from_hz: u32, to_hz: u32) -> Self {
         let resampler = (from_hz != to_hz).then(|| StreamingResampler::new(from_hz, to_hz));
-        ResamplingProducer { producer, resampler, input_total_written: 0 }
+        ResamplingProducer {
+            producer,
+            resampler,
+            input_total_written: 0,
+        }
     }
 
     /// Push as many *input* samples as fit. Returns how many were accepted,
@@ -215,7 +229,10 @@ impl ResamplingProducer {
         // cached) because `fill`, running concurrently on the audio
         // thread, can free room between calls -- same reasoning as the
         // engine's own `headroom` calculation in `engine.rs`.
-        let room = self.producer.capacity().saturating_sub(self.producer.pending());
+        let room = self
+            .producer
+            .capacity()
+            .saturating_sub(self.producer.pending());
         let prefix = resampler.largest_prefix_within(samples.len(), room);
         if prefix == 0 {
             return 0;
@@ -289,7 +306,11 @@ mod tests {
     fn passthrough_at_equal_rates_returns_input_unchanged() {
         let mut r = StreamingResampler::new(24_000, 24_000);
         let input = vec![0.1, -0.2, 0.3, 0.0, 1.0, -1.0];
-        assert_eq!(r.process(&input), input, "equal rates must be sample-for-sample identity");
+        assert_eq!(
+            r.process(&input),
+            input,
+            "equal rates must be sample-for-sample identity"
+        );
         // A second call, with different data, must still be pure identity --
         // proof that no state was carried from the first call.
         let input2 = vec![9.0, 8.0, 7.0];
@@ -324,7 +345,9 @@ mod tests {
     }
 
     fn sine(n: usize, freq_hz: f32, sample_rate: f32) -> Vec<f32> {
-        (0..n).map(|i| (2.0 * std::f32::consts::PI * freq_hz * i as f32 / sample_rate).sin()).collect()
+        (0..n)
+            .map(|i| (2.0 * std::f32::consts::PI * freq_hz * i as f32 / sample_rate).sin())
+            .collect()
     }
 
     #[test]
@@ -421,7 +444,11 @@ mod tests {
         let (raw, _cons) = ring(64);
         let mut rp = ResamplingProducer::new(raw, 24_000, 24_000);
         assert_eq!(rp.push(&[1.0, 2.0, 3.0]), 3);
-        assert_eq!(rp.pending(), 3, "equal rates: pending is untouched ring pending, no arithmetic");
+        assert_eq!(
+            rp.pending(),
+            3,
+            "equal rates: pending is untouched ring pending, no arithmetic"
+        );
         assert_eq!(rp.total_written(), 3);
         assert_eq!(rp.capacity(), 64);
     }
@@ -435,7 +462,10 @@ mod tests {
 
         let input: Vec<f32> = (0..500).map(|i| i as f32 * 0.001).collect();
         let n = rp.push(&input);
-        assert_eq!(n, 500, "small push relative to a large ring should be fully accepted");
+        assert_eq!(
+            n, 500,
+            "small push relative to a large ring should be fully accepted"
+        );
         assert_eq!(rp.total_written(), 500, "total_written is in input units");
         // Not exactly 500: the streaming resampler always withholds a
         // fractional-sample residual (at most ~1 input sample's worth)
@@ -443,7 +473,10 @@ mod tests {
         // doc comment. `pending()` is necessarily an approximation once
         // resampling is in play, unlike `total_written()`, which is exact.
         let pending = rp.pending();
-        assert!((pending as i64 - 500).abs() <= 2, "expected pending() close to 500, got {pending}");
+        assert!(
+            (pending as i64 - 500).abs() <= 2,
+            "expected pending() close to 500, got {pending}"
+        );
 
         // Drain the device-rate ring in device-sized chunks (roughly
         // 2*500 = 1000 device samples buffered) until it's empty, the way
@@ -452,7 +485,11 @@ mod tests {
         for _ in 0..20 {
             cons.fill(&mut out, 1);
         }
-        assert_eq!(rp.pending(), 0, "pending must converge to zero (in input units) once played");
+        assert_eq!(
+            rp.pending(),
+            0,
+            "pending must converge to zero (in input units) once played"
+        );
         assert_eq!(rp.total_written(), 500, "total_written never decreases");
     }
 
@@ -500,9 +537,16 @@ mod tests {
                 consumed += n;
             }
             guard += 1;
-            assert!(guard < 1_000_000, "made no progress -- partial acceptance stuck");
+            assert!(
+                guard < 1_000_000,
+                "made no progress -- partial acceptance stuck"
+            );
         }
-        assert_eq!(consumed, input.len(), "every input sample must eventually be consumed");
+        assert_eq!(
+            consumed,
+            input.len(),
+            "every input sample must eventually be consumed"
+        );
 
         // Drain whatever's left in the ring.
         for _ in 0..device_rate as usize {
@@ -542,7 +586,11 @@ mod tests {
 
         let input: Vec<f32> = (0..50).map(|i| i as f32).collect();
         let n1 = rp.push(&input);
-        assert!(n1 > 0 && n1 < input.len(), "expected a short accept, got {n1} of {}", input.len());
+        assert!(
+            n1 > 0 && n1 < input.len(),
+            "expected a short accept, got {n1} of {}",
+            input.len()
+        );
 
         // The producer must report having accepted exactly the input
         // samples it says it did -- not the whole slice we handed it.

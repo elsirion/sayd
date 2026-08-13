@@ -59,7 +59,7 @@ pub fn read(source: Source) -> Result<String, String> {
         }
         Err(Error::PrimarySelectionUnsupported) => {
             return Err(
-                "this compositor does not support the primary selection protocol".to_string()
+                "this compositor does not support the primary selection protocol".to_string(),
             )
         }
         Err(Error::MissingProtocol { name, version }) => {
@@ -71,7 +71,11 @@ pub fn read(source: Source) -> Result<String, String> {
         Err(e) => {
             let msg = e.to_string();
             let lowercase_msg = if let Some(first_char) = msg.chars().next() {
-                format!("{}{}", first_char.to_lowercase(), &msg[first_char.len_utf8()..])
+                format!(
+                    "{}{}",
+                    first_char.to_lowercase(),
+                    &msg[first_char.len_utf8()..]
+                )
             } else {
                 msg
             };
@@ -110,11 +114,17 @@ mod tests {
         // No compositor is reachable in the test environment, so this
         // exercises the failure path. It must return a readable reason.
         let r = read(Source::Primary);
-        assert!(r.is_err(), "expected an error with no compositor, got {r:?}");
+        assert!(
+            r.is_err(),
+            "expected an error with no compositor, got {r:?}"
+        );
         let msg = r.unwrap_err();
         assert!(!msg.is_empty());
         assert!(
-            msg.chars().next().map(|c| c.is_lowercase() || c.is_numeric()).unwrap_or(false),
+            msg.chars()
+                .next()
+                .map(|c| c.is_lowercase() || c.is_numeric())
+                .unwrap_or(false),
             "error messages are sentence fragments, not capitalised: {msg:?}"
         );
     }

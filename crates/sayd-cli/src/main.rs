@@ -116,17 +116,27 @@ async fn main() -> std::process::ExitCode {
 
     let empty: HashMap<String, OwnedValue> = HashMap::new();
     let result = match cli.command {
-        Some(Command::Selection) => call(proxy.call_method("SaySelection", &(empty,))).await.map(|_| ()),
-        Some(Command::Clipboard) => call(proxy.call_method("SayClipboard", &(empty,))).await.map(|_| ()),
+        Some(Command::Selection) => call(proxy.call_method("SaySelection", &(empty,)))
+            .await
+            .map(|_| ()),
+        Some(Command::Clipboard) => call(proxy.call_method("SayClipboard", &(empty,)))
+            .await
+            .map(|_| ()),
         Some(Command::Pause) => call(proxy.call_method("Pause", &())).await.map(|_| ()),
         Some(Command::Resume) => call(proxy.call_method("Resume", &())).await.map(|_| ()),
         Some(Command::PlayPause) => call(proxy.call_method("PlayPause", &())).await.map(|_| ()),
         Some(Command::Stop) => call(proxy.call_method("Stop", &())).await.map(|_| ()),
         Some(Command::Next) => call(proxy.call_method("Next", &())).await.map(|_| ()),
-        Some(Command::Skip) => call(proxy.call_method("SkipSentence", &())).await.map(|_| ()),
+        Some(Command::Skip) => call(proxy.call_method("SkipSentence", &()))
+            .await
+            .map(|_| ()),
         Some(Command::Clear) => call(proxy.call_method("ClearQueue", &())).await.map(|_| ()),
-        Some(Command::Mute) => call(proxy.call_method("SetMuted", &(true,))).await.map(|_| ()),
-        Some(Command::Unmute) => call(proxy.call_method("SetMuted", &(false,))).await.map(|_| ()),
+        Some(Command::Mute) => call(proxy.call_method("SetMuted", &(true,)))
+            .await
+            .map(|_| ()),
+        Some(Command::Unmute) => call(proxy.call_method("SetMuted", &(false,)))
+            .await
+            .map(|_| ()),
         Some(Command::Status { json }) => {
             return match status(&proxy, json).await {
                 Ok(()) => std::process::ExitCode::SUCCESS,
@@ -138,7 +148,9 @@ async fn main() -> std::process::ExitCode {
         }
         None => {
             let text = cli.text.join(" ");
-            call(proxy.call_method("Say", &(text, empty))).await.map(|_| ())
+            call(proxy.call_method("Say", &(text, empty)))
+                .await
+                .map(|_| ())
         }
     };
 
@@ -221,8 +233,12 @@ async fn status(proxy: &zbus::Proxy<'_>, json: bool) -> Result<(), CallError> {
     let voice: String = call(proxy.get_property("Voice")).await.unwrap_or_default();
     let speed: f64 = call(proxy.get_property("Speed")).await.unwrap_or(1.0);
     let queue: u32 = call(proxy.get_property("QueueLength")).await.unwrap_or(0);
-    let remaining: f64 = call(proxy.get_property("RemainingSeconds")).await.unwrap_or(0.0);
-    let current: String = call(proxy.get_property("CurrentText")).await.unwrap_or_default();
+    let remaining: f64 = call(proxy.get_property("RemainingSeconds"))
+        .await
+        .unwrap_or(0.0);
+    let current: String = call(proxy.get_property("CurrentText"))
+        .await
+        .unwrap_or_default();
     let error: String = call(proxy.get_property("Error")).await.unwrap_or_default();
 
     if json {
@@ -292,7 +308,10 @@ mod tests {
     fn a_subcommand_name_wins_over_text() {
         let c = Cli::try_parse_from(["say", "stop"]).expect("parses");
         assert!(matches!(c.command, Some(Command::Stop)));
-        assert!(c.text.is_empty(), "a recognised verb must not also be spoken");
+        assert!(
+            c.text.is_empty(),
+            "a recognised verb must not also be spoken"
+        );
     }
 
     #[test]

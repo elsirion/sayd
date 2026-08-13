@@ -258,14 +258,14 @@ async fn main() -> std::process::ExitCode {
     let mut next_recovery_attempt = Instant::now();
     let mut recovery_failure_logged = false;
     let mut ticker = tokio::time::interval(PUBLISH_INTERVAL);
-    let mut sigterm =
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("error: could not install the SIGTERM handler: {e}");
-                return std::process::ExitCode::FAILURE;
-            }
-        };
+    let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: could not install the SIGTERM handler: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
 
     loop {
         tokio::select! {

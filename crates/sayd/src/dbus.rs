@@ -54,7 +54,12 @@ fn say_opts_from(opts: &HashMap<String, OwnedValue>, source: QueueSource) -> Say
         .and_then(|v| v.downcast_ref::<f64>().ok())
         .map(|d| d as f32);
 
-    SayOpts { policy, voice, speed, source }
+    SayOpts {
+        policy,
+        voice,
+        speed,
+        source,
+    }
 }
 
 impl SaydIface {
@@ -226,7 +231,10 @@ mod tests {
     #[test]
     fn opts_default_to_the_source_policy() {
         let o = say_opts_from(&HashMap::new(), QueueSource::DBus);
-        assert!(o.policy.is_none(), "an unset policy must fall through to the source default");
+        assert!(
+            o.policy.is_none(),
+            "an unset policy must fall through to the source default"
+        );
         assert_eq!(o.source, QueueSource::DBus);
     }
 
@@ -241,15 +249,24 @@ mod tests {
     #[test]
     fn an_unknown_policy_string_is_ignored_rather_than_failing() {
         let mut m = HashMap::new();
-        m.insert("policy".to_string(), OwnedValue::from(Str::from("nonsense")));
+        m.insert(
+            "policy".to_string(),
+            OwnedValue::from(Str::from("nonsense")),
+        );
         let o = say_opts_from(&m, QueueSource::DBus);
-        assert_eq!(o.policy, None, "an unknown policy falls back to the source default");
+        assert_eq!(
+            o.policy, None,
+            "an unknown policy falls back to the source default"
+        );
     }
 
     #[test]
     fn opts_parse_voice_and_speed() {
         let mut m = HashMap::new();
-        m.insert("voice".to_string(), OwnedValue::from(Str::from("am_fenrir")));
+        m.insert(
+            "voice".to_string(),
+            OwnedValue::from(Str::from("am_fenrir")),
+        );
         m.insert("speed".to_string(), OwnedValue::from(1.25f64));
         let o = say_opts_from(&m, QueueSource::DBus);
         assert_eq!(o.voice.as_deref(), Some("am_fenrir"));
@@ -281,18 +298,27 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        panic!("timed out waiting for {label}; snapshot = {:?}", engine.snapshot());
+        panic!(
+            "timed out waiting for {label}; snapshot = {:?}",
+            engine.snapshot()
+        );
     }
 
     #[tokio::test]
     async fn say_returns_a_nonzero_id_and_zero_when_nothing_is_queued() {
         let i = iface();
-        let id = i.say("hello there.".into(), HashMap::new()).await.expect("accepted");
+        let id = i
+            .say("hello there.".into(), HashMap::new())
+            .await
+            .expect("accepted");
         assert_ne!(id, 0);
 
         i.set_muted(true).await;
         wait_for(&i.engine, "muted", |s| s.muted);
-        let muted_id = i.say("nobody hears this".into(), HashMap::new()).await.expect("accepted");
+        let muted_id = i
+            .say("nobody hears this".into(), HashMap::new())
+            .await
+            .expect("accepted");
         assert_eq!(muted_id, 0, "0 means accepted but nothing queued");
         i.engine.shutdown();
     }
@@ -300,7 +326,10 @@ mod tests {
     #[tokio::test]
     async fn say_reports_a_rejection_as_a_dbus_error() {
         let i = SaydIface::new(sayd_core::handle::EngineHandle::spawn(
-            Config { max_chars: 5, ..Config::default() },
+            Config {
+                max_chars: 5,
+                ..Config::default()
+            },
             Box::new(StubSynthesizer::new()),
             Box::new(VecSink::new(24_000)),
         ));

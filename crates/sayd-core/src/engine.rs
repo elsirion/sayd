@@ -383,7 +383,9 @@ impl Engine {
             return;
         }
 
-        let Some(c) = self.current.as_mut() else { return };
+        let Some(c) = self.current.as_mut() else {
+            return;
+        };
         if c.next_chunk >= c.chunks.len() {
             self.current = None;
             if self.queue.is_empty() {
@@ -519,7 +521,11 @@ impl Engine {
             speed: self.cfg.speed,
             queue_len: self.queue.len(),
             remaining_secs: self.remaining_secs(),
-            current_text: self.current.as_ref().map(|c| c.text.clone()).unwrap_or_default(),
+            current_text: self
+                .current
+                .as_ref()
+                .map(|c| c.text.clone())
+                .unwrap_or_default(),
             current_id: self.current.as_ref().map(|c| c.id).unwrap_or(0),
             error: self.error.clone(),
         }
@@ -695,7 +701,10 @@ mod tests {
     }
 
     fn say(text: &str) -> Command {
-        Command::Say { text: text.into(), opts: SayOpts::default() }
+        Command::Say {
+            text: text.into(),
+            opts: SayOpts::default(),
+        }
     }
 
     /// Run `tick` until idle or `max` iterations, whichever comes first.
@@ -755,7 +764,10 @@ mod tests {
         run(&mut e, 500);
 
         let pending = sink.lock().unwrap().pending();
-        assert!(pending > 0, "test is only meaningful with audio still buffered");
+        assert!(
+            pending > 0,
+            "test is only meaningful with audio still buffered"
+        );
         let s = e.snapshot();
         assert_eq!(
             s.state,
@@ -769,7 +781,11 @@ mod tests {
 
         sink.lock().unwrap().drain(usize::MAX);
         e.tick();
-        assert_eq!(e.snapshot().state, State::Idle, "must go Idle once the sink actually drains");
+        assert_eq!(
+            e.snapshot().state,
+            State::Idle,
+            "must go Idle once the sink actually drains"
+        );
     }
 
     #[test]
@@ -784,7 +800,10 @@ mod tests {
         run(&mut e, 500);
         assert_eq!(e.snapshot().state, State::Speaking);
         let pending_before = sink.lock().unwrap().pending();
-        assert!(pending_before > 0, "test is only meaningful with audio still buffered");
+        assert!(
+            pending_before > 0,
+            "test is only meaningful with audio still buffered"
+        );
 
         e.handle(Command::Pause);
         assert_eq!(e.snapshot().state, State::Paused);
@@ -794,7 +813,11 @@ mod tests {
         }
 
         let s = e.snapshot();
-        assert_eq!(s.state, State::Paused, "must not spuriously become Idle while paused");
+        assert_eq!(
+            s.state,
+            State::Paused,
+            "must not spuriously become Idle while paused"
+        );
         assert_eq!(
             sink.lock().unwrap().pending(),
             pending_before,
@@ -840,7 +863,10 @@ mod tests {
         e.handle(Command::Stop);
         let s = e.snapshot();
         assert_eq!(s.state, State::Idle);
-        assert_eq!(s.queue_len, 0, "Stop is the shut-up verb: it clears everything");
+        assert_eq!(
+            s.queue_len, 0,
+            "Stop is the shut-up verb: it clears everything"
+        );
     }
 
     #[test]
@@ -875,9 +901,16 @@ mod tests {
         e.tick();
         e.handle(Command::Say {
             text: "Selected text.".into(),
-            opts: SayOpts { source: Source::Hotkey, ..Default::default() },
+            opts: SayOpts {
+                source: Source::Hotkey,
+                ..Default::default()
+            },
         });
-        assert_eq!(e.snapshot().queue_len, 1, "replace drops everything pending");
+        assert_eq!(
+            e.snapshot().queue_len,
+            1,
+            "replace drops everything pending"
+        );
     }
 
     #[test]
@@ -892,7 +925,11 @@ mod tests {
                 ..Default::default()
             },
         });
-        assert_eq!(e.snapshot().queue_len, 2, "explicit enqueue beats the hotkey default");
+        assert_eq!(
+            e.snapshot().queue_len,
+            2,
+            "explicit enqueue beats the hotkey default"
+        );
     }
 
     #[test]
@@ -907,7 +944,10 @@ mod tests {
 
     #[test]
     fn text_over_max_chars_is_rejected() {
-        let cfg = Config { max_chars: 10, ..Config::default() };
+        let cfg = Config {
+            max_chars: 10,
+            ..Config::default()
+        };
         let mut e = Engine::new(
             cfg,
             Box::new(StubSynthesizer::new()),
@@ -921,7 +961,10 @@ mod tests {
 
     #[test]
     fn a_later_successful_say_clears_the_error() {
-        let cfg = Config { max_chars: 10, ..Config::default() };
+        let cfg = Config {
+            max_chars: 10,
+            ..Config::default()
+        };
         let mut e = Engine::new(
             cfg,
             Box::new(StubSynthesizer::new()),
@@ -937,7 +980,10 @@ mod tests {
     fn stop_dismisses_a_stuck_error() {
         // Stop is the daemon's designated "shut up" command: it must be able
         // to clear Error even though nothing else naturally can.
-        let cfg = Config { max_chars: 5, ..Config::default() };
+        let cfg = Config {
+            max_chars: 5,
+            ..Config::default()
+        };
         let mut e = Engine::new(
             cfg,
             Box::new(StubSynthesizer::new()),
@@ -953,7 +999,10 @@ mod tests {
 
     #[test]
     fn next_dismisses_a_stuck_error_when_the_queue_is_empty() {
-        let cfg = Config { max_chars: 5, ..Config::default() };
+        let cfg = Config {
+            max_chars: 5,
+            ..Config::default()
+        };
         let mut e = Engine::new(
             cfg,
             Box::new(StubSynthesizer::new()),
@@ -974,7 +1023,10 @@ mod tests {
         // explicit command may dismiss it. `synth_failure_surfaces_as_error_
         // and_does_not_wedge` already covers the synth-failure route to
         // Error; this covers the rejection route.
-        let cfg = Config { max_chars: 5, ..Config::default() };
+        let cfg = Config {
+            max_chars: 5,
+            ..Config::default()
+        };
         let mut e = Engine::new(
             cfg,
             Box::new(StubSynthesizer::new()),
@@ -986,7 +1038,11 @@ mod tests {
             e.tick();
         }
         let s = e.snapshot();
-        assert_eq!(s.state, State::Error, "no command was issued; the error must persist");
+        assert_eq!(
+            s.state,
+            State::Error,
+            "no command was issued; the error must persist"
+        );
         assert!(s.error.is_some());
     }
 
@@ -996,7 +1052,10 @@ mod tests {
         // legitimately speaking must not flip the engine to Error: A is
         // unaffected and should play to completion. The rejection must
         // still be observable -- now synchronously, as `submit`'s `Err`.
-        let cfg = Config { max_chars: 5, ..Config::default() };
+        let cfg = Config {
+            max_chars: 5,
+            ..Config::default()
+        };
         let mut e = Engine::new(
             cfg,
             Box::new(StubSynthesizer::new()),
@@ -1026,7 +1085,10 @@ mod tests {
 
     #[test]
     fn rejection_while_paused_leaves_playback_untouched() {
-        let cfg = Config { max_chars: 5, ..Config::default() };
+        let cfg = Config {
+            max_chars: 5,
+            ..Config::default()
+        };
         let mut e = Engine::new(
             cfg,
             Box::new(StubSynthesizer::new()),
@@ -1099,7 +1161,9 @@ mod tests {
         }
         fn build_speaking() -> Engine {
             let mut e = engine();
-            e.handle(say("Hello there. This keeps it busy for quite a while indeed."));
+            e.handle(say(
+                "Hello there. This keeps it busy for quite a while indeed.",
+            ));
             e.tick();
             e
         }
@@ -1109,7 +1173,10 @@ mod tests {
             e
         }
         fn build_error() -> Engine {
-            let cfg = Config { max_chars: 5, ..Config::default() };
+            let cfg = Config {
+                max_chars: 5,
+                ..Config::default()
+            };
             let mut e = Engine::new(
                 cfg,
                 Box::new(StubSynthesizer::new()),
@@ -1133,7 +1200,9 @@ mod tests {
                 Box::new(StubSynthesizer::new()),
                 Box::new(sink.clone()),
             );
-            e.handle(say("Hello there. This keeps it busy for quite a while indeed."));
+            e.handle(say(
+                "Hello there. This keeps it busy for quite a while indeed.",
+            ));
             e.tick();
             e.handle(Command::Pause);
             sink.inject_failure("audio device disappeared");
@@ -1154,7 +1223,10 @@ mod tests {
         check_from("speaking", build_speaking);
         check_from("paused", build_paused);
         check_from("error", build_error);
-        check_from("device_failed_while_paused", build_error_from_device_failure_while_paused);
+        check_from(
+            "device_failed_while_paused",
+            build_error_from_device_failure_while_paused,
+        );
     }
 
     #[test]
@@ -1188,7 +1260,9 @@ mod tests {
             Box::new(StubSynthesizer::new()),
             Box::new(VecSink::new(100)),
         );
-        e.handle(say("A reasonably long sentence to force a big carry remainder."));
+        e.handle(say(
+            "A reasonably long sentence to force a big carry remainder.",
+        ));
         e.tick(); // pop -> synth -> partial push -> the rest parked in carry
         let s = e.snapshot();
         // With only 100 samples possibly in the sink (100 / 24_000 s), any
@@ -1244,7 +1318,10 @@ mod tests {
         // unload as soon as idle. C1: as in `returns_to_idle_when_the_queue_
         // empties`, actually reaching `Idle` -- the precondition this test
         // is exercising -- now requires draining the sink first.
-        let cfg = Config { idle_unload_secs: 0, ..Config::default() };
+        let cfg = Config {
+            idle_unload_secs: 0,
+            ..Config::default()
+        };
         let sink = Arc::new(Mutex::new(VecSink::new(24_000 * 10)));
         let mut e = Engine::new(
             cfg,
@@ -1261,18 +1338,26 @@ mod tests {
         sink.lock().unwrap().drain(usize::MAX);
         e.tick(); // reach Idle and trigger the unload check in the same tick
         assert_eq!(e.snapshot().state, State::Idle);
-        assert!(!e.is_model_loaded(), "expected the model to unload when idle");
+        assert!(
+            !e.is_model_loaded(),
+            "expected the model to unload when idle"
+        );
     }
 
     #[test]
     fn model_does_not_unload_while_speaking() {
-        let cfg = Config { idle_unload_secs: 0, ..Config::default() };
+        let cfg = Config {
+            idle_unload_secs: 0,
+            ..Config::default()
+        };
         let mut e = Engine::new(
             cfg,
             Box::new(StubSynthesizer::new()),
             Box::new(VecSink::new(24_000 * 10)),
         );
-        e.handle(say("A reasonably long sentence to keep it busy for a while."));
+        e.handle(say(
+            "A reasonably long sentence to keep it busy for a while.",
+        ));
         e.tick();
         e.tick();
         assert!(e.is_model_loaded());
@@ -1308,7 +1393,9 @@ mod tests {
             Box::new(StubSynthesizer::new()),
             Box::new(VecSink::new(24_000 * 10)),
         );
-        e.handle(say("First sentence here. Second sentence here. Third one here."));
+        e.handle(say(
+            "First sentence here. Second sentence here. Third one here.",
+        ));
         e.tick();
         let before = e.audio_written();
         e.handle(Command::SkipSentence);
@@ -1325,7 +1412,10 @@ mod tests {
         // run while in `Error` and `SkipSentence` from an error state was a
         // silent no-op, contradicting `dismiss_error_and_go_idle`'s own doc
         // comment. This pins the rejection entry point to `Error`.
-        let cfg = Config { max_chars: 5, ..Config::default() };
+        let cfg = Config {
+            max_chars: 5,
+            ..Config::default()
+        };
         let mut e = Engine::new(
             cfg,
             Box::new(StubSynthesizer::new()),
@@ -1419,7 +1509,10 @@ mod tests {
     fn submit_rejection_while_idle_returns_err_and_sets_error_state() {
         // Nothing is legitimately in flight, so the rejection both answers
         // the caller directly and becomes the engine-wide `Error`.
-        let cfg = Config { max_chars: 5, ..Config::default() };
+        let cfg = Config {
+            max_chars: 5,
+            ..Config::default()
+        };
         let mut e = Engine::new(
             cfg,
             Box::new(StubSynthesizer::new()),
@@ -1438,7 +1531,10 @@ mod tests {
         // Same busy-vs-idle distinction as `rejection_while_speaking_leaves_
         // playback_untouched`, but pinned directly against the new method's
         // return value rather than only through `handle`.
-        let cfg = Config { max_chars: 5, ..Config::default() };
+        let cfg = Config {
+            max_chars: 5,
+            ..Config::default()
+        };
         let mut e = Engine::new(
             cfg,
             Box::new(StubSynthesizer::new()),
@@ -1455,7 +1551,11 @@ mod tests {
 
         assert!(result.is_err());
         let s = e.snapshot();
-        assert_eq!(s.state, State::Speaking, "the unrelated playback must continue");
+        assert_eq!(
+            s.state,
+            State::Speaking,
+            "the unrelated playback must continue"
+        );
         assert_eq!(s.error, None);
     }
 
@@ -1474,7 +1574,10 @@ mod tests {
     fn submit_returns_none_when_muted() {
         let mut e = engine();
         e.handle(Command::SetMuted(true));
-        assert_eq!(e.submit("nobody hears this".into(), SayOpts::default()), Ok(None));
+        assert_eq!(
+            e.submit("nobody hears this".into(), SayOpts::default()),
+            Ok(None)
+        );
     }
 
     #[test]
@@ -1486,7 +1589,9 @@ mod tests {
     #[test]
     fn submit_returns_some_nonzero_id_when_queued() {
         let mut e = engine();
-        let id = e.submit("hello there.".into(), SayOpts::default()).expect("accepted");
+        let id = e
+            .submit("hello there.".into(), SayOpts::default())
+            .expect("accepted");
         assert!(id.is_some());
         assert_ne!(id, Some(0), "id 0 is the nothing-is-playing sentinel");
     }
@@ -1494,7 +1599,10 @@ mod tests {
     #[test]
     fn submit_still_returns_err_when_rejected() {
         let mut e = Engine::new(
-            Config { max_chars: 5, ..Config::default() },
+            Config {
+                max_chars: 5,
+                ..Config::default()
+            },
             Box::new(StubSynthesizer::new()),
             Box::new(VecSink::new(24_000)),
         );
@@ -1510,7 +1618,11 @@ mod tests {
 
     impl FailingSink {
         fn new() -> Self {
-            FailingSink { accepted_once: false, err: None, paused: false }
+            FailingSink {
+                accepted_once: false,
+                err: None,
+                paused: false,
+            }
         }
     }
 
@@ -1562,12 +1674,17 @@ mod tests {
             Box::new(StubSynthesizer::new()),
             Box::new(FailingSink::new()),
         );
-        e.submit(text_spanning_multiple_chunks(), SayOpts::default()).expect("accepted");
+        e.submit(text_spanning_multiple_chunks(), SayOpts::default())
+            .expect("accepted");
         for _ in 0..200 {
             e.tick();
         }
         let s = e.snapshot();
-        assert_eq!(s.state, State::Error, "a dead device must not leave the engine Speaking");
+        assert_eq!(
+            s.state,
+            State::Error,
+            "a dead device must not leave the engine Speaking"
+        );
         assert!(s.error.as_deref().unwrap_or("").contains("device"));
     }
 
@@ -1578,7 +1695,8 @@ mod tests {
             Box::new(StubSynthesizer::new()),
             Box::new(FailingSink::new()),
         );
-        e.submit(text_spanning_multiple_chunks(), SayOpts::default()).expect("accepted");
+        e.submit(text_spanning_multiple_chunks(), SayOpts::default())
+            .expect("accepted");
         for _ in 0..200 {
             e.tick();
         }
@@ -1589,11 +1707,15 @@ mod tests {
         assert_eq!(s.state, State::Idle, "a fresh sink clears the failure");
         assert_eq!(s.error, None);
 
-        e.submit("after recovery.".into(), SayOpts::default()).expect("accepted");
+        e.submit("after recovery.".into(), SayOpts::default())
+            .expect("accepted");
         for _ in 0..500 {
             e.tick();
         }
-        assert!(e.audio_written() > 0, "the engine must work again after the sink is replaced");
+        assert!(
+            e.audio_written() > 0,
+            "the engine must work again after the sink is replaced"
+        );
     }
 
     #[test]
@@ -1615,7 +1737,9 @@ mod tests {
             Box::new(StubSynthesizer::new()),
             Box::new(sink.clone()),
         );
-        e.handle(say("Hello there. This keeps it busy for quite a while indeed."));
+        e.handle(say(
+            "Hello there. This keeps it busy for quite a while indeed.",
+        ));
         e.tick();
         e.handle(Command::Pause);
         assert_eq!(e.snapshot().state, State::Paused);
@@ -1625,7 +1749,11 @@ mod tests {
         e.tick();
 
         let s = e.snapshot();
-        assert_eq!(s.state, State::Error, "a device failure must surface even while paused");
+        assert_eq!(
+            s.state,
+            State::Error,
+            "a device failure must surface even while paused"
+        );
         assert!(
             !sink.is_paused(),
             "leaving Paused for Error must unpause the sink in the same step"
@@ -1647,7 +1775,9 @@ mod tests {
             Box::new(StubSynthesizer::new()),
             Box::new(sink.clone()),
         );
-        e.handle(say("Hello there. This keeps it busy for quite a while indeed."));
+        e.handle(say(
+            "Hello there. This keeps it busy for quite a while indeed.",
+        ));
         e.tick();
         e.handle(Command::Pause);
         sink.inject_failure("audio device disappeared");
@@ -1659,7 +1789,8 @@ mod tests {
         assert_eq!(s.state, State::Idle, "a fresh sink clears the failure");
         assert_eq!(s.error, None);
 
-        e.submit("after recovery.".into(), SayOpts::default()).expect("accepted");
+        e.submit("after recovery.".into(), SayOpts::default())
+            .expect("accepted");
         for _ in 0..500 {
             e.tick();
         }

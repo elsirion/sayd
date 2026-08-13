@@ -43,7 +43,10 @@ pub fn chunk(text: &str, target_chars: usize) -> Vec<Chunk> {
             }
         }
         if !buf.is_empty() {
-            out.push(Chunk { text: buf, starts_paragraph: first_of_para });
+            out.push(Chunk {
+                text: buf,
+                starts_paragraph: first_of_para,
+            });
         }
     }
     out
@@ -236,7 +239,10 @@ mod tests {
     #[test]
     fn refit_splits_chunks_that_overrun_the_token_budget() {
         // A chunk that fits the character target but not the token budget.
-        let cs = vec![Chunk { text: "aaa bbb ccc ddd".into(), starts_paragraph: true }];
+        let cs = vec![Chunk {
+            text: "aaa bbb ccc ddd".into(),
+            starts_paragraph: true,
+        }];
         // Pretend anything over 7 characters overruns.
         let out = refit(cs, |s| s.chars().count() <= 7);
         assert!(out.len() > 1, "expected a split, got {out:?}");
@@ -247,14 +253,20 @@ mod tests {
 
     #[test]
     fn refit_keeps_chunks_that_already_fit() {
-        let cs = vec![Chunk { text: "short".into(), starts_paragraph: false }];
+        let cs = vec![Chunk {
+            text: "short".into(),
+            starts_paragraph: false,
+        }];
         let out = refit(cs.clone(), |_| true);
         assert_eq!(out, cs);
     }
 
     #[test]
     fn refit_only_the_first_piece_keeps_the_paragraph_flag() {
-        let cs = vec![Chunk { text: "aaa bbb ccc".into(), starts_paragraph: true }];
+        let cs = vec![Chunk {
+            text: "aaa bbb ccc".into(),
+            starts_paragraph: true,
+        }];
         let out = refit(cs, |s| s.chars().count() <= 3);
         assert!(out[0].starts_paragraph);
         assert!(out[1..].iter().all(|c| !c.starts_paragraph));
@@ -263,9 +275,16 @@ mod tests {
     #[test]
     fn refit_gives_up_on_an_unsplittable_chunk_rather_than_looping() {
         // A single word that can never fit. Must terminate and return it.
-        let cs = vec![Chunk { text: "supercalifragilistic".into(), starts_paragraph: false }];
+        let cs = vec![Chunk {
+            text: "supercalifragilistic".into(),
+            starts_paragraph: false,
+        }];
         let out = refit(cs, |s| s.chars().count() <= 3);
-        assert_eq!(out.len(), 1, "unsplittable input must be passed through, not looped on");
+        assert_eq!(
+            out.len(),
+            1,
+            "unsplittable input must be passed through, not looped on"
+        );
     }
 
     /// Every whitespace-separated piece in the chunk output must equal some
@@ -296,7 +315,10 @@ mod tests {
         let word = "supercalifragilisticexpialidocious";
         let cs = chunk(word, 10);
         assert_eq!(cs.len(), 1);
-        assert_eq!(cs[0].text, word, "a lone unsplittable word must come back whole");
+        assert_eq!(
+            cs[0].text, word,
+            "a lone unsplittable word must come back whole"
+        );
     }
 
     #[test]
@@ -314,9 +336,15 @@ mod tests {
         let input = "supercalifragilisticexpialidocious is long";
         assert_no_word_is_shredded(input, 20);
         let cs = chunk(input, 20);
-        let rejoined: String = cs.iter().map(|c| c.text.as_str()).collect::<Vec<_>>().join(" ");
+        let rejoined: String = cs
+            .iter()
+            .map(|c| c.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
         assert!(
-            rejoined.split_whitespace().any(|w| w == "supercalifragilisticexpialidocious"),
+            rejoined
+                .split_whitespace()
+                .any(|w| w == "supercalifragilisticexpialidocious"),
             "the long word must survive whole: {rejoined:?}"
         );
     }
@@ -335,15 +363,24 @@ mod tests {
         let strip = |w: &str| w.trim_matches(|c: char| ",.;:!?".contains(c)).to_string();
 
         for input in inputs {
-            let expected: Vec<String> =
-                input.split_whitespace().map(strip).filter(|w| !w.is_empty()).collect();
+            let expected: Vec<String> = input
+                .split_whitespace()
+                .map(strip)
+                .filter(|w| !w.is_empty())
+                .collect();
 
             for &target in &targets {
                 let cs = chunk(input, target);
-                let rejoined: String =
-                    cs.iter().map(|c| c.text.as_str()).collect::<Vec<_>>().join(" ");
-                let actual: Vec<String> =
-                    rejoined.split_whitespace().map(strip).filter(|w| !w.is_empty()).collect();
+                let rejoined: String = cs
+                    .iter()
+                    .map(|c| c.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let actual: Vec<String> = rejoined
+                    .split_whitespace()
+                    .map(strip)
+                    .filter(|w| !w.is_empty())
+                    .collect();
                 assert_eq!(
                     actual, expected,
                     "word sequence mismatch for {input:?} at target {target}: got chunks {cs:?}"

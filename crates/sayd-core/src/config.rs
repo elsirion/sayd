@@ -52,7 +52,10 @@ pub struct ChunkConfig {
 
 impl Default for ChunkConfig {
     fn default() -> Self {
-        ChunkConfig { target_chars: 400, lookahead_chunks: 2 }
+        ChunkConfig {
+            target_chars: 400,
+            lookahead_chunks: 2,
+        }
     }
 }
 
@@ -109,9 +112,7 @@ impl Config {
     pub fn load_from(path: &Path) -> (Config, Option<String>) {
         let txt = match std::fs::read_to_string(path) {
             Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return (Config::default(), None)
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Config::default(), None),
             Err(e) => return (Config::default(), Some(format!("{}: {e}", path.display()))),
         };
         match toml::from_str(&txt) {
@@ -187,7 +188,10 @@ mod tests {
         std::fs::write(&p, "voice = [this is not toml").expect("write");
         let (c, err) = Config::load_from(&p);
         assert_eq!(c, Config::default());
-        assert!(err.is_some(), "a malformed config must be surfaced, not swallowed");
+        assert!(
+            err.is_some(),
+            "a malformed config must be surfaced, not swallowed"
+        );
     }
 
     #[test]

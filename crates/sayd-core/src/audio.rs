@@ -51,7 +51,12 @@ pub struct VecSink {
 
 impl VecSink {
     pub fn new(capacity: usize) -> Self {
-        VecSink { capacity, queued: 0, written: Vec::new(), paused: false }
+        VecSink {
+            capacity,
+            queued: 0,
+            written: Vec::new(),
+            paused: false,
+        }
     }
 
     /// Pretend `n` samples have been played.
@@ -120,7 +125,11 @@ mod tests {
         s.push(&[1.0, 2.0]);
         s.clear();
         assert_eq!(s.pending(), 0);
-        assert_eq!(s.written, vec![1.0, 2.0], "written is the test's transcript");
+        assert_eq!(
+            s.written,
+            vec![1.0, 2.0],
+            "written is the test's transcript"
+        );
     }
 
     #[test]

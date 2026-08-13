@@ -5,10 +5,10 @@
 
 use std::path::{Path, PathBuf};
 
-use sayd_g2p::{Dialect, Phonemizer};
-use sayd_kokoro::Kokoro;
 use sayd_core::config::Config;
 use sayd_core::synth::Synthesizer;
+use sayd_g2p::{Dialect, Phonemizer};
+use sayd_kokoro::Kokoro;
 
 pub struct KokoroSynthesizer {
     models_dir: PathBuf,
@@ -59,7 +59,9 @@ impl KokoroSynthesizer {
             self.session = Some(k);
             self.loaded_voices.clear();
         }
-        self.session.as_mut().ok_or_else(|| "session missing".to_string())
+        self.session
+            .as_mut()
+            .ok_or_else(|| "session missing".to_string())
     }
 }
 
@@ -84,14 +86,20 @@ impl Synthesizer for KokoroSynthesizer {
         self.ensure_session()?;
 
         if !self.loaded_voices.contains(&voice.to_string()) {
-            let k = self.session.as_mut().ok_or_else(|| "session missing".to_string())?;
+            let k = self
+                .session
+                .as_mut()
+                .ok_or_else(|| "session missing".to_string())?;
             k.load_voice(voice).map_err(|e| e.to_string())?;
             // The previous borrow of `k` ends at the statement above, so
             // mutating `loaded_voices` here does not conflict with it.
             self.loaded_voices.push(voice.to_string());
         }
 
-        let k = self.session.as_mut().ok_or_else(|| "session missing".to_string())?;
+        let k = self
+            .session
+            .as_mut()
+            .ok_or_else(|| "session missing".to_string())?;
         k.synth(phonemes, voice, speed).map_err(|e| e.to_string())
     }
 
@@ -127,7 +135,10 @@ mod models_tests {
 
         let text = "Hello there. This is sayd speaking from the engine.";
         let phonemes = s.phonemize(text, "af_heart");
-        assert!(!phonemes.is_empty(), "expected non-empty phonemes for real text");
+        assert!(
+            !phonemes.is_empty(),
+            "expected non-empty phonemes for real text"
+        );
 
         let audio = s.synth(&phonemes, "af_heart", 1.0).expect("synth succeeds");
         assert!(!audio.is_empty(), "expected non-empty audio");
@@ -241,7 +252,8 @@ mod engine_models_tests {
         let mut e = Engine::new(cfg, Box::new(synth), Box::new(DrainableSink(sink.clone())));
 
         let text = "Hello there. This is sayd speaking from the engine.";
-        e.submit(text.into(), SayOpts::default()).expect("well-formed text is accepted");
+        e.submit(text.into(), SayOpts::default())
+            .expect("well-formed text is accepted");
 
         // Tick the real engine to completion: nothing left queued, nothing
         // still in flight. The bound is generous because this drives real
@@ -269,7 +281,10 @@ mod engine_models_tests {
         );
 
         let written = sink.lock().unwrap().written.clone();
-        assert!(!written.is_empty(), "expected some audio to have been written");
+        assert!(
+            !written.is_empty(),
+            "expected some audio to have been written"
+        );
         assert!(
             written.iter().any(|&x| x != 0.0),
             "expected non-silent audio from the real synthesizer, got all zeros"

@@ -258,7 +258,10 @@ fn strip_list_or_heading(segment: &str, prev: Option<char>) -> String {
     if needs_sentinel {
         // The sentinel can never itself be consumed by `LIST_OR_HEADING`
         // (see doc comment above), so it is always still there to strip.
-        replaced.strip_prefix(SENTINEL).map(str::to_string).unwrap_or(replaced)
+        replaced
+            .strip_prefix(SENTINEL)
+            .map(str::to_string)
+            .unwrap_or(replaced)
     } else {
         replaced
     }
