@@ -18,7 +18,7 @@
 
 use ksni::menu::{CheckmarkItem, StandardItem};
 use ksni::{Handle, MenuItem, Tray, TrayMethods};
-use sayd_core::engine::{Command, Snapshot, State, SayOpts};
+use sayd_core::engine::{Command, SayOpts, Snapshot, State};
 use sayd_core::handle::EngineHandle;
 use sayd_core::queue::Source;
 
@@ -480,7 +480,8 @@ mod tests {
         use sayd_core::queue::Policy;
         let opts = super::speak_opts();
         assert_eq!(
-            opts.source, Source::Hotkey,
+            opts.source,
+            Source::Hotkey,
             "tray speak actions must use Hotkey source"
         );
         assert_eq!(
