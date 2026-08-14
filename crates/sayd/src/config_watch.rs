@@ -71,6 +71,32 @@ impl ConfigStore {
         &self.path
     }
 
+    /// The config the file most recently held, as far as the daemon knows.
+    ///
+    /// `save` stamps this *before* every write and `reload` re-stamps it
+    /// whenever it applies an external edit, so this is the freshest content
+    /// either direction has produced -- ours or a hand edit -- without a
+    /// re-read of the file. That makes it the right seed for a caller that
+    /// wants to build on top of "whatever the file currently says" (the
+    /// settings model's `edit`, in particular): no re-read means no TOCTOU
+    /// against the write it is about to do, and no race with the debounce
+    /// thread's own read.
+    ///
+    /// Only one path leaves this `None`: a `save` whose write itself failed,
+    /// which clears the stamp because at that point the on-disk content is
+    /// genuinely unknown (see `save`'s doc comment). `Config::default()` is
+    /// returned there rather than threading an `Option` through every
+    /// caller; the seed is inconsequential in that state; a store broken
+    /// enough to have produced it fails the very next `save` too, regardless
+    /// of what that save was seeded with.
+    pub fn current(&self) -> Config {
+        self.last_written
+            .lock()
+            .expect("last_written mutex")
+            .clone()
+            .unwrap_or_default()
+    }
+
     /// Write `cfg` to disk and apply it to the engine.
     ///
     /// The stamp is taken *before* the write: the watcher thread can observe
