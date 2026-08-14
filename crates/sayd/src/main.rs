@@ -7,6 +7,7 @@
 
 mod dbus;
 mod kokoro_synth;
+mod mpris;
 mod resample;
 mod ring;
 mod selection;
@@ -333,6 +334,18 @@ async fn main() -> std::process::ExitCode {
         }
     };
 
+    // Same reasoning as the tray immediately above: no MPRIS means no media
+    // keys and no playerctl/waybar mpris module, but the daemon is still
+    // useful serving just the control interface, so this must not be fatal
+    // either.
+    let mpris_handle = match mpris::spawn(engine.clone()).await {
+        Ok(s) => Some(s),
+        Err(e) => {
+            eprintln!("info: {e}; continuing without MPRIS (media keys, playerctl)");
+            None
+        }
+    };
+
     // If text was given on the command line, speak it now.
     if !text.trim().is_empty() {
         match engine.submit(text, sayd_core::engine::SayOpts::default()) {
@@ -436,6 +449,35 @@ async fn main() -> std::process::ExitCode {
                     if let Some(h) = tray_handle.as_ref() {
                         let s = now.clone();
                         h.update(move |t| t.set_snapshot(s)).await;
+                    }
+                    // Same "emit only what changed" discipline as the D-Bus
+                    // properties just above -- MPRIS's `PropertiesChanged`
+                    // is opt-in per property (`Server::properties_changed`
+                    // takes the changed values themselves, not a dirty
+                    // flag), so this builds exactly the ones that moved
+                    // rather than resending all three on every publish.
+                    if let Some(server) = mpris_handle.as_ref() {
+                        let mut mpris_props = Vec::new();
+                        if now.state != last.state {
+                            mpris_props.push(mpris_server::Property::PlaybackStatus(
+                                mpris::playback_status_for(now.state),
+                            ));
+                        }
+                        // `current_text` only ever changes together with
+                        // `current_id` (a new utterance becoming current),
+                        // so this mirrors the D-Bus `current_id_changed`
+                        // branch above rather than diffing the text too.
+                        if now.current_id != last.current_id {
+                            mpris_props.push(mpris_server::Property::Metadata(
+                                mpris::metadata_for(now.current_id, &now.current_text),
+                            ));
+                        }
+                        if (now.speed - last.speed).abs() > f32::EPSILON {
+                            mpris_props.push(mpris_server::Property::Rate(now.speed as f64));
+                        }
+                        if !mpris_props.is_empty() {
+                            let _ = server.properties_changed(mpris_props).await;
+                        }
                     }
                     last = now;
                 }

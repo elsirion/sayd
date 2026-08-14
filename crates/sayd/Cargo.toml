@@ -20,6 +20,7 @@ wl-clipboard-rs = { version = "0.9", default-features = false, features = ["dlop
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
 ksni = "0.3"
+mpris-server = { version = "0.10", features = ["tokio"] }
 
 [features]
 models = []
