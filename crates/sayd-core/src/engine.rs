@@ -126,7 +126,10 @@ pub struct SayOpts {
 
 #[derive(Clone, Debug)]
 pub enum Command {
-    Say { text: String, opts: SayOpts },
+    Say {
+        text: String,
+        opts: SayOpts,
+    },
     Pause,
     Resume,
     PlayPause,
@@ -932,9 +935,10 @@ impl Engine {
     /// backdates by an hour and still expects the model to be loaded.
     #[cfg(test)]
     fn backdate_idle(&mut self, ago: Duration) {
-        self.idle_since = self
-            .idle_since
-            .map(|t| t.checked_sub(ago).expect("monotonic clock predates the test"));
+        self.idle_since = self.idle_since.map(|t| {
+            t.checked_sub(ago)
+                .expect("monotonic clock predates the test")
+        });
     }
 
     #[cfg(test)]
@@ -1951,7 +1955,8 @@ mod tests {
         // instead of being baked into the loop.
         run(&mut e, 50);
         assert_ne!(
-            e.snapshot().current_id, current_id,
+            e.snapshot().current_id,
+            current_id,
             "test needs the utterance in progress to actually finish within \
              the tick budget, not just run out of ticks"
         );
