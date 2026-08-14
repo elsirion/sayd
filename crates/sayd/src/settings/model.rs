@@ -96,6 +96,20 @@ struct Pending {
     /// `ConfigStore::current`, whose lock the writer is holding across the
     /// disk write at that very moment.
     write: Option<Config>,
+    /// What `write` was seeded from at the *start* of the burst currently
+    /// accumulating in it -- `None` exactly when `write` is. IMPORTANT 2:
+    /// `write_loop` cannot just write `write` verbatim, because a burst is
+    /// seeded once and can sit debouncing for up to `WRITE_DEBOUNCE` while
+    /// something else (a tray mute, an MPRIS rate change, a hand edit)
+    /// writes the file in between -- writing the whole seeded copy back
+    /// would silently clobber it. Comparing `write` against `write_seed`
+    /// field by field is how `write_loop` tells "this burst actually
+    /// changed this field" from "this field just happens to match its
+    /// starting value"; see `ConfigStore::save_merging` and
+    /// `merge_untouched` in `config_watch.rs`. Set only when a burst starts
+    /// (`edit` finds `write` already `None`) and cleared in lock-step with
+    /// `write` by `write_loop` once nothing is owed -- see both.
+    write_seed: Option<Config>,
     /// Set by `Drop` to bring the writer thread down, after one last
     /// undebounced flush so a change made just before the window closed is
     /// not lost.
@@ -195,6 +209,7 @@ impl SettingsModel {
             pending: Mutex::new(Pending {
                 current,
                 write: None,
+                write_seed: None,
                 stop: false,
                 flush: false,
                 last_write_error: None,
@@ -357,16 +372,37 @@ impl SettingsModel {
                 "the settings writer thread is not running; changes cannot be saved".to_string(),
             );
         }
-        let seed = lock(&self.shared.pending).write.clone();
-        let mut next = match seed {
+        let pending_write = lock(&self.shared.pending).write.clone();
+        let mut next = match pending_write {
             Some(pending) => pending,
             None => self.shared.store.current(),
         };
+        // IMPORTANT 2: captured before `f` mutates `next`, so it is what
+        // this edit started from. `write_loop`'s `save_merging` compares
+        // this against whatever the burst's `write` has become by the time
+        // it is finally written, to tell which fields the burst actually
+        // touched from which ones are just carrying their stale seed value
+        // -- see `Pending::write_seed` and `merge_untouched` in
+        // `config_watch.rs`.
+        let seed = next.clone();
         f(&mut next);
         validate(&mut next)?;
 
         let mut p = lock(&self.shared.pending);
         p.current = next.clone();
+        // Set only at a burst's genuine start. `p.write` is `None` here
+        // either because this is the first edit since the writer last
+        // finished, or because it finished *during* this call, in the gap
+        // between the read above and this lock -- `write_loop` is the only
+        // other place `write` changes, and it only ever clears it, so that
+        // is the sole way this check can disagree with the read above. Both
+        // cases want the same thing: `seed` is this edit's own starting
+        // point, and it equals exactly what the writer just finished
+        // writing (or is about to), which is the correct comparison base
+        // for a burst starting now either way.
+        if p.write.is_none() {
+            p.write_seed = Some(seed);
+        }
         p.write = Some(next.clone());
         drop(p);
         self.shared.work.notify_one();
@@ -554,19 +590,32 @@ fn write_loop(shared: &Shared) {
         // so stays off the store's stamp -- which is precisely what `save`
         // is about to hold across a disk write.
         let Some(cfg) = p.write.clone() else { return };
+        // IMPORTANT 2: the burst's own starting point, needed by
+        // `save_merging` to tell which fields this burst actually changed
+        // from which ones are just carrying their seed value -- see
+        // `Pending::write_seed`. Falls back to `cfg` itself (a no-op merge:
+        // every field then reads as "unchanged", so `save_merging` takes
+        // it entirely from the fresh stamp) only for an invariant that
+        // should not break -- `edit` sets `write_seed` in the same lock
+        // acquisition it first sets `write` in.
+        let seed = p.write_seed.clone().unwrap_or_else(|| cfg.clone());
         let stop = p.stop;
         drop(p);
 
-        let outcome = shared.store.save(&cfg);
+        let outcome = shared.store.save_merging(&seed, &cfg);
         shared.writes.fetch_add(1, Ordering::Relaxed);
 
         match outcome {
             Ok(()) => {
                 let mut p = lock(&shared.pending);
                 // Only if nothing arrived while we were writing; if
-                // something did, it is a newer config and still owed.
+                // something did, it is a newer config and still owed, and
+                // `write_seed` must keep tracking the same burst it already
+                // does -- that newer `edit` left it alone precisely because
+                // `write` was still `Some` when it ran.
                 if p.write.as_ref() == Some(&cfg) {
                     p.write = None;
+                    p.write_seed = None;
                 }
                 // Recorded even when a newer write superseded this one: a
                 // `flush` waiting on that newer write should see the newest
@@ -583,6 +632,7 @@ fn write_loop(shared: &Shared) {
                 let truth = shared.store.current();
                 let mut p = lock(&shared.pending);
                 p.write = None;
+                p.write_seed = None;
                 p.current = truth;
                 p.last_write_error = Some(e.clone());
                 drop(p);
@@ -925,6 +975,61 @@ mod tests {
             engine_cfg.expect("engine answers").model,
             "q8",
             "the running engine must not have been reverted to fp32 either"
+        );
+        engine.shutdown();
+    }
+
+    /// IMPORTANT 2, the reviewer's own reproduction. A field this model
+    /// never edits at all (`muted` -- there is no mute row in the window)
+    /// but that lands on disk *while* an unrelated edit is still inside its
+    /// debounce must survive that edit's write when it finally lands.
+    ///
+    /// Before this, `write_loop` wrote the whole config the burst had been
+    /// seeded with at its start -- `muted: false`, since nothing in this
+    /// burst ever touches it -- and that write landed *after*
+    /// `store.set_muted(true)` (the tray's own write, straight through the
+    /// store, exactly as `say mute`/D-Bus/MPRIS do), clobbering it: the
+    /// tray's checkbox would flip back off on its own about `WRITE_DEBOUNCE`
+    /// after the user pressed Mute.
+    #[test]
+    fn a_pending_edit_does_not_clobber_a_mute_that_lands_during_its_debounce() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let models = models_dir_with(&["af_heart"], dir.path());
+        let path = dir.path().join("config.toml");
+        let (store, engine) = store_in(dir.path());
+        let m = SettingsModel::new(store.clone(), models, Config::default());
+
+        // The window row nudged; the write is now pending, inside its
+        // 250ms debounce.
+        m.edit(|c| c.speed = 1.5).expect("edit succeeds");
+
+        // The tray mute lands independently and immediately, straight
+        // through the store -- exactly like `store.set_muted` inside
+        // `persist_in_background`, never through the model.
+        store.set_muted(true).expect("the mute write must succeed");
+
+        // The window's debounced write lands.
+        settled(&m);
+
+        let (on_disk, err) = Config::load_from(&path);
+        assert_eq!(err, None);
+        assert_eq!(on_disk.speed, 1.5, "the edit itself must still land");
+        assert!(
+            on_disk.muted,
+            "the mute must survive the window's pending write"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut engine_cfg = engine.config();
+        while engine_cfg.as_ref().map(|c| c.muted) != Some(true)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            engine_cfg = engine.config();
+        }
+        assert!(
+            engine_cfg.expect("engine answers").muted,
+            "the running engine must not have been unmuted by the window's write either"
         );
         engine.shutdown();
     }

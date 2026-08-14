@@ -199,10 +199,11 @@ lookahead_chunks = 2
 ```
 
 A malformed file never wedges the daemon, and is not overwritten until you
-change something in the window: `sayd` keeps the settings it is already
-running, reports the parse error in the tray menu (as a `Config:` line,
-separate from the engine's own errors -- a typo in `config.toml` never stops
-the daemon speaking), and picks the file up the moment it parses again.
+change something in the window -- or until you press Mute, which writes
+through too (see below): `sayd` keeps the settings it is already running,
+reports the parse error in the tray menu (as a `Config:` line, separate from
+the engine's own errors -- a typo in `config.toml` never stops the daemon
+speaking), and picks the file up the moment it parses again.
 
 A file that parses but says something `sayd` cannot do is applied as the
 nearest thing it *can* do, and says so in the same place: an unrecognised

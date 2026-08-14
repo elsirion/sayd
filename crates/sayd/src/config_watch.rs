@@ -26,7 +26,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use notify::event::{EventKind, ModifyKind};
@@ -156,11 +156,17 @@ impl ConfigStore {
     /// useful answer to both of the questions asked of it: an edit seeded
     /// from here builds on what is actually running and is not refused by
     /// `validate` over a field the user never touched, and a `ApplyConfig`
-    /// sent from here says what the engine is really doing. The cost is that
-    /// own-write suppression cannot recognise such a file as its own, so a
-    /// later, unrelated write to it re-applies and re-warns; that is one
-    /// redundant apply of an identical config, and only for a file the user
-    /// has already been warned about.
+    /// sent from here says what the engine is really doing. This does not
+    /// cost own-write suppression what an earlier version of this comment
+    /// claimed: `reload` normalises *before* it compares against the stamp
+    /// (see its body), so a byte-identical rewrite of such a file
+    /// normalises to the same thing every time and is still recognised as
+    /// our own -- one apply for a real edit, none for an echo, exactly like
+    /// any other file. The one real residual was that a *suppressed* reload
+    /// of such a file re-printed its warnings on every occurrence rather
+    /// than only the one that changed anything; `reload` now logs them only
+    /// on the path that actually enters the stamp, next to the equality
+    /// check that decides it.
     ///
     /// There is no "we do not know" state to represent: the stamp is seeded
     /// at construction with the config the engine was spawned with, and a
@@ -209,7 +215,7 @@ impl ConfigStore {
         }
     }
 
-    /// Write `cfg` to disk and apply it to the engine.
+    /// Write `cfg` to disk verbatim and apply it to the engine.
     ///
     /// The stamp is taken *before* the write: the watcher thread can observe
     /// the file the instant `save_to` renames it, and a stamp written
@@ -218,9 +224,52 @@ impl ConfigStore {
     ///
     /// The stamp's lock is what makes a save and a reload one at a time --
     /// see `reload`.
-    pub fn save(&self, cfg: &Config) -> Result<(), String> {
+    ///
+    /// Test-only now, and deliberately not the primitive either production
+    /// writer builds on: `update` (mute, speed) always seeds `cfg` from the
+    /// stamp's *current* value, so nothing about it needs merging, and
+    /// `SettingsModel`'s writer thread needs `save_merging` instead --
+    /// IMPORTANT 2, on that method. What is left for `save` to do in
+    /// production is nothing; what is left for it to do in tests is be the
+    /// simplest possible way to put an exact, known config on disk and have
+    /// it reach the engine, which most of this module's tests want and none
+    /// of them want entangled with burst/seed bookkeeping that has nothing
+    /// to do with what they are testing.
+    #[cfg(test)]
+    fn save(&self, cfg: &Config) -> Result<(), String> {
         let mut stamp = self.stamp();
-        let displaced = std::mem::replace(&mut *stamp, cfg.clone());
+        self.write_locked(&mut stamp, cfg.clone())
+    }
+
+    /// Write `next` to disk and apply it to the engine, except for whatever
+    /// fields a debounced burst of edits did not itself change: those come
+    /// from the stamp's *current* value rather than from whatever it held
+    /// when the burst started. See `merge_untouched`.
+    ///
+    /// IMPORTANT 2: `SettingsModel`'s writer thread seeds a burst once, at
+    /// its start, from the stamp then -- and only writes once the debounce
+    /// settles, up to `WRITE_DEBOUNCE` later. Anything else that wrote to
+    /// the file in between (a tray mute, an MPRIS rate change, a hand edit
+    /// picked up by `reload`) is already in the stamp and on disk by the
+    /// time this runs, and writing the burst's whole seeded copy verbatim
+    /// would silently overwrite it -- the reviewer's repro was exactly
+    /// this: nudge Speed in the window, mute from the tray before the
+    /// window's debounce lands, and the mute reappeared unmuted ~250ms
+    /// later. Taking the stamp once, here, and merging against it under the
+    /// same lock the write itself uses closes the gap a separate
+    /// `current()` call followed by a plain write would leave open (another
+    /// writer landing between the read and the write, to be silently
+    /// re-clobbered by this one).
+    pub fn save_merging(&self, seed: &Config, next: &Config) -> Result<(), String> {
+        let mut stamp = self.stamp();
+        let merged = merge_untouched(seed, next, &stamp);
+        self.write_locked(&mut stamp, merged)
+    }
+
+    /// The write both `save` and `save_merging` do, once the config to write
+    /// has been decided and the stamp is already held.
+    fn write_locked(&self, stamp: &mut MutexGuard<'_, Config>, cfg: Config) -> Result<(), String> {
+        let displaced = std::mem::replace(&mut **stamp, cfg.clone());
         if let Err(e) = cfg.save_to(&self.path) {
             // `save_to` writes a temp file and renames it, and every failure
             // path fails before the rename -- so the destination still holds
@@ -228,14 +277,29 @@ impl ConfigStore {
             // describes. Restoring it keeps own-write suppression correct for
             // the write *before* this one, and keeps `current` returning the
             // file's real content rather than a config nobody chose.
-            *stamp = displaced;
+            **stamp = displaced;
+            // MINOR 6: a write failure here used to reach only the caller
+            // (and, for `update`'s callers, the log via `persist_in_
+            // background`) -- never the tray. The window's own toast covers
+            // the common case, but this is also reached from the writer
+            // thread's debounce tail, which can finish after the window
+            // that made the edit has closed; stderr is then the only
+            // surface. `update`'s failure already went here; `save`'s now
+            // does too.
+            //
+            // MINOR 4: without the path, for the same reason the parse-error
+            // path lost its path in `e0a0fb2` -- the line is already
+            // labelled `Config:`, there is exactly one config file, and an
+            // 80-character menu label has no room to spare for one. The
+            // `Err` returned below keeps the full path, for the log.
+            self.status.set(Some(format!("could not write: {e}")));
             return Err(format!("could not write {}: {e}", self.path.display()));
         }
         // Whatever the file's standing complaint was, it is about a file
         // that no longer exists: this write went through `validate`, so the
         // model is one this build knows and the ranges are the engine's own.
         self.status.set(None);
-        self.engine.send(Command::ApplyConfig(cfg.clone()));
+        self.engine.send(Command::ApplyConfig(cfg));
         Ok(())
     }
 
@@ -264,31 +328,49 @@ impl ConfigStore {
     /// the *running* one, and seeding an edit from there is what the
     /// settings model deliberately avoids (see `SettingsModel::edit`).
     ///
-    /// Blocking, like `save` and for the same reason -- it is `save`'s write
-    /// -- so callers on a thread that must not block on disk go through
+    /// Blocking, like `save_merging` and for the same reason -- it is
+    /// `write_locked`'s write, the same disk I/O both go through -- so
+    /// callers on a thread that must not block on disk go through
     /// [`persist_in_background`].
     ///
-    /// A failed write still applies the change: a mute the daemon cannot
-    /// write down must still shut it up. The caller gets the error back and
-    /// the tray gets the standing complaint, but the room goes quiet either
-    /// way.
+    /// `fallback` is sent unconditionally, *before* anything here touches
+    /// disk -- MINOR 8: `save_to` sits between "not yet applied" and either
+    /// outcome for as long as the write takes, unbounded on a hung NFS or
+    /// FUSE home, and a fallback that only fired from the error arm could
+    /// not help while the write was still in flight -- "shut up now" would
+    /// wait on a stuck filesystem. Sending it first means it never does. The
+    /// later `ApplyConfig` carries the same value once the write is decided
+    /// either way, so for a mute this makes it a no-op by the time it lands:
+    /// `Engine::handle`'s transition test (`cfg.muted && !self.cfg.muted`)
+    /// is already false, because `fallback` already made it so.
+    ///
+    /// The stamp is held across the send on both the success and the
+    /// failure path, exactly like `save`/`save_merging` and `reload` -- and
+    /// for exactly `reload`'s reason (see its doc comment) -- because this
+    /// goes through the same `write_locked` they do. Releasing it first was
+    /// this method's own bug, back when it had its own copy of this write
+    /// instead: a mute's `update` could release the stamp, be preempted
+    /// before its `ApplyConfig(cfg)` send, let a `save` or `reload` run its
+    /// whole read-write-send cycle under the lock this one had just given
+    /// up, and only then send its own now-stale `ApplyConfig` last --
+    /// landing the engine on a config the stamp (and the file) had already
+    /// moved past, with own-write suppression then swallowing every later
+    /// reload that might have corrected it. That is this module's original
+    /// failure shape -- the engine and the file disagreeing about mute,
+    /// durably -- re-entering through the one writer that was not holding
+    /// the lock across its send.
+    ///
+    /// A failed write still applies the change (via `fallback`, above): a
+    /// mute the daemon cannot write down must still shut it up. The caller
+    /// gets the error back and the tray gets the standing complaint, but the
+    /// room goes quiet either way.
     fn update(&self, change: impl FnOnce(&mut Config), fallback: Command) -> Result<(), String> {
+        self.engine.send(fallback);
+
         let mut stamp = self.stamp();
         let mut cfg = stamp.clone();
         change(&mut cfg);
-        let displaced = std::mem::replace(&mut *stamp, cfg.clone());
-        if let Err(e) = cfg.save_to(&self.path) {
-            *stamp = displaced;
-            drop(stamp);
-            let msg = format!("could not write {}: {e}", self.path.display());
-            self.status.set(Some(msg.clone()));
-            self.engine.send(fallback);
-            return Err(msg);
-        }
-        self.status.set(None);
-        drop(stamp);
-        self.engine.send(Command::ApplyConfig(cfg));
-        Ok(())
+        self.write_locked(&mut stamp, cfg)
     }
 
     /// Mute or unmute, persistently. See [`ConfigStore::update`].
@@ -312,8 +394,8 @@ impl ConfigStore {
     /// Read the file and apply it unless it is our own echo.
     ///
     /// The stamp's lock is held across the whole of read, compare and
-    /// stamp -- and across `save`'s whole write -- so that the two cannot
-    /// interleave. Taking it only for the compare left this window: a
+    /// stamp -- and across `write_locked`'s whole write -- so that the two
+    /// cannot interleave. Taking it only for the compare left this window: a
     /// reload reads config A, a save writes B and sends `ApplyConfig(B)`,
     /// and the reload then finds A different from the stamp and sends
     /// `ApplyConfig(A)` *after* it. The engine ends up running a config the
@@ -324,13 +406,14 @@ impl ConfigStore {
     /// reach the engine the order the file actually changed; the sends
     /// underneath it are non-blocking channel pushes, so the lock is never
     /// held waiting on the engine -- but it *is* held across the file write
-    /// itself: `save`'s `save_to` call is disk I/O with no bound this
-    /// module puts on it. `save` is what the settings window's writes end up
-    /// in, so it must not be called from a thread that cannot block on disk
-    /// (a UI event-loop thread, say) -- doing so would stall every reload
-    /// for as long as that write takes, and freeze the UI with it. That is
-    /// why `SettingsModel` owns a writer thread and never calls this from
-    /// the glib main thread; see `SettingsModel::edit`.
+    /// itself: `write_locked`'s `save_to` call is disk I/O with no bound
+    /// this module puts on it. `save_merging` is what the settings window's
+    /// writes end up in, so it (like `update`) must not be called from a
+    /// thread that cannot block on disk (a UI event-loop thread, say) --
+    /// doing so would stall every reload for as long as that write takes,
+    /// and freeze the UI with it. That is why `SettingsModel` owns a writer
+    /// thread and never calls this from the glib main thread; see
+    /// `SettingsModel::edit`.
     ///
     /// A panic inside `save_to` or `load_str` while this lock is held still
     /// poisons the mutex, but no longer propagates: every taker goes through
@@ -350,10 +433,30 @@ impl ConfigStore {
         let mut stamp = self.stamp();
         let txt = match std::fs::read_to_string(&self.path) {
             Ok(txt) => txt,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ReloadOutcome::Missing,
-            Err(e) => return ReloadOutcome::Failed(format!("{}: {e}", self.path.display())),
+            // MINOR 5: a deleted file is not a standing complaint about one
+            // -- deleting `config.toml` to start over is a plausible thing
+            // to do, and the tray must not go on showing a parse error (or
+            // a stale clamp warning) for a file that is no longer there.
+            // `NotFound` used to leave `status` untouched, so whatever it
+            // said before the delete just sat there.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.status.set(None);
+                return ReloadOutcome::Missing;
+            }
+            // Some other I/O problem (permissions, a symlink loop) -- itself
+            // a standing complaint about the file, same as a parse failure
+            // below, and must replace whatever `status` held before rather
+            // than leave it stale next to it.
+            Err(e) => {
+                self.status.set(Some(e.to_string()));
+                return ReloadOutcome::Failed(format!("{}: {e}", self.path.display()));
+            }
         };
         if txt.trim().is_empty() {
+            // Same reasoning as `NotFound` just above: treated as `Missing`
+            // because nobody means an empty file (see the comment on
+            // `DEBOUNCE`), so treated the same for the standing complaint.
+            self.status.set(None);
             return ReloadOutcome::Missing;
         }
         let (mut cfg, err) = Config::load_str(&txt);
@@ -385,9 +488,6 @@ impl ConfigStore {
         // so it says what it had to change and carries on. Nothing is
         // written back (spec §11).
         let warnings = crate::settings::model::normalize(&mut cfg);
-        for w in &warnings {
-            eprintln!("warning: {}: {w}", self.path.display());
-        }
         self.status.set(if warnings.is_empty() {
             None
         } else {
@@ -395,6 +495,17 @@ impl ConfigStore {
         });
         if *stamp == cfg {
             return ReloadOutcome::OwnWrite;
+        }
+        // Logged only here, on the path that actually enters the stamp --
+        // not above, next to `status.set`. A file the daemon cannot honour
+        // literally normalises to the same warned-about config on every
+        // reload, so without this a periodic rewrite of such a file (or
+        // anything else that fires a reload without changing what it says)
+        // would re-print the same warnings forever, even though `status`
+        // already carries them and nothing about the running config just
+        // changed.
+        for w in &warnings {
+            eprintln!("warning: {}: {w}", self.path.display());
         }
         *stamp = cfg.clone();
         self.applied_reloads.fetch_add(1, Ordering::Relaxed);
@@ -411,6 +522,59 @@ impl ConfigStore {
     #[cfg(test)]
     fn applied_reloads(&self) -> usize {
         self.applied_reloads.load(Ordering::Relaxed)
+    }
+}
+
+/// Build the config `save_merging` should actually write: `next` for a field
+/// that differs from `seed`, `fresh` (the stamp's value at write time) for
+/// one that does not.
+///
+/// `seed` is what the writing burst started from and `next` is what it has
+/// become after every edit in it; a field where the two disagree is a field
+/// this burst genuinely set, and that value must win no matter what else has
+/// happened to the file meanwhile -- it is the whole reason the burst is
+/// being written at all. A field where they agree was never touched by this
+/// burst, and `next`'s value for it is nothing but a stale copy of whatever
+/// the stamp held when the burst was seeded; `fresh` is what the stamp holds
+/// *now*, which is the freshest thing anyone has told this store about that
+/// field, ours or another writer's (`update`, `reload`) that landed while
+/// this burst was debouncing.
+///
+/// The comparison is against `seed`, deliberately not against `fresh`:
+/// comparing `next` to `fresh` would call a field "touched" merely because
+/// someone else changed it, and write back this burst's stale copy of it --
+/// exactly the clobber this function exists to avoid.
+///
+/// The one case this does not distinguish is a field the burst set back to
+/// its own seed value within itself (nudge Speed up, then down to exactly
+/// where it started, before the debounce fires): that is indistinguishable
+/// from never having touched it and is treated the same way, which can only
+/// ever lose a no-op. Whole nested structs (`cleanup`, `chunking`) are
+/// compared and taken as a unit, matching how the window itself changes
+/// them -- one row's handler sets one field of `cfg.cleanup`, never `cleanup`
+/// piecemeal from two different writers.
+fn merge_untouched(seed: &Config, next: &Config, fresh: &Config) -> Config {
+    fn pick<T: Clone + PartialEq>(seed: &T, next: &T, fresh: &T) -> T {
+        if next != seed {
+            next.clone()
+        } else {
+            fresh.clone()
+        }
+    }
+    Config {
+        voice: pick(&seed.voice, &next.voice, &fresh.voice),
+        speed: pick(&seed.speed, &next.speed, &fresh.speed),
+        model: pick(&seed.model, &next.model, &fresh.model),
+        threads: pick(&seed.threads, &next.threads, &fresh.threads),
+        idle_unload_secs: pick(
+            &seed.idle_unload_secs,
+            &next.idle_unload_secs,
+            &fresh.idle_unload_secs,
+        ),
+        muted: pick(&seed.muted, &next.muted, &fresh.muted),
+        max_chars: pick(&seed.max_chars, &next.max_chars, &fresh.max_chars),
+        cleanup: pick(&seed.cleanup, &next.cleanup, &fresh.cleanup),
+        chunking: pick(&seed.chunking, &next.chunking, &fresh.chunking),
     }
 }
 
@@ -884,6 +1048,86 @@ mod tests {
             running,
             "a failed save must leave the previous config as the seed"
         );
+        engine.shutdown();
+    }
+
+    /// MINOR 6: `save`'s failure used to reach only the caller -- `update`'s
+    /// already went to the tray, `save`'s did not. The window's own toast
+    /// covers the common case, but this is also what `save_merging` shares
+    /// (`SettingsModel`'s writer thread calls it well after the click that
+    /// triggered it, and the debounce tail can outlive the window that made
+    /// the edit), so stderr used to be the only surface for a write that
+    /// failed after the window that caused it had already closed.
+    #[test]
+    fn a_failed_save_reaches_the_tray_the_same_way_a_failed_update_does() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"not a directory").expect("blocker");
+        let engine = engine();
+        let store = ConfigStore::new(
+            blocker.join("config.toml"),
+            engine.clone(),
+            Config::default(),
+        );
+
+        let cfg = Config {
+            voice: "am_fenrir".into(),
+            ..Config::default()
+        };
+        assert!(store.save(&cfg).is_err(), "the write must fail");
+        assert_eq!(
+            store
+                .status()
+                .get()
+                .as_deref()
+                .map(|s| s.contains("could not write")),
+            Some(true),
+            "a failed settings-window write must reach the tray, exactly like a failed update"
+        );
+        engine.shutdown();
+    }
+
+    /// MINOR 8: `update` used to send its transport fallback only from the
+    /// error arm of a *finished* write, so a write that is neither `Ok` nor
+    /// `Err` yet -- stuck, on a hung NFS or FUSE mount -- left "shut up now"
+    /// waiting on it too. A named pipe at the write's temp-file path
+    /// reproduces "stuck" precisely: `Config::save_to` writes to
+    /// `<path>.tmp` with a plain `std::fs::write`, and opening a FIFO for
+    /// writing blocks until something reads it -- nothing here ever does,
+    /// so the write never returns for the life of this test.
+    #[test]
+    fn a_mute_takes_effect_even_while_the_write_is_stuck() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let tmp = path.with_extension("toml.tmp");
+        let tmp_c = std::ffi::CString::new(tmp.to_str().expect("utf8 path")).expect("no NUL");
+        assert_eq!(
+            unsafe { libc::mkfifo(tmp_c.as_ptr(), 0o600) },
+            0,
+            "mkfifo failed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        let engine = engine();
+        let store = Arc::new(ConfigStore::new(
+            path.clone(),
+            engine.clone(),
+            Config::default(),
+        ));
+
+        // `set_muted` blocks inside `save_to`'s `std::fs::write` to the
+        // FIFO -- that is the point, it is a synchronous call -- so it runs
+        // on its own thread, deliberately never joined: nothing ever reads
+        // the FIFO, so this call does not return before the test process
+        // does.
+        let writer = store.clone();
+        std::thread::spawn(move || {
+            let _ = writer.set_muted(true);
+        });
+
+        wait_for(&engine, "the engine to mute despite the stuck write", |s| {
+            s.muted
+        });
         engine.shutdown();
     }
 
@@ -1406,6 +1650,84 @@ mod tests {
         engine.shutdown();
     }
 
+    /// IMPORTANT 1: `update` (what `set_muted`/`set_speed` call) used to
+    /// release the stamp before sending `ApplyConfig`, the only one of the
+    /// three writers that did. That let a concurrent `save` run its whole
+    /// stamp-write-send cycle inside the gap, so `update`'s own send --
+    /// built from an older config -- could land at the engine *after* it:
+    /// the engine ends up on a config the stamp (and the file) have already
+    /// moved past, and since the stamp really does say the newer thing,
+    /// `reload` treats every later attempt to correct it as an echo and
+    /// swallows it. That is this module's original failure shape -- the
+    /// engine and the file disagreeing about mute, durably and silently --
+    /// re-entering through the one writer that did not hold the lock across
+    /// its send.
+    ///
+    /// Same technique as `a_reload_racing_saves_cannot_leave_the_engine_on_
+    /// the_older_config` above: race the two for long enough and check only
+    /// the final state, since the losing interleaving is narrow and only
+    /// the last loser leaves a mark that survives to the assertion. With
+    /// the stamp held across every writer's send, the total order of stamp
+    /// writes and the total order of engine sends are the same order, so
+    /// the engine and the stamp cannot disagree once both race loops stop.
+    #[test]
+    fn a_mute_racing_a_save_cannot_leave_the_engine_disagreeing_with_the_stamp() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let engine = engine();
+        let store = Arc::new(ConfigStore::new(
+            path.clone(),
+            engine.clone(),
+            Config::default(),
+        ));
+
+        let unrelated_a = Config {
+            voice: "am_fenrir".into(),
+            ..Config::default()
+        };
+        let unrelated_b = Config {
+            voice: "bm_george".into(),
+            ..Config::default()
+        };
+
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let savers: Vec<_> = [unrelated_a, unrelated_b]
+            .into_iter()
+            .map(|cfg| {
+                let store = store.clone();
+                let done = done.clone();
+                std::thread::spawn(move || {
+                    while !done.load(Ordering::Relaxed) {
+                        let _ = store.save(&cfg);
+                    }
+                })
+            })
+            .collect();
+        for i in 0..4_000 {
+            store.set_muted(i % 2 == 0).expect("the write must succeed");
+        }
+        done.store(true, Ordering::Relaxed);
+        for saver in savers {
+            saver.join().expect("saver thread");
+        }
+
+        // Deliberately no reload here, for the same reason the racing-saves
+        // test has none: a reload would re-read the file and could paper
+        // over a stuck engine by correcting it, rather than exposing that
+        // it was ever stuck.
+        let want = store.current();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while engine.config().as_ref() != Some(&want) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            engine.config().expect("engine answers"),
+            want,
+            "the engine must not be stuck on a config older than the stamp (and the file)"
+        );
+        engine.shutdown();
+    }
+
     /// IMPORTANT 3: a file the daemon cannot honour literally is applied as
     /// what it will actually run, and says so. Before this, `model = "int4"`
     /// went to the engine verbatim, `model_file_for` fell through to fp32,
@@ -1514,6 +1836,37 @@ mod tests {
             engine.snapshot().voice,
             "am_fenrir",
             "a deleted config must leave the running settings alone"
+        );
+        engine.shutdown();
+    }
+
+    /// MINOR 5: a deleted config file is not a standing complaint about one.
+    /// Measured: after `rm ~/.config/sayd/config.toml` the tray kept
+    /// showing a parse error for a file that no longer existed --
+    /// `reload`'s `NotFound` arm returned `Missing` without ever touching
+    /// `status`, so whatever it said before the delete just sat there.
+    /// Deleting the config to start fresh is a plausible thing for a user
+    /// to do, and the tray line has to clear when they do it.
+    #[test]
+    fn a_deleted_config_clears_a_stale_tray_complaint() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let engine = engine();
+        let store = ConfigStore::new(path.clone(), engine.clone(), Config::default());
+
+        std::fs::write(&path, "voice = [this is not toml").expect("write");
+        assert!(matches!(store.reload(), ReloadOutcome::Failed(_)));
+        assert!(
+            store.status().get().is_some(),
+            "sanity: the file's complaint must be standing before the delete"
+        );
+
+        std::fs::remove_file(&path).expect("delete the config");
+        assert_eq!(store.reload(), ReloadOutcome::Missing);
+        assert_eq!(
+            store.status().get(),
+            None,
+            "a deleted file cannot still be malformed"
         );
         engine.shutdown();
     }
