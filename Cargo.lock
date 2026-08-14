@@ -1065,6 +1065,7 @@ name = "sayd"
 version = "0.2.0"
 dependencies = [
  "cpal",
+ "libc",
  "rtrb",
  "sayd-core",
  "sayd-g2p",

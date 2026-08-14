@@ -30,6 +30,23 @@ const OBJECT_PATH: &str = "/sh/sayd/Sayd";
 /// `RemainingSeconds` ticking down does not flood the bus.
 const PUBLISH_INTERVAL: Duration = Duration::from_millis(200);
 
+/// How often `RemainingSeconds` republishes while it is actively counting
+/// down.
+///
+/// `RemainingSeconds` is a `#[zbus(property)]`, which zbus's introspection
+/// XML annotates `emits-change` by default; a spec-conformant client (e.g.
+/// waybar's D-Bus module) is entitled to cache a property's value forever
+/// once read, until a change signal says otherwise. The publish loop used
+/// to never send one for this property at all -- deliberately, per the
+/// comment that used to sit above the emission list -- which meant such a
+/// client saw the value it first read and nothing else, forever.
+///
+/// The design doc's target for a live countdown is 1 Hz: fast enough to
+/// read as ticking on a tray or waybar module, slow enough not to flood the
+/// bus the way publishing every `PUBLISH_INTERVAL` (200 ms) would -- five
+/// times the traffic for a number nobody can read that precisely anyway.
+const REMAINING_SECONDS_PUBLISH_INTERVAL: Duration = Duration::from_secs(1);
+
 /// Minimum spacing between device-reacquisition attempts while the engine is
 /// stuck in `State::Error`.
 ///
@@ -138,9 +155,54 @@ fn open_sink() -> Result<Box<dyn AudioSink>, String> {
     Ok(Box::new(sink))
 }
 
+/// Print a short usage summary for `sayd --help`.
+///
+/// Deliberately not `clap`: `sayd`'s only argument surface is "text to
+/// speak, or nothing" (see `main`'s module doc), and pulling in a parser
+/// crate for two flags would be the tail wagging the dog. `sayd-cli`'s
+/// `say` binary is where real argument parsing belongs.
+fn print_help() {
+    println!("sayd {}", env!("CARGO_PKG_VERSION"));
+    println!("Local text-to-speech daemon for Wayland");
+    println!();
+    println!("USAGE:");
+    println!("    sayd [TEXT...]");
+    println!();
+    println!("Run with no arguments to start the daemon (a no-op if one is already");
+    println!("running). Any other arguments are joined with spaces and spoken --");
+    println!("starting the daemon first if it is not already running.");
+    println!();
+    println!("For pause/stop/selection/clipboard/status and everything else, use");
+    println!("the `say` command instead of talking to `sayd` directly.");
+    println!();
+    println!("OPTIONS:");
+    println!("    -h, --help       Print this message and exit");
+    println!("    -V, --version    Print version and exit");
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> std::process::ExitCode {
-    let text: String = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // Finding 4: with no special-casing, these two are joined into text and
+    // spoken by the daemon instead of doing what every other CLI does with
+    // them. Recognised only as the *sole* argument, exactly like a real
+    // parser would treat a bare `--help`/`--version` with nothing else on
+    // the line -- `sayd --help really means this` still gets spoken, which
+    // is correct: `sayd`'s whole argument surface is "text, or nothing."
+    match args.as_slice() {
+        [flag] if flag == "--help" || flag == "-h" => {
+            print_help();
+            return std::process::ExitCode::SUCCESS;
+        }
+        [flag] if flag == "--version" || flag == "-V" => {
+            println!("sayd {}", env!("CARGO_PKG_VERSION"));
+            return std::process::ExitCode::SUCCESS;
+        }
+        _ => {}
+    }
+
+    let text: String = args.join(" ");
 
     let connection = match zbus::connection::Builder::session() {
         Ok(b) => match b.build().await {
@@ -204,6 +266,16 @@ async fn main() -> std::process::ExitCode {
         eprintln!("warning: {e}; using defaults");
     }
 
+    // Finding 2: load and validate the ONNX Runtime dylib now, up front,
+    // where a failure can be reported with a clean exit -- rather than
+    // letting the first synthesis discover it lazily inside `ort`, which
+    // panics instead of returning `Err` (see `sayd_kokoro::init_environment`'s
+    // doc comment for the SIGABRT this avoids).
+    if let Err(e) = sayd_kokoro::init_environment() {
+        eprintln!("error: {e}");
+        return std::process::ExitCode::FAILURE;
+    }
+
     let synth = match kokoro_synth::KokoroSynthesizer::new(&models_dir(), &cfg) {
         Ok(s) => s,
         Err(e) => {
@@ -256,6 +328,14 @@ async fn main() -> std::process::ExitCode {
     // keeps a standing failure to one line instead of one every `PUBLISH_INTERVAL`.
     let mut next_recovery_attempt = Instant::now();
     let mut recovery_failure_logged = false;
+    // Finding 3: `RemainingSeconds` publish throttling. `next_remaining_publish`
+    // paces periodic emissions to `REMAINING_SECONDS_PUBLISH_INTERVAL` while
+    // counting down; `remaining_was_active` remembers whether the previous
+    // tick was counting down, so the transition into Idle/Paused/Error gets
+    // exactly one settling emission (correcting a client's cache to the
+    // final value) instead of either silence or a steady stream of zeros.
+    let mut next_remaining_publish = Instant::now();
+    let mut remaining_was_active = false;
     let mut ticker = tokio::time::interval(PUBLISH_INTERVAL);
     let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
     {
@@ -270,11 +350,29 @@ async fn main() -> std::process::ExitCode {
         tokio::select! {
             _ = ticker.tick() => {
                 let now = engine.snapshot();
-                if now != last {
+                let now_instant = Instant::now();
+
+                // Finding 3: bounded `RemainingSeconds` publishing. "Active"
+                // means it is actually counting down -- `Speaking` with
+                // something still outstanding -- not merely nonzero (a
+                // `Paused` utterance mid-playback has a nonzero
+                // `remaining_secs` that is not currently changing, so there
+                // is nothing to publish about it beyond the settle emission
+                // below).
+                let remaining_is_active =
+                    now.state == sayd_core::engine::State::Speaking && now.remaining_secs > 0.0;
+                let remaining_due =
+                    remaining_is_active && now_instant >= next_remaining_publish;
+                // Just stopped counting down: one more emission corrects a
+                // caching client to the settled value (typically 0) instead
+                // of leaving it stuck on the last mid-countdown number.
+                let remaining_settling = !remaining_is_active && remaining_was_active;
+
+                if now != last || remaining_due || remaining_settling {
                     let ctx = iface_ref.signal_emitter();
                     let i = iface_ref.get().await;
                     // Emit only what changed; a client diffing every property
-                    // on every tick would see RemainingSeconds churn forever.
+                    // on every tick would see them churn on every tick.
                     if now.state != last.state {
                         let _ = i.state_changed(ctx).await;
                     }
@@ -297,8 +395,19 @@ async fn main() -> std::process::ExitCode {
                     if now.error != last.error {
                         let _ = i.error_changed(ctx).await;
                     }
+                    if remaining_due || remaining_settling {
+                        let _ = i.remaining_seconds_changed(ctx).await;
+                    }
                     last = now;
                 }
+                if remaining_due {
+                    next_remaining_publish = now_instant + REMAINING_SECONDS_PUBLISH_INTERVAL;
+                } else if remaining_settling {
+                    // Ready to fire immediately the moment it becomes active
+                    // again, rather than waiting out a stale interval.
+                    next_remaining_publish = now_instant;
+                }
+                remaining_was_active = remaining_is_active;
 
                 // Recover from a *sink*-kind engine error by reacquiring the
                 // device, regardless of which cpal `StreamError` variant

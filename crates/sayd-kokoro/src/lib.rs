@@ -14,6 +14,64 @@ use std::path::{Path, PathBuf};
 use ort::session::Session;
 use ort::value::Tensor;
 
+/// Load the ONNX Runtime shared library and commit it as the process-wide
+/// `ort` environment, once, up front.
+///
+/// Without this, the first call into `ort` (deep inside [`Kokoro::new`],
+/// called from `sayd`'s `KokoroSynthesizer::ensure_session` on first
+/// synthesis) discovers a missing or incompatible dylib *lazily*, inside
+/// `ort`'s internal `setup_api`, which does `load_dynamic::init(&path)
+/// .expect("Failed to load ONNX Runtime dylib")` -- a panic, not a
+/// `Result`. That panic kills the engine thread; the daemon's main thread
+/// then trips over the resulting poisoned state, and `ort`'s
+/// `release_env_on_exit` panics again during process teardown in a context
+/// that cannot unwind, producing `SIGABRT` instead of a clean, reportable
+/// exit. Under a systemd unit with `Restart=on-failure`, that is a crash
+/// loop.
+///
+/// Calling this explicitly, before anything else in the process touches
+/// `ort`, performs the same dylib load `ort` would have attempted lazily,
+/// but as an ordinary `Result` the caller can print and exit on cleanly --
+/// the same way a missing audio device is already reported.
+///
+/// Respects `ORT_DYLIB_PATH` exactly as `ort` itself does; falls back to
+/// the platform's default dynamic library name (searched via the normal
+/// dynamic linker path, e.g. `LD_LIBRARY_PATH` on Linux) when unset.
+pub fn init_environment() -> Result<(), String> {
+    let path: PathBuf = match std::env::var_os("ORT_DYLIB_PATH") {
+        Some(s) if !s.is_empty() => PathBuf::from(s),
+        _ => default_dylib_name(),
+    };
+    ort::init_from(&path)
+        .map_err(|e| {
+            format!(
+                "could not load ONNX Runtime: {e}; set ORT_DYLIB_PATH to the \
+                 ONNX Runtime shared library (e.g. /usr/lib/libonnxruntime.so) \
+                 if it is not on the dynamic linker's search path"
+            )
+        })?
+        .commit();
+    Ok(())
+}
+
+/// The dylib name `ort` itself falls back to when `ORT_DYLIB_PATH` is
+/// unset, mirrored here so this explicit load looks in exactly the place
+/// the lazy fallback inside `ort` would have.
+fn default_dylib_name() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        PathBuf::from("onnxruntime.dll")
+    }
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
+    {
+        PathBuf::from("libonnxruntime.so")
+    }
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        PathBuf::from("libonnxruntime.dylib")
+    }
+}
+
 pub const SAMPLE_RATE: u32 = 24_000;
 /// Style packs have exactly `STYLE_ROWS` rows and are indexed by token count,
 /// so `STYLE_ROWS - 1` is the usable maximum.
