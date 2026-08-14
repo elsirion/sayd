@@ -339,9 +339,12 @@ impl Engine {
             Command::SetMuted(m) => {
                 self.cfg.muted = m;
                 if m {
-                    self.queue.clear();
-                    self.discard_current();
-                    self.dismiss_error_and_go_idle();
+                    // Unconditional, unlike `ApplyConfig`'s transition test
+                    // below: this is one of the explicit "shut up" commands
+                    // (see `dismiss_error_and_go_idle`), so re-asserting a
+                    // mute that is already set must still dismiss a stuck
+                    // error rather than being a silent no-op.
+                    self.silence();
                 }
             }
             Command::SetVoice(v) => self.cfg.voice = v,
@@ -381,7 +384,32 @@ impl Engine {
                         self.synth.unload();
                     }
                 }
+                // IMPORTANT 5: `muted` is not like the other fields. Every
+                // other one is read per-utterance and so takes effect on the
+                // next submission by assignment alone, but mute is a
+                // transport verb as much as a setting -- `SetMuted(true)`
+                // discards what is speaking and clears the queue, because a
+                // user who mutes wants the room quiet *now*, not once the
+                // current article finishes. Reaching the same field through
+                // the config (hand-editing `muted = true`, or the tray
+                // routing its mute through `ConfigStore` so it persists)
+                // used to leave the current utterance talking to the end,
+                // so the same intent got two different behaviours depending
+                // on which writer expressed it.
+                //
+                // Only on a false -> true *transition*: `ApplyConfig` also
+                // arrives for every unrelated edit (a voice change, a
+                // reload of a file that has said `muted = true` all along),
+                // and silencing on those would make any config apply while
+                // muted a second "shut up" the user never asked for.
+                // Assigning `self.cfg` first so `silence` -- and anything
+                // it reaches -- sees the new config, never a half-applied
+                // one.
+                let muting = cfg.muted && !self.cfg.muted;
                 self.cfg = cfg;
+                if muting {
+                    self.silence();
+                }
             }
             Command::Shutdown => {
                 self.shutdown = true;
@@ -755,6 +783,22 @@ impl Engine {
         if self.idle_since.is_none() {
             self.idle_since = Some(Instant::now());
         }
+    }
+
+    /// Everything muting does to the transport: the queue goes, the current
+    /// utterance goes, and the engine lands in `Idle` with no error and an
+    /// unpaused sink.
+    ///
+    /// Shared by `Command::SetMuted(true)` and by `Command::ApplyConfig`'s
+    /// false -> true mute transition so the two cannot drift -- see the
+    /// `ApplyConfig` arm for why the second one has to do this at all.
+    /// `dismiss_error_and_go_idle` is what keeps the two documented
+    /// invariants (`error.is_some() <=> state == Error`, and `state !=
+    /// Paused` implies the sink is not paused) true across both.
+    fn silence(&mut self) {
+        self.queue.clear();
+        self.discard_current();
+        self.dismiss_error_and_go_idle();
     }
 
     /// Discard whatever is currently speaking and drop any buffered audio.
@@ -1835,6 +1879,100 @@ mod tests {
         assert!((e.snapshot().configured_speed - 0.5).abs() < f32::EPSILON);
     }
 
+    /// IMPORTANT 5: mute reaching the engine as a config must do what mute
+    /// reaching it as a command does.
+    ///
+    /// `muted` is the one config field that is also a transport verb.
+    /// `SetMuted(true)` discards what is speaking and clears the queue; a
+    /// hand-edited `muted = true` (or the tray's own mute, now routed
+    /// through `ConfigStore` so it persists -- see `config_watch`) used to
+    /// arrive as `ApplyConfig` and leave the current utterance talking to
+    /// the end, so the same intent behaved differently depending on which
+    /// writer expressed it.
+    #[test]
+    fn applying_a_config_that_mutes_stops_the_current_utterance() {
+        let mut e = engine();
+        e.handle(say("First one here."));
+        e.handle(say("Second one here."));
+        e.tick();
+        assert_eq!(e.snapshot().state, State::Speaking, "setup");
+        assert_eq!(e.snapshot().queue_len, 1, "setup");
+
+        e.handle(Command::ApplyConfig(Config {
+            muted: true,
+            ..Config::default()
+        }));
+
+        let s = e.snapshot();
+        assert!(s.muted);
+        assert_eq!(
+            s.state,
+            State::Idle,
+            "muting through the config must stop what is speaking, as SetMuted(true) does"
+        );
+        assert_eq!(s.current_id, 0, "the current utterance must be discarded");
+        assert_eq!(s.queue_len, 0, "and the queue cleared");
+        assert_eq!(s.error, None, "the error invariant must survive");
+    }
+
+    /// The counterpart to the test above: `ApplyConfig` must not silence
+    /// anything unless `muted` actually *moved* false -> true. A reload of a
+    /// file that has said `muted = true` all along, or any unrelated edit
+    /// while muted, is not a fresh "shut up" -- and since a muted engine
+    /// still accepts and discards submissions, treating every apply as one
+    /// would be an invisible second stop.
+    #[test]
+    fn applying_a_config_that_was_already_muted_is_not_a_second_stop() {
+        let muted = Config {
+            muted: true,
+            ..Config::default()
+        };
+        let mut e = Engine::new(
+            muted.clone(),
+            Box::new(StubSynthesizer::new()),
+            Box::new(VecSink::new(24_000 * 10)),
+        );
+        // Muted, so nothing can be *submitted*; drive an utterance in
+        // through a config that is not muted, then mute again by config and
+        // check the second, no-op apply leaves it alone.
+        e.handle(Command::ApplyConfig(Config::default()));
+        e.handle(say("First one here."));
+        e.tick();
+        assert_eq!(e.snapshot().state, State::Speaking, "setup");
+
+        // `muted` is already true in this config *and* about to be true in
+        // the engine; the transition happens on this apply.
+        e.handle(Command::ApplyConfig(muted.clone()));
+        assert_eq!(e.snapshot().state, State::Idle, "the transition silences");
+
+        e.handle(say("Nobody hears this."));
+        e.handle(Command::ApplyConfig(Config {
+            voice: "am_fenrir".into(),
+            ..muted
+        }));
+        let s = e.snapshot();
+        assert_eq!(s.state, State::Idle);
+        assert_eq!(s.voice, "am_fenrir", "the unrelated edit still lands");
+    }
+
+    /// A config that mutes must also apply an `ApplyConfig`-deferred model
+    /// unload, for the same reason `Stop`/`Next`/`SetMuted(true)` do: it
+    /// goes through `discard_current`, so the utterance the deferral was
+    /// protecting no longer exists.
+    #[test]
+    fn applying_a_config_that_mutes_unloads_a_deferred_model_change() {
+        let mut e = mid_utterance_with_deferred_unload(Box::new(VecSink::new(24_000 * 10)));
+        e.handle(Command::ApplyConfig(Config {
+            muted: true,
+            model: "q8".into(),
+            ..Config::default()
+        }));
+        assert!(
+            !e.is_model_loaded(),
+            "muting through the config must apply the deferred unload via discard_current"
+        );
+    }
+
     /// A model or thread-count change has to reach the synthesizer
     /// eventually, and a voice-only change must never touch a loaded model
     /// at all (reloading costs ~1.27 GB and over a second of latency) --
@@ -1854,6 +1992,13 @@ mod tests {
     /// while silently breaking `state`, `error`, `current_id` and the
     /// queue, so all four are checked unchanged across the `ApplyConfig`
     /// that lands mid-utterance.
+    ///
+    /// The one deliberate exception, added by IMPORTANT 5 and pinned by
+    /// `applying_a_config_that_mutes_stops_the_current_utterance`: a false
+    /// -> true `muted` transition *does* silence the transport, because
+    /// mute is a transport verb as much as a setting. Every config applied
+    /// below leaves `muted` at its default `false`, so nothing here is
+    /// touched by that.
     #[test]
     fn a_model_change_defers_the_unload_until_the_utterance_in_progress_finishes() {
         // Small `target_chars` so the utterance below splits into more than
