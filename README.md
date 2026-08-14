@@ -103,8 +103,24 @@ Bus name `sh.sayd.Sayd`, object path `/sh/sayd/Sayd`, interface
 
 `opts` accepts `policy` (`"enqueue"`/`"interrupt"`/`"replace"`/`"front"`),
 `voice` and `speed`; unknown keys and unparseable values are ignored rather
-than rejected. `Say`/`SaySelection`/`SayClipboard` return the queued
-utterance id, or `0` if nothing was queued (muted, or empty after cleanup).
+than rejected.
+
+`Say`/`SaySelection`/`SayClipboard` return one of three things:
+
+| Return | Meaning |
+|---|---|
+| a positive id | queued; `Cancel` will accept it |
+| `0` | accepted, nothing queued -- muted, or empty after cleanup |
+| `4294967295` (`u32::MAX`) | queued, but the id could not be confirmed in time |
+
+**Expect the last one routinely under a burst of submissions**, not as an
+exotic edge case. The engine synthesises a whole chunk per step, taking
+several seconds, and a call arriving mid-chunk waits for it; rather than
+block the caller, the daemon acknowledges the submission without its id. The
+text *is* queued and will play. What is lost is the ability to `Cancel` that
+particular utterance by id — `Cancel(4294967295)` is a harmless no-op. If you
+need ids reliably, submit one utterance at a time and wait for the previous
+`CurrentId` to change.
 
 | Property | Type | Meaning |
 |---|---|---|
