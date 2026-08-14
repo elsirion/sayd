@@ -43,6 +43,20 @@ pub trait Synthesizer: Send {
     fn voice_exists(&self, _voice: &str) -> bool {
         true
     }
+
+    /// Take new settings that affect how audio is produced.
+    ///
+    /// Returns `true` if the change requires dropping any loaded model --
+    /// the engine calls `unload` in that case, and the next `synth` reloads
+    /// with the new settings. Returning `false` means the change needs no
+    /// reload (or that this implementation has nothing to reconfigure).
+    ///
+    /// Only `model` and `threads` can require a reload. Voice, speed and
+    /// every text-processing setting are read per-utterance by the engine
+    /// and never reach here.
+    fn reconfigure(&mut self, _cfg: &crate::config::Config) -> bool {
+        false
+    }
 }
 
 /// Test double. Emits silence at roughly the rate real speech occupies, so
@@ -52,6 +66,18 @@ pub struct StubSynthesizer {
     loaded: bool,
     pub synth_calls: usize,
     pub unload_calls: usize,
+    /// What `reconfigure` was last handed, so tests can assert the engine
+    /// forwards a config change rather than only storing it. Seeded from
+    /// `Config::default()`'s `(model, threads)` at construction, not `None`
+    /// -- `StubSynthesizer` implicitly starts out "as if" constructed under
+    /// the default config, mirroring how `KokoroSynthesizer::new` seeds its
+    /// own `model_file`/`threads` fields from the `cfg` it is built with.
+    /// Seeding this `None` instead would make the very first `reconfigure`
+    /// call after construction always report `changed = true`, even when
+    /// the config it is handed is the unchanged default -- indistinguishable
+    /// from an actual model change to any caller.
+    pub reconfigured_to: Option<(String, usize)>,
+    pub reconfigure_calls: usize,
     /// `None` (the default, from `new`/`with_token_budget`) means every
     /// voice is treated as usable -- the vast majority of engine tests pass
     /// an arbitrary voice string while exercising behaviour that has
@@ -70,11 +96,14 @@ impl StubSynthesizer {
     }
 
     pub fn with_token_budget(token_budget: usize) -> Self {
+        let d = crate::config::Config::default();
         StubSynthesizer {
             token_budget,
             loaded: false,
             synth_calls: 0,
             unload_calls: 0,
+            reconfigured_to: Some((d.model, d.threads)),
+            reconfigure_calls: 0,
             known_voices: None,
         }
     }
@@ -132,6 +161,13 @@ impl Synthesizer for StubSynthesizer {
             Some(known) => known.contains(voice),
             None => true,
         }
+    }
+
+    fn reconfigure(&mut self, cfg: &crate::config::Config) -> bool {
+        self.reconfigure_calls += 1;
+        let changed = self.reconfigured_to.as_ref() != Some(&(cfg.model.clone(), cfg.threads));
+        self.reconfigured_to = Some((cfg.model.clone(), cfg.threads));
+        changed
     }
 }
 

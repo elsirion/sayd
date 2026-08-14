@@ -127,6 +127,14 @@ impl Synthesizer for KokoroSynthesizer {
             .join(format!("{voice}.bin"))
             .is_file()
     }
+
+    fn reconfigure(&mut self, cfg: &Config) -> bool {
+        let file = model_file_for(&cfg.model).to_string();
+        let changed = file != self.model_file || cfg.threads != self.threads;
+        self.model_file = file;
+        self.threads = cfg.threads;
+        changed
+    }
 }
 
 #[cfg(all(test, feature = "models"))]
@@ -196,6 +204,38 @@ mod models_tests {
         assert_ne!(
             us, gb,
             "British voice bf_emma must not collapse into the American phonemization"
+        );
+    }
+
+    /// Only `model` and `threads` may invalidate a loaded session -- this
+    /// needs no model load, just the field bookkeeping `reconfigure` does
+    /// before any session is ever created.
+    #[test]
+    fn reconfigure_reports_a_reload_only_when_the_model_or_thread_count_moves() {
+        let cfg = Config::default();
+        let mut s = KokoroSynthesizer::new(models_dir(), &cfg).expect("synthesizer constructs");
+
+        let same = Config {
+            voice: "am_fenrir".into(),
+            ..Config::default()
+        };
+        assert!(!s.reconfigure(&same), "a voice change needs no reload");
+
+        let q8 = Config {
+            model: "q8".into(),
+            ..Config::default()
+        };
+        assert!(s.reconfigure(&q8), "a model change needs a reload");
+
+        let mut threads = q8.clone();
+        threads.threads = 4;
+        assert!(
+            s.reconfigure(&threads),
+            "a thread-count change needs a reload"
+        );
+        assert!(
+            !s.reconfigure(&threads),
+            "reapplying the same config does not"
         );
     }
 }

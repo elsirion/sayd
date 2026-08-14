@@ -138,6 +138,15 @@ pub enum Command {
     SetMuted(bool),
     SetVoice(String),
     SetSpeed(f32),
+    /// Replace every setting at once, from the config file or the settings
+    /// window.
+    ///
+    /// This is the only way a config change reaches a running engine: the
+    /// settings window, the file watcher and the CLI all send this, so there
+    /// is exactly one place where "new config" turns into "new behaviour".
+    /// `SetVoice`/`SetSpeed` remain for the single-value paths (MPRIS `Rate`)
+    /// that have no whole-config to send.
+    ApplyConfig(Config),
     Shutdown,
 }
 
@@ -321,6 +330,19 @@ impl Engine {
             }
             Command::SetVoice(v) => self.cfg.voice = v,
             Command::SetSpeed(s) => self.cfg.speed = s.clamp(0.5, 2.0),
+            Command::ApplyConfig(cfg) => {
+                // Only `model` and `threads` can invalidate a loaded ORT
+                // session; the synthesizer decides, since it owns those.
+                // Everything else here is read per-utterance from `self.cfg`
+                // and so takes effect on the next submission by assignment
+                // alone.
+                if self.synth.reconfigure(&cfg) {
+                    self.synth.unload();
+                }
+                self.cfg = cfg;
+                // Same clamp as `SetSpeed`: a hand-edited file is untrusted.
+                self.cfg.speed = self.cfg.speed.clamp(0.5, 2.0);
+            }
             Command::Shutdown => {
                 self.shutdown = true;
                 self.handle(Command::Stop);
@@ -833,6 +855,11 @@ impl Engine {
     #[cfg(test)]
     fn snapshot_queue_ids(&self) -> Vec<u64> {
         self.queue.iter().map(|u| u.id).collect()
+    }
+
+    #[cfg(test)]
+    fn queued_utterance(&self, id: u64) -> Option<&Utterance> {
+        self.queue.iter().find(|u| u.id == id)
     }
 }
 
@@ -1515,6 +1542,7 @@ mod tests {
                 Command::SetMuted(false),
                 Command::SetVoice("am_fenrir".into()),
                 Command::SetSpeed(1.5),
+                Command::ApplyConfig(Config::default()),
                 Command::Shutdown,
             ]
         }
@@ -1664,6 +1692,99 @@ mod tests {
         let mut e = engine();
         e.handle(Command::SetVoice("am_fenrir".into()));
         assert_eq!(e.snapshot().voice, "am_fenrir");
+    }
+
+    /// The whole point of `ApplyConfig`: a settings change is visible to the
+    /// very next submission, without a restart and without a second copy of
+    /// the config living anywhere.
+    #[test]
+    fn apply_config_changes_the_defaults_the_next_utterance_uses() {
+        let mut e = engine();
+
+        let cfg = Config {
+            voice: "am_fenrir".into(),
+            speed: 1.3,
+            ..Config::default()
+        };
+        e.handle(Command::ApplyConfig(cfg));
+
+        let snap = e.snapshot();
+        assert_eq!(snap.voice, "am_fenrir");
+        assert!((snap.configured_speed - 1.3).abs() < f32::EPSILON);
+
+        // A submission that names neither must inherit both.
+        let outcome = e
+            .submit("hello".into(), SayOpts::default())
+            .expect("accepted");
+        let id = match outcome {
+            Submitted::Queued(id) => id,
+            other => panic!("expected Queued, got {other:?}"),
+        };
+        let u = e.queued_utterance(id).expect("queued");
+        assert_eq!(u.voice, "am_fenrir");
+        assert!((u.speed - 1.3).abs() < f32::EPSILON);
+    }
+
+    /// Speed is clamped on this path exactly as it is on `SetSpeed`. A
+    /// hand-edited config file is an untrusted input.
+    #[test]
+    fn apply_config_clamps_speed_the_same_way_set_speed_does() {
+        let mut e = engine();
+
+        let fast = Config {
+            speed: 9.0,
+            ..Config::default()
+        };
+        e.handle(Command::ApplyConfig(fast));
+        assert!((e.snapshot().configured_speed - 2.0).abs() < f32::EPSILON);
+
+        let slow = Config {
+            speed: 0.01,
+            ..Config::default()
+        };
+        e.handle(Command::ApplyConfig(slow));
+        assert!((e.snapshot().configured_speed - 0.5).abs() < f32::EPSILON);
+    }
+
+    /// A model or thread-count change has to reach the synthesizer and drop
+    /// the loaded session; anything else must leave a loaded model alone,
+    /// because reloading costs ~1.27 GB and over a second of latency.
+    #[test]
+    fn a_model_change_unloads_but_a_voice_change_does_not() {
+        let mut e = engine();
+
+        // Force a load so there is something to unload -- same technique as
+        // `model_does_not_unload_while_speaking` below.
+        e.handle(say(
+            "A reasonably long sentence to keep it busy for a while.",
+        ));
+        e.tick();
+        e.tick();
+        assert!(
+            e.is_model_loaded(),
+            "the stub should be loaded after speaking"
+        );
+
+        let voice_only = Config {
+            voice: "am_fenrir".into(),
+            ..Config::default()
+        };
+        e.handle(Command::ApplyConfig(voice_only));
+        assert!(
+            e.is_model_loaded(),
+            "a voice change must not drop the model"
+        );
+
+        let new_model = Config {
+            voice: "am_fenrir".into(),
+            model: "q8".into(),
+            ..Config::default()
+        };
+        e.handle(Command::ApplyConfig(new_model));
+        assert!(
+            !e.is_model_loaded(),
+            "a model change must drop the loaded model"
+        );
     }
 
     #[test]
