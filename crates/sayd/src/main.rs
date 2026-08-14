@@ -237,6 +237,9 @@ fn print_help() {
 
 /// Sender for "open the settings window", read by the glib main loop.
 ///
+/// Bounded at 1 -- see `request_settings`'s doc comment for why that is only
+/// sound together with `try_send`, never `send`/`send_blocking`.
+///
 /// A `OnceLock` rather than a parameter because the tray's menu callbacks
 /// are built deep inside `ksni`'s tree and run on tokio's threads; threading
 /// a channel down to them would mean changing every menu constructor for one
@@ -245,14 +248,40 @@ static SETTINGS_REQUESTS: std::sync::OnceLock<async_channel::Sender<()>> =
     std::sync::OnceLock::new();
 
 /// Ask the main thread to open the settings window. Safe to call from any
-/// thread; a no-op if the glib loop is not running (nothing to open onto).
+/// thread, including tokio worker threads and (in Task 5) ksni's own
+/// callback threads.
+///
+/// Uses `try_send`, not `send`/`send_blocking`. The channel is bounded at 1,
+/// which expresses "at most one pending open request" -- if one is already
+/// queued, a second click before the main loop drains it is dropped rather
+/// than piling up (fine as long as `settings::window::open` is idempotent:
+/// re-presenting an already-open window). This pairing is load-bearing: on
+/// a *bounded* channel, `send`/`send_blocking` parks the calling thread once
+/// the buffer is full, which here would block a tokio worker thread or a
+/// ksni callback thread -- do not swap this back to `send`/`send_blocking`
+/// without also going back to `async_channel::unbounded`.
+///
+/// This only enqueues (or drops) the request; it does not confirm the glib
+/// loop is actually draining it. If the loop has not started yet
+/// (`SETTINGS_REQUESTS` unset) or the receiver has been dropped, that is
+/// logged below. But if the loop *has* started and then stalls or exits
+/// without dropping the receiver, `try_send` still reports success -- the
+/// request just sits queued, silently, until (if ever) something drains it.
+/// That gap is not closed here; it would need the loop to expose whether it
+/// is actually running.
 pub fn request_settings() {
     match SETTINGS_REQUESTS.get() {
-        Some(tx) => {
-            if tx.send_blocking(()).is_err() {
+        Some(tx) => match tx.try_send(()) {
+            Ok(()) => {}
+            Err(async_channel::TrySendError::Full(())) => {
+                // A request is already queued; `open()` is about to run for
+                // it, and re-presenting an already-open window covers this
+                // click too.
+            }
+            Err(async_channel::TrySendError::Closed(())) => {
                 eprintln!("warning: the settings window host is gone");
             }
-        }
+        },
         None => eprintln!("warning: settings requested before the UI host started"),
     }
 }
@@ -765,7 +794,9 @@ fn main() -> std::process::ExitCode {
     let main_ctx = glib::MainContext::default();
     let main_loop = glib::MainLoop::new(Some(&main_ctx), false);
 
-    let (tx, rx) = async_channel::unbounded::<()>();
+    // Bounded at 1, drained with `try_send` -- see `request_settings`'s doc
+    // comment for why the two go together.
+    let (tx, rx) = async_channel::bounded::<()>(1);
     let _ = SETTINGS_REQUESTS.set(tx);
     main_ctx.spawn_local(async move {
         while rx.recv().await.is_ok() {
@@ -778,13 +809,67 @@ fn main() -> std::process::ExitCode {
     // down with it, carrying the exit code it chose out through `exit`
     // rather than letting `main_loop.run()` return one of its own (it has
     // none to give: `MainLoop::quit` takes no code).
-    let exit = std::sync::Arc::new(std::sync::Mutex::new(std::process::ExitCode::SUCCESS));
+    //
+    // Defaults to `FAILURE`, not `SUCCESS`: the only thing that overwrites
+    // this is the explicit assignment below, on `run_daemon`'s normal
+    // return. If that line never runs -- see `QuitOnDrop` -- `main` must not
+    // report success for a process that never actually finished.
+    let exit = std::sync::Arc::new(std::sync::Mutex::new(std::process::ExitCode::FAILURE));
     let daemon_exit = exit.clone();
-    let quit_loop = main_loop.clone();
+
+    // Drops the glib main loop even if `run_daemon` panics instead of
+    // returning.
+    //
+    // Before this restructure, the daemon's body ran under `#[tokio::main]`
+    // directly on `main`'s thread: a panic there unwound out of `main`
+    // itself and the process died with exit code 101, same as any other
+    // panicking `main`. Moving that body onto a `tokio::spawn`'d task
+    // changed this silently -- tokio wraps a spawned task's poll in
+    // `catch_unwind`, stores the panic in the (here, discarded) `JoinHandle`,
+    // and the task simply ends. Nothing tells `main_loop.run()` to return:
+    // it blocks forever, immune to both SIGTERM and SIGINT. It is worse than
+    // a plain hang, too -- `tokio::signal`'s process-wide handlers for both
+    // signals are already installed by the time the publish loop is
+    // running, and the runtime keeps them drained with nowhere to deliver
+    // them, so both signals are silently swallowed rather than merely
+    // unhandled. Only SIGHUP (which `sayd` does not install a handler for)
+    // or SIGKILL end it. `Restart=on-failure` never fires, because the unit
+    // never exits.
+    //
+    // A local variable in the spawned async block is dropped during unwind
+    // exactly like it would be on a synchronous panic, so a guard held there
+    // for the lifetime of `run_daemon().await` runs on every exit path --
+    // normal return, an early `return` inside `run_daemon`, or a panic --
+    // with no special-casing needed for any of them.
+    struct QuitOnDrop {
+        main_ctx: glib::MainContext,
+        main_loop: glib::MainLoop,
+    }
+    impl Drop for QuitOnDrop {
+        fn drop(&mut self) {
+            // `Priority::DEFAULT`, not `invoke`'s own default of
+            // `DEFAULT_IDLE` (the same priority `idle_add_once` used to run
+            // this at): once Task 5 opens a real window, `DEFAULT_IDLE`
+            // (200) sits *below* `GDK_PRIORITY_REDRAW` (120, and lower
+            // numbers run first in glib), so a continuously animating
+            // widget could keep preempting the quit source and shutdown
+            // latency would become unbounded while that window is open.
+            // `DEFAULT` (0) outranks the redraw source and is serviced
+            // ahead of it.
+            let main_loop = self.main_loop.clone();
+            self.main_ctx
+                .invoke_with_priority(glib::Priority::DEFAULT, move || main_loop.quit());
+        }
+    }
+
+    let quit_guard = QuitOnDrop {
+        main_ctx: main_ctx.clone(),
+        main_loop: main_loop.clone(),
+    };
     rt.spawn(async move {
+        let _quit_guard = quit_guard;
         let code = run_daemon().await;
         *daemon_exit.lock().expect("exit mutex") = code;
-        glib::idle_add_once(move || quit_loop.quit());
     });
 
     main_loop.run();
