@@ -48,7 +48,7 @@ pub enum ReloadOutcome {
 pub struct ConfigStore {
     path: PathBuf,
     engine: EngineHandle,
-    last_written: Mutex<Option<Config>>,
+    last_written: Mutex<Config>,
     applied_reloads: AtomicUsize,
 }
 
@@ -62,7 +62,7 @@ impl ConfigStore {
         ConfigStore {
             path,
             engine,
-            last_written: Mutex::new(Some(running)),
+            last_written: Mutex::new(running),
             applied_reloads: AtomicUsize::new(0),
         }
     }
@@ -82,19 +82,18 @@ impl ConfigStore {
     /// against the write it is about to do, and no race with the debounce
     /// thread's own read.
     ///
-    /// Only one path leaves this `None`: a `save` whose write itself failed,
-    /// which clears the stamp because at that point the on-disk content is
-    /// genuinely unknown (see `save`'s doc comment). `Config::default()` is
-    /// returned there rather than threading an `Option` through every
-    /// caller; the seed is inconsequential in that state; a store broken
-    /// enough to have produced it fails the very next `save` too, regardless
-    /// of what that save was seeded with.
+    /// There is no "we do not know" state to represent: the stamp is seeded
+    /// at construction with the config the engine was spawned with, and a
+    /// failed `save` restores what it displaced rather than clearing it (see
+    /// `save`). A `None` here would be worse than useless to the caller that
+    /// needs it most -- seeding an edit from `Config::default()` after a
+    /// failed write would turn the next successful write into a reset of
+    /// every setting the user has.
     pub fn current(&self) -> Config {
         self.last_written
             .lock()
             .expect("last_written mutex")
             .clone()
-            .unwrap_or_default()
     }
 
     /// Write `cfg` to disk and apply it to the engine.
@@ -108,11 +107,15 @@ impl ConfigStore {
     /// see `reload`.
     pub fn save(&self, cfg: &Config) -> Result<(), String> {
         let mut stamp = self.last_written.lock().expect("last_written mutex");
-        *stamp = Some(cfg.clone());
+        let displaced = std::mem::replace(&mut *stamp, cfg.clone());
         if let Err(e) = cfg.save_to(&self.path) {
-            // The stamp now describes a file that does not exist. Clear it
-            // so a later genuine edit is not mistaken for our echo.
-            *stamp = None;
+            // `save_to` writes a temp file and renames it, and every failure
+            // path fails before the rename -- so the destination still holds
+            // exactly what it held before, which is what `displaced`
+            // describes. Restoring it keeps own-write suppression correct for
+            // the write *before* this one, and keeps `current` returning the
+            // file's real content rather than a config nobody chose.
+            *stamp = displaced;
             return Err(format!("could not write {}: {e}", self.path.display()));
         }
         self.engine.send(Command::ApplyConfig(cfg.clone()));
@@ -170,10 +173,10 @@ impl ConfigStore {
             // every setting the user has because of one typo.
             return ReloadOutcome::Failed(format!("{}: {reason}", self.path.display()));
         }
-        if stamp.as_ref() == Some(&cfg) {
+        if *stamp == cfg {
             return ReloadOutcome::OwnWrite;
         }
-        *stamp = Some(cfg.clone());
+        *stamp = cfg.clone();
         self.applied_reloads.fetch_add(1, Ordering::Relaxed);
         self.engine.send(Command::ApplyConfig(cfg));
         ReloadOutcome::Applied
@@ -558,6 +561,42 @@ mod tests {
     /// for the tests that assert nothing happens.
     fn settle() {
         std::thread::sleep(DEBOUNCE * 3);
+    }
+
+    /// A failed write must not cost the caller its seed for the next one.
+    ///
+    /// `save` stamps before it writes, so a failure has to put back what it
+    /// displaced. Clearing the stamp instead looks harmless -- the file is
+    /// unknown, so claim nothing -- but the settings model seeds every edit
+    /// from `current`, so the next edit after a failed one would build on
+    /// `Config::default()` and its (successful) write would silently reset
+    /// every setting the user has.
+    #[test]
+    fn a_failed_write_leaves_the_stamp_describing_the_file_not_defaults() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = engine();
+        // A path whose parent is a regular file cannot be created as a
+        // directory, so `save_to` fails without any permission games.
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"not a directory").expect("blocker");
+        let running = Config {
+            voice: "am_fenrir".into(),
+            model: "q8".into(),
+            ..Config::default()
+        };
+        let store = ConfigStore::new(blocker.join("config.toml"), engine.clone(), running.clone());
+
+        let doomed = Config {
+            speed: 1.75,
+            ..running.clone()
+        };
+        assert!(store.save(&doomed).is_err(), "the write must fail");
+        assert_eq!(
+            store.current(),
+            running,
+            "a failed save must leave the previous config as the seed"
+        );
+        engine.shutdown();
     }
 
     /// The write-through path: what the settings window calls. The file on
