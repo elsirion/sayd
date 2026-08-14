@@ -1,0 +1,51 @@
+// sayd -- waybar modules for the tray icon and MPRIS transport controls.
+//
+// Merge these into ~/.config/waybar/config(.jsonc) and reload waybar
+// ($mod+Shift+c in sway, or `pkill -SIGUSR2 waybar`). Both modules need
+// listing in one of "modules-left" / "modules-center" / "modules-right".
+
+{
+    // Generic waybar setup -- not sayd-specific. This is *the* tray module;
+    // it renders every StatusNotifierItem registered on the session bus, not
+    // just sayd's. If another tray app (NetworkManager applet, etc.) is
+    // already running, its icon appears alongside sayd's automatically.
+    "tray": {
+        "icon-size": 18,
+        "spacing": 8
+    },
+
+    // Generic waybar module, configured here for sayd specifically through
+    // "player" and the format strings below.
+    "mpris": {
+        // sayd-specific: mpris-server registers "org.mpris.MediaPlayer2.sayd",
+        // so playerctl/waybar address it as player "sayd". Without this,
+        // the module follows whichever MPRIS player last changed state,
+        // which is confusing with more than one player running (browsers
+        // register MPRIS players too).
+        "player": "sayd",
+
+        // sayd-specific format strings: sayd has no artist and the title
+        // *is* the utterance being spoken, so {title} alone is what is
+        // worth showing; {artist} would just print "sayd" from the
+        // fallback title (see mpris.rs::title_for) when nothing is queued.
+        "format": "{status_icon} {title}",
+        "format-paused": "{status_icon} {title}",
+        "format-stopped": "sayd idle",
+
+        // Plain Unicode glyphs rather than a Nerd Font icon set, so this
+        // renders with no extra font installed. Swap for icon-font
+        // codepoints if your bar already uses one.
+        "status-icons": {
+            "playing": "▶",
+            "paused": "⏸",
+            "stopped": "⏹"
+        },
+
+        // Generic waybar setting: truncate a long title instead of pushing
+        // the rest of the bar around.
+        "max-length": 40,
+
+        // Generic waybar binding: left-click toggles play/pause.
+        "on-click": "playerctl -p sayd play-pause"
+    }
+}
