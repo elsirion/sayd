@@ -361,13 +361,18 @@ impl ConfigStore {
             // Deliberately not applying `cfg` here: `load_str` returns
             // defaults alongside the error, and applying those would reset
             // every setting the user has because of one typo.
-            let msg = format!("{}: {reason}", self.path.display());
             // IMPORTANT 4: and into the tray, per spec §11 -- see
             // `ConfigStatus`. stderr alone means a desktop user learns
             // nothing at all; measured, `sh.sayd.Sayd1.Error` was `""` and
             // `State` was `idle` after a malformed file landed.
-            self.status.set(Some(msg.clone()));
-            return ReloadOutcome::Failed(msg);
+            //
+            // The tray gets the reason without the path: the line is
+            // already labelled `Config:`, the daemon has exactly one config
+            // file, and a menu label is truncated -- measured, a path long
+            // enough to fill it left the user with nothing but the path.
+            // The log below keeps the full thing.
+            self.status.set(Some(reason.clone()));
+            return ReloadOutcome::Failed(format!("{}: {reason}", self.path.display()));
         }
         // IMPORTANT 3: nothing used to stand between `load_str` and the
         // engine, so a file the daemon could not honour literally was
@@ -386,7 +391,7 @@ impl ConfigStore {
         self.status.set(if warnings.is_empty() {
             None
         } else {
-            Some(format!("{}: {}", self.path.display(), warnings.join("; ")))
+            Some(warnings.join("; "))
         });
         if *stamp == cfg {
             return ReloadOutcome::OwnWrite;
@@ -1457,7 +1462,10 @@ mod tests {
         assert!(matches!(store.reload(), ReloadOutcome::Failed(_)));
 
         let problem = store.status().get().expect("the tray must be told");
-        assert!(problem.contains("config.toml"), "{problem}");
+        assert!(
+            problem.contains("expected"),
+            "the parse reason, not just the path a truncated menu label would eat: {problem}"
+        );
         let s = engine.snapshot();
         assert_eq!(
             s.error, None,

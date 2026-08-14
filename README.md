@@ -212,6 +212,11 @@ what is actually being used. As above, your file is left exactly as you
 wrote it -- the corrected value only reaches the disk when you next change a
 setting, at which point the window writes the whole config it is running.
 
+Any of those writes -- from the window, from the tray, from `say mute` --
+rewrites the whole file in canonical form. A config you maintain by hand
+keeps its *values*, but not its comments or its key order, from the first
+time something writes it.
+
 Mute is the one control that is both a setting and a transport command.
 Muting from the tray, `say mute`, D-Bus or the settings window silences what
 is playing *and* writes `muted = true` to the config, so it survives a

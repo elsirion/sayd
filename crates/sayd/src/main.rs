@@ -390,13 +390,13 @@ async fn run_daemon() -> std::process::ExitCode {
     let cfg_problem = match cfg_err {
         Some(e) => {
             eprintln!("warning: {e}; using defaults");
-            Some(e)
+            // Without the path, like `ConfigStore::reload`'s -- see there.
+            // `load_from` builds this message as exactly `"{path}: {reason}"`,
+            // so stripping that prefix is precise rather than a guess.
+            let prefix = format!("{}: ", Config::path().display());
+            Some(e.strip_prefix(&prefix).unwrap_or(&e).to_string())
         }
-        None if !cfg_warnings.is_empty() => Some(format!(
-            "{}: {}",
-            Config::path().display(),
-            cfg_warnings.join("; ")
-        )),
+        None if !cfg_warnings.is_empty() => Some(cfg_warnings.join("; ")),
         None => None,
     };
 
