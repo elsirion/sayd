@@ -61,6 +61,37 @@ impl Default for ChunkConfig {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
+pub struct NotificationConfig {
+    /// Off by default: narration changes how someone's desktop behaves, so it
+    /// is asked for rather than assumed.
+    pub enabled: bool,
+    /// Application names to speak, matched case-insensitively against the
+    /// `app_name` the application passes to `Notify`. Empty means silent --
+    /// with `enabled = true` that is the intended way to discover names, since
+    /// the daemon logs each one it declines to speak.
+    pub allow: Vec<String>,
+    /// Per-application rate-limit window.
+    pub cooldown_secs: u64,
+    pub speak_app_name: bool,
+    /// Bodies are frequently several sentences and often restate the summary,
+    /// so this is offered rather than assumed.
+    pub speak_body: bool,
+}
+
+impl Default for NotificationConfig {
+    fn default() -> Self {
+        NotificationConfig {
+            enabled: false,
+            allow: Vec::new(),
+            cooldown_secs: 30,
+            speak_app_name: true,
+            speak_body: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Config {
     pub voice: String,
     pub speed: f32,
@@ -76,6 +107,7 @@ pub struct Config {
     pub max_chars: usize,
     pub cleanup: CleanupConfig,
     pub chunking: ChunkConfig,
+    pub notifications: NotificationConfig,
 }
 
 impl Default for Config {
@@ -90,6 +122,7 @@ impl Default for Config {
             max_chars: 20_000,
             cleanup: CleanupConfig::default(),
             chunking: ChunkConfig::default(),
+            notifications: NotificationConfig::default(),
         }
     }
 }
@@ -216,6 +249,43 @@ mod tests {
         assert_eq!(err, None);
         assert_eq!(c.voice, "bm_george");
         assert_eq!(c.threads, 8, "unspecified keys must keep their defaults");
+    }
+
+    /// The defaults are a promise: narration is off, and turning it on speaks
+    /// nothing until an application is named. A default that spoke everything
+    /// would make enabling the feature a surprise.
+    #[test]
+    fn notification_defaults_are_silent_and_opt_in() {
+        let c = Config::default();
+        assert!(!c.notifications.enabled);
+        assert!(c.notifications.allow.is_empty());
+        assert_eq!(c.notifications.cooldown_secs, 30);
+        assert!(c.notifications.speak_app_name);
+        assert!(!c.notifications.speak_body);
+    }
+
+    /// A config written before this milestone has no `[notifications]` table
+    /// at all, and must keep loading.
+    #[test]
+    fn a_config_without_the_notifications_table_still_loads() {
+        let (c, err) = Config::load_str("voice = \"am_fenrir\"\n");
+        assert_eq!(err, None);
+        assert_eq!(c.voice, "am_fenrir");
+        assert!(!c.notifications.enabled);
+    }
+
+    #[test]
+    fn the_notifications_table_round_trips() {
+        let mut c = Config::default();
+        c.notifications.enabled = true;
+        c.notifications.allow = vec!["Signal".into(), "Fractal".into()];
+        c.notifications.speak_body = true;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("config.toml");
+        c.save_to(&p).expect("save");
+        let (back, err) = Config::load_from(&p);
+        assert_eq!(err, None);
+        assert_eq!(back, c);
     }
 
     #[test]
