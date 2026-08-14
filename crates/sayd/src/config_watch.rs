@@ -90,10 +90,34 @@ impl ConfigStore {
     /// failed write would turn the next successful write into a reset of
     /// every setting the user has.
     pub fn current(&self) -> Config {
-        self.last_written
-            .lock()
-            .expect("last_written mutex")
-            .clone()
+        self.stamp().clone()
+    }
+
+    /// The stamp, taken poison-tolerantly.
+    ///
+    /// Every caller goes through here rather than `.lock().expect(...)`, and
+    /// the reason is not tidiness. A panic anywhere under this lock -- the
+    /// `save_to` or `load_str` calls below are the candidates -- poisons the
+    /// mutex permanently, and every later `expect` then panics too. Before
+    /// there was a settings window that cost a dead debounce thread and a
+    /// silently stopped watch. It now costs the whole daemon: `save` and
+    /// `current` are reached from GTK signal handlers, and glib invokes
+    /// those through an `extern "C"` frame, so a panic there is a
+    /// *non-unwinding* panic -- measured, it aborts the process outright
+    /// ("panic in a function that cannot unwind ... aborting"), with no
+    /// shutdown, no exit code, and immune to a `catch_unwind` in the frame
+    /// below. Mid-utterance, on a click on any settings row.
+    ///
+    /// A poisoned stamp is also not meaningfully corrupt: it is one `Config`
+    /// replaced wholesale under the lock, so the worst an observer can see
+    /// is the value from before the panicking write -- exactly what the
+    /// failure path restores anyway. Same reasoning, and the same
+    /// `into_inner()` shape, as `EngineHandle::snapshot`.
+    fn stamp(&self) -> std::sync::MutexGuard<'_, Config> {
+        match self.last_written.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        }
     }
 
     /// Write `cfg` to disk and apply it to the engine.
@@ -106,7 +130,7 @@ impl ConfigStore {
     /// The stamp's lock is what makes a save and a reload one at a time --
     /// see `reload`.
     pub fn save(&self, cfg: &Config) -> Result<(), String> {
-        let mut stamp = self.last_written.lock().expect("last_written mutex");
+        let mut stamp = self.stamp();
         let displaced = std::mem::replace(&mut *stamp, cfg.clone());
         if let Err(e) = cfg.save_to(&self.path) {
             // `save_to` writes a temp file and renames it, and every failure
@@ -138,14 +162,17 @@ impl ConfigStore {
     /// underneath it are non-blocking channel pushes, so the lock is never
     /// held waiting on the engine -- but it *is* held across the file write
     /// itself: `save`'s `save_to` call is disk I/O with no bound this
-    /// module puts on it. `save` is what Task 3's settings window calls, so
-    /// it must not be called from a thread that cannot block on disk (a UI
-    /// event-loop thread, say) -- doing so would stall every reload for as
-    /// long as that write takes. A panic inside `save_to` or `load_str`
-    /// while this lock is held poisons the mutex; every later
-    /// `.expect("last_written mutex")` then panics too, which kills the
-    /// debounce thread and stops the watch -- silently, short of whatever
-    /// the panic message reaches on stderr.
+    /// module puts on it. `save` is what the settings window's writes end up
+    /// in, so it must not be called from a thread that cannot block on disk
+    /// (a UI event-loop thread, say) -- doing so would stall every reload
+    /// for as long as that write takes, and freeze the UI with it. That is
+    /// why `SettingsModel` owns a writer thread and never calls this from
+    /// the glib main thread; see `SettingsModel::edit`.
+    ///
+    /// A panic inside `save_to` or `load_str` while this lock is held still
+    /// poisons the mutex, but no longer propagates: every taker goes through
+    /// `stamp`, which reads through the poison. See its doc comment for why
+    /// that is both safe here and now mandatory.
     ///
     /// Reads the file exactly once, deciding everything from those bytes
     /// rather than from a separate `exists()` check: checking existence and
@@ -157,7 +184,7 @@ impl ConfigStore {
     /// parsed; see the comment on [`DEBOUNCE`] for why that is safe and
     /// where its limit is.
     pub fn reload(&self) -> ReloadOutcome {
-        let mut stamp = self.last_written.lock().expect("last_written mutex");
+        let mut stamp = self.stamp();
         let txt = match std::fs::read_to_string(&self.path) {
             Ok(txt) => txt,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ReloadOutcome::Missing,
@@ -625,6 +652,63 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert_eq!(engine.snapshot().voice, "am_fenrir");
+        engine.shutdown();
+    }
+
+    /// A panic under the stamp's lock must not turn every later settings
+    /// click into a dead daemon.
+    ///
+    /// `save` and `current` are reached from GTK signal handlers, which glib
+    /// calls through an `extern "C"` frame: a panic there is a
+    /// *non-unwinding* panic and aborts the process outright -- measured, no
+    /// shutdown, no exit code, and unstoppable by `catch_unwind`. So a
+    /// poisoned stamp (from a panic inside `save_to`/`load_str`, the only
+    /// non-trivial code this lock is held across) must be read through
+    /// rather than propagated, the way `EngineHandle::snapshot` already
+    /// does.
+    #[test]
+    fn a_poisoned_stamp_is_read_through_rather_than_propagated() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let engine = engine();
+        let store = std::sync::Arc::new(ConfigStore::new(
+            path.clone(),
+            engine.clone(),
+            Config::default(),
+        ));
+
+        // Poison it the only way a mutex can be poisoned: panic while
+        // holding it. `save_to`/`load_str` panicking under `save`/`reload`
+        // is the real-world route to the same state.
+        let poisoner = store.clone();
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let _ = std::thread::spawn(move || {
+            let _held = poisoner.last_written.lock().expect("lock");
+            panic!("deliberate: poisoning the stamp");
+        })
+        .join();
+        std::panic::set_hook(hook);
+        assert!(
+            store.last_written.is_poisoned(),
+            "sanity: the test must actually have poisoned it"
+        );
+
+        // Every path that takes the stamp must still work.
+        assert_eq!(store.current(), Config::default());
+        let cfg = Config {
+            voice: "am_fenrir".into(),
+            ..Config::default()
+        };
+        store
+            .save(&cfg)
+            .expect("save must survive a poisoned stamp");
+        assert_eq!(store.current(), cfg);
+        assert_eq!(
+            store.reload(),
+            ReloadOutcome::OwnWrite,
+            "own-write suppression must survive it too"
+        );
         engine.shutdown();
     }
 
