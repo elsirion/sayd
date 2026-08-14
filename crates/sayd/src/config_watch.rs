@@ -18,6 +18,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use notify::event::{EventKind, ModifyKind};
 use notify::{Event, RecursiveMode, Watcher};
 use sayd_core::config::Config;
 use sayd_core::engine::Command;
@@ -95,6 +96,35 @@ impl ConfigStore {
     }
 }
 
+/// Does this event mean the file's *contents* may have changed?
+///
+/// Filtering on the kind matters far more than it looks. notify's inotify
+/// backend puts `IN_OPEN` in its watch mask, and the first thing a reload
+/// does is open the file -- so a watcher that reloads on any event feeds
+/// itself its own event, as fast as the machine can read a small TOML file
+/// (measured: ~101k events/s, ~91% of a core, indefinitely, after a single
+/// edit). It is invisible by hand because every self-triggered reload is
+/// suppressed as an `OwnWrite` and logs nothing.
+///
+/// `Modify(Metadata)` (`IN_ATTRIB`, from `touch`/`chmod`) is dropped for a
+/// related reason: `SetVoice`/`SetSpeed`/`SetMuted` change the engine
+/// without touching the file, so *any* reload re-applies the file over
+/// them. Muting from the tray and then merely reading -- or touching --
+/// `config.toml` would unmute the daemon and let it speak.
+///
+/// The atomic temp+rename write still arrives: notify maps `IN_MOVED_TO`
+/// to `Modify(Name(To))` and, paired with the temp file's `IN_MOVED_FROM`,
+/// also emits `Modify(Name(Both))`; both carry the destination path, so
+/// own-write suppression still sees the write it has to suppress.
+fn is_content_change(kind: &EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::Create(_)
+            | EventKind::Remove(_)
+            | EventKind::Modify(ModifyKind::Data(_) | ModifyKind::Name(_))
+    )
+}
+
 /// Watch the config file's directory and reload on change.
 ///
 /// The *directory* is watched, not the file: an atomic temp+rename replaces
@@ -117,7 +147,7 @@ pub fn spawn(store: Arc<ConfigStore>) -> Result<notify::RecommendedWatcher, Stri
     let watched = store.path().to_path_buf();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
         let Ok(event) = res else { return };
-        if !event.paths.contains(&watched) {
+        if !is_content_change(&event.kind) || !event.paths.contains(&watched) {
             return;
         }
         match store.reload() {
@@ -153,6 +183,24 @@ mod tests {
             // synthesis) could plausibly fill it.
             Box::new(VecSink::new(24_000 * 10)),
         )
+    }
+
+    /// The engine runs on its own thread, and the watcher adds an inotify
+    /// round trip on top; wait for the value rather than asserting on a
+    /// race, and give up at a deadline so a failure says what the voice
+    /// actually was.
+    fn wait_for_voice(engine: &EngineHandle, want: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while engine.snapshot().voice != want && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(engine.snapshot().voice, want);
+    }
+
+    /// Long enough that anything the watcher was going to do has happened,
+    /// for the tests that assert nothing happens.
+    fn settle() {
+        std::thread::sleep(std::time::Duration::from_millis(600));
     }
 
     /// The write-through path: what the settings window calls. The file on
@@ -254,6 +302,59 @@ mod tests {
             engine.snapshot().voice,
             "am_fenrir",
             "a malformed file must not reset the running config to defaults"
+        );
+        engine.shutdown();
+    }
+
+    /// The inotify half, end to end. Every other test in this module drives
+    /// `reload` directly, which leaves the watch itself -- directory versus
+    /// file, the path filter, the event kinds, the watcher's lifetime --
+    /// entirely uncovered. That gap is what let a self-triggering reload
+    /// loop ship.
+    #[test]
+    fn an_edit_through_the_watcher_reaches_the_engine() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let engine = engine();
+        let store = Arc::new(ConfigStore::new(path.clone(), engine.clone()));
+        let _watcher = spawn(store).expect("watcher starts");
+
+        std::fs::write(&path, "voice = \"bm_george\"\n").expect("write");
+        wait_for_voice(&engine, "bm_george");
+        engine.shutdown();
+    }
+
+    /// Regression for the reload loop, and for what it costs.
+    ///
+    /// `reload` opens the file, and notify's inotify mask includes
+    /// `IN_OPEN`, so an unfiltered watcher re-enters itself on its own read
+    /// and never stops. Reading the file from outside is the cheapest probe
+    /// for that: it produces exactly the event the reload's own
+    /// `read_to_string` produces. The damage is asserted rather than the
+    /// event count, because that is what a user sees -- `SetVoice` never
+    /// touches the file, so a reload triggered by a pure read drags the
+    /// engine back to whatever the file says.
+    #[test]
+    fn merely_reading_the_config_does_not_revert_runtime_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        // Written before the watch starts: no event, so the store has never
+        // seen this content and cannot mistake it for its own write.
+        std::fs::write(&path, "voice = \"bm_george\"\n").expect("write");
+
+        let engine = engine();
+        let store = Arc::new(ConfigStore::new(path.clone(), engine.clone()));
+        let _watcher = spawn(store).expect("watcher starts");
+
+        engine.send(Command::SetVoice("am_fenrir".into()));
+        wait_for_voice(&engine, "am_fenrir");
+
+        std::fs::read_to_string(&path).expect("read");
+        settle();
+        assert_eq!(
+            engine.snapshot().voice,
+            "am_fenrir",
+            "reading the config file must not re-apply it over runtime state"
         );
         engine.shutdown();
     }
