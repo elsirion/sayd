@@ -16,11 +16,15 @@
 //! bitten by before -- the tests would keep passing on the copy they
 //! exercise while the copy users actually see quietly drifted.
 
+use std::sync::Arc;
+
 use ksni::menu::{CheckmarkItem, StandardItem};
 use ksni::{Handle, MenuItem, Tray, TrayMethods};
 use sayd_core::engine::{Command, SayOpts, Snapshot, State};
 use sayd_core::handle::EngineHandle;
 use sayd_core::queue::Source;
+
+use crate::config_watch::{persist_in_background, ConfigStatus, ConfigStore};
 
 /// How much of an utterance to show in a menu label.
 const LABEL_CHARS: usize = 40;
@@ -77,11 +81,20 @@ fn human_secs(s: f64) -> String {
 /// This is the one place that computes the status block's *content*.
 /// `build_menu` renders it as disabled items; `menu_labels` (below) exposes
 /// it to tests via the same call. Neither keeps its own copy.
-fn status_lines(s: &Snapshot) -> Vec<String> {
+fn status_lines(s: &Snapshot, config_problem: Option<&str>) -> Vec<String> {
     let mut out = Vec::new();
 
     if let Some(e) = s.error.as_deref() {
         out.push(format!("Error: {}", short(e, 80)));
+    }
+    // IMPORTANT 4: spec §11 puts a malformed config "in the tray", and this
+    // is the tray. Deliberately a *second*, separately-labelled line rather
+    // than folded into the engine's `error` above: the engine's error means
+    // synthesis is broken and makes it reject every submission, so putting
+    // a config typo there would stop the daemon speaking over a file it is
+    // perfectly able to ignore. See `config_watch::ConfigStatus`.
+    if let Some(p) = config_problem {
+        out.push(format!("Config: {}", short(p, 80)));
     }
 
     match s.state {
@@ -124,10 +137,10 @@ fn status_lines(s: &Snapshot) -> Vec<String> {
 ///
 /// Volume is deliberately absent -- the daemon registers as a named
 /// PipeWire client, so `pavucontrol` already gives per-application volume.
-fn build_menu(s: &Snapshot) -> Vec<MenuItem<SaydTray>> {
+fn build_menu(s: &Snapshot, config_problem: Option<&str>) -> Vec<MenuItem<SaydTray>> {
     let mut items: Vec<MenuItem<SaydTray>> = Vec::new();
 
-    for label in status_lines(s) {
+    for label in status_lines(s, config_problem) {
         items.push(
             StandardItem {
                 label,
@@ -191,9 +204,15 @@ fn build_menu(s: &Snapshot) -> Vec<MenuItem<SaydTray>> {
         CheckmarkItem {
             label: "Mute".into(),
             checked: s.muted,
+            // CRITICAL 1: through the store, not `Command::SetMuted`. A
+            // mute set here has to survive the next config apply and the
+            // next restart -- spec §6 -- and an engine-only mute did
+            // neither: nudging Speed in the settings window, or any tool
+            // rewriting `~/.config/sayd`, unmuted the daemon and flipped
+            // this checkbox back on its own.
             activate: Box::new(|t: &mut SaydTray| {
-                let now = t.snapshot.muted;
-                t.engine.send(Command::SetMuted(!now));
+                let muted = !t.snapshot.muted;
+                persist_in_background(t.store.clone(), move |s| s.set_muted(muted));
             }),
             ..Default::default()
         }
@@ -240,8 +259,8 @@ fn build_menu(s: &Snapshot) -> Vec<MenuItem<SaydTray>> {
 /// only its own D-Bus tree, which `Tray::menu` already produces straight
 /// from `build_menu`.
 #[cfg(test)]
-pub fn menu_labels(s: &Snapshot) -> Vec<String> {
-    build_menu(s)
+pub fn menu_labels(s: &Snapshot, config_problem: Option<&str>) -> Vec<String> {
+    build_menu(s, config_problem)
         .into_iter()
         .filter_map(|item| match item {
             MenuItem::Standard(i) => Some(i.label),
@@ -255,12 +274,29 @@ pub fn menu_labels(s: &Snapshot) -> Vec<String> {
 pub struct SaydTray {
     engine: EngineHandle,
     snapshot: Snapshot,
+    /// Where the Mute item's change is persisted -- see its `activate`.
+    store: Arc<ConfigStore>,
+    /// The config file's standing problem, read live rather than pushed:
+    /// `menu` is called by the host whenever it renders, so reading the
+    /// shared slot there needs no snapshot round trip. The publish loop
+    /// still asks ksni for a layout update when it changes, so a host that
+    /// caches the layout is told to come back for it.
+    config_status: Arc<ConfigStatus>,
 }
 
 impl SaydTray {
-    pub fn new(engine: EngineHandle) -> Self {
+    pub fn new(
+        engine: EngineHandle,
+        store: Arc<ConfigStore>,
+        config_status: Arc<ConfigStatus>,
+    ) -> Self {
         let snapshot = engine.snapshot();
-        SaydTray { engine, snapshot }
+        SaydTray {
+            engine,
+            snapshot,
+            store,
+            config_status,
+        }
     }
 
     /// Replace the rendered state. The caller decides when it changed.
@@ -328,7 +364,7 @@ impl Tray for SaydTray {
     }
 
     fn menu(&self) -> Vec<MenuItem<Self>> {
-        build_menu(&self.snapshot)
+        build_menu(&self.snapshot, self.config_status.get().as_deref())
     }
 }
 
@@ -338,8 +374,12 @@ impl Tray for SaydTray {
 /// config without waybar has no `org.kde.StatusNotifierWatcher` at all, and
 /// the caller is expected to log once and carry on serving the control
 /// interface rather than treat this as fatal.
-pub async fn spawn(engine: EngineHandle) -> Result<Handle<SaydTray>, String> {
-    SaydTray::new(engine)
+pub async fn spawn(
+    engine: EngineHandle,
+    store: Arc<ConfigStore>,
+    config_status: Arc<ConfigStatus>,
+) -> Result<Handle<SaydTray>, String> {
+    SaydTray::new(engine, store, config_status)
         .spawn()
         .await
         .map_err(|e| format!("could not register the tray: {e}"))
@@ -394,7 +434,7 @@ mod tests {
     fn an_error_puts_its_message_first_in_the_menu() {
         let mut s = snap(State::Error);
         s.error = Some("the audio device disappeared".into());
-        let labels = menu_labels(&s);
+        let labels = menu_labels(&s, None);
         assert!(
             labels
                 .first()
@@ -409,7 +449,7 @@ mod tests {
         let mut s = snap(State::Speaking);
         s.current_text = "the quick brown fox jumps over the lazy dog".into();
         s.remaining_secs = 42.0;
-        let labels = menu_labels(&s);
+        let labels = menu_labels(&s, None);
         let joined = labels.join(" | ");
         assert!(joined.contains("quick brown fox"), "got {joined}");
         assert!(
@@ -422,7 +462,7 @@ mod tests {
     fn a_long_utterance_is_truncated_in_the_menu() {
         let mut s = snap(State::Speaking);
         s.current_text = "x".repeat(500);
-        for l in menu_labels(&s) {
+        for l in menu_labels(&s, None) {
             assert!(
                 l.chars().count() < 120,
                 "menu label too long: {} chars",
@@ -435,10 +475,10 @@ mod tests {
     fn multibyte_text_is_truncated_without_panicking() {
         let mut s = snap(State::Speaking);
         s.current_text = "日本語のテキスト".repeat(50);
-        let _ = menu_labels(&s);
+        let _ = menu_labels(&s, None);
         let mut s2 = snap(State::Speaking);
         s2.current_text = "🎤".repeat(200);
-        let _ = menu_labels(&s2);
+        let _ = menu_labels(&s2, None);
     }
 
     #[test]
@@ -446,7 +486,7 @@ mod tests {
         let mut s = snap(State::Speaking);
         s.queue_heads = (1..=5).map(|i| (i, format!("utterance {i}"))).collect();
         s.queue_len = 9;
-        let joined = menu_labels(&s).join(" | ");
+        let joined = menu_labels(&s, None).join(" | ");
         assert!(joined.contains("utterance 1"), "got {joined}");
         assert!(
             joined.contains("4"),
@@ -457,14 +497,14 @@ mod tests {
     #[test]
     fn an_empty_queue_adds_no_pending_entries() {
         let s = snap(State::Idle);
-        let joined = menu_labels(&s).join(" | ");
+        let joined = menu_labels(&s, None).join(" | ");
         assert!(!joined.to_lowercase().contains("pending"), "got {joined}");
     }
 
     #[test]
     fn the_menu_offers_every_action_the_spec_lists() {
         let s = snap(State::Speaking);
-        let joined = menu_labels(&s).join(" | ").to_lowercase();
+        let joined = menu_labels(&s, None).join(" | ").to_lowercase();
         for action in [
             "pause",
             "skip",
@@ -488,10 +528,72 @@ mod tests {
     /// the window is unreachable, not merely inconvenient.
     #[test]
     fn the_menu_offers_settings() {
-        let joined = menu_labels(&snap(State::Idle)).join(" | ").to_lowercase();
+        let joined = menu_labels(&snap(State::Idle), None)
+            .join(" | ")
+            .to_lowercase();
         assert!(
             joined.contains("settings"),
             "the settings entry should be in the menu: {joined}"
+        );
+    }
+
+    /// IMPORTANT 4: spec §11 says a malformed config is surfaced "in the
+    /// tray". It reached stderr and nothing else -- measured, `sh.sayd.
+    /// Sayd1.Error` was `""` and `State` was `idle` after a malformed file
+    /// landed, so the daemon knew and no surface said so.
+    #[test]
+    fn a_config_problem_appears_in_the_menu() {
+        let labels = menu_labels(
+            &snap(State::Idle),
+            Some("/home/u/.config/sayd/config.toml: expected an equals, found a newline"),
+        );
+        let joined = labels.join(" | ");
+        assert!(
+            joined.contains("expected an equals"),
+            "the parse error must be in the menu: {joined}"
+        );
+        assert!(
+            joined.to_lowercase().contains("config"),
+            "and be labelled as a config problem, not just dumped: {joined}"
+        );
+    }
+
+    /// The engine's own error keeps the first line: it means synthesis is
+    /// broken and every submission is being rejected, which is the more
+    /// urgent of the two. A config problem is additional, never a
+    /// replacement -- and never in `Snapshot::error`, which is what would
+    /// make a typo in `config.toml` stop the daemon speaking.
+    #[test]
+    fn a_config_problem_does_not_displace_the_engines_own_error() {
+        let mut s = snap(State::Error);
+        s.error = Some("the audio device disappeared".into());
+        let labels = menu_labels(&s, Some("config.toml: not toml"));
+        assert!(
+            labels.first().map(|l| l.contains("audio device")) == Some(true),
+            "expected the engine error first, got {labels:?}"
+        );
+        assert!(
+            labels.iter().any(|l| l.contains("not toml")),
+            "and the config problem alongside it, got {labels:?}"
+        );
+    }
+
+    /// With no complaint about the file, the menu must look exactly as it
+    /// did -- the overwhelmingly common case.
+    #[test]
+    fn no_config_problem_adds_no_line() {
+        let s = snap(State::Idle);
+        assert_eq!(
+            menu_labels(&s, None).len() + 1,
+            menu_labels(&s, Some("something")).len(),
+            "the problem line is the only difference"
+        );
+        assert!(
+            !menu_labels(&s, None)
+                .join(" | ")
+                .to_lowercase()
+                .contains("config"),
+            "nothing about the config file when there is nothing wrong with it"
         );
     }
 

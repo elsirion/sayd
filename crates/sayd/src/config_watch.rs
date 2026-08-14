@@ -1,11 +1,15 @@
 //! The config file as a live, two-way surface.
 //!
-//! Two directions meet here and must not fight:
+//! Three directions meet here and must not fight:
 //!
 //! - **Write-through.** The settings window changes a value; it lands in
 //!   `config.toml` and in the running engine.
 //! - **Reload.** Someone edits `config.toml` by hand; it lands in the
 //!   running engine.
+//! - **Runtime control.** The tray, `say`, D-Bus or MPRIS changes mute or
+//!   speed; it lands in both, through [`ConfigStore::update`]. It used to
+//!   land in the engine alone, which meant the first change from either of
+//!   the other two directions silently undid it -- see that method.
 //!
 //! Both go through `Command::ApplyConfig`, so there is one place where a
 //! config becomes behaviour. The hazard is the loop between them: our own
@@ -45,10 +49,52 @@ pub enum ReloadOutcome {
     Failed(String),
 }
 
+/// The standing complaint about the config *file*, for the tray to show.
+///
+/// Spec §11 asks for a malformed config to be surfaced in the tray, and
+/// there was nowhere to put it: `main` printed the parse error to stderr at
+/// startup and `debounce_loop` printed it on every failed reload, which on a
+/// desktop means nobody ever sees it. The engine's own `error`/`State::Error`
+/// is deliberately *not* that place -- it means "synthesis is broken" and
+/// makes `Engine::submit` reject everything while it holds, so a typo in
+/// `config.toml` would stop the daemon speaking at all, which is the
+/// opposite of §11's "fall back to defaults, keep running".
+///
+/// So: a daemon-side slot, written by whatever last had an opinion about the
+/// file (startup load, reload, a persisted mute that could not be written)
+/// and read by `tray::SaydTray::menu`. One string, not a list: these are
+/// alternatives, not accumulations -- the newest verdict on the file
+/// replaces the previous one, and a good load clears it.
+#[derive(Default)]
+pub struct ConfigStatus {
+    problem: Mutex<Option<String>>,
+}
+
+impl ConfigStatus {
+    /// Poison-tolerant for the same reason `ConfigStore::stamp` is: this is
+    /// read from `Tray::menu`, and a panic while the lock was held would
+    /// otherwise turn every later menu render into a panic of its own.
+    fn slot(&self) -> std::sync::MutexGuard<'_, Option<String>> {
+        match self.problem.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    pub fn set(&self, problem: Option<String>) {
+        *self.slot() = problem;
+    }
+
+    pub fn get(&self) -> Option<String> {
+        self.slot().clone()
+    }
+}
+
 pub struct ConfigStore {
     path: PathBuf,
     engine: EngineHandle,
     last_written: Mutex<Config>,
+    status: Arc<ConfigStatus>,
     applied_reloads: AtomicUsize,
 }
 
@@ -63,12 +109,23 @@ impl ConfigStore {
             path,
             engine,
             last_written: Mutex::new(running),
+            status: Arc::new(ConfigStatus::default()),
             applied_reloads: AtomicUsize::new(0),
         }
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The slot the tray renders the file's standing problem from.
+    ///
+    /// Owned here rather than passed in so `ConfigStore::new` keeps its
+    /// signature: startup hands its own parse error straight to
+    /// `store.status().set(..)` after construction, and the tray is given a
+    /// clone of the same `Arc`.
+    pub fn status(&self) -> Arc<ConfigStatus> {
+        self.status.clone()
     }
 
     /// The config the file most recently held, as far as the daemon knows.
@@ -81,6 +138,19 @@ impl ConfigStore {
     /// settings model's `edit`, in particular): no re-read means no TOCTOU
     /// against the write it is about to do, and no race with the debounce
     /// thread's own read.
+    ///
+    /// What the stamp holds is the file's content *as the daemon runs it* --
+    /// after `settings::model::normalize` (see `reload`), not the raw bytes.
+    /// The two differ only for a file the daemon cannot honour literally
+    /// (`model = "int4"`, `speed = 9.0`), and for those this is the more
+    /// useful answer to both of the questions asked of it: an edit seeded
+    /// from here builds on what is actually running and is not refused by
+    /// `validate` over a field the user never touched, and a `ApplyConfig`
+    /// sent from here says what the engine is really doing. The cost is that
+    /// own-write suppression cannot recognise such a file as its own, so a
+    /// later, unrelated write to it re-applies and re-warns; that is one
+    /// redundant apply of an identical config, and only for a file the user
+    /// has already been warned about.
     ///
     /// There is no "we do not know" state to represent: the stamp is seeded
     /// at construction with the config the engine was spawned with, and a
@@ -142,8 +212,82 @@ impl ConfigStore {
             *stamp = displaced;
             return Err(format!("could not write {}: {e}", self.path.display()));
         }
+        // Whatever the file's standing complaint was, it is about a file
+        // that no longer exists: this write went through `validate`, so the
+        // model is one this build knows and the ranges are the engine's own.
+        self.status.set(None);
         self.engine.send(Command::ApplyConfig(cfg.clone()));
         Ok(())
+    }
+
+    /// Persist a runtime control change -- mute, speed -- and apply it.
+    ///
+    /// CRITICAL 1 / IMPORTANT 2: three writers can change what the engine is
+    /// running (this store, the file watcher, and the runtime commands from
+    /// the tray, `say`, D-Bus and MPRIS), and only two of them used to end
+    /// up in the file. `Command::SetMuted`/`SetSpeed` changed `cfg` inside
+    /// the engine and nowhere else, so the *next* `ApplyConfig` from either
+    /// of the other two writers -- a settings-window save, a hand edit, a
+    /// dotfile manager rewriting `~/.config/sayd` -- replaced the whole
+    /// `Config` and silently undid them. Measured: mute from the tray, then
+    /// edit the config's *voice*, and the daemon unmutes, the tray checkbox
+    /// flips back on its own and the next submission is audible. Spec §6 is
+    /// explicit that mute "is sticky across utterances and persists to
+    /// config", and a restart lost it too.
+    ///
+    /// So these go through the file like every other setting, and reach the
+    /// engine as `ApplyConfig` -- the one place a config becomes behaviour.
+    /// For mute that also needs `ApplyConfig` to keep doing what
+    /// `SetMuted(true)` does to the transport, which is IMPORTANT 5, fixed
+    /// in `sayd-core`'s engine.
+    ///
+    /// Seeded from the stamp, not from the engine: the engine's `Config` is
+    /// the *running* one, and seeding an edit from there is what the
+    /// settings model deliberately avoids (see `SettingsModel::edit`).
+    ///
+    /// Blocking, like `save` and for the same reason -- it is `save`'s write
+    /// -- so callers on a thread that must not block on disk go through
+    /// [`persist_in_background`].
+    ///
+    /// A failed write still applies the change: a mute the daemon cannot
+    /// write down must still shut it up. The caller gets the error back and
+    /// the tray gets the standing complaint, but the room goes quiet either
+    /// way.
+    fn update(&self, change: impl FnOnce(&mut Config), fallback: Command) -> Result<(), String> {
+        let mut stamp = self.stamp();
+        let mut cfg = stamp.clone();
+        change(&mut cfg);
+        let displaced = std::mem::replace(&mut *stamp, cfg.clone());
+        if let Err(e) = cfg.save_to(&self.path) {
+            *stamp = displaced;
+            drop(stamp);
+            let msg = format!("could not write {}: {e}", self.path.display());
+            self.status.set(Some(msg.clone()));
+            self.engine.send(fallback);
+            return Err(msg);
+        }
+        self.status.set(None);
+        drop(stamp);
+        self.engine.send(Command::ApplyConfig(cfg));
+        Ok(())
+    }
+
+    /// Mute or unmute, persistently. See [`ConfigStore::update`].
+    pub fn set_muted(&self, muted: bool) -> Result<(), String> {
+        self.update(|cfg| cfg.muted = muted, Command::SetMuted(muted))
+    }
+
+    /// Set the speed, persistently, clamped exactly as the engine and the
+    /// settings window clamp it -- MPRIS advertises `MinimumRate`/
+    /// `MaximumRate` over the same bounds, but a client is free to ignore
+    /// them, and an out-of-range value must not reach the file when the
+    /// engine would only clamp it again. See [`ConfigStore::update`].
+    pub fn set_speed(&self, speed: f32) -> Result<(), String> {
+        let speed = speed.clamp(
+            crate::settings::model::SPEED_MIN,
+            crate::settings::model::SPEED_MAX,
+        );
+        self.update(|cfg| cfg.speed = speed, Command::SetSpeed(speed))
     }
 
     /// Read the file and apply it unless it is our own echo.
@@ -193,13 +337,38 @@ impl ConfigStore {
         if txt.trim().is_empty() {
             return ReloadOutcome::Missing;
         }
-        let (cfg, err) = Config::load_str(&txt);
+        let (mut cfg, err) = Config::load_str(&txt);
         if let Some(reason) = err {
             // Deliberately not applying `cfg` here: `load_str` returns
             // defaults alongside the error, and applying those would reset
             // every setting the user has because of one typo.
-            return ReloadOutcome::Failed(format!("{}: {reason}", self.path.display()));
+            let msg = format!("{}: {reason}", self.path.display());
+            // IMPORTANT 4: and into the tray, per spec §11 -- see
+            // `ConfigStatus`. stderr alone means a desktop user learns
+            // nothing at all; measured, `sh.sayd.Sayd1.Error` was `""` and
+            // `State` was `idle` after a malformed file landed.
+            self.status.set(Some(msg.clone()));
+            return ReloadOutcome::Failed(msg);
         }
+        // IMPORTANT 3: nothing used to stand between `load_str` and the
+        // engine, so a file the daemon could not honour literally was
+        // applied verbatim and in silence -- `model = "int4"` left the
+        // daemon running fp32 (`model_file_for`'s fallback) while the file
+        // and `say status` both claimed int4, durably and invisibly, and
+        // `speed = 9.0` left the file disagreeing with the engine's clamp
+        // indefinitely. `normalize` is the settings window's own rules, in
+        // the one shape a reload can use: it cannot refuse the user's file,
+        // so it says what it had to change and carries on. Nothing is
+        // written back (spec §11).
+        let warnings = crate::settings::model::normalize(&mut cfg);
+        for w in &warnings {
+            eprintln!("warning: {}: {w}", self.path.display());
+        }
+        self.status.set(if warnings.is_empty() {
+            None
+        } else {
+            Some(format!("{}: {}", self.path.display(), warnings.join("; ")))
+        });
         if *stamp == cfg {
             return ReloadOutcome::OwnWrite;
         }
@@ -219,6 +388,33 @@ impl ConfigStore {
     fn applied_reloads(&self) -> usize {
         self.applied_reloads.load(Ordering::Relaxed)
     }
+}
+
+/// Run a persisting change off the calling thread, reporting a failure.
+///
+/// Every caller of [`ConfigStore::set_muted`]/[`ConfigStore::set_speed`] in
+/// the daemon is somewhere that must not block on disk: a zbus method
+/// handler (`dbus.rs`), a ksni menu callback (`tray.rs`) or an MPRIS
+/// property setter (`mpris.rs`). All three run on tokio -- ksni's own
+/// service task is `tokio::spawn`ed, which is what makes a runtime
+/// guaranteed to be in scope for its callbacks too (see
+/// `tray::SaydTray::speak`) -- so `spawn_blocking` is available to all of
+/// them and is the one place that knows this, rather than three copies of
+/// the same three lines.
+///
+/// Fire and forget, like `EngineHandle::send`: a mute is a transport
+/// command whose caller has already been answered, and the change reaches
+/// the engine whether or not the write succeeds (see `update`). The failure
+/// is logged here and shown in the tray by `update` itself.
+pub fn persist_in_background(
+    store: Arc<ConfigStore>,
+    change: impl FnOnce(&ConfigStore) -> Result<(), String> + Send + 'static,
+) {
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = change(&store) {
+            eprintln!("warning: {e}");
+        }
+    });
 }
 
 /// Does this event mean the file's *contents* may have changed?
@@ -461,6 +657,8 @@ fn debounce_loop(
         }
         match store.reload() {
             ReloadOutcome::Applied => eprintln!("sayd: reloaded {}", store.path().display()),
+            // Also in the tray from here on, per spec §11 -- `reload` puts
+            // it in the `ConfigStatus` slot; this line is for the log.
             ReloadOutcome::Failed(reason) => {
                 eprintln!("warning: {reason}; keeping the running settings");
             }
@@ -582,6 +780,45 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert_eq!(engine.snapshot().voice, want);
+    }
+
+    /// Poll the published snapshot until `f` holds. The engine runs on its
+    /// own thread, so every command is fire-and-forget from here.
+    fn wait_for(
+        engine: &EngineHandle,
+        label: &str,
+        f: impl Fn(&sayd_core::engine::Snapshot) -> bool,
+    ) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if f(&engine.snapshot()) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!(
+            "timed out waiting for {label}; snapshot = {:?}",
+            engine.snapshot()
+        );
+    }
+
+    /// The same, for the engine's live `Config` -- which, unlike the
+    /// snapshot, carries the fields (`model`, `threads`) a config apply is
+    /// mostly about.
+    fn wait_for_config(engine: &EngineHandle, label: &str, f: impl Fn(&Config) -> bool) -> Config {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if let Some(c) = engine.config() {
+                if f(&c) {
+                    return c;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!(
+            "timed out waiting for {label}; config = {:?}",
+            engine.config()
+        );
     }
 
     /// Long enough that anything the watcher was going to do has happened,
@@ -1056,6 +1293,169 @@ mod tests {
             "am_fenrir",
             "reading the config file must not re-apply it over runtime state"
         );
+        engine.shutdown();
+    }
+
+    /// CRITICAL 1 at the store level: mute goes to the file as well as the
+    /// engine, so the next `ApplyConfig` from any of the other writers
+    /// cannot undo it and a restart does not lose it (spec §6).
+    #[test]
+    fn a_persisted_mute_reaches_both_the_file_and_the_engine() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let engine = engine();
+        let store = ConfigStore::new(path.clone(), engine.clone(), Config::default());
+
+        store.set_muted(true).expect("the write must succeed");
+        let (on_disk, err) = Config::load_from(&path);
+        assert_eq!(err, None);
+        assert!(on_disk.muted, "spec §6: mute persists to config");
+        wait_for(&engine, "the engine to mute", |s| s.muted);
+
+        // And the reverse, so the file cannot get stuck muted.
+        store.set_muted(false).expect("the write must succeed");
+        let (on_disk, _) = Config::load_from(&path);
+        assert!(!on_disk.muted);
+        wait_for(&engine, "the engine to unmute", |s| !s.muted);
+        engine.shutdown();
+    }
+
+    /// The measured failure: mute, then edit an unrelated field of the file,
+    /// and the daemon used to unmute itself.
+    #[test]
+    fn a_persisted_mute_survives_a_reload_of_an_unrelated_edit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let engine = engine();
+        let store = ConfigStore::new(path.clone(), engine.clone(), Config::default());
+
+        store.set_muted(true).expect("the write must succeed");
+        wait_for(&engine, "the engine to mute", |s| s.muted);
+
+        let (mut edited, _) = Config::load_from(&path);
+        edited.voice = "bm_george".into();
+        edited.save_to(&path).expect("hand edit");
+        assert_eq!(store.reload(), ReloadOutcome::Applied);
+
+        wait_for_voice(&engine, "bm_george");
+        assert!(
+            engine.snapshot().muted,
+            "a config change that never mentioned mute must not unmute"
+        );
+        engine.shutdown();
+    }
+
+    /// A mute the daemon cannot write down must still shut it up: the
+    /// transport behaviour is the urgent half, and the caller (and the tray)
+    /// still learn the file did not get it.
+    #[test]
+    fn a_mute_that_cannot_be_written_still_mutes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A path whose parent is a *file* cannot be created as a directory,
+        // so `save_to` fails for a reason that needs no permission games.
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"not a directory").expect("blocker");
+        let engine = engine();
+        let store = ConfigStore::new(
+            blocker.join("config.toml"),
+            engine.clone(),
+            Config::default(),
+        );
+
+        let err = store.set_muted(true).expect_err("the write cannot succeed");
+        assert!(!err.is_empty());
+        wait_for(&engine, "the engine to mute anyway", |s| s.muted);
+        assert_eq!(
+            store
+                .status()
+                .get()
+                .as_deref()
+                .map(|s| s.contains("could not write")),
+            Some(true),
+            "and the tray is told the file did not get it"
+        );
+        assert_eq!(
+            store.current(),
+            Config::default(),
+            "a failed write must leave the stamp on what the file really holds"
+        );
+        engine.shutdown();
+    }
+
+    /// IMPORTANT 3: a file the daemon cannot honour literally is applied as
+    /// what it will actually run, and says so. Before this, `model = "int4"`
+    /// went to the engine verbatim, `model_file_for` fell through to fp32,
+    /// and nothing anywhere said the daemon was running a different model
+    /// from the one the file (and `say status`) claimed.
+    #[test]
+    fn an_unrunnable_model_is_normalized_and_reported_rather_than_applied_verbatim() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let engine = engine();
+        let store = ConfigStore::new(path.clone(), engine.clone(), Config::default());
+
+        std::fs::write(&path, "model = \"int4\"\nthreads = 0\nspeed = 9.0\n").expect("write");
+        assert_eq!(store.reload(), ReloadOutcome::Applied);
+
+        let applied = wait_for_config(&engine, "the normalized config", |c| c.model == "fp32");
+        assert_eq!(applied.threads, 1, "threads = 0 is not a thread count");
+        assert!(
+            (applied.speed - 2.0).abs() < f32::EPSILON,
+            "speed is clamped"
+        );
+        assert_eq!(
+            store.current(),
+            applied,
+            "the stamp must hold what is running, so the window builds on it"
+        );
+
+        let problem = store.status().get().expect("the tray must be told");
+        assert!(problem.contains("int4"), "{problem}");
+        assert!(problem.contains("fp32"), "{problem}");
+        assert!(problem.contains("9"), "the clamp too: {problem}");
+        assert!(
+            !std::fs::read_to_string(&path)
+                .expect("read")
+                .contains("fp32"),
+            "spec §11: the user's file is not corrected behind their back"
+        );
+        engine.shutdown();
+    }
+
+    /// IMPORTANT 4: spec §11 says a malformed config is surfaced *in the
+    /// tray*. Measured before this: after `voice = [this is not toml`
+    /// landed, `sh.sayd.Sayd1.Error` was `""` and `State` was `idle` -- the
+    /// daemon knew and no surface said so. It must also not go into the
+    /// engine's error, which would reject every submission.
+    #[test]
+    fn a_malformed_config_is_surfaced_for_the_tray_without_erroring_the_engine() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let engine = engine();
+        let store = ConfigStore::new(path.clone(), engine.clone(), Config::default());
+
+        std::fs::write(&path, "voice = [this is not toml").expect("write");
+        assert!(matches!(store.reload(), ReloadOutcome::Failed(_)));
+
+        let problem = store.status().get().expect("the tray must be told");
+        assert!(problem.contains("config.toml"), "{problem}");
+        let s = engine.snapshot();
+        assert_eq!(
+            s.error, None,
+            "a typo in config.toml must not look like broken synthesis"
+        );
+        assert_ne!(s.state, sayd_core::engine::State::Error);
+        assert!(
+            engine
+                .submit("Still speaking.".into(), Default::default())
+                .is_ok(),
+            "and must not stop the daemon speaking"
+        );
+
+        // And it clears once the file parses again.
+        Config::default().save_to(&path).expect("repair");
+        let _ = store.reload();
+        assert_eq!(store.status().get(), None);
         engine.shutdown();
     }
 

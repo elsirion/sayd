@@ -19,8 +19,12 @@ use mpris_server::zbus::Result as ZResult;
 use mpris_server::{
     LoopStatus, Metadata, PlaybackStatus, PlayerInterface, RootInterface, Server, Time, TrackId,
 };
+use std::sync::Arc;
+
 use sayd_core::engine::{Command, State};
 use sayd_core::handle::EngineHandle;
+
+use crate::config_watch::{persist_in_background, ConfigStore};
 
 /// How much of an utterance to advertise as the track title.
 const TITLE_CHARS: usize = 120;
@@ -72,11 +76,14 @@ pub fn metadata_for(current_id: u64, current_text: &str) -> Metadata {
 
 pub struct SaydPlayer {
     engine: EngineHandle,
+    /// Where `Rate` goes, so a speed set through MPRIS survives the next
+    /// config apply -- see `set_rate`.
+    store: Arc<ConfigStore>,
 }
 
 impl SaydPlayer {
-    pub fn new(engine: EngineHandle) -> Self {
-        SaydPlayer { engine }
+    pub fn new(engine: EngineHandle, store: Arc<ConfigStore>) -> Self {
+        SaydPlayer { engine, store }
     }
 }
 
@@ -179,8 +186,23 @@ impl PlayerInterface for SaydPlayer {
         // instant it lands (see `Snapshot::configured_speed`'s doc comment).
         Ok(self.engine.snapshot().configured_speed as f64)
     }
+    /// IMPORTANT 2: persisted, like every other `speed` writer.
+    ///
+    /// This used to send `Command::SetSpeed` alone, which changed `cfg.speed`
+    /// inside the engine and nowhere else -- so the next `ApplyConfig` from
+    /// the settings window or a hand edit reverted it, complete with a
+    /// `PropertiesChanged` announcing the new value, leaving a client unable
+    /// to tell who had changed it. Measured: set `Rate = 1.75`, edit the
+    /// config's *voice*, and `Rate` is 1.0 again. `speed` is a config field
+    /// the settings window already writes, so the three writers of it should
+    /// agree, and the only way for them to agree is the file.
+    ///
+    /// Off this thread because it writes to disk; the trait's `ZResult`
+    /// leaves nowhere to report a failed *write* anyway, and a rate that
+    /// could not be written still takes effect (see `ConfigStore::update`).
     async fn set_rate(&self, rate: f64) -> ZResult<()> {
-        self.engine.send(Command::SetSpeed(rate as f32));
+        let rate = rate as f32;
+        persist_in_background(self.store.clone(), move |s| s.set_speed(rate));
         Ok(())
     }
     async fn minimum_rate(&self) -> FdoResult<f64> {
@@ -236,8 +258,11 @@ impl PlayerInterface for SaydPlayer {
 /// Fails cleanly (as `Err`, never a panic) rather than aborting startup --
 /// as with the tray, the caller is expected to log once and carry on serving
 /// the control interface without media-key/playerctl support.
-pub async fn spawn(engine: EngineHandle) -> Result<Server<SaydPlayer>, String> {
-    Server::new("sayd", SaydPlayer::new(engine))
+pub async fn spawn(
+    engine: EngineHandle,
+    store: Arc<ConfigStore>,
+) -> Result<Server<SaydPlayer>, String> {
+    Server::new("sayd", SaydPlayer::new(engine, store))
         .await
         .map_err(|e| format!("could not start the MPRIS server: {e}"))
 }
@@ -291,13 +316,21 @@ mod tests {
         assert_ne!(trackid_for(1), TrackId::NO_TRACK);
     }
 
-    fn player() -> (SaydPlayer, EngineHandle) {
+    /// A player over a real engine and a store rooted in `dir`, so
+    /// `set_rate` writes somewhere harmless. The store is told the same
+    /// config the engine was spawned with, as `ConfigStore::new` requires.
+    fn player_in(dir: &std::path::Path) -> (SaydPlayer, EngineHandle) {
         let h = EngineHandle::spawn(
             sayd_core::config::Config::default(),
             Box::new(sayd_core::synth::StubSynthesizer::new()),
             Box::new(sayd_core::audio::VecSink::new(24_000 * 10)),
         );
-        (SaydPlayer::new(h.clone()), h)
+        let store = Arc::new(ConfigStore::new(
+            dir.join("config.toml"),
+            h.clone(),
+            sayd_core::config::Config::default(),
+        ));
+        (SaydPlayer::new(h.clone(), store), h)
     }
 
     /// Poll a `PlayerInterface` read until `f` holds or the deadline passes.
@@ -321,7 +354,8 @@ mod tests {
         // I1, exercised end to end through `SaydPlayer`: a per-utterance
         // speed override must not leak into `Rate`, and a `SetRate` issued
         // while that utterance is still playing must be visible right away.
-        let (player, h) = player();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (player, h) = player_in(dir.path());
         h.submit(
             "An utterance with its own speed override.".into(),
             sayd_core::engine::SayOpts {
@@ -352,6 +386,89 @@ mod tests {
         h.shutdown();
     }
 
+    /// IMPORTANT 2: `Rate` used to be engine-only, so any config apply
+    /// silently reverted it -- measured, setting `Rate = 1.75` and then
+    /// editing the config's *voice* put it back to 1.0, with a
+    /// `PropertiesChanged` announcing the reversion, so a client could not
+    /// tell who had changed it. `speed` is a config field the settings
+    /// window already writes; the three writers of it have to agree, and
+    /// the file is the only place they can.
+    #[tokio::test]
+    async fn a_rate_set_through_mpris_persists_and_survives_a_config_reload() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let (player, h) = player_in(dir.path());
+        let store = Arc::new(ConfigStore::new(
+            path.clone(),
+            h.clone(),
+            sayd_core::config::Config::default(),
+        ));
+
+        player
+            .set_rate(1.75)
+            .await
+            .expect("set_rate must not error");
+        wait_for(|| player.rate(), |r| (*r - 1.75).abs() < 1e-6).await;
+
+        // The file, not just the engine.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let (cfg, _) = sayd_core::config::Config::load_from(&path);
+            if (cfg.speed - 1.75).abs() < f32::EPSILON {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the rate never reached the file"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        // An unrelated hand edit, made the way an editor makes one.
+        let (mut edited, err) = sayd_core::config::Config::load_from(&path);
+        assert_eq!(err, None);
+        edited.voice = "am_fenrir".into();
+        edited.save_to(&path).expect("hand edit");
+        assert_eq!(
+            store.reload(),
+            crate::config_watch::ReloadOutcome::Applied,
+            "the hand edit must be applied for this to test anything"
+        );
+
+        let rate = wait_for(|| player.rate(), |r| (*r - 1.75).abs() < 1e-6).await;
+        assert!(
+            (rate - 1.75).abs() < 1e-6,
+            "an unrelated config change must not revert Rate, got {rate}"
+        );
+        h.shutdown();
+    }
+
+    /// A client is free to ignore `MinimumRate`/`MaximumRate`; the file must
+    /// not then hold a speed the engine would only clamp again on the way
+    /// back in (finding 9's disagreement, in the one place this path can
+    /// still create it).
+    #[tokio::test]
+    async fn an_out_of_range_rate_is_clamped_before_it_reaches_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let (player, h) = player_in(dir.path());
+
+        player.set_rate(9.0).await.expect("set_rate must not error");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let (cfg, _) = sayd_core::config::Config::load_from(&path);
+            if (cfg.speed - 2.0).abs() < f32::EPSILON {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the clamped rate never reached the file, or was not clamped"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        h.shutdown();
+    }
+
     #[tokio::test]
     async fn metadata_and_status_show_the_about_to_play_utterance_immediately() {
         // I2, exercised through the real EngineHandle/mpris boundary. Only
@@ -360,7 +477,8 @@ mod tests {
         // queue-head fallback, both report the same id/text -- this is
         // deterministic despite running against a real background thread,
         // not a race against it.
-        let (player, h) = player();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (player, h) = player_in(dir.path());
         h.submit(
             "The utterance about to play.".into(),
             sayd_core::engine::SayOpts::default(),

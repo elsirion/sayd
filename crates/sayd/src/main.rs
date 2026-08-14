@@ -373,10 +373,32 @@ async fn run_daemon() -> std::process::ExitCode {
     }
 
     // We are the daemon.
-    let (cfg, cfg_err) = Config::load();
-    if let Some(e) = cfg_err {
-        eprintln!("warning: {e}; using defaults");
+    let (mut cfg, cfg_err) = Config::load();
+    // IMPORTANT 3, at startup rather than on reload: the same normalisation
+    // the reload path applies (`ConfigStore::reload`), so the engine, the
+    // store's stamp and the file's meaning agree from t=0 instead of from
+    // the first hand edit. Without it a daemon started against `model =
+    // "int4"` ran fp32 while claiming int4 until something happened to
+    // rewrite the file.
+    let cfg_warnings = settings::model::normalize(&mut cfg);
+    for w in &cfg_warnings {
+        eprintln!("warning: {}: {w}", Config::path().display());
     }
+    // Kept for the tray, per spec §11 -- see `config_watch::ConfigStatus`.
+    // A parse failure wins over a normalisation warning: there is no
+    // honoured value to complain about in a file that did not parse at all.
+    let cfg_problem = match cfg_err {
+        Some(e) => {
+            eprintln!("warning: {e}; using defaults");
+            Some(e)
+        }
+        None if !cfg_warnings.is_empty() => Some(format!(
+            "{}: {}",
+            Config::path().display(),
+            cfg_warnings.join("; ")
+        )),
+        None => None,
+    };
 
     // Finding 2: load and validate the ONNX Runtime dylib now, up front,
     // where a failure can be reported with a clean exit -- rather than
@@ -433,6 +455,7 @@ async fn run_daemon() -> std::process::ExitCode {
         engine.clone(),
         cfg,
     ));
+    store.status().set(cfg_problem);
     // The settings window is built and destroyed on demand, so the model it
     // edits has to outlive every window: it lives behind `settings`'s own
     // `OnceLock` from here on.
@@ -462,7 +485,7 @@ async fn run_daemon() -> std::process::ExitCode {
         }
     };
 
-    let iface = dbus::SaydIface::new(engine.clone());
+    let iface = dbus::SaydIface::new(engine.clone(), store.clone());
     if let Err(e) = connection.object_server().at(OBJECT_PATH, iface).await {
         eprintln!("error: could not serve the interface: {e}");
         return std::process::ExitCode::FAILURE;
@@ -474,7 +497,7 @@ async fn run_daemon() -> std::process::ExitCode {
     // without waybar has no StatusNotifierWatcher running at all, and the
     // daemon is still useful serving just the control interface. Log once
     // and carry on rather than exit.
-    let tray_handle = match tray::spawn(engine.clone()).await {
+    let tray_handle = match tray::spawn(engine.clone(), store.clone(), store.status()).await {
         Ok(h) => Some(h),
         Err(e) => {
             eprintln!("info: {e}; continuing without a tray icon");
@@ -486,7 +509,7 @@ async fn run_daemon() -> std::process::ExitCode {
     // keys and no playerctl/waybar mpris module, but the daemon is still
     // useful serving just the control interface, so this must not be fatal
     // either.
-    let mpris_handle = match mpris::spawn(engine.clone()).await {
+    let mpris_handle = match mpris::spawn(engine.clone(), store.clone()).await {
         Ok(s) => Some(s),
         Err(e) => {
             eprintln!("info: {e}; continuing without MPRIS (media keys, playerctl)");
@@ -522,6 +545,13 @@ async fn run_daemon() -> std::process::ExitCode {
     // still gets delivered on the next attempt even if nothing *else* has
     // changed in the meantime -- see `FANOUT_TIMEOUT`'s doc comment.
     let mut tray_last_sent = last.clone();
+    // IMPORTANT 4: the tray reads the config file's standing problem live
+    // from the shared slot when it renders its menu, but a host is entitled
+    // to cache the layout until told otherwise -- so a problem appearing
+    // (or clearing) while nothing else moves still has to trigger a fan-out,
+    // exactly as a snapshot change does.
+    let config_status = store.status();
+    let mut tray_last_problem = config_status.get();
     let mut next_tray_attempt = Instant::now();
     let mut tray_backoff_logged = false;
     let mut mpris_last_sent = last.clone();
@@ -612,8 +642,11 @@ async fn run_daemon() -> std::process::ExitCode {
                 // independently of the D-Bus emissions above and of each
                 // other -- see `FANOUT_TIMEOUT`'s doc comment for why an
                 // unbounded wait here used to freeze the whole loop.
+                let config_problem = config_status.get();
                 if let Some(h) = tray_handle.as_ref() {
-                    if now != tray_last_sent && now_instant >= next_tray_attempt {
+                    if (now != tray_last_sent || config_problem != tray_last_problem)
+                        && now_instant >= next_tray_attempt
+                    {
                         let s = now.clone();
                         match tokio::time::timeout(
                             FANOUT_TIMEOUT,
@@ -623,6 +656,7 @@ async fn run_daemon() -> std::process::ExitCode {
                         {
                             Ok(_) => {
                                 tray_last_sent = now.clone();
+                                tray_last_problem = config_problem.clone();
                                 tray_backoff_logged = false;
                             }
                             Err(_) => {

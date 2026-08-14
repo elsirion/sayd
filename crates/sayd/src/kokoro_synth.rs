@@ -20,7 +20,11 @@ pub struct KokoroSynthesizer {
     loaded_voices: Vec<String>,
 }
 
-fn model_file_for(model: &str) -> &'static str {
+/// `pub(crate)` so `settings::model`'s tests can pin
+/// `settings::model::FALLBACK_MODEL` against the file this actually loads
+/// for an unrecognised string -- the whole premise of normalising an unknown
+/// `model` to fp32 rather than to something else.
+pub(crate) fn model_file_for(model: &str) -> &'static str {
     match model {
         "fp16" => "model_fp16.onnx",
         "q8" => "model_quantized.onnx",

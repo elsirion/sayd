@@ -523,26 +523,108 @@ fn write_loop(shared: &Shared) {
     }
 }
 
+/// What `kokoro_synth::model_file_for` loads for a `model` string it does
+/// not recognise -- its `_ => "model.onnx"` arm, which is fp32's file.
+///
+/// Taken from `MODELS[0]` rather than written out again so the two cannot
+/// drift; `the_fallback_model_is_the_one_the_synthesizer_actually_loads`
+/// pins it against both `model_file_for` and `Config::default`.
+const FALLBACK_MODEL: &str = MODELS[0].0;
+
+fn known_models() -> String {
+    MODELS
+        .iter()
+        .map(|(v, _)| *v)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Clamp the fields that have a sensible nearest value, saying what was
+/// changed and to what.
+///
+/// Shared by `validate` (the window) and `normalize` (the reload path) so
+/// there is one set of range rules rather than two that can disagree about
+/// what the engine will actually honour. The bounds themselves are
+/// `SPEED_MIN`/`SPEED_MAX`, which exist to match `Engine`'s own clamp
+/// exactly.
+fn clamp_ranges(cfg: &mut Config) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let speed = cfg.speed.clamp(SPEED_MIN, SPEED_MAX);
+    if (speed - cfg.speed).abs() > f32::EPSILON {
+        warnings.push(format!(
+            "speed {} is outside {SPEED_MIN}-{SPEED_MAX}; running at {speed}",
+            cfg.speed
+        ));
+        cfg.speed = speed;
+    }
+    if cfg.threads == 0 {
+        warnings.push("threads = 0 is not a thread count; running with 1".to_string());
+        cfg.threads = 1;
+    }
+    warnings
+}
+
 /// Clamp what has a sensible nearest value, reject what does not.
 ///
 /// Speed and thread count have obvious clamps. A model string does not: an
 /// unrecognised one would fall through `model_file_for` to fp32, so the
-/// file would claim something other than what loads.
+/// file would claim something other than what loads -- and this path is
+/// about to *write* the value, so refusing is the only way to keep the file
+/// honest. That is the deliberate asymmetry against `normalize` below,
+/// which cannot refuse a file the user already wrote.
+///
+/// The clamps' own warnings are dropped rather than returned: an accepted
+/// edit is not a failure, and the window already marks a row whose value
+/// the engine had to clamp (see `window.rs`'s spin rows).
 fn validate(cfg: &mut Config) -> Result<(), String> {
-    cfg.speed = cfg.speed.clamp(SPEED_MIN, SPEED_MAX);
-    cfg.threads = cfg.threads.max(1);
+    let _ = clamp_ranges(cfg);
     if !MODELS.iter().any(|(v, _)| *v == cfg.model) {
         return Err(format!(
             "'{}' is not a model this build knows; expected one of {}",
             cfg.model,
-            MODELS
-                .iter()
-                .map(|(v, _)| *v)
-                .collect::<Vec<_>>()
-                .join(", ")
+            known_models()
         ));
     }
     Ok(())
+}
+
+/// The config as the daemon will actually run it, plus one warning per field
+/// whose written value could not be honoured.
+///
+/// For configs that arrive from the *file* -- at startup and on every
+/// reload -- rather than from the window. The difference from `validate` is
+/// the whole point: the window may refuse a value because the user is about
+/// to write it, but a file the user has already written cannot be refused.
+/// Rejecting it would mean either ignoring the whole edit (so a typo in one
+/// field discards the other eight) or wedging the daemon on a file it will
+/// not run; both are worse than running the nearest thing and saying so.
+///
+/// So an unrecognised `model` becomes [`FALLBACK_MODEL`] here, because that
+/// is what `model_file_for` was going to load anyway -- IMPORTANT 3: before
+/// this, `model = "int4"` was applied verbatim, the daemon ran fp32 while
+/// `say status` and the file both claimed int4, and nothing at all was
+/// logged. Making the config say what is really running also un-wedges the
+/// settings window, whose `edit` seeds from the store and would otherwise
+/// have `validate` refuse every later edit over a field the user never
+/// touched.
+///
+/// This deliberately does not write anything back to the file: spec §11
+/// ("do not overwrite the user's file until they change something in the
+/// UI") means the corrected value reaches the disk only when the user next
+/// changes a setting, which is also the moment the file stops being theirs
+/// alone.
+pub fn normalize(cfg: &mut Config) -> Vec<String> {
+    let mut warnings = clamp_ranges(cfg);
+    if !MODELS.iter().any(|(v, _)| *v == cfg.model) {
+        warnings.push(format!(
+            "'{}' is not a model this build knows (expected one of {}); running {} instead",
+            cfg.model,
+            known_models(),
+            FALLBACK_MODEL
+        ));
+        cfg.model = FALLBACK_MODEL.to_string();
+    }
+    warnings
 }
 
 /// Voice-pack names from `<models_dir>/voices/*.bin`, sorted.
@@ -1049,6 +1131,138 @@ mod tests {
             result.is_err(),
             "a write that cannot reach disk must not be reported as flushed"
         );
+        engine.shutdown();
+    }
+
+    /// IMPORTANT 3: an unrecognised `model` is not something the reload
+    /// path may refuse -- the user has already written it -- so it says
+    /// what it will run instead. Before this it said nothing at all and the
+    /// daemon ran fp32 while the file (and `say status`) claimed int4.
+    #[test]
+    fn normalize_names_an_unknown_model_and_what_will_run_instead() {
+        let mut cfg = Config {
+            model: "int4".into(),
+            ..Config::default()
+        };
+        let warnings = normalize(&mut cfg);
+        assert_eq!(cfg.model, FALLBACK_MODEL, "the config must say what runs");
+        assert_eq!(warnings.len(), 1, "one field, one warning: {warnings:?}");
+        assert!(
+            warnings[0].contains("int4"),
+            "the rejected value must be named: {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains(FALLBACK_MODEL),
+            "and what will actually be used: {warnings:?}"
+        );
+    }
+
+    /// Finding 9: the engine clamps `speed` on `ApplyConfig` but the file
+    /// keeps its out-of-range value, so `say status` and MPRIS disagree with
+    /// the file indefinitely. Nothing said so; now the same warning that
+    /// covers the model covers the clamp.
+    #[test]
+    fn normalize_reports_the_speed_clamp_the_engine_would_apply_silently() {
+        let mut cfg = Config {
+            speed: 9.0,
+            ..Config::default()
+        };
+        let warnings = normalize(&mut cfg);
+        assert!((cfg.speed - SPEED_MAX).abs() < f32::EPSILON);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains('9'), "{warnings:?}");
+        assert!(warnings[0].contains('2'), "{warnings:?}");
+
+        let mut zero_threads = Config {
+            threads: 0,
+            ..Config::default()
+        };
+        let warnings = normalize(&mut zero_threads);
+        assert_eq!(zero_threads.threads, 1);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+    }
+
+    /// The overwhelmingly common case: a config the daemon can honour
+    /// exactly must come through untouched and silent, or every reload
+    /// would cry wolf.
+    #[test]
+    fn normalize_leaves_an_honourable_config_alone() {
+        let mut cfg = Config {
+            voice: "am_fenrir".into(),
+            speed: 1.25,
+            model: "q8".into(),
+            threads: 4,
+            ..Config::default()
+        };
+        let before = cfg.clone();
+        assert!(normalize(&mut cfg).is_empty());
+        assert_eq!(cfg, before);
+    }
+
+    /// The premise of normalising an unknown model to `FALLBACK_MODEL`: that
+    /// is the file the synthesizer was going to load for it anyway. If
+    /// `model_file_for`'s catch-all ever changed, normalising to fp32 would
+    /// start writing a *different* lie into the running config.
+    #[test]
+    fn the_fallback_model_is_the_one_the_synthesizer_actually_loads() {
+        use crate::kokoro_synth::model_file_for;
+        assert_eq!(model_file_for("int4"), model_file_for(FALLBACK_MODEL));
+        assert_eq!(
+            FALLBACK_MODEL,
+            Config::default().model,
+            "the fallback must also be what a config that says nothing gets"
+        );
+    }
+
+    /// The asymmetry between the two paths, stated as a test: the window
+    /// refuses (it is about to write the value), the reload path does not
+    /// (the user already wrote it).
+    #[test]
+    fn the_window_refuses_the_model_the_reload_path_normalizes() {
+        let mut for_window = Config {
+            model: "int4".into(),
+            ..Config::default()
+        };
+        assert!(validate(&mut for_window).is_err());
+        let mut from_file = Config {
+            model: "int4".into(),
+            ..Config::default()
+        };
+        assert!(!normalize(&mut from_file).is_empty());
+        assert_eq!(from_file.model, FALLBACK_MODEL);
+    }
+
+    /// IMPORTANT 3, the part the user actually hits: a file the window
+    /// would refuse used to lock every row of the window. `edit` seeds from
+    /// the store, `validate` rejects the whole config, and touching *Speed*
+    /// toasted "'int4' is not a model this build knows" -- nine settings
+    /// unreachable over a field the user never touched. Normalising on the
+    /// reload path means the store holds a config the window can build on.
+    #[test]
+    fn an_unrunnable_model_in_the_file_does_not_lock_the_window_out() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let models = models_dir_with(&["af_heart"], dir.path());
+        let path = dir.path().join("config.toml");
+        let (store, engine) = store_in(dir.path());
+        let m = SettingsModel::new(store.clone(), models, Config::default());
+
+        // Hand-written, as a user would: `model_file_for` will fall through
+        // to fp32 for this.
+        // `speed` differs from the stamp so the reload is a genuine
+        // `Applied` rather than an echo: normalising `int4` to fp32 makes
+        // the rest of this file identical to the default the store was
+        // seeded with.
+        std::fs::write(&path, "model = \"int4\"\nspeed = 1.25\n").expect("hand edit");
+        assert_eq!(store.reload(), ReloadOutcome::Applied);
+
+        let after = m.edit(|c| c.speed = 1.5).expect(
+            "an edit to an unrelated row must not be refused over the file's unrunnable model",
+        );
+        assert_eq!(after.model, FALLBACK_MODEL, "and it writes what is running");
+        settled(&m);
+        let (on_disk, err) = Config::load_from(&path);
+        assert_eq!(err, None);
+        assert_eq!(on_disk.speed, 1.5);
         engine.shutdown();
     }
 

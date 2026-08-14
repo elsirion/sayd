@@ -6,6 +6,7 @@
 //! and block -- run on a blocking thread so they cannot stall the runtime.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use sayd_core::engine::{Command, SayOpts, State, Submitted};
 use sayd_core::handle::EngineHandle;
@@ -14,10 +15,14 @@ use zbus::fdo;
 use zbus::interface;
 use zbus::zvariant::{OwnedValue, Str};
 
+use crate::config_watch::{persist_in_background, ConfigStore};
 use crate::selection;
 
 pub struct SaydIface {
     pub engine: EngineHandle,
+    /// Where `SetMuted` goes, so a mute survives the next config apply and
+    /// the next restart -- see `ConfigStore::update` and spec §6.
+    pub store: Arc<ConfigStore>,
 }
 
 /// The lowercase names the `State` property uses on the bus.
@@ -63,8 +68,8 @@ fn say_opts_from(opts: &HashMap<String, OwnedValue>, source: QueueSource) -> Say
 }
 
 impl SaydIface {
-    pub fn new(engine: EngineHandle) -> Self {
-        SaydIface { engine }
+    pub fn new(engine: EngineHandle, store: Arc<ConfigStore>) -> Self {
+        SaydIface { engine, store }
     }
 
     /// Shared body of `Say`, `SaySelection` and `SayClipboard`.
@@ -209,8 +214,25 @@ impl SaydIface {
         self.engine.send(Command::Cancel(id as u64));
     }
 
+    /// Mute or unmute -- persistently, per spec §6 ("mute is sticky across
+    /// utterances and persists to config").
+    ///
+    /// CRITICAL 1: this used to send `Command::SetMuted` and nothing else,
+    /// which changed `cfg.muted` inside the engine alone. Any later
+    /// `ApplyConfig` -- a settings-window save, a hand edit, a dotfile
+    /// manager rewriting `~/.config/sayd` -- replaced the whole `Config` and
+    /// unmuted the daemon on its own, and a restart lost the mute too.
+    /// Routing it through the store makes the file and the engine agree;
+    /// the engine's own transport behaviour on a false -> true transition is
+    /// unchanged (`sayd-core`'s `ApplyConfig`, IMPORTANT 5).
+    ///
+    /// Off this thread because it writes to disk, and still fire-and-forget
+    /// on the bus: the D-Bus signature has no return value to report a
+    /// failed *write* through, and a mute that could not be written still
+    /// mutes. `Muted` reports the truth either way, and the failure reaches
+    /// the log and the tray.
     async fn set_muted(&self, muted: bool) {
-        self.engine.send(Command::SetMuted(muted));
+        persist_in_background(self.store.clone(), move |s| s.set_muted(muted));
     }
 
     async fn quit(&self) {
@@ -285,12 +307,21 @@ mod tests {
     use sayd_core::config::Config;
     use sayd_core::synth::StubSynthesizer;
 
-    fn iface() -> SaydIface {
-        SaydIface::new(sayd_core::handle::EngineHandle::spawn(
+    /// An interface over a real engine and a store rooted in `dir`, so
+    /// `SetMuted` writes somewhere harmless. The store is told the same
+    /// config the engine was spawned with, as `ConfigStore::new` requires.
+    fn iface_in(dir: &std::path::Path) -> SaydIface {
+        let engine = sayd_core::handle::EngineHandle::spawn(
             Config::default(),
             Box::new(StubSynthesizer::new()),
             Box::new(VecSink::new(24_000 * 10)),
-        ))
+        );
+        let store = Arc::new(ConfigStore::new(
+            dir.join("config.toml"),
+            engine.clone(),
+            Config::default(),
+        ));
+        SaydIface::new(engine, store)
     }
 
     #[test]
@@ -371,7 +402,8 @@ mod tests {
 
     #[tokio::test]
     async fn say_returns_a_nonzero_id_and_zero_when_nothing_is_queued() {
-        let i = iface();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let i = iface_in(dir.path());
         let id = i
             .say("hello there.".into(), HashMap::new())
             .await
@@ -390,21 +422,30 @@ mod tests {
 
     #[tokio::test]
     async fn say_reports_a_rejection_as_a_dbus_error() {
-        let i = SaydIface::new(sayd_core::handle::EngineHandle::spawn(
-            Config {
-                max_chars: 5,
-                ..Config::default()
-            },
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = Config {
+            max_chars: 5,
+            ..Config::default()
+        };
+        let engine = sayd_core::handle::EngineHandle::spawn(
+            cfg.clone(),
             Box::new(StubSynthesizer::new()),
             Box::new(VecSink::new(24_000)),
+        );
+        let store = Arc::new(ConfigStore::new(
+            dir.path().join("config.toml"),
+            engine.clone(),
+            cfg,
         ));
+        let i = SaydIface::new(engine, store);
         assert!(i.say("far too long".into(), HashMap::new()).await.is_err());
         i.engine.shutdown();
     }
 
     #[tokio::test]
     async fn queue_heads_reports_pending_utterances_in_order() {
-        let i = iface();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let i = iface_in(dir.path());
         // Fill the queue. The first becomes current; the rest stay pending.
         for n in ["first one here.", "second one here.", "third one here."] {
             i.say(n.into(), HashMap::new()).await.expect("accepted");
@@ -421,9 +462,85 @@ mod tests {
         i.engine.shutdown();
     }
 
+    /// Wait for the config file to satisfy `f`. `SetMuted` writes on a
+    /// blocking task (it must not block the bus handler), so the write is
+    /// not done when the call returns -- same reason `wait_for` exists for
+    /// the engine side.
+    fn wait_for_file(path: &std::path::Path, label: &str, f: impl Fn(&Config) -> bool) -> Config {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let (cfg, _) = Config::load_from(path);
+            if f(&cfg) {
+                return cfg;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {label}; file = {cfg:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// CRITICAL 1, first half: spec §6 -- "mute is sticky across utterances
+    /// and persists to config". It did not reach the file at all, so a
+    /// restart came back unmuted.
+    #[tokio::test]
+    async fn set_muted_persists_to_the_config_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let i = iface_in(dir.path());
+
+        i.set_muted(true).await;
+        wait_for(&i.engine, "the engine to mute", |s| s.muted);
+        wait_for_file(&path, "the file to record the mute", |c| c.muted);
+
+        i.set_muted(false).await;
+        wait_for(&i.engine, "the engine to unmute", |s| !s.muted);
+        wait_for_file(&path, "the file to record the unmute", |c| !c.muted);
+        i.engine.shutdown();
+    }
+
+    /// CRITICAL 1, second half, and the measured failure: mute from the
+    /// tray or `say mute`, then edit an unrelated field of `config.toml`,
+    /// and the daemon used to unmute itself -- `ApplyConfig` replaces the
+    /// whole `Config`, and the file had never been told about the mute. Ten
+    /// minutes after muting for a meeting, a dotfile manager rewriting
+    /// `~/.config/sayd` was enough to make the next submission audible.
+    #[tokio::test]
+    async fn a_mute_survives_an_unrelated_hand_edit_of_the_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let i = iface_in(dir.path());
+
+        i.set_muted(true).await;
+        wait_for(&i.engine, "the engine to mute", |s| s.muted);
+        wait_for_file(&path, "the file to record the mute", |c| c.muted);
+
+        // A hand edit of the *voice*, exactly as an editor makes it: read
+        // what is there, change one field, write it back.
+        let (mut edited, err) = Config::load_from(&path);
+        assert_eq!(err, None);
+        edited.voice = "am_fenrir".into();
+        edited.save_to(&path).expect("hand edit");
+        assert_eq!(
+            i.store.reload(),
+            crate::config_watch::ReloadOutcome::Applied
+        );
+
+        wait_for(&i.engine, "the voice change to land", |s| {
+            s.voice == "am_fenrir"
+        });
+        assert!(
+            i.engine.snapshot().muted,
+            "the mute must survive a config change that never mentioned it"
+        );
+        i.engine.shutdown();
+    }
+
     #[tokio::test]
     async fn queue_heads_is_empty_when_nothing_is_pending() {
-        let i = iface();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let i = iface_in(dir.path());
         assert!(i.queue_heads().await.is_empty());
         i.engine.shutdown();
     }

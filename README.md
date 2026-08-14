@@ -178,8 +178,8 @@ here:
 
 ```toml
 voice = "af_heart"      # any voice pack in <models>/voices, without the .bin
-speed = 1.0             # 0.5 to 2.0
-model = "fp32"          # fp32 | fp16 | q8
+speed = 1.0             # 0.5 to 2.0; outside that it is clamped, with a warning
+model = "fp32"          # fp32 | fp16 | q8; anything else runs fp32, with a warning
 threads = 8             # measured peak; 16 and 24 both regress
 idle_unload_secs = 600  # seconds idle before the session is dropped; 0 = never
 muted = false
@@ -198,9 +198,26 @@ target_chars = 400
 lookahead_chunks = 2
 ```
 
-A malformed file never wedges the daemon and is never overwritten: `sayd`
-keeps the settings it is already running, reports the parse error, and picks
-the file up the moment it parses again.
+A malformed file never wedges the daemon, and is not overwritten until you
+change something in the window: `sayd` keeps the settings it is already
+running, reports the parse error in the tray menu (as a `Config:` line,
+separate from the engine's own errors -- a typo in `config.toml` never stops
+the daemon speaking), and picks the file up the moment it parses again.
+
+A file that parses but says something `sayd` cannot do is applied as the
+nearest thing it *can* do, and says so in the same place: an unrecognised
+`model` runs `fp32` (which is what would have loaded anyway) and `speed`
+outside `0.5`-`2.0` is clamped, each with a warning naming the value and
+what is actually being used. As above, your file is left exactly as you
+wrote it -- the corrected value only reaches the disk when you next change a
+setting, at which point the window writes the whole config it is running.
+
+Mute is the one control that is both a setting and a transport command.
+Muting from the tray, `say mute`, D-Bus or the settings window silences what
+is playing *and* writes `muted = true` to the config, so it survives a
+restart (spec §6); the same is true of the speed set through MPRIS `Rate`.
+Before this they lived only inside the running daemon, and the next config
+change of any kind silently undid them.
 
 ## `say`, the control CLI
 
@@ -296,8 +313,11 @@ skip-to-next-queued-utterance as `Command::Next`), `Quit`, and the `Rate`
 property, which genuinely changes playback speed -- reading it back after a
 `SetRate` (or after `say status`) reflects the new speed on the next
 utterance, clamped to `[0.5, 2.0]` (`MinimumRate`/`MaximumRate` advertise
-the same bounds; the engine enforces the clamp, the same one `SetSpeed`
-enforces on the D-Bus interface). `Metadata` carries a title built from the
+the same bounds; the clamp is enforced on the way to the config file and
+again by the engine, the same one `SetSpeed` enforces on the D-Bus
+interface). A rate set here is written to `config.toml` -- see
+[Settings](#settings) -- so it is not silently reverted by the next config
+change, and it survives a restart. `Metadata` carries a title built from the
 current utterance's text and a per-utterance `mpris:trackid` so it changes
 between utterances, per spec, instead of holding one placeholder id
 throughout.
