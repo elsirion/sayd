@@ -43,8 +43,8 @@ impl fmt::Display for Source {
 /// Invalid UTF-8 elsewhere in the selection is also replaced lossily.
 const MAX_BYTES: u64 = 4 * 1024 * 1024;
 
-/// How long to wait for the selection owner to keep sending data before
-/// giving up.
+/// How long to wait, after the most recently received byte, for the
+/// selection owner to send more before giving up.
 ///
 /// `get_contents` hands back a pipe fed by *another* Wayland client -- the
 /// application that currently owns the selection -- not by the compositor.
@@ -60,7 +60,32 @@ const MAX_BYTES: u64 = 4 * 1024 * 1024;
 /// start of the read, so a large but genuinely slow paste keeps extending
 /// its own deadline as data trickles in, while an owner that produces
 /// nothing at all is cut off after this long.
+///
+/// That reset-on-any-byte behaviour is also this deadline's blind spot: an
+/// owner that writes a single byte every `SELECTION_READ_TIMEOUT` minus a
+/// hair never trips it, no matter how long the read has been running.
+/// [`SELECTION_READ_OVERALL_CAP`] exists to bound that case; this constant
+/// alone only bounds a silent, fully wedged owner.
 const SELECTION_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The absolute longest a single selection read may run in total, measured
+/// from when the read started -- independent of how recently data arrived.
+///
+/// [`SELECTION_READ_TIMEOUT`] resets on every byte received, so an owner
+/// that dribbles one byte every few seconds forever never trips it: each
+/// byte resets the inactivity clock without ever satisfying it, so the read
+/// -- and the `spawn_blocking` thread behind it (see that constant's doc
+/// comment) -- could otherwise be held open until `MAX_BYTES` at whatever
+/// rate the owner feels like. That is not meaningfully different from the
+/// unbounded hang this module exists to prevent.
+///
+/// Set to six times `SELECTION_READ_TIMEOUT`: generous enough that a real,
+/// large, honestly-slow transfer -- one that pauses for most of an
+/// inactivity window several times over -- still completes, while short
+/// enough that a blocking-pool thread can never be pinned for minutes over
+/// a single selection read.
+const SELECTION_READ_OVERALL_CAP: Duration =
+    Duration::from_secs(SELECTION_READ_TIMEOUT.as_secs() * 6);
 
 /// Convert raw bytes to a String, replacing invalid UTF-8 sequences lossily.
 fn bytes_to_string(bytes: Vec<u8>) -> String {
@@ -113,22 +138,39 @@ fn wait_readable(fd: RawFd, timeout: Duration) -> io::Result<bool> {
     Ok(ret > 0)
 }
 
-/// Read `reader` to EOF, but give up if `timeout` passes with no forward
-/// progress -- see [`SELECTION_READ_TIMEOUT`] for why this exists.
+/// Read `reader` to EOF, bounded by two independent deadlines:
+///
+/// - `inactivity_timeout`: give up if no bytes arrive for this long at a
+///   stretch. Reset by every successful read, however small -- see
+///   [`SELECTION_READ_TIMEOUT`].
+/// - `overall_cap`: give up once this much wall-clock time has passed since
+///   the read began, no matter how recently data arrived -- see
+///   [`SELECTION_READ_OVERALL_CAP`]. This is what bounds an owner that
+///   dribbles data just fast enough to keep resetting the inactivity clock
+///   without ever tripping it.
+///
+/// If `overall_cap` is what ends the read and at least one byte had
+/// already arrived, that partial data is returned as `Ok` -- a partial
+/// selection is more useful spoken aloud than discarded outright. If
+/// nothing at all had arrived by then, it is reported as an error rather
+/// than an empty `Ok`, so it cannot be mistaken for a genuinely empty
+/// selection by the `buf.trim().is_empty()` check in [`read`].
 ///
 /// Generic over `Read + AsRawFd` rather than named against
 /// `wl_clipboard_rs`'s `os_pipe::PipeReader` so this logic can be unit
 /// tested against a plain OS pipe, with no Wayland connection involved.
 fn read_with_deadline<R: Read + AsRawFd>(
     mut reader: R,
-    timeout: Duration,
+    inactivity_timeout: Duration,
+    overall_cap: Duration,
 ) -> Result<Vec<u8>, String> {
     let fd = reader.as_raw_fd();
     set_nonblocking(fd).map_err(|e| format!("could not prepare to read: {e}"))?;
 
     let mut bytes = Vec::new();
     let mut buf = [0u8; 64 * 1024];
-    let mut last_progress = Instant::now();
+    let start = Instant::now();
+    let mut last_progress = start;
     loop {
         match reader.read(&mut buf) {
             Ok(0) => return Ok(bytes), // EOF: the writer closed its end.
@@ -141,20 +183,41 @@ fn read_with_deadline<R: Read + AsRawFd>(
                 }
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                let elapsed = last_progress.elapsed();
-                if elapsed >= timeout {
+                let now = Instant::now();
+
+                let inactive_for = now.duration_since(last_progress);
+                if inactive_for >= inactivity_timeout {
                     return Err(format!(
                         "the selection owner sent no data for {:.0}s; giving up",
-                        timeout.as_secs_f64()
+                        inactivity_timeout.as_secs_f64()
                     ));
                 }
-                if let Err(e) = wait_readable(fd, timeout - elapsed) {
+
+                let running_for = now.duration_since(start);
+                if running_for >= overall_cap {
+                    if bytes.is_empty() {
+                        return Err(format!(
+                            "the selection owner did not send any data within \
+                             {:.0}s overall; giving up",
+                            overall_cap.as_secs_f64()
+                        ));
+                    }
+                    // Progress kept arriving, just slowly enough to keep
+                    // resetting the inactivity clock without ever tripping
+                    // it -- the dribble case. Speak what arrived rather
+                    // than hold the thread (or the caller) open any
+                    // longer.
+                    return Ok(bytes);
+                }
+
+                // Neither deadline has passed yet; wait for whichever one
+                // is closer, then loop back and let the checks above be
+                // the single source of truth for whether that counts as
+                // giving up.
+                let wait_for = (inactivity_timeout - inactive_for).min(overall_cap - running_for);
+                if let Err(e) = wait_readable(fd, wait_for) {
                     return Err(format!("could not wait for data: {e}"));
                 }
-                // Either the fd became readable, the wait itself timed out,
-                // or a signal interrupted it -- loop back and let the
-                // `elapsed >= timeout` check above be the single source of
-                // truth for whether that counts as giving up.
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(format!("{e}")),
@@ -199,7 +262,7 @@ pub fn read(source: Source) -> Result<String, String> {
         }
     };
 
-    let bytes = read_with_deadline(reader, SELECTION_READ_TIMEOUT)
+    let bytes = read_with_deadline(reader, SELECTION_READ_TIMEOUT, SELECTION_READ_OVERALL_CAP)
         .map_err(|e| format!("could not read the {source}: {e}"))?;
 
     let buf = bytes_to_string(bytes);
@@ -295,7 +358,8 @@ mod tests {
             // signals EOF to the reader side.
         });
 
-        let got = read_with_deadline(reader, Duration::from_secs(5)).expect("read succeeds");
+        let got = read_with_deadline(reader, Duration::from_secs(5), Duration::from_secs(30))
+            .expect("read succeeds");
         writer_thread.join().expect("writer thread does not panic");
         assert_eq!(got, expected);
     }
@@ -308,7 +372,7 @@ mod tests {
         let (reader, writer) = std::io::pipe().expect("pipe");
 
         let start = Instant::now();
-        let result = read_with_deadline(reader, Duration::from_millis(200));
+        let result = read_with_deadline(reader, Duration::from_millis(200), Duration::from_secs(5));
         let elapsed = start.elapsed();
         drop(writer); // keep the write end alive until here, on purpose
 
@@ -337,9 +401,73 @@ mod tests {
 
         // Each gap between chunks (100ms) is well inside the 500ms
         // inactivity deadline, even though the whole transfer (~300ms+)
-        // exceeds it.
-        let got = read_with_deadline(reader, Duration::from_millis(500)).expect("read succeeds");
+        // exceeds it. The overall cap is set generously (5s) so it plays
+        // no part here -- that is the next test's job.
+        let got = read_with_deadline(reader, Duration::from_millis(500), Duration::from_secs(5))
+            .expect("read succeeds");
         writer_thread.join().expect("writer thread does not panic");
         assert_eq!(got, b"one two thre".to_vec());
+    }
+
+    /// Finding: the gap this change closes. A writer that dribbles data
+    /// steadily enough to keep resetting the inactivity clock -- never
+    /// stalling for a whole `inactivity_timeout` at a stretch -- must still
+    /// be cut off once `overall_cap` elapses. Without the overall cap, this
+    /// pattern is unbounded: it can hold the read (and the blocking-pool
+    /// thread behind it) open indefinitely, which is not meaningfully
+    /// different from the silent-hang case the inactivity deadline alone
+    /// was meant to fix.
+    ///
+    /// Both deadlines are scaled down (milliseconds, not the real
+    /// 5s/30s constants) so the test proves the shape of the behaviour
+    /// without waiting for it in real time.
+    #[test]
+    fn read_with_deadline_is_cut_off_by_the_overall_cap_despite_dribbling_progress() {
+        let (reader, mut writer) = std::io::pipe().expect("pipe");
+        let inactivity_timeout = Duration::from_millis(150);
+        let overall_cap = Duration::from_millis(400);
+
+        let writer_thread = std::thread::spawn(move || {
+            use std::io::Write;
+            // One byte every 50ms: comfortably inside the 150ms inactivity
+            // deadline (so it never trips), but the loop runs far longer
+            // than the 400ms overall cap if left uninterrupted.
+            //
+            // Once the overall cap fires, `read_with_deadline` drops the
+            // reader and closes its end of the pipe (see the module's
+            // Drop-based fd cleanup); any write after that legitimately
+            // fails with a broken-pipe error. That is expected, not a bug
+            // in the writer, so it just stops instead of panicking.
+            for _ in 0..40 {
+                if writer.write_all(b"x").is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+
+        let start = Instant::now();
+        let result = read_with_deadline(reader, inactivity_timeout, overall_cap);
+        let elapsed = start.elapsed();
+        writer_thread.join().expect("writer thread does not panic");
+
+        let bytes = result.expect("partial data is returned rather than an error");
+        assert!(
+            !bytes.is_empty(),
+            "some bytes should have trickled in before the cap fired"
+        );
+        assert!(
+            bytes.len() < 40,
+            "the writer's full run should have been cut short: got {} bytes",
+            bytes.len()
+        );
+        assert!(
+            elapsed >= overall_cap,
+            "returned before the overall cap even elapsed: took {elapsed:?}"
+        );
+        assert!(
+            elapsed < overall_cap + Duration::from_millis(300),
+            "the overall cap did not bound the wait: took {elapsed:?}"
+        );
     }
 }
