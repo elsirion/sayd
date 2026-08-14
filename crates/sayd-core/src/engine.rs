@@ -1852,6 +1852,11 @@ mod tests {
         assert_ne!(current_id, 0, "test needs a genuine in-progress utterance");
         let queue_len = before.queue_len;
         assert_eq!(queue_len, 1, "sanity: the second utterance is queued");
+        let queued_id = before
+            .queue_heads
+            .first()
+            .map(|(id, _)| *id)
+            .expect("sanity: the second utterance is queued");
 
         let voice_only = Config {
             voice: "am_fenrir".into(),
@@ -1894,15 +1899,306 @@ mod tests {
             "ApplyConfig must not touch the queue"
         );
 
+        // Cancel the queued second utterance before driving to completion:
+        // this plain `VecSink` is never drained, so `sink.pending() > 0`
+        // holds forever and `go_idle` never lets `state` reach `Idle` (see
+        // `state_stays_speaking_while_audio_is_still_pending_in_the_sink`)
+        // -- `run`'s Idle-seeking exit condition would just burn its whole
+        // budget regardless of what's queued. With nothing left to pop once
+        // `current` clears, `current_id` resetting to 0 is a bound-agnostic
+        // signal that the deferred boundary was actually crossed, instead
+        // of one that depends on how many ticks a second utterance happens
+        // to need.
+        e.handle(Command::Cancel(queued_id));
+
         // Drive the utterance to completion; only once `current` actually
-        // clears -- the deferred boundary -- does the unload happen.
-        while e.snapshot().current_id == current_id {
-            e.tick();
-        }
+        // clears -- the deferred boundary -- does the unload happen. Bounded
+        // like every other multi-tick loop in this file (see `run` and the
+        // `for _ in 0..50` loops below): an unbounded `while current_id ==
+        // ..` here would hang the whole suite, rather than just fail this
+        // test, the moment some future change stopped `current_id` from
+        // ever advancing -- so the exit condition is asserted explicitly
+        // instead of being baked into the loop.
+        run(&mut e, 50);
+        assert_ne!(
+            e.snapshot().current_id, current_id,
+            "test needs the utterance in progress to actually finish within \
+             the tick budget, not just run out of ticks"
+        );
         assert!(
             !e.is_model_loaded(),
             "the deferred model change must take effect once the \
              utterance in progress finishes"
+        );
+    }
+
+    /// Build an engine with a session loaded and a model change already
+    /// deferred, mid-utterance -- the setup every test below shares with
+    /// `a_model_change_defers_the_unload_until_the_utterance_in_progress_
+    /// finishes`, factored out because each of those tests only cares about
+    /// *one* of the five other call sites `apply_pending_unload` (see
+    /// `pending_unload`'s doc comment) has to reach it from, not about
+    /// re-deriving this state each time.
+    ///
+    /// After this returns: `current` is `Some` (chunk 1 of 2 already
+    /// synthesized), `pending_unload` is `true`, and the stub is still
+    /// loaded on the *old* model -- exactly the state a reviewer found
+    /// untested at five of those six sites.
+    fn mid_utterance_with_deferred_unload(sink: Box<dyn AudioSink>) -> Engine {
+        let mut cfg = Config::default();
+        cfg.chunking.target_chars = 25;
+        let mut e = Engine::new(cfg, Box::new(StubSynthesizer::new()), sink);
+
+        e.handle(say("First sentence here. Second sentence here."));
+        e.tick(); // pops the utterance into `current`, synthesizes chunk 1 of 2
+        assert!(
+            e.is_model_loaded(),
+            "setup: the stub should be loaded after speaking"
+        );
+
+        let new_model = Config {
+            model: "q8".into(),
+            ..Config::default()
+        };
+        e.handle(Command::ApplyConfig(new_model));
+        assert!(
+            e.is_model_loaded(),
+            "setup: a model change must defer, not drop, a session still in \
+             use mid-utterance"
+        );
+        e
+    }
+
+    /// `Stop` discards `current` through `discard_current` (`engine.rs:
+    /// 306` -> `:763`). If that call to `apply_pending_unload` were
+    /// deleted, `pending_unload` would stay `true` across the `Stop` and
+    /// the *next* utterance would synthesize on the old, still-loaded
+    /// model -- the daemon would speak with the model the user just
+    /// switched away from, once, silently, self-healing only when that
+    /// utterance ends.
+    #[test]
+    fn stop_unloads_a_deferred_model_change() {
+        let mut e = mid_utterance_with_deferred_unload(Box::new(VecSink::new(24_000 * 10)));
+        e.handle(Command::Stop);
+        assert!(
+            !e.is_model_loaded(),
+            "Stop must apply the deferred unload via discard_current"
+        );
+    }
+
+    /// `Next` discards `current` through the same `discard_current` ->
+    /// `apply_pending_unload` call as `Stop` (`engine.rs:310` -> `:763`),
+    /// but is a distinct call *site* in `handle`'s match arm -- see
+    /// `stop_unloads_a_deferred_model_change` for the failure this pins.
+    #[test]
+    fn next_unloads_a_deferred_model_change() {
+        let mut e = mid_utterance_with_deferred_unload(Box::new(VecSink::new(24_000 * 10)));
+        e.handle(Command::Next);
+        assert!(
+            !e.is_model_loaded(),
+            "Next must apply the deferred unload via discard_current"
+        );
+    }
+
+    /// `SetMuted(true)` also routes through `discard_current` (`engine.rs:
+    /// 340` -> `:763`) -- see `stop_unloads_a_deferred_model_change` for the
+    /// failure this pins.
+    #[test]
+    fn set_muted_true_unloads_a_deferred_model_change() {
+        let mut e = mid_utterance_with_deferred_unload(Box::new(VecSink::new(24_000 * 10)));
+        e.handle(Command::SetMuted(true));
+        assert!(
+            !e.is_model_loaded(),
+            "SetMuted(true) must apply the deferred unload via discard_current"
+        );
+    }
+
+    /// A `Replace`/`Interrupt` submission blows away whatever is current
+    /// through the same `discard_current` (`engine.rs:509` -> `:763`) --
+    /// see `stop_unloads_a_deferred_model_change` for the failure this
+    /// pins. `Policy::Replace` is forced explicitly here (rather than via a
+    /// source's default policy) so the test exercises exactly this branch
+    /// regardless of `Source::default_policy`'s own mapping.
+    #[test]
+    fn a_replacing_submission_unloads_a_deferred_model_change() {
+        let mut e = mid_utterance_with_deferred_unload(Box::new(VecSink::new(24_000 * 10)));
+        e.handle(Command::Say {
+            text: "Replacement, arriving mid-utterance.".into(),
+            opts: SayOpts {
+                policy: Some(Policy::Replace),
+                ..Default::default()
+            },
+        });
+        assert!(
+            !e.is_model_loaded(),
+            "a Replace/Interrupt submission must apply the deferred unload \
+             via discard_current"
+        );
+    }
+
+    /// `SkipSentence` has its own, separate `apply_pending_unload` call
+    /// (`engine.rs:320-321`) for the one tick-wide window where every chunk
+    /// has already been dispatched to the synthesizer (`next_chunk ==
+    /// chunks.len()`) but `current` has not yet been cleared -- that only
+    /// happens on `tick`'s *next* call, at the natural-completion site
+    /// (`:635-636`). Skipping in that window must not wait for that next
+    /// tick to apply a deferred unload; it has to do it itself. Deleting
+    /// `:321` leaves the model loaded here even though `tick`'s own
+    /// call at `:636` would still (eventually) cover most other cases,
+    /// which is exactly why the reviewer found this one silently uncovered.
+    #[test]
+    fn skip_sentence_past_the_last_chunk_unloads_a_deferred_model_change() {
+        let mut e = mid_utterance_with_deferred_unload(Box::new(VecSink::new(24_000 * 10)));
+        // Dispatches chunk 2 of 2: next_chunk becomes == chunks.len(), but
+        // `current` stays `Some` until the *next* tick notices. Calling
+        // SkipSentence right here is the only way to reach its own
+        // apply_pending_unload call instead of tick's.
+        e.tick();
+        e.handle(Command::SkipSentence);
+        assert!(
+            !e.is_model_loaded(),
+            "SkipSentence past the last chunk must apply the deferred \
+             unload itself, not rely on tick's natural-completion path"
+        );
+    }
+
+    /// `tick`'s synth-error branch has its own `apply_pending_unload` call
+    /// (`engine.rs:662-663`), separate from the natural-completion one a
+    /// few lines above it. `FlakySynthesizer` succeeds once (so there is a
+    /// session to defer-unload in the first place, unlike `FailingSynth`
+    /// below which never loads at all) and fails on the second call,
+    /// modelling a model that loads fine but breaks mid-article -- e.g. a
+    /// corrupt weight file only `ort` notices once asked to actually run
+    /// it.
+    #[test]
+    fn a_synth_failure_mid_utterance_unloads_a_deferred_model_change() {
+        struct FlakySynthesizer {
+            calls: usize,
+            loaded: bool,
+            reconfigured_to: (String, usize),
+        }
+        impl FlakySynthesizer {
+            fn new() -> Self {
+                let d = crate::config::Config::default();
+                FlakySynthesizer {
+                    calls: 0,
+                    loaded: false,
+                    reconfigured_to: (d.model, d.threads),
+                }
+            }
+        }
+        impl crate::synth::Synthesizer for FlakySynthesizer {
+            fn phonemize(&mut self, t: &str, _voice: &str) -> String {
+                t.to_lowercase()
+            }
+            fn fits(&mut self, _: &str) -> bool {
+                true
+            }
+            fn synth(
+                &mut self,
+                phonemes: &str,
+                _voice: &str,
+                speed: f32,
+            ) -> Result<Vec<f32>, String> {
+                self.calls += 1;
+                if self.calls == 1 {
+                    self.loaded = true;
+                    let per_char = 24_000.0f32 * 0.08;
+                    let n =
+                        ((phonemes.chars().count() as f32 * per_char) / speed.max(0.1)) as usize;
+                    Ok(vec![0.0; n])
+                } else {
+                    Err("model exploded mid-utterance".into())
+                }
+            }
+            fn unload(&mut self) {
+                self.loaded = false;
+            }
+            fn is_loaded(&self) -> bool {
+                self.loaded
+            }
+            fn reconfigure(&mut self, cfg: &crate::config::Config) -> bool {
+                let next = (cfg.model.clone(), cfg.threads);
+                let changed = self.reconfigured_to != next;
+                self.reconfigured_to = next;
+                changed
+            }
+        }
+
+        let mut cfg = Config::default();
+        cfg.chunking.target_chars = 25;
+        let mut e = Engine::new(
+            cfg,
+            Box::new(FlakySynthesizer::new()),
+            Box::new(VecSink::new(24_000 * 10)),
+        );
+        e.handle(say("First sentence here. Second sentence here."));
+        e.tick(); // chunk 1 of 2 succeeds
+        assert!(
+            e.is_model_loaded(),
+            "setup: the flaky synth should be loaded after its first call"
+        );
+
+        let new_model = Config {
+            model: "q8".into(),
+            ..Config::default()
+        };
+        e.handle(Command::ApplyConfig(new_model));
+        assert!(
+            e.is_model_loaded(),
+            "setup: a model change must defer while mid-utterance"
+        );
+
+        e.tick(); // chunk 2 of 2 fails
+        assert_eq!(
+            e.snapshot().state,
+            State::Error,
+            "setup: the synth failure must actually surface"
+        );
+        assert!(
+            !e.is_model_loaded(),
+            "a synth failure mid-utterance must apply the deferred unload"
+        );
+    }
+
+    /// `replace_sink` has its own `apply_pending_unload` call (`engine.rs:
+    /// 692-693`): it always discards whatever utterance was in progress
+    /// (its own doc comment: "returns the engine to a clean idle state
+    /// rather than resuming a half-played utterance whose audio is gone"),
+    /// so a pending unload from an `ApplyConfig` that arrived just before a
+    /// device failure must not survive the sink swap either.
+    #[test]
+    fn replace_sink_unloads_a_deferred_model_change() {
+        let mut e = mid_utterance_with_deferred_unload(Box::new(VecSink::new(24_000 * 10)));
+        e.replace_sink(Box::new(VecSink::new(24_000 * 10)));
+        assert!(
+            !e.is_model_loaded(),
+            "replace_sink must apply the deferred unload"
+        );
+    }
+
+    /// `tick`'s device-failure branch (`self.sink.take_error()`) has its
+    /// own `apply_pending_unload` call (`engine.rs:541-542`), reached
+    /// before the `Paused` early return and independent of the
+    /// natural-completion and synth-error branches below it. Modelled with
+    /// `FaultInjectableSink`, the same double used by
+    /// `device_failure_while_paused_unpauses_the_sink_and_reaches_error`,
+    /// since a real device failure arrives asynchronously from cpal's
+    /// callback rather than from anything `push` observes.
+    #[test]
+    fn a_device_failure_mid_utterance_unloads_a_deferred_model_change() {
+        let sink = FaultInjectableSink::new(24_000 * 10);
+        let mut e = mid_utterance_with_deferred_unload(Box::new(sink.clone()));
+        sink.inject_failure("audio device disappeared");
+        e.tick();
+        assert_eq!(
+            e.snapshot().state,
+            State::Error,
+            "setup: the injected device failure must actually surface"
+        );
+        assert!(
+            !e.is_model_loaded(),
+            "tick's device-failure branch must apply the deferred unload"
         );
     }
 
