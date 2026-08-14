@@ -14,9 +14,16 @@
 //! matches it -- comparing content rather than timestamps, because the
 //! temp+rename write arrives as a create/rename on the destination and
 //! because an editor may write identical bytes back.
+//!
+//! Applying a config is not free -- `ApplyConfig` can drop and rebuild the
+//! ~1.27 GB ORT session -- so events are debounced rather than acted on one
+//! by one; see [`DEBOUNCE`].
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use notify::event::{EventKind, ModifyKind};
 use notify::{Event, RecursiveMode, Watcher};
@@ -42,6 +49,7 @@ pub struct ConfigStore {
     path: PathBuf,
     engine: EngineHandle,
     last_written: Mutex<Option<Config>>,
+    applied_reloads: AtomicUsize,
 }
 
 impl ConfigStore {
@@ -50,6 +58,7 @@ impl ConfigStore {
             path,
             engine,
             last_written: Mutex::new(None),
+            applied_reloads: AtomicUsize::new(0),
         }
     }
 
@@ -91,8 +100,20 @@ impl ConfigStore {
             return ReloadOutcome::OwnWrite;
         }
         *self.last_written.lock().expect("last_written mutex") = Some(cfg.clone());
+        self.applied_reloads.fetch_add(1, Ordering::Relaxed);
         self.engine.send(Command::ApplyConfig(cfg));
         ReloadOutcome::Applied
+    }
+
+    /// How many reloads have reached the engine.
+    ///
+    /// Test-only, and not a nicety: "one edit became one apply" is invisible
+    /// in the engine's final state, and the cost the debounce exists to
+    /// avoid -- a session teardown and a rebuild of over a second -- is paid
+    /// per apply, not per final state.
+    #[cfg(test)]
+    fn applied_reloads(&self) -> usize {
+        self.applied_reloads.load(Ordering::Relaxed)
     }
 }
 
@@ -125,6 +146,51 @@ fn is_content_change(kind: &EventKind) -> bool {
     )
 }
 
+/// How quiet the file must be before an edit is applied.
+///
+/// A write is not one event. `cat > config.toml` truncates on the first
+/// keystroke and grows a line at a time; an editor unlinks and recreates;
+/// `save_to` renames over the file. Every prefix of a TOML file is itself
+/// valid TOML and every `Config` field has a serde default, so the empty
+/// file in the middle of a `>` redirect parses cleanly into a *complete
+/// default config* -- there is no malformed-input error to hide behind, and
+/// no emptiness or "equals `Config::default()`" test can tell it from a
+/// user who genuinely wants defaults. Only time can: wait for the writer to
+/// stop.
+///
+/// The cost of getting this wrong is not a blip. `ApplyConfig` reconfigures
+/// the synthesizer and drops the ~1.27 GB ORT session when `model` moves,
+/// so an edit that never mentioned `model` would pay for a teardown and a
+/// rebuild of over a second, twice -- and on a machine that has only the
+/// `q8` model installed, the rebuild for the *default* `fp32` fails into a
+/// sticky synth error that rejects every later submission.
+const DEBOUNCE: Duration = Duration::from_millis(250);
+
+/// What the notify callback tells the reload thread.
+enum Tick {
+    /// The watched file may have changed.
+    Changed,
+    /// The [`ConfigWatcher`] was dropped; wind up.
+    Stop,
+}
+
+/// A running config watch. Dropping it stops the watch.
+///
+/// The `notify` watcher itself lives on the reload thread rather than in
+/// here, so this handle asks that thread to finish instead of dropping the
+/// watcher directly.
+pub struct ConfigWatcher {
+    tx: Sender<Tick>,
+}
+
+impl Drop for ConfigWatcher {
+    fn drop(&mut self) {
+        // Nothing to do if the thread is already gone: the watch died with
+        // it.
+        let _ = self.tx.send(Tick::Stop);
+    }
+}
+
 /// Watch the config file's directory and reload on change.
 ///
 /// The *directory* is watched, not the file: an atomic temp+rename replaces
@@ -132,9 +198,9 @@ fn is_content_change(kind: &EventKind) -> bool {
 /// first write, and a config that does not exist yet cannot be watched at
 /// all.
 ///
-/// The returned watcher must be kept alive for the watch to stay active --
+/// The returned handle must be kept alive for the watch to stay active --
 /// dropping it silently stops the reload.
-pub fn spawn(store: Arc<ConfigStore>) -> Result<notify::RecommendedWatcher, String> {
+pub fn spawn(store: Arc<ConfigStore>) -> Result<ConfigWatcher, String> {
     let dir = store
         .path()
         .parent()
@@ -144,28 +210,67 @@ pub fn spawn(store: Arc<ConfigStore>) -> Result<notify::RecommendedWatcher, Stri
         return Err(format!("could not create {}: {e}", dir.display()));
     }
 
+    let (tx, rx) = mpsc::channel();
     let watched = store.path().to_path_buf();
+    let events = tx.clone();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
         let Ok(event) = res else { return };
         if !is_content_change(&event.kind) || !event.paths.contains(&watched) {
             return;
         }
-        match store.reload() {
-            ReloadOutcome::Applied => {
-                eprintln!("sayd: reloaded {}", watched.display());
-            }
-            ReloadOutcome::Failed(reason) => {
-                eprintln!("warning: {reason}; keeping the running settings");
-            }
-            ReloadOutcome::OwnWrite | ReloadOutcome::Missing => {}
-        }
+        // Deliberately no work here beyond the filter: this runs on
+        // notify's own event-loop thread, which must stay free to drain the
+        // inotify queue.
+        let _ = events.send(Tick::Changed);
     })
     .map_err(|e| format!("could not create a config watcher: {e}"))?;
 
+    // Started before the thread so that a watch we cannot establish is
+    // reported to the caller as an error rather than dying silently in a
+    // thread it cannot see.
     watcher
         .watch(&dir, RecursiveMode::NonRecursive)
         .map_err(|e| format!("could not watch {}: {e}", dir.display()))?;
-    Ok(watcher)
+
+    let path = store.path().to_path_buf();
+    std::thread::Builder::new()
+        .name("sayd-config-watch".into())
+        .spawn(move || {
+            // The watcher rides along: it stops watching when it is
+            // dropped, so its lifetime is this thread's lifetime.
+            let _watcher = watcher;
+            debounce_loop(&store, &rx, &path);
+        })
+        .map_err(|e| format!("could not start the config watch thread: {e}"))?;
+
+    Ok(ConfigWatcher { tx })
+}
+
+/// Coalesce ticks and reload once the file has been quiet for [`DEBOUNCE`].
+fn debounce_loop(store: &ConfigStore, rx: &mpsc::Receiver<Tick>, path: &Path) {
+    // The sender is held by the callback, which this thread owns through
+    // the watcher, so the channel never disconnects on its own: `Stop` from
+    // the dropped handle is the only way out.
+    while let Ok(Tick::Changed) = rx.recv() {
+        loop {
+            match rx.recv_timeout(DEBOUNCE) {
+                // Still being written. Restart the quiet period.
+                Ok(Tick::Changed) => continue,
+                Ok(Tick::Stop) => return,
+                Err(RecvTimeoutError::Timeout) => break,
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+        }
+        match store.reload() {
+            ReloadOutcome::Applied => eprintln!("sayd: reloaded {}", path.display()),
+            ReloadOutcome::Failed(reason) => {
+                eprintln!("warning: {reason}; keeping the running settings");
+            }
+            // `Missing` is not worth a word: an editor that unlinks and
+            // recreates passes through it on the way to a real edit.
+            ReloadOutcome::OwnWrite | ReloadOutcome::Missing => {}
+        }
+    }
 }
 
 #[cfg(test)]
@@ -200,7 +305,7 @@ mod tests {
     /// Long enough that anything the watcher was going to do has happened,
     /// for the tests that assert nothing happens.
     fn settle() {
-        std::thread::sleep(std::time::Duration::from_millis(600));
+        std::thread::sleep(DEBOUNCE * 3);
     }
 
     /// The write-through path: what the settings window calls. The file on
@@ -321,6 +426,49 @@ mod tests {
 
         std::fs::write(&path, "voice = \"bm_george\"\n").expect("write");
         wait_for_voice(&engine, "bm_george");
+        engine.shutdown();
+    }
+
+    /// A shell redirect is a truncate followed by writes, and every prefix
+    /// of a TOML file parses -- into a full default config, since every
+    /// field has a serde default. Applying those intermediate states is not
+    /// cosmetic: each one can drop and rebuild the ORT session, and the
+    /// default `model` may not even be installed. The whole sequence must
+    /// land as exactly one apply, of the content the writer finished with.
+    #[test]
+    fn a_truncate_and_rewrite_is_applied_once_as_its_final_content() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "voice = \"bm_george\"\nspeed = 1.5\n").expect("write");
+
+        let engine = engine();
+        let store = Arc::new(ConfigStore::new(path.clone(), engine.clone()));
+        let _watcher = spawn(store.clone()).expect("watcher starts");
+
+        // What `cat > config.toml` looks like from the outside: empty, then
+        // one valid prefix at a time. Spaced out, because that is the case
+        // that matters -- an interactive writer takes far longer between
+        // lines than a burst of `write` calls, long enough that each state
+        // is comfortably observable.
+        let between = DEBOUNCE / 5;
+        std::fs::write(&path, "").expect("truncate");
+        std::thread::sleep(between);
+        std::fs::write(&path, "voice = \"am_fenrir\"\n").expect("write");
+        std::thread::sleep(between);
+        std::fs::write(&path, "voice = \"am_fenrir\"\nspeed = 1.5\n").expect("write");
+
+        wait_for_voice(&engine, "am_fenrir");
+        settle();
+        assert_eq!(
+            engine.config().expect("engine answers").speed,
+            1.5,
+            "the content the writer finished with must be what is applied"
+        );
+        assert_eq!(
+            store.applied_reloads(),
+            1,
+            "the truncate and its partial prefixes must not each be applied"
+        );
         engine.shutdown();
     }
 
