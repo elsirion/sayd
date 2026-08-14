@@ -72,12 +72,16 @@ impl ConfigStore {
     /// the file the instant `save_to` renames it, and a stamp written
     /// afterwards would lose that race and let our own write bounce back as
     /// an external change.
+    ///
+    /// The stamp's lock is what makes a save and a reload one at a time --
+    /// see `reload`.
     pub fn save(&self, cfg: &Config) -> Result<(), String> {
-        *self.last_written.lock().expect("last_written mutex") = Some(cfg.clone());
+        let mut stamp = self.last_written.lock().expect("last_written mutex");
+        *stamp = Some(cfg.clone());
         if let Err(e) = cfg.save_to(&self.path) {
             // The stamp now describes a file that does not exist. Clear it
             // so a later genuine edit is not mistaken for our echo.
-            *self.last_written.lock().expect("last_written mutex") = None;
+            *stamp = None;
             return Err(format!("could not write {}: {e}", self.path.display()));
         }
         self.engine.send(Command::ApplyConfig(cfg.clone()));
@@ -85,7 +89,22 @@ impl ConfigStore {
     }
 
     /// Read the file and apply it unless it is our own echo.
+    ///
+    /// The stamp's lock is held across the whole of read, compare and
+    /// stamp -- and across `save`'s whole write -- so that the two cannot
+    /// interleave. Taking it only for the compare left this window: a
+    /// reload reads config A, a save writes B and sends `ApplyConfig(B)`,
+    /// and the reload then finds A different from the stamp and sends
+    /// `ApplyConfig(A)` *after* it. The engine ends up running a config the
+    /// disk no longer holds, and stays there until some later event happens
+    /// to arrive -- with a model change in play, each of those steps costs a
+    /// session unload. A settings window saving once per slider tick hits
+    /// exactly this. Holding the lock across both makes the order commands
+    /// reach the engine the order the file actually changed; the sends
+    /// underneath it are non-blocking channel pushes, so the lock is never
+    /// held waiting on the engine.
     pub fn reload(&self) -> ReloadOutcome {
+        let mut stamp = self.last_written.lock().expect("last_written mutex");
         if !self.path.exists() {
             return ReloadOutcome::Missing;
         }
@@ -96,10 +115,10 @@ impl ConfigStore {
             // every setting the user has because of one typo.
             return ReloadOutcome::Failed(reason);
         }
-        if self.last_written.lock().expect("last_written mutex").as_ref() == Some(&cfg) {
+        if stamp.as_ref() == Some(&cfg) {
             return ReloadOutcome::OwnWrite;
         }
-        *self.last_written.lock().expect("last_written mutex") = Some(cfg.clone());
+        *stamp = Some(cfg.clone());
         self.applied_reloads.fetch_add(1, Ordering::Relaxed);
         self.engine.send(Command::ApplyConfig(cfg));
         ReloadOutcome::Applied
@@ -426,6 +445,57 @@ mod tests {
 
         std::fs::write(&path, "voice = \"bm_george\"\n").expect("write");
         wait_for_voice(&engine, "bm_george");
+        engine.shutdown();
+    }
+
+    /// Saves and reloads race by construction: a settings window emits one
+    /// save per slider tick while the watcher reads the file underneath it.
+    /// Whatever order they interleave in, the engine must end up on the
+    /// config the disk holds -- never on an older one that a reload read
+    /// before the newer save and applied after it.
+    #[test]
+    fn a_reload_racing_saves_cannot_leave_the_engine_on_the_older_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let engine = engine();
+        let store = Arc::new(ConfigStore::new(path.clone(), engine.clone()));
+
+        let older = Config::default();
+        let newer = Config {
+            voice: "am_fenrir".into(),
+            speed: 1.5,
+            ..Config::default()
+        };
+
+        // Several readers and a long run because the losing interleaving is
+        // narrow -- the window is one file read -- and only the *last* one
+        // to lose shows up in the final state. This can only fail on code
+        // that has the bug, never on code that does not.
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let store = store.clone();
+                let done = done.clone();
+                std::thread::spawn(move || {
+                    while !done.load(Ordering::Relaxed) {
+                        store.reload();
+                    }
+                })
+            })
+            .collect();
+        for _ in 0..400 {
+            store.save(&older).expect("save succeeds");
+            store.save(&newer).expect("save succeeds");
+        }
+        done.store(true, Ordering::Relaxed);
+        for reader in readers {
+            reader.join().expect("reader thread");
+        }
+
+        // Deliberately no reload here: one would paper over the bug by
+        // re-reading the file that is already correct.
+        wait_for_voice(&engine, "am_fenrir");
+        assert_eq!(engine.config().expect("engine answers"), newer);
         engine.shutdown();
     }
 
