@@ -10,6 +10,7 @@ mod kokoro_synth;
 mod resample;
 mod ring;
 mod selection;
+mod tray;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -320,6 +321,18 @@ async fn main() -> std::process::ExitCode {
 
     eprintln!("sayd: listening on {BUS_NAME} at {OBJECT_PATH}");
 
+    // A tray registration failure must not be fatal: a bare sway config
+    // without waybar has no StatusNotifierWatcher running at all, and the
+    // daemon is still useful serving just the control interface. Log once
+    // and carry on rather than exit.
+    let tray_handle = match tray::spawn(engine.clone()).await {
+        Ok(h) => Some(h),
+        Err(e) => {
+            eprintln!("info: {e}; continuing without a tray icon");
+            None
+        }
+    };
+
     // If text was given on the command line, speak it now.
     if !text.trim().is_empty() {
         match engine.submit(text, sayd_core::engine::SayOpts::default()) {
@@ -419,6 +432,10 @@ async fn main() -> std::process::ExitCode {
                     }
                     if remaining_due || remaining_settling {
                         let _ = i.remaining_seconds_changed(ctx).await;
+                    }
+                    if let Some(h) = tray_handle.as_ref() {
+                        let s = now.clone();
+                        h.update(move |t| t.set_snapshot(s)).await;
                     }
                     last = now;
                 }

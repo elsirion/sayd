@@ -19,6 +19,7 @@ libc = "0.2"
 wl-clipboard-rs = { version = "0.9", default-features = false, features = ["dlopen"] }
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
+ksni = "0.3"
 
 [features]
 models = []
