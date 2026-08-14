@@ -60,6 +60,15 @@ const TICK_INTERVAL: Duration = Duration::from_millis(10);
 /// queued at all.
 const SUBMIT_REPLY_TIMEOUT: Duration = Duration::from_millis(250);
 
+/// How long `config` waits for the engine's answer before giving up.
+///
+/// Same bound and the same reasoning as [`SUBMIT_REPLY_TIMEOUT`]: the
+/// engine thread can be deep inside a single `tick()` call synthesizing a
+/// chunk (measured 3.5-7.5s on real ONNX) when this request arrives, and
+/// this keeps a caller -- in particular a settings window populating its
+/// fields (I3) -- from waiting out the rest of that chunk.
+const CONFIG_REPLY_TIMEOUT: Duration = SUBMIT_REPLY_TIMEOUT;
+
 /// A submission plus the channel its answer goes back on.
 type SubmitJob = (String, SayOpts, Sender<Result<Submitted, String>>);
 
@@ -67,6 +76,7 @@ enum Msg {
     Cmd(Command),
     Submit(Box<SubmitJob>),
     ReplaceSink(Box<dyn AudioSink>),
+    GetConfig(Sender<Config>),
     Shutdown,
 }
 
@@ -139,6 +149,32 @@ impl EngineHandle {
             Ok(g) => g.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
         }
+    }
+
+    /// Read the engine's live [`Config`] -- e.g. to populate a settings
+    /// window (voice, speed, model, thread count, idle-unload timeout,
+    /// cleanup toggles, the long-text threshold) with what is actually
+    /// configured (I3). `Snapshot::voice`/`Snapshot::speed` are the wrong
+    /// source for that: they deliberately report the *current utterance's*
+    /// overrides while one is playing (Finding 1), not the configured
+    /// defaults. A fresh `Config::load()` from disk is also wrong: it would
+    /// diverge from the engine's in-memory copy the instant `SetMuted`/
+    /// `SetVoice`/`SetSpeed` runs, since none of those persist to disk (that
+    /// is left for M4, which also needs somewhere to surface a failed
+    /// write -- see `Config::save`'s doc comment).
+    ///
+    /// This asks the engine thread directly, the same way `submit` does --
+    /// a genuine round trip, not a copy the handle caches on its own -- so
+    /// the engine stays the sole owner of its state. Returns `None` if the
+    /// engine thread could not answer within [`CONFIG_REPLY_TIMEOUT`] or is
+    /// no longer running; a caller that needs *some* answer rather than
+    /// none should fall back to its own last-known value, the same as a
+    /// `submit` timeout leaves its own caller to decide what "no
+    /// confirmation yet" means for them.
+    pub fn config(&self) -> Option<Config> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.tx.send(Msg::GetConfig(reply_tx)).ok()?;
+        reply_rx.recv_timeout(CONFIG_REPLY_TIMEOUT).ok()
     }
 
     /// Hand the engine a fresh audio device after a failure. Fire and
@@ -231,6 +267,10 @@ fn run(
             Ok(Msg::ReplaceSink(sink)) => {
                 engine.replace_sink(sink);
                 publish(&published, &engine);
+            }
+            Ok(Msg::GetConfig(reply)) => {
+                // A pure read: does not mutate the engine, so no publish.
+                let _ = reply.send(engine.config());
             }
             // An explicit `Msg::Shutdown` breaks immediately, skipping the
             // final `tick()` and publish below; a `Command::Shutdown` sent
@@ -542,6 +582,43 @@ mod tests {
             .expect("accepted");
         assert!(matches!(outcome, Submitted::Queued(_)), "got {outcome:?}");
         h.shutdown();
+    }
+
+    #[test]
+    fn config_reflects_a_set_speed_issued_moments_earlier() {
+        // I3: `config()` must be a live read of the engine's own `Config`,
+        // not a stale copy -- `SetSpeed` is fire-and-forget (`send`), so
+        // this polls the way every other command-then-observe test in this
+        // module does, rather than asserting immediately after `send`
+        // returns.
+        let h = handle();
+        let before = h.config().expect("engine should answer");
+        assert_eq!(before.speed, Config::default().speed);
+
+        h.send(Command::SetSpeed(1.75));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let c = h.config().expect("engine should still answer");
+            if (c.speed - 1.75).abs() < f32::EPSILON {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "config() never reflected SetSpeed"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        h.shutdown();
+    }
+
+    #[test]
+    fn config_returns_none_after_shutdown_instead_of_hanging() {
+        let h = handle();
+        h.shutdown();
+        let start = Instant::now();
+        assert_eq!(h.config(), None);
+        assert!(start.elapsed() < Duration::from_secs(5), "config() hung");
     }
 
     #[test]
