@@ -194,6 +194,10 @@ const DEBOUNCE: Duration = Duration::from_millis(250);
 enum Tick {
     /// The watched file may have changed.
     Changed,
+    /// The watched directory went away, taking the watch with it.
+    Rewatch,
+    /// notify reported a failure rather than an event.
+    Failed(String),
     /// The [`ConfigWatcher`] was dropped; wind up.
     Stop,
 }
@@ -236,15 +240,48 @@ pub fn spawn(store: Arc<ConfigStore>) -> Result<ConfigWatcher, String> {
 
     let (tx, rx) = mpsc::channel();
     let watched = store.path().to_path_buf();
+    let watched_dir = dir.clone();
     let events = tx.clone();
+    // Deliberately no work in here beyond classifying the event: this runs
+    // on notify's own event-loop thread, which must stay free to drain the
+    // inotify queue -- and which cannot call `watch` on its own watcher
+    // without deadlocking on itself.
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
-        let Ok(event) = res else { return };
+        let event = match res {
+            Ok(event) => event,
+            // Not only per-event problems arrive here: notify reports
+            // watch-level failures through the same channel. Swallowing
+            // them left a dead watch indistinguishable from a quiet one.
+            Err(e) => {
+                let _ = events.send(Tick::Failed(e.to_string()));
+                return;
+            }
+        };
+        // The watch is on the directory, so losing the directory loses the
+        // watch: inotify's `IN_DELETE_SELF`/`IN_MOVE_SELF` arrive as a
+        // remove or a rename *of the directory itself*, and after them the
+        // old inode's watch reports nothing, ever. A dotfile manager
+        // replacing `~/.config/sayd` does exactly this, and every hand edit
+        // after it was ignored silently.
+        if event.paths.contains(&watched_dir)
+            && matches!(
+                event.kind,
+                EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_))
+            )
+        {
+            let _ = events.send(Tick::Rewatch);
+            return;
+        }
+        // The kernel dropped events we will never see (inotify's queue
+        // overflowed). We cannot know whether the file was among them, so
+        // assume it was.
+        if event.need_rescan() {
+            let _ = events.send(Tick::Changed);
+            return;
+        }
         if !is_content_change(&event.kind) || !event.paths.contains(&watched) {
             return;
         }
-        // Deliberately no work here beyond the filter: this runs on
-        // notify's own event-loop thread, which must stay free to drain the
-        // inotify queue.
         let _ = events.send(Tick::Changed);
     })
     .map_err(|e| format!("could not create a config watcher: {e}"))?;
@@ -256,14 +293,15 @@ pub fn spawn(store: Arc<ConfigStore>) -> Result<ConfigWatcher, String> {
         .watch(&dir, RecursiveMode::NonRecursive)
         .map_err(|e| format!("could not watch {}: {e}", dir.display()))?;
 
-    let path = store.path().to_path_buf();
     std::thread::Builder::new()
         .name("sayd-config-watch".into())
         .spawn(move || {
-            // The watcher rides along: it stops watching when it is
-            // dropped, so its lifetime is this thread's lifetime.
-            let _watcher = watcher;
-            debounce_loop(&store, &rx, &path);
+            // The watcher lives here rather than in the returned handle:
+            // re-arming a lost watch means calling `watch` from somewhere
+            // that is not notify's event-loop thread, and this is the only
+            // such place that outlives the call to `spawn`.
+            let mut watcher = watcher;
+            debounce_loop(&store, &rx, &mut watcher, &dir);
         })
         .map_err(|e| format!("could not start the config watch thread: {e}"))?;
 
@@ -271,22 +309,38 @@ pub fn spawn(store: Arc<ConfigStore>) -> Result<ConfigWatcher, String> {
 }
 
 /// Coalesce ticks and reload once the file has been quiet for [`DEBOUNCE`].
-fn debounce_loop(store: &ConfigStore, rx: &mpsc::Receiver<Tick>, path: &Path) {
+fn debounce_loop(
+    store: &ConfigStore,
+    rx: &mpsc::Receiver<Tick>,
+    watcher: &mut notify::RecommendedWatcher,
+    dir: &Path,
+) {
     // The sender is held by the callback, which this thread owns through
     // the watcher, so the channel never disconnects on its own: `Stop` from
     // the dropped handle is the only way out.
-    while let Ok(Tick::Changed) = rx.recv() {
+    let mut errors = 0usize;
+    loop {
+        match rx.recv() {
+            Ok(tick) => match handle(tick, watcher, dir, &mut errors) {
+                Next::Reload => {}
+                Next::Wait => continue,
+                Next::Stop => return,
+            },
+            Err(_) => return,
+        }
         loop {
             match rx.recv_timeout(DEBOUNCE) {
                 // Still being written. Restart the quiet period.
-                Ok(Tick::Changed) => continue,
-                Ok(Tick::Stop) => return,
+                Ok(tick) => match handle(tick, watcher, dir, &mut errors) {
+                    Next::Reload | Next::Wait => continue,
+                    Next::Stop => return,
+                },
                 Err(RecvTimeoutError::Timeout) => break,
                 Err(RecvTimeoutError::Disconnected) => return,
             }
         }
         match store.reload() {
-            ReloadOutcome::Applied => eprintln!("sayd: reloaded {}", path.display()),
+            ReloadOutcome::Applied => eprintln!("sayd: reloaded {}", store.path().display()),
             ReloadOutcome::Failed(reason) => {
                 eprintln!("warning: {reason}; keeping the running settings");
             }
@@ -294,6 +348,66 @@ fn debounce_loop(store: &ConfigStore, rx: &mpsc::Receiver<Tick>, path: &Path) {
             // recreates passes through it on the way to a real edit.
             ReloadOutcome::OwnWrite | ReloadOutcome::Missing => {}
         }
+    }
+}
+
+/// What the debounce loop should do next.
+enum Next {
+    /// This tick wants the file read.
+    Reload,
+    /// Dealt with; nothing to read.
+    Wait,
+    /// Wind up the thread, and the watch with it.
+    Stop,
+}
+
+/// Act on one tick. `errors` counts the failures reported so far.
+fn handle(
+    tick: Tick,
+    watcher: &mut notify::RecommendedWatcher,
+    dir: &Path,
+    errors: &mut usize,
+) -> Next {
+    match tick {
+        Tick::Changed => Next::Reload,
+        // The file may well have changed while we were blind, so read it
+        // once the watch is back.
+        Tick::Rewatch => {
+            rearm(watcher, dir);
+            Next::Reload
+        }
+        // Said once, not once per failure: notify's inotify loop re-reads
+        // after a failed read without pausing, so a persistent one (a
+        // buffer too small for a very long name, say) arrives as fast as
+        // the thread can produce it, and stderr is a log file on a real
+        // machine.
+        Tick::Failed(reason) => {
+            *errors += 1;
+            match *errors {
+                1 => eprintln!("warning: config watch error: {reason}"),
+                2 => eprintln!("warning: further config watch errors will not be repeated"),
+                _ => {}
+            }
+            Next::Wait
+        }
+        Tick::Stop => Next::Stop,
+    }
+}
+
+/// Put the watch back after the directory it was on was removed or renamed.
+fn rearm(watcher: &mut notify::RecommendedWatcher, dir: &Path) {
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        eprintln!(
+            "warning: could not recreate {}: {e}; config changes will need a restart",
+            dir.display()
+        );
+        return;
+    }
+    if let Err(e) = watcher.watch(dir, RecursiveMode::NonRecursive) {
+        eprintln!(
+            "warning: could not watch {} again: {e}; config changes will need a restart",
+            dir.display()
+        );
     }
 }
 
@@ -477,7 +591,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
         let engine = engine();
-        let store = Arc::new(ConfigStore::new(path.clone(), engine.clone(), Config::default()));
+        let store = Arc::new(ConfigStore::new(
+            path.clone(),
+            engine.clone(),
+            Config::default(),
+        ));
         let _watcher = spawn(store).expect("watcher starts");
 
         std::fs::write(&path, "voice = \"bm_george\"\n").expect("write");
@@ -495,7 +613,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
         let engine = engine();
-        let store = Arc::new(ConfigStore::new(path.clone(), engine.clone(), Config::default()));
+        let store = Arc::new(ConfigStore::new(
+            path.clone(),
+            engine.clone(),
+            Config::default(),
+        ));
 
         let older = Config::default();
         let newer = Config {
@@ -549,7 +671,11 @@ mod tests {
         std::fs::write(&path, "voice = \"bm_george\"\nspeed = 1.5\n").expect("write");
 
         let engine = engine();
-        let store = Arc::new(ConfigStore::new(path.clone(), engine.clone(), Config::default()));
+        let store = Arc::new(ConfigStore::new(
+            path.clone(),
+            engine.clone(),
+            Config::default(),
+        ));
         let _watcher = spawn(store.clone()).expect("watcher starts");
 
         // What `cat > config.toml` looks like from the outside: empty, then
@@ -579,6 +705,36 @@ mod tests {
         engine.shutdown();
     }
 
+    /// A dotfile manager that replaces `~/.config/sayd` wholesale takes the
+    /// watched directory's inode with it, and inotify has nothing more to
+    /// say about the old one. Without re-arming, this is permanent and
+    /// silent: every hand edit for the rest of the process is ignored.
+    #[test]
+    fn a_replaced_config_directory_is_watched_again() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let dir = home.path().join("sayd");
+        let path = dir.join("config.toml");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        let engine = engine();
+        let store = Arc::new(ConfigStore::new(
+            path.clone(),
+            engine.clone(),
+            Config::default(),
+        ));
+        let _watcher = spawn(store).expect("watcher starts");
+
+        std::fs::remove_dir_all(&dir).expect("remove the directory");
+        std::fs::create_dir_all(&dir).expect("and put a fresh one back");
+        // Let the re-watch land before editing: this test is about the
+        // watch surviving, not about racing it.
+        settle();
+
+        std::fs::write(&path, "voice = \"bm_george\"\n").expect("write");
+        wait_for_voice(&engine, "bm_george");
+        engine.shutdown();
+    }
+
     /// Regression for the reload loop, and for what it costs.
     ///
     /// `reload` opens the file, and notify's inotify mask includes
@@ -598,7 +754,11 @@ mod tests {
         std::fs::write(&path, "voice = \"bm_george\"\n").expect("write");
 
         let engine = engine();
-        let store = Arc::new(ConfigStore::new(path.clone(), engine.clone(), Config::default()));
+        let store = Arc::new(ConfigStore::new(
+            path.clone(),
+            engine.clone(),
+            Config::default(),
+        ));
         let _watcher = spawn(store).expect("watcher starts");
 
         engine.send(Command::SetVoice("am_fenrir".into()));
