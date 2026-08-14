@@ -575,6 +575,7 @@ fn merge_untouched(seed: &Config, next: &Config, fresh: &Config) -> Config {
         max_chars: pick(&seed.max_chars, &next.max_chars, &fresh.max_chars),
         cleanup: pick(&seed.cleanup, &next.cleanup, &fresh.cleanup),
         chunking: pick(&seed.chunking, &next.chunking, &fresh.chunking),
+        notifications: pick(&seed.notifications, &next.notifications, &fresh.notifications),
     }
 }
 
