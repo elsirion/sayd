@@ -177,7 +177,14 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 pub struct SettingsModel {
     shared: Arc<Shared>,
     voices: Vec<String>,
-    /// `None` only after `Drop` has taken it to join.
+    /// The writer thread, or `None` if it could not be started at all
+    /// (finding 8) -- and, after `Drop` has taken it to join, `None` for
+    /// that reason instead.
+    ///
+    /// Nothing drains `pending.write` without it, so `edit` and `flush` both
+    /// refuse rather than pretend: an edit that cannot be written must not
+    /// be reported as applied, and a shutdown flush must not wait out its
+    /// whole timeout for a thread that was never there.
     writer: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -199,16 +206,50 @@ impl SettingsModel {
         });
         let writer = {
             let shared = shared.clone();
-            std::thread::Builder::new()
+            match std::thread::Builder::new()
                 .name("settings-writer".into())
                 .spawn(move || write_loop(&shared))
-                .ok()
+            {
+                Ok(w) => Some(w),
+                // Finding 8: swallowed with `.ok()`, this was the quietest
+                // possible failure. Every `edit` would be accepted and shown
+                // to the user as applied, `pending.write` would be set and
+                // never drained, nothing would ever reach the disk, and the
+                // shutdown `flush` would block its full timeout waiting for
+                // a thread that does not exist. `edit` and `flush` now check
+                // for it (see `writer`'s doc comment), but it still has to
+                // be said out loud once, here, where the reason is known.
+                Err(e) => {
+                    eprintln!(
+                        "warning: could not start the settings writer thread: {e}; \
+                         settings changes cannot be saved this session"
+                    );
+                    None
+                }
+            }
         };
         SettingsModel {
             shared,
             voices: list_voices(&models_dir),
             writer,
         }
+    }
+
+    /// A model in the state finding 8 leaves behind: no writer thread.
+    ///
+    /// There is no way to make `Builder::spawn` fail on demand, so this
+    /// starts the real thread and then stops and joins it, which reaches
+    /// exactly the same state (`writer: None`, nothing draining
+    /// `pending.write`) by a route a test can take.
+    #[cfg(test)]
+    fn without_writer(store: Arc<ConfigStore>, models_dir: PathBuf, current: Config) -> Self {
+        let mut m = Self::new(store, models_dir, current);
+        lock(&m.shared.pending).stop = true;
+        m.shared.work.notify_all();
+        if let Some(w) = m.writer.take() {
+            let _ = w.join();
+        }
+        m
     }
 
     /// The dropdown's contents: sorted voice-pack names.
@@ -239,10 +280,28 @@ impl SettingsModel {
     /// A write still owed to the disk wins over the file: it *is* the newer
     /// value, and the store has not been told about it yet.
     pub fn refresh(&self) -> Config {
-        // Not under `pending`: `store.current()` takes the store's stamp,
-        // and the writer thread takes that stamp and then `pending`. Taking
-        // them in that order here too is what keeps the two from being a
-        // lock cycle.
+        // Finding 6: routed around `ConfigStore::current` exactly the way
+        // `edit` is, and for the same reason. `store.current()` takes the
+        // store's stamp, and `ConfigStore::save` holds that stamp across a
+        // temp-write and rename in the user's home with no timeout anywhere
+        // on the path -- on a network, FUSE or encrypted home, for as long
+        // as the filesystem takes. This runs on the glib main thread (the
+        // window calls it as it builds its rows and whenever it is
+        // re-presented), so taking the stamp unconditionally meant
+        // presenting the window during a write froze the UI for that write.
+        // A pending write is the newer value anyway, so when there is one
+        // there is nothing the store could tell us that we do not already
+        // have.
+        //
+        // Checked and released before touching the store: the writer thread
+        // takes the stamp first and `pending` second, always, so nesting
+        // them the other way round here would be a lock cycle. A write that
+        // starts in the gap is harmless -- the same window `edit` has -- and
+        // the re-check below is what keeps its value from being overwritten
+        // by the staler one this read may then return.
+        if let Some(pending) = lock(&self.shared.pending).write.clone() {
+            return pending;
+        }
         let latest = self.shared.store.current();
         let mut p = lock(&self.shared.pending);
         if p.write.is_none() {
@@ -288,6 +347,16 @@ impl SettingsModel {
     /// persisted. Seeding from there would let an unrelated slider move
     /// write a transient tray mute into the file permanently.
     pub fn edit(&self, f: impl FnOnce(&mut Config)) -> Result<Config, String> {
+        // Finding 8: with no writer thread there is nobody to drain
+        // `pending.write`, so adopting this edit would show the user a value
+        // that is never going to reach the file -- the one thing this whole
+        // module is arranged to avoid. Refusing sends it back through the
+        // same toast a validation failure uses.
+        if self.writer.is_none() {
+            return Err(
+                "the settings writer thread is not running; changes cannot be saved".to_string(),
+            );
+        }
         let seed = lock(&self.shared.pending).write.clone();
         let mut next = match seed {
             Some(pending) => pending,
@@ -366,6 +435,16 @@ impl SettingsModel {
         let mut p = lock(&self.shared.pending);
         if p.write.is_none() {
             return Ok(());
+        }
+        // Finding 8: nothing will ever clear `write` without the writer
+        // thread, so waiting for it would spend the whole timeout on the
+        // shutdown path and then report a timeout for a write that was
+        // never going to happen. Say what actually went wrong instead, at
+        // once. (`edit` refuses in the same case, so reaching this needs the
+        // thread to have died after an edit was accepted rather than failing
+        // to start -- rare, but the wait would be just as pointless.)
+        if self.writer.is_none() {
+            return Err("the settings writer thread is not running".to_string());
         }
         p.flush = true;
         drop(p);
@@ -1263,6 +1342,90 @@ mod tests {
         let (on_disk, err) = Config::load_from(&path);
         assert_eq!(err, None);
         assert_eq!(on_disk.speed, 1.5);
+        engine.shutdown();
+    }
+
+    /// Finding 6: `refresh` runs on the glib main thread, and
+    /// `ConfigStore::save` holds the store's stamp across a temp-write and
+    /// rename with no timeout anywhere on the path -- so taking that stamp
+    /// while a write is in flight freezes the UI for the length of a disk
+    /// write. `edit` is routed around it; `refresh` was not. "Did not take
+    /// the lock" is invisible in the value returned, so the store counts the
+    /// reads (see `ConfigStore::stamp_reads`).
+    #[test]
+    fn refresh_does_not_touch_the_store_while_a_write_is_in_flight() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let models = models_dir_with(&["af_heart"], dir.path());
+        let (store, engine) = store_in(dir.path());
+        // No writer thread, so the pending write below stays pending for
+        // the whole test rather than racing the 250ms debounce.
+        let m = SettingsModel::without_writer(store.clone(), models, Config::default());
+
+        let owed = Config {
+            speed: 1.5,
+            ..Config::default()
+        };
+        lock(&m.shared.pending).write = Some(owed.clone());
+
+        let before = store.stamp_reads();
+        let shown = m.refresh();
+        assert_eq!(
+            store.stamp_reads(),
+            before,
+            "refresh must not take the store's stamp while a write is in flight"
+        );
+        assert_eq!(shown, owed, "and must show the newer, pending value");
+
+        // With nothing owed it must still re-read, which is what it is for.
+        lock(&m.shared.pending).write = None;
+        let _ = m.refresh();
+        assert_eq!(store.stamp_reads(), before + 1);
+        engine.shutdown();
+    }
+
+    /// Finding 8: a writer thread that could not be started used to be
+    /// swallowed by `.ok()`. Every edit was then accepted and shown to the
+    /// user as applied, `pending.write` was set and never drained, and
+    /// nothing was ever written.
+    #[test]
+    fn an_edit_is_refused_when_there_is_no_writer_thread() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let models = models_dir_with(&["af_heart", "am_fenrir"], dir.path());
+        let (store, engine) = store_in(dir.path());
+        let m = SettingsModel::without_writer(store, models, Config::default());
+
+        let err = m
+            .edit(|c| c.voice = "am_fenrir".into())
+            .expect_err("an edit that can never be written must not be reported as applied");
+        assert!(!err.is_empty());
+        assert_eq!(
+            m.current().voice,
+            "af_heart",
+            "and must not change what the window shows"
+        );
+        engine.shutdown();
+    }
+
+    /// The other half of finding 8: the shutdown flush must not spend its
+    /// whole timeout waiting for a thread that is not running.
+    #[test]
+    fn flush_does_not_wait_for_a_writer_thread_that_is_not_running() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let models = models_dir_with(&["af_heart"], dir.path());
+        let (store, engine) = store_in(dir.path());
+        let m = SettingsModel::without_writer(store, models, Config::default());
+        lock(&m.shared.pending).write = Some(Config::default());
+
+        let start = std::time::Instant::now();
+        assert!(
+            m.flush(Duration::from_secs(5)).is_err(),
+            "a write that cannot happen must not be reported as flushed"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "and must not wait out the timeout: took {:?}",
+            start.elapsed()
+        );
         engine.shutdown();
     }
 

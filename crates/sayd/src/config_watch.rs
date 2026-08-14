@@ -96,6 +96,14 @@ pub struct ConfigStore {
     last_written: Mutex<Config>,
     status: Arc<ConfigStatus>,
     applied_reloads: AtomicUsize,
+    /// Test-only: how many times `current` took the stamp.
+    ///
+    /// Finding 6 is about a caller on the glib main thread taking this lock
+    /// while a write holds it, and "did not take a lock" is invisible in any
+    /// value the caller returns -- only in how long it took, which is not
+    /// something to build a test on. Counting the reads makes it assertable.
+    #[cfg(test)]
+    stamp_reads: AtomicUsize,
 }
 
 impl ConfigStore {
@@ -111,6 +119,8 @@ impl ConfigStore {
             last_written: Mutex::new(running),
             status: Arc::new(ConfigStatus::default()),
             applied_reloads: AtomicUsize::new(0),
+            #[cfg(test)]
+            stamp_reads: AtomicUsize::new(0),
         }
     }
 
@@ -160,7 +170,16 @@ impl ConfigStore {
     /// failed write would turn the next successful write into a reset of
     /// every setting the user has.
     pub fn current(&self) -> Config {
+        #[cfg(test)]
+        self.stamp_reads.fetch_add(1, Ordering::Relaxed);
         self.stamp().clone()
+    }
+
+    /// How many times `current` has taken the stamp. Test-only; see the
+    /// field's doc comment.
+    #[cfg(test)]
+    pub(crate) fn stamp_reads(&self) -> usize {
+        self.stamp_reads.load(Ordering::Relaxed)
     }
 
     /// The stamp, taken poison-tolerantly.

@@ -906,6 +906,21 @@ fn main() -> std::process::ExitCode {
     }
     impl Drop for QuitOnDrop {
         fn drop(&mut self) {
+            // Finding 7: `run_daemon`'s tidy shutdown flushes a pending
+            // settings edit before it returns, but it is not the only way
+            // out. Three post-`install` early returns (the interface not
+            // serving, the interface reference not obtainable, the SIGTERM
+            // handler not installing) and a panic anywhere in the body all
+            // land here instead, and used to quit the loop with an edit the
+            // user was shown as saved still sitting on the writer's queue.
+            // Nothing can request a settings window that early *today* --
+            // the tray is what opens it and those returns precede
+            // `tray::spawn` -- but that is an accident of ordering, not an
+            // invariant, and this guard is the one place every exit passes
+            // through. Idempotent: on the tidy path the flush has already
+            // happened and this is the documented fast no-op.
+            settings::flush_pending();
+
             // `Priority::DEFAULT`, not `invoke`'s own default of
             // `DEFAULT_IDLE` (the same priority `idle_add_once` used to run
             // this at): once Task 5 opens a real window, `DEFAULT_IDLE`

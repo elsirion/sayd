@@ -64,18 +64,25 @@ fn host() -> Option<(Arc<SettingsModel>, EngineHandle)> {
 /// Flush a settings edit still owed to disk, if any, before the daemon
 /// exits.
 ///
-/// Called once, from `run_daemon`'s single shutdown path (`main.rs`) --
-/// `SettingsModel` lives in `HOST` for the process's whole life and so is
-/// never otherwise dropped in production, which is exactly what its own
-/// `Drop` impl (see `SettingsModel::flush`'s doc comment) exists to cover
-/// for tests. Without this call, a settings change made in the last 250ms
-/// before SIGTERM/`Quit()`/`say quit` -- already shown to the user, in the
-/// window, as applied -- would simply never reach the file.
+/// Called from `run_daemon`'s tidy shutdown path (`main.rs`), before the
+/// engine goes away, *and* from `main`'s `QuitOnDrop` guard, which is the
+/// one thing every other way out of the process passes through -- an early
+/// return from a startup failure after `install`, or a panic in the daemon
+/// body (finding 7). `SettingsModel` lives in `HOST` for the process's whole
+/// life and so is never otherwise dropped in production, which is exactly
+/// what its own `Drop` impl (see `SettingsModel::flush`'s doc comment)
+/// exists to cover for tests. Without this call, a settings change made in
+/// the last 250ms before SIGTERM/`Quit()`/`say quit` -- already shown to the
+/// user, in the window, as applied -- would simply never reach the file.
+///
+/// Idempotent, which is what lets both callers have it: `flush` with
+/// nothing owed returns immediately (there is no fake deadline to wait
+/// out), so the guard's call after a tidy shutdown costs nothing.
 ///
 /// A no-op if `install` was never reached: that only happens when
-/// `run_daemon` returns early from a startup failure, in which case there is
-/// no window that could have shown anyone an edit as applied, and nothing to
-/// flush.
+/// `run_daemon` returns early from a startup failure before it, in which
+/// case there is no window that could have shown anyone an edit as applied,
+/// and nothing to flush.
 pub fn flush_pending() {
     let Some(host) = HOST.get() else { return };
     if let Err(e) = host.model.flush(FLUSH_TIMEOUT) {
