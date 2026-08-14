@@ -62,6 +62,56 @@ const REMAINING_SECONDS_PUBLISH_INTERVAL: Duration = Duration::from_secs(1);
 /// noticing recovery promptly once it does.
 const RECOVERY_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
+/// How long the publish loop waits for a single tray or MPRIS fan-out call
+/// (`ksni::Handle::update`, `mpris_server::Server::properties_changed`)
+/// before giving up on it for this tick.
+///
+/// C1: `ksni`'s background service task processes tray updates and its own
+/// `RegisterStatusNotifierItem` re-registration (fired on every
+/// `NameOwnerChanged` for `org.kde.StatusNotifierWatcher` -- in practice,
+/// every waybar restart or config reload) on the same task, behind the same
+/// internal mutex, held across whichever `.await` is in flight at the time.
+/// A watcher that is slow -- or never -- to answer that re-registration call
+/// holds the mutex for the same duration, and `Handle::update`'s own
+/// internal wait for that mutex, previously awaited here with no bound at
+/// all, blocked this entire `tokio::select!` loop for exactly as long:
+/// measured 29.49s of zero `PropertiesChanged` on *both* the control
+/// interface and MPRIS against a watcher that stalled 30s, and SIGTERM
+/// ignored for 60.6s against one that never answered -- `select!` cannot
+/// preempt a branch once chosen, so the shutdown arms never got a turn
+/// either. Wrapping the await in a timeout is what lets this branch finish
+/// -- unsuccessfully, but promptly -- and hand control back to `select!` for
+/// the next tick, the signal handlers, and device recovery, none of which
+/// are otherwise related to a stuck tray host but were blocked alongside it.
+///
+/// The alternative this project considered was moving the fan-out off the
+/// loop's critical path entirely (e.g. a dedicated task per consumer, fed by
+/// a channel). A bounded, in-line timeout was chosen instead: it is a
+/// smaller, easier-to-verify change to a loop that already reasons carefully
+/// about ordering (see the comments throughout `main`'s publish loop), and
+/// it directly targets the actual failure mode measured -- an unbounded
+/// wait -- without introducing a second task whose own lifecycle (startup,
+/// shutdown ordering, backpressure if it falls behind) would need the same
+/// scrutiny this file already gives everything else. A generous local
+/// session-bus round trip is comfortably under 50ms, so a healthy host is
+/// never affected by this bound.
+const FANOUT_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Once a fan-out call to the tray or MPRIS times out, how long to stop
+/// retrying that consumer before trying again.
+///
+/// Without this, a permanently stuck host would pay up to `FANOUT_TIMEOUT`
+/// on nearly every `PUBLISH_INTERVAL` tick forever -- 500ms owed out of
+/// every 200ms -- which is a milder version of the exact problem this fix
+/// exists for: the loop would spend most of its time blocked on a consumer
+/// that is not coming back, rather than the brief, occasional stall this
+/// backoff leaves in its place. Modeled on `RECOVERY_RETRY_INTERVAL`'s
+/// reasoning for the same shape of problem on the audio-device side: a
+/// couple of seconds is generous for a host to recover, longer here because
+/// unlike a dead audio device (which blocks all output), a stalled tray or
+/// MPRIS host only delays a diagnostic display, not audio.
+const FANOUT_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+
 /// How long a forwarding call to an already-running daemon may block before
 /// this instance gives up and reports a timeout instead of hanging.
 ///
@@ -368,6 +418,17 @@ async fn main() -> std::process::ExitCode {
     };
 
     let mut last = engine.snapshot();
+    // C1: tray and MPRIS fan-out are tracked independently of `last` (which
+    // stays purely for the D-Bus control interface's own property diffing)
+    // so that a fan-out skipped during a `FANOUT_RETRY_INTERVAL` backoff
+    // still gets delivered on the next attempt even if nothing *else* has
+    // changed in the meantime -- see `FANOUT_TIMEOUT`'s doc comment.
+    let mut tray_last_sent = last.clone();
+    let mut next_tray_attempt = Instant::now();
+    let mut tray_backoff_logged = false;
+    let mut mpris_last_sent = last.clone();
+    let mut next_mpris_attempt = Instant::now();
+    let mut mpris_backoff_logged = false;
     // Reacquisition state for the recovery branch below: `next_recovery_attempt`
     // throttles retries while `State::Error` persists, and `recovery_failure_logged`
     // keeps a standing failure to one line instead of one every `PUBLISH_INTERVAL`.
@@ -446,19 +507,53 @@ async fn main() -> std::process::ExitCode {
                     if remaining_due || remaining_settling {
                         let _ = i.remaining_seconds_changed(ctx).await;
                     }
-                    if let Some(h) = tray_handle.as_ref() {
+                    last = now.clone();
+                }
+
+                // C1: tray and MPRIS fan-out, bounded and backed off
+                // independently of the D-Bus emissions above and of each
+                // other -- see `FANOUT_TIMEOUT`'s doc comment for why an
+                // unbounded wait here used to freeze the whole loop.
+                if let Some(h) = tray_handle.as_ref() {
+                    if now != tray_last_sent && now_instant >= next_tray_attempt {
                         let s = now.clone();
-                        h.update(move |t| t.set_snapshot(s)).await;
+                        match tokio::time::timeout(
+                            FANOUT_TIMEOUT,
+                            h.update(move |t| t.set_snapshot(s)),
+                        )
+                        .await
+                        {
+                            Ok(_) => {
+                                tray_last_sent = now.clone();
+                                tray_backoff_logged = false;
+                            }
+                            Err(_) => {
+                                next_tray_attempt = now_instant + FANOUT_RETRY_INTERVAL;
+                                if !tray_backoff_logged {
+                                    eprintln!(
+                                        "warning: the tray host did not respond to an update \
+                                         within {:.1}s; backing off tray updates for {:.0}s so \
+                                         a stuck host cannot stall the daemon",
+                                        FANOUT_TIMEOUT.as_secs_f64(),
+                                        FANOUT_RETRY_INTERVAL.as_secs_f64()
+                                    );
+                                    tray_backoff_logged = true;
+                                }
+                            }
+                        }
                     }
-                    // Same "emit only what changed" discipline as the D-Bus
-                    // properties just above -- MPRIS's `PropertiesChanged`
-                    // is opt-in per property (`Server::properties_changed`
-                    // takes the changed values themselves, not a dirty
-                    // flag), so this builds exactly the ones that moved
-                    // rather than resending all three on every publish.
-                    if let Some(server) = mpris_handle.as_ref() {
+                }
+                // Same "emit only what changed" discipline as the D-Bus
+                // properties above -- MPRIS's `PropertiesChanged` is opt-in
+                // per property (`Server::properties_changed` takes the
+                // changed values themselves, not a dirty flag), so this
+                // builds exactly the ones that moved rather than resending
+                // all three on every publish. Diffed against `mpris_last_sent`
+                // rather than `last` for the same reason as the tray above.
+                if let Some(server) = mpris_handle.as_ref() {
+                    if now_instant >= next_mpris_attempt {
                         let mut mpris_props = Vec::new();
-                        if now.state != last.state {
+                        if now.state != mpris_last_sent.state {
                             mpris_props.push(mpris_server::Property::PlaybackStatus(
                                 mpris::playback_status_for(now.state),
                             ));
@@ -467,19 +562,51 @@ async fn main() -> std::process::ExitCode {
                         // `current_id` (a new utterance becoming current),
                         // so this mirrors the D-Bus `current_id_changed`
                         // branch above rather than diffing the text too.
-                        if now.current_id != last.current_id {
+                        if now.current_id != mpris_last_sent.current_id {
                             mpris_props.push(mpris_server::Property::Metadata(
                                 mpris::metadata_for(now.current_id, &now.current_text),
                             ));
                         }
-                        if (now.speed - last.speed).abs() > f32::EPSILON {
-                            mpris_props.push(mpris_server::Property::Rate(now.speed as f64));
+                        // I1: `configured_speed`, not `speed` -- `Rate`
+                        // reads `configured_speed` (see `mpris::rate`'s doc
+                        // comment), so the proactive change notification
+                        // must be built from the same field or a client
+                        // would receive a `PropertiesChanged` whose value
+                        // disagrees with what a following `Get` returns.
+                        if (now.configured_speed - mpris_last_sent.configured_speed).abs()
+                            > f32::EPSILON
+                        {
+                            mpris_props.push(mpris_server::Property::Rate(
+                                now.configured_speed as f64,
+                            ));
                         }
                         if !mpris_props.is_empty() {
-                            let _ = server.properties_changed(mpris_props).await;
+                            match tokio::time::timeout(
+                                FANOUT_TIMEOUT,
+                                server.properties_changed(mpris_props),
+                            )
+                            .await
+                            {
+                                Ok(_) => {
+                                    mpris_last_sent = now.clone();
+                                    mpris_backoff_logged = false;
+                                }
+                                Err(_) => {
+                                    next_mpris_attempt = now_instant + FANOUT_RETRY_INTERVAL;
+                                    if !mpris_backoff_logged {
+                                        eprintln!(
+                                            "warning: the MPRIS host did not respond to an \
+                                             update within {:.1}s; backing off MPRIS updates \
+                                             for {:.0}s so a stuck host cannot stall the daemon",
+                                            FANOUT_TIMEOUT.as_secs_f64(),
+                                            FANOUT_RETRY_INTERVAL.as_secs_f64()
+                                        );
+                                        mpris_backoff_logged = true;
+                                    }
+                                }
+                            }
                         }
                     }
-                    last = now;
                 }
                 if remaining_due {
                     next_remaining_publish = now_instant + REMAINING_SECONDS_PUBLISH_INTERVAL;
