@@ -107,18 +107,42 @@ impl ConfigStore {
     /// exactly this. Holding the lock across both makes the order commands
     /// reach the engine the order the file actually changed; the sends
     /// underneath it are non-blocking channel pushes, so the lock is never
-    /// held waiting on the engine.
+    /// held waiting on the engine -- but it *is* held across the file write
+    /// itself: `save`'s `save_to` call is disk I/O with no bound this
+    /// module puts on it. `save` is what Task 3's settings window calls, so
+    /// it must not be called from a thread that cannot block on disk (a UI
+    /// event-loop thread, say) -- doing so would stall every reload for as
+    /// long as that write takes. A panic inside `save_to` or `load_str`
+    /// while this lock is held poisons the mutex; every later
+    /// `.expect("last_written mutex")` then panics too, which kills the
+    /// debounce thread and stops the watch -- silently, short of whatever
+    /// the panic message reaches on stderr.
+    ///
+    /// Reads the file exactly once, deciding everything from those bytes
+    /// rather than from a separate `exists()` check: checking existence and
+    /// then loading is two syscalls with a gap between them, and a delete
+    /// landing in that gap used to make `load_from`'s own `NotFound`
+    /// fallback -- `(Config::default(), None)`, indistinguishable from an
+    /// empty file -- read as a real load rather than as `Missing`. An empty
+    /// or whitespace-only file is also treated as `Missing` rather than
+    /// parsed; see the comment on [`DEBOUNCE`] for why that is safe and
+    /// where its limit is.
     pub fn reload(&self) -> ReloadOutcome {
         let mut stamp = self.last_written.lock().expect("last_written mutex");
-        if !self.path.exists() {
+        let txt = match std::fs::read_to_string(&self.path) {
+            Ok(txt) => txt,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ReloadOutcome::Missing,
+            Err(e) => return ReloadOutcome::Failed(format!("{}: {e}", self.path.display())),
+        };
+        if txt.trim().is_empty() {
             return ReloadOutcome::Missing;
         }
-        let (cfg, err) = Config::load_from(&self.path);
+        let (cfg, err) = Config::load_str(&txt);
         if let Some(reason) = err {
-            // Deliberately not applying `cfg` here: `load_from` returns
+            // Deliberately not applying `cfg` here: `load_str` returns
             // defaults alongside the error, and applying those would reset
             // every setting the user has because of one typo.
-            return ReloadOutcome::Failed(reason);
+            return ReloadOutcome::Failed(format!("{}: {reason}", self.path.display()));
         }
         if stamp.as_ref() == Some(&cfg) {
             return ReloadOutcome::OwnWrite;
@@ -174,20 +198,37 @@ fn is_content_change(kind: &EventKind) -> bool {
 ///
 /// A write is not one event. `cat > config.toml` truncates on the first
 /// keystroke and grows a line at a time; an editor unlinks and recreates;
-/// `save_to` renames over the file. Every prefix of a TOML file is itself
-/// valid TOML and every `Config` field has a serde default, so the empty
-/// file in the middle of a `>` redirect parses cleanly into a *complete
-/// default config* -- there is no malformed-input error to hide behind, and
-/// no emptiness or "equals `Config::default()`" test can tell it from a
-/// user who genuinely wants defaults. Only time can: wait for the writer to
-/// stop.
+/// `save_to` renames over the file. Debouncing coalesces the burst of
+/// events one edit produces into a single reload of whatever the writer
+/// finished with, instead of one reload per intermediate state.
 ///
-/// The cost of getting this wrong is not a blip. `ApplyConfig` reconfigures
-/// the synthesizer and drops the ~1.27 GB ORT session when `model` moves,
-/// so an edit that never mentioned `model` would pay for a teardown and a
-/// rebuild of over a second, twice -- and on a machine that has only the
-/// `q8` model installed, the rebuild for the *default* `fp32` fails into a
-/// sticky synth error that rejects every later submission.
+/// The window alone is not a complete fix: a human typing into `cat >`, or
+/// a script that truncates and then computes before writing the real
+/// content, can pause longer than any window this module could pick
+/// without a normal edit starting to feel laggy. `reload` closes the gap
+/// from the read side too, by treating an empty or whitespace-only file as
+/// `Missing` rather than parsing it. An earlier version of this comment
+/// argued that no emptiness test could tell a mid-truncate file from a user
+/// who genuinely wants defaults -- true of a test on the *parsed* result
+/// (`== Config::default()`: a config with every field left at its default
+/// is indistinguishable from one that says nothing), but not of a test on
+/// the *raw bytes* before parsing. Nobody means an empty file: a user who
+/// wants defaults either deletes the config (already `Missing`) or writes
+/// explicit default values. The honest limit is the partial-but-valid
+/// prefix -- `cat >` after the first line has landed but before the rest
+/// has -- which is not empty, still parses, and still gets applied,
+/// resetting whichever fields the writer has not reached yet to their
+/// defaults. That is a much smaller blast radius than the full-default
+/// reset a bare truncate used to produce (every field, not just the
+/// untyped ones), but it is not zero; the debounce window above is what
+/// keeps it rare rather than routine.
+///
+/// The cost of getting either of these wrong is not a blip. `ApplyConfig`
+/// reconfigures the synthesizer and drops the ~1.27 GB ORT session when
+/// `model` moves, so an edit that never mentioned `model` would pay for a
+/// teardown and a rebuild of over a second, twice -- and on a machine that
+/// has only the `q8` model installed, the rebuild for the *default* `fp32`
+/// fails into a sticky synth error that rejects every later submission.
 const DEBOUNCE: Duration = Duration::from_millis(250);
 
 /// What the notify callback tells the reload thread.
@@ -846,6 +887,100 @@ mod tests {
             engine.snapshot().voice,
             "am_fenrir",
             "a deleted config must leave the running settings alone"
+        );
+        engine.shutdown();
+    }
+
+    /// The Important finding this module was re-reviewed for: with a
+    /// `cat >`-shaped rewrite of a *non-default* config, the engine must
+    /// never observe a complete default config at any point, not merely
+    /// converge to the right value eventually. Before the fix, `reload`
+    /// read the file whole (via `Config::load_from`'s `exists()`-then-load)
+    /// with no way to tell an empty file, mid-truncate, from one that
+    /// genuinely means defaults, so the truncate step parsed cleanly into
+    /// `Config::default()` and got applied: a `muted = true` daemon started
+    /// speaking, and `model` moved `q8` -> `fp32` -> `q8` -- two ORT
+    /// session teardowns and a rebuild of over a second for an edit that
+    /// never touched `model` -- with a `q8`-only install landing in the
+    /// sticky `Synth` wedge (`engine.rs:357-373`) for however long the
+    /// `fp32` rebuild is live.
+    ///
+    /// Polled continuously from a background thread rather than checked
+    /// only before and after: the whole point is that a transient default
+    /// that lands and clears between two polls of the writer thread alone
+    /// would otherwise hide.
+    #[test]
+    fn a_truncate_never_makes_the_engine_observe_a_default_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        // The reviewer's own repro setup: voice, model and muted all
+        // non-default, so a full-default apply is unmistakable in any one
+        // of three different ways.
+        let starting = Config {
+            voice: "bm_george".into(),
+            model: "q8".into(),
+            muted: true,
+            ..Config::default()
+        };
+        starting.save_to(&path).expect("write");
+
+        let engine = engine_with(starting.clone());
+        let store = Arc::new(ConfigStore::new(
+            path.clone(),
+            engine.clone(),
+            starting.clone(),
+        ));
+        let _watcher = spawn(store.clone()).expect("watcher starts");
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw_default = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watcher_thread = {
+            let engine = engine.clone();
+            let stop = stop.clone();
+            let saw_default = saw_default.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    if let Some(cfg) = engine.config() {
+                        if cfg == Config::default() {
+                            saw_default.store(true, Ordering::Relaxed);
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            })
+        };
+
+        // What `cat > config.toml` looks like from the outside: truncate,
+        // then one valid prefix at a time. Spaced *longer* than DEBOUNCE --
+        // the reviewer's own repro used ~500ms writes against a 250ms
+        // window -- so each state gets its own reload instead of being
+        // coalesced into one; a burst faster than DEBOUNCE would hide
+        // exactly the bug this test is for.
+        let between = DEBOUNCE + Duration::from_millis(50);
+        std::fs::write(&path, "").expect("truncate");
+        std::thread::sleep(between);
+        std::fs::write(&path, "voice = \"bm_george\"\n").expect("write");
+        std::thread::sleep(between);
+        std::fs::write(&path, "voice = \"bm_george\"\nmodel = \"q8\"\n").expect("write");
+        std::thread::sleep(between);
+        std::fs::write(
+            &path,
+            "voice = \"bm_george\"\nmodel = \"q8\"\nmuted = true\n",
+        )
+        .expect("write");
+        std::thread::sleep(between);
+
+        stop.store(true, Ordering::Relaxed);
+        watcher_thread.join().expect("watcher thread");
+
+        assert!(
+            !saw_default.load(Ordering::Relaxed),
+            "the engine must never observe a complete default config mid-edit"
+        );
+        assert_eq!(
+            engine.config().expect("engine answers"),
+            starting,
+            "the edit must settle on the content the writer finished with"
         );
         engine.shutdown();
     }

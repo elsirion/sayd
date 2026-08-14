@@ -115,9 +115,21 @@ impl Config {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Config::default(), None),
             Err(e) => return (Config::default(), Some(format!("{}: {e}", path.display()))),
         };
-        match toml::from_str(&txt) {
+        let (cfg, err) = Self::load_str(&txt);
+        (cfg, err.map(|e| format!("{}: {e}", path.display())))
+    }
+
+    /// Parse already-read text into a config, with no I/O of its own.
+    ///
+    /// Split out of `load_from` so a caller that must read the file itself
+    /// first -- `config_watch::ConfigStore::reload`'s TOCTOU-safe path,
+    /// which needs to see `NotFound` and an empty file separately from a
+    /// parse error -- can parse the bytes it already has instead of paying
+    /// for, and racing, a second read.
+    pub fn load_str(txt: &str) -> (Config, Option<String>) {
+        match toml::from_str(txt) {
             Ok(c) => (c, None),
-            Err(e) => (Config::default(), Some(format!("{}: {e}", path.display()))),
+            Err(e) => (Config::default(), Some(e.to_string())),
         }
     }
 
