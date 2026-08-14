@@ -235,8 +235,36 @@ fn print_help() {
     println!("    -V, --version    Print version and exit");
 }
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() -> std::process::ExitCode {
+/// Sender for "open the settings window", read by the glib main loop.
+///
+/// A `OnceLock` rather than a parameter because the tray's menu callbacks
+/// are built deep inside `ksni`'s tree and run on tokio's threads; threading
+/// a channel down to them would mean changing every menu constructor for one
+/// entry.
+static SETTINGS_REQUESTS: std::sync::OnceLock<async_channel::Sender<()>> =
+    std::sync::OnceLock::new();
+
+/// Ask the main thread to open the settings window. Safe to call from any
+/// thread; a no-op if the glib loop is not running (nothing to open onto).
+pub fn request_settings() {
+    match SETTINGS_REQUESTS.get() {
+        Some(tx) => {
+            if tx.send_blocking(()).is_err() {
+                eprintln!("warning: the settings window host is gone");
+            }
+        }
+        None => eprintln!("warning: settings requested before the UI host started"),
+    }
+}
+
+/// Runs the daemon: connects to the session bus, spawns the engine, tray and
+/// MPRIS, and drives the publish/shutdown loop until something ends it
+/// (SIGTERM, `Quit()`, or a fatal startup error).
+///
+/// Split out from `main` so that GTK can own the main thread (see `main`'s
+/// doc comment) while this runs on the tokio runtime's own threads instead.
+/// The body is unchanged from when this function itself was `main`.
+async fn run_daemon() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     // Finding 4: with no special-casing, these two are joined into text and
@@ -708,4 +736,58 @@ async fn main() -> std::process::ExitCode {
     eprintln!("sayd: shutting down");
     engine.shutdown();
     std::process::ExitCode::SUCCESS
+}
+
+/// GTK4 must run on the thread that initialises it, so that thread has to be
+/// this one -- `main` -- rather than whatever thread `#[tokio::main]` used to
+/// hand off to. The daemon does not need the main thread for anything, so
+/// the swap is: build a `tokio::runtime::Runtime`, spawn `run_daemon` on it,
+/// and run a `glib::MainLoop` here instead.
+///
+/// GTK itself is *not* initialised here, or anywhere at startup -- only on
+/// the first settings request, inside `settings::window::open` (Task 5). A
+/// daemon that never opens the window never touches GTK, so it behaves
+/// exactly as it did before this restructure, on a machine with no display
+/// at all; an `adw::init()` that fails there costs nothing but a logged
+/// warning when a settings request actually arrives.
+fn main() -> std::process::ExitCode {
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("error: could not start the runtime: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+
+    let main_ctx = glib::MainContext::default();
+    let main_loop = glib::MainLoop::new(Some(&main_ctx), false);
+
+    let (tx, rx) = async_channel::unbounded::<()>();
+    let _ = SETTINGS_REQUESTS.set(tx);
+    main_ctx.spawn_local(async move {
+        while rx.recv().await.is_ok() {
+            settings::window::open();
+        }
+    });
+
+    // The daemon is what decides when sayd stops -- SIGTERM, `Quit()`, a
+    // fatal startup error -- so ending its future has to bring the glib loop
+    // down with it, carrying the exit code it chose out through `exit`
+    // rather than letting `main_loop.run()` return one of its own (it has
+    // none to give: `MainLoop::quit` takes no code).
+    let exit = std::sync::Arc::new(std::sync::Mutex::new(std::process::ExitCode::SUCCESS));
+    let daemon_exit = exit.clone();
+    let quit_loop = main_loop.clone();
+    rt.spawn(async move {
+        let code = run_daemon().await;
+        *daemon_exit.lock().expect("exit mutex") = code;
+        glib::idle_add_once(move || quit_loop.quit());
+    });
+
+    main_loop.run();
+    let code = *exit.lock().expect("exit mutex");
+    code
 }

@@ -30,6 +30,16 @@ mpris-server = { version = "0.10", features = ["tokio"] }
 # and this daemon is Wayland-only; on Linux the inotify backend is compiled
 # in unconditionally, so no feature buys anything here.
 notify = { version = "8", default-features = false }
+gtk4 = "0.11.4"
+adw = { package = "libadwaita", version = "0.9.2" }
+# glib is a direct dependency of gtk4 already, but must be named here to use
+# `glib::MainContext`/`MainLoop`/`idle_add_once` directly in `main`.
+glib = "0.22"
+# glib 0.22 has no `MainContext::channel` (removed in favour of plain async
+# channels driven by `spawn_local`); this is what wakes the main thread for
+# a settings request. Already in Cargo.lock at 2.5.0 as a transitive
+# dependency of other crates, so naming it directly adds no new code.
+async-channel = "2"
 
 [dev-dependencies]
 tempfile = "3"

@@ -14,6 +14,8 @@
           espeak-ng
           onnxruntime
           alsa-lib
+          gtk4
+          libadwaita
         ];
 
         nativeBuildInputs = with pkgs; [
