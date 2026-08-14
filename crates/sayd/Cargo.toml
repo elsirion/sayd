@@ -31,7 +31,15 @@ mpris-server = { version = "0.10", features = ["tokio"] }
 # in unconditionally, so no feature buys anything here.
 notify = { version = "8", default-features = false }
 gtk4 = "0.11.4"
-adw = { package = "libadwaita", version = "0.9.2" }
+# `v1_4` is what makes `SpinRow`/`SwitchRow` (and, transitively, `EntryRow`)
+# exist at all: libadwaita's bindings have no `default` feature, so every type
+# newer than 1.0 is compiled out unless a version feature asks for it. Pinned
+# at `v1_4` rather than the newest available on purpose -- `v1_6` marks
+# `PreferencesWindow` and its `add`/`add_toast` deprecated in favour of
+# `PreferencesDialog`, which must be presented against a parent widget this
+# daemon does not have (it has no application window at all, only a tray
+# icon). The system libadwaita here is 1.9.3, comfortably above 1.4.
+adw = { package = "libadwaita", version = "0.9.2", features = ["v1_4"] }
 # glib is a direct dependency of gtk4 already, but must be named here to use
 # `glib::MainContext`/`MainLoop`/`idle_add_once` directly in `main`.
 glib = "0.22"

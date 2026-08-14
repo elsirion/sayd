@@ -28,6 +28,32 @@ pub const MODELS: [(&str, &str); 3] = [
 pub const SPEED_MIN: f32 = 0.5;
 pub const SPEED_MAX: f32 = 2.0;
 
+/// What the window's spin rows offer, per spec §8. These live here, not in
+/// `window.rs`, for the same reason everything else does: the window is the
+/// one layer with no test coverage, so it must contain no number of its own.
+///
+/// Unlike `SPEED_MIN`/`SPEED_MAX` these are deliberately *not* enforced by
+/// `validate`. `edit` seeds its copy from whatever the file currently holds,
+/// so clamping here would mean a hand-edited `threads = 64` got silently
+/// rewritten to 32 the next time the user nudged an unrelated row -- the
+/// same shape of "an edit rewrites a field nobody touched" bug that `edit`'s
+/// seeding was changed to avoid. The spinner simply cannot *produce* a value
+/// outside these; a value that arrived some other way is left alone.
+///
+/// `f64` because that is what `gtk::Adjustment` takes, and a cast in the
+/// widget layer is one more place for the two to disagree.
+pub const THREADS_MIN: f64 = 1.0;
+pub const THREADS_MAX: f64 = 32.0;
+pub const THREADS_STEP: f64 = 1.0;
+pub const SPEED_STEP: f64 = 0.05;
+/// `0` means never unload, which is why the minimum is 0 and not 1.
+pub const IDLE_UNLOAD_MIN: f64 = 0.0;
+pub const IDLE_UNLOAD_MAX: f64 = 3600.0;
+pub const IDLE_UNLOAD_STEP: f64 = 30.0;
+pub const MAX_CHARS_MIN: f64 = 100.0;
+pub const MAX_CHARS_MAX: f64 = 200_000.0;
+pub const MAX_CHARS_STEP: f64 = 500.0;
+
 /// `current` is a display cache, not the source of truth: it is seeded once
 /// at construction and refreshed only after this model's own successful
 /// `edit`s. Nothing here subscribes to `ConfigStore::reload`, so if an
@@ -36,11 +62,15 @@ pub const SPEED_MAX: f32 = 2.0;
 /// longer holds. That is display staleness only: `edit` itself no longer
 /// builds its write on top of this cache (see `edit`'s doc comment), so the
 /// stale display cannot be written back over the external edit, only look
-/// wrong until the next `edit` or window reopen refreshes it. Task 5 should
-/// close that gap by re-reading (`store.current()`) when the window opens,
-/// and, if it wants to track a hand edit made while already open, on every
-/// `ConfigStore::reload` too -- this model exposes no signal for the latter
-/// today.
+/// wrong until the next `edit` or window reopen refreshes it.
+///
+/// Task 5 closed the half of that gap that matters: `refresh` re-seeds from
+/// the store, and `window::build` calls it as the window opens, so a freshly
+/// drawn set of widgets never shows a value the file does not hold. The
+/// remaining half -- a hand edit landing while the window is *already* open
+/// -- is left deliberately: it would need a change signal this model does
+/// not expose, and the spec asks for a view of the config, not for
+/// live-updating widgets.
 pub struct SettingsModel {
     store: Arc<ConfigStore>,
     voices: Vec<String>,
@@ -63,6 +93,26 @@ impl SettingsModel {
 
     pub fn current(&self) -> Config {
         self.current.lock().expect("settings mutex").clone()
+    }
+
+    /// Re-seed the display cache from the store, and hand back what it now
+    /// holds.
+    ///
+    /// `current` is refreshed only by this model's own successful `edit`s
+    /// (see the struct's doc comment), so a hand edit that
+    /// `ConfigStore::reload` applied in between leaves it stale. The window
+    /// calls this as it builds its rows, so what it draws comes from what
+    /// the file actually holds rather than from whatever this model last
+    /// wrote itself.
+    ///
+    /// `store.current()` and not a fresh `Config::load`: it already reflects
+    /// both directions -- our writes and the watcher's reloads -- without a
+    /// read of the file, so this cannot race the debounce thread or see a
+    /// half-written file (see `ConfigStore::current`'s doc comment).
+    pub fn refresh(&self) -> Config {
+        let latest = self.store.current();
+        *self.current.lock().expect("settings mutex") = latest.clone();
+        latest
     }
 
     /// Apply one change: mutate a copy, validate it, write it through, and
@@ -323,6 +373,37 @@ mod tests {
             "q8",
             "the running engine must not have been reverted to fp32 either"
         );
+        engine.shutdown();
+    }
+
+    /// A window opening after a hand edit must draw the hand-edited value,
+    /// not the one this model last wrote itself. `current` alone cannot
+    /// deliver that -- only this model's own `edit`s refresh it -- which is
+    /// exactly the display staleness the struct's doc comment describes and
+    /// `refresh` (called from `window::build`) exists to close.
+    #[test]
+    fn refresh_picks_up_a_change_this_model_did_not_make() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let models = models_dir_with(&["af_heart"], dir.path());
+        let path = dir.path().join("config.toml");
+        let (store, engine) = store_in(dir.path());
+        let m = SettingsModel::new(store.clone(), models, Config::default());
+
+        Config {
+            model: "q8".into(),
+            ..Config::default()
+        }
+        .save_to(&path)
+        .expect("hand edit");
+        assert_eq!(store.reload(), ReloadOutcome::Applied);
+
+        assert_eq!(
+            m.current().model,
+            "fp32",
+            "the cache is stale until something refreshes it -- that is the premise"
+        );
+        assert_eq!(m.refresh().model, "q8");
+        assert_eq!(m.current().model, "q8", "and it stays refreshed");
         engine.shutdown();
     }
 

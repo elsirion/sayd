@@ -122,9 +122,7 @@ fn status_lines(s: &Snapshot) -> Vec<String> {
 /// there is no way for the two to show different text for the same
 /// `Snapshot`.
 ///
-/// "Settings…" is deliberately absent: the window it opens is the next
-/// milestone, and a menu entry that does nothing is worse than no entry.
-/// Volume is deliberately absent too -- the daemon registers as a named
+/// Volume is deliberately absent -- the daemon registers as a named
 /// PipeWire client, so `pavucontrol` already gives per-application volume.
 fn build_menu(s: &Snapshot) -> Vec<MenuItem<SaydTray>> {
     let mut items: Vec<MenuItem<SaydTray>> = Vec::new();
@@ -197,6 +195,20 @@ fn build_menu(s: &Snapshot) -> Vec<MenuItem<SaydTray>> {
                 let now = t.snapshot.muted;
                 t.engine.send(Command::SetMuted(!now));
             }),
+            ..Default::default()
+        }
+        .into(),
+    );
+    items.push(MenuItem::Separator);
+
+    items.push(
+        StandardItem {
+            label: "Settings…".into(),
+            // Not opened here: this callback runs on ksni's own task, and
+            // GTK may only be touched from the thread that initialised it.
+            // `request_settings` just wakes the glib main loop, which calls
+            // `settings::window::open` there.
+            activate: Box::new(|_: &mut SaydTray| crate::request_settings()),
             ..Default::default()
         }
         .into(),
@@ -471,13 +483,15 @@ mod tests {
         }
     }
 
+    /// The tray is the only way to reach the settings window -- there is no
+    /// CLI verb and no D-Bus method for it -- so an entry missing here means
+    /// the window is unreachable, not merely inconvenient.
     #[test]
-    fn settings_is_absent_until_the_window_exists() {
-        let s = snap(State::Idle);
-        let joined = menu_labels(&s).join(" | ").to_lowercase();
+    fn the_menu_offers_settings() {
+        let joined = menu_labels(&snap(State::Idle)).join(" | ").to_lowercase();
         assert!(
-            !joined.contains("settings"),
-            "a dead Settings entry is worse than none"
+            joined.contains("settings"),
+            "the settings entry should be in the menu: {joined}"
         );
     }
 

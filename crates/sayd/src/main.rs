@@ -433,6 +433,25 @@ async fn run_daemon() -> std::process::ExitCode {
         engine.clone(),
         cfg,
     ));
+    // The settings window is built and destroyed on demand, so the model it
+    // edits has to outlive every window: it lives behind `settings`'s own
+    // `OnceLock` from here on.
+    //
+    // Seeded from `store.current()` rather than `engine.config()`: the store
+    // was just told what the engine was spawned with, so the two are the
+    // same value, but this one needs no 250ms round trip through an engine
+    // thread that may be mid-chunk and has no `Option` to invent a fallback
+    // for. `SettingsModel::refresh` re-reads it every time a window opens
+    // regardless, so a hand edit in between is not missed.
+    settings::install(
+        std::sync::Arc::new(settings::model::SettingsModel::new(
+            store.clone(),
+            models_dir(),
+            store.current(),
+        )),
+        engine.clone(),
+    );
+
     // Held for the life of the process: dropping the watcher stops the
     // watch, silently.
     let _config_watcher = match config_watch::spawn(store.clone()) {
