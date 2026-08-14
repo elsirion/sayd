@@ -12,6 +12,7 @@ mod mpris;
 mod resample;
 mod ring;
 mod selection;
+mod settings;
 mod tray;
 
 use std::collections::HashMap;
