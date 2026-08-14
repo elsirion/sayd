@@ -153,8 +153,13 @@ pub fn version() -> &'static str {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn crate_builds() {
-        assert_eq!(super::version(), "0.1.0");
+    fn version_reports_the_crate_version() {
+        // Deliberately not a literal: this previously asserted "0.1.0" and so
+        // failed on the first release bump, which is the one moment a version
+        // test should stay quiet. What is worth pinning is that `version()`
+        // reports this crate's own version rather than something stale.
+        assert_eq!(super::version(), env!("CARGO_PKG_VERSION"));
+        assert!(super::version().split('.').count() >= 3, "expected semver");
     }
 }
 

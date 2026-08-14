@@ -3,12 +3,21 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 # Highest floor across the workspace's dependency graph (zbus 5 requires 1.87);
 # the leaf crates need less, but one number is easier to keep honest.
 rust-version = "1.87"
+
+# Internal crates are declared once here so a release bumps one place. A
+# published crate cannot depend on a bare path, so each carries a version too;
+# keeping them beside the workspace version is what stops the two drifting.
+[workspace.dependencies]
+sayd-core = { path = "crates/sayd-core", version = "0.2.0" }
+sayd-g2p = { path = "crates/sayd-g2p", version = "0.2.0" }
+sayd-kokoro = { path = "crates/sayd-kokoro", version = "0.2.0" }
+sayd-misaki-en = { path = "crates/sayd-misaki-en", version = "0.2.0" }
 
 [profile.release]
 opt-level = 3

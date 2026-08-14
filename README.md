@@ -156,6 +156,33 @@ M1 (engine and audio) and M2 (D-Bus interface, `say` CLI, selection and
 clipboard reading, single-instance handling) are done. The tray icon,
 MPRIS integration and a settings window are still to come.
 
+## Publishing
+
+The workspace version lives in one place — `[workspace.package]` in the root
+`Cargo.toml` — and the internal crates are declared once in
+`[workspace.dependencies]` with a matching version. Bump both together; a
+published crate cannot depend on a bare path, so they must not drift.
+
+Crates must be published bottom-up, because each dry-run resolves its
+dependencies against the real index:
+
+```sh
+cargo publish -p sayd-misaki-en
+cargo publish -p sayd-g2p        # needs sayd-misaki-en on the index
+cargo publish -p sayd-kokoro
+cargo publish -p sayd-core
+cargo publish -p sayd            # needs sayd-core, sayd-g2p, sayd-kokoro
+cargo publish -p sayd-cli
+```
+
+`cargo publish --dry-run` for a dependent crate will fail until its
+dependencies are actually on the index — `failed to select a version for the
+requirement` is expected at that stage, not a packaging error.
+
+Note that `sayd-g2p` will not build for anyone without espeak-ng, and
+`sayd-kokoro` will build but not run without ONNX Runtime; both say so up
+front in their own READMEs.
+
 ## Licence
 
 MIT, except the vendored misaki lexicons in

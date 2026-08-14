@@ -10,4 +10,4 @@ keywords = ["tts", "g2p", "espeak", "phonemes", "speech"]
 categories = ["text-processing", "accessibility"]
 
 [dependencies]
-sayd-misaki-en = { path = "../sayd-misaki-en", version = "0.1.0" }
+sayd-misaki-en.workspace = true

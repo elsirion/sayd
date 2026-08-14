@@ -10,9 +10,9 @@ keywords = ["tts", "speech", "wayland", "sway", "daemon"]
 categories = ["multimedia::audio", "accessibility", "command-line-utilities"]
 
 [dependencies]
-sayd-core = { path = "../sayd-core", version = "0.1.0" }
-sayd-kokoro = { path = "../sayd-kokoro", version = "0.1.0" }
-sayd-g2p = { path = "../sayd-g2p", version = "0.1.0" }
+sayd-core.workspace = true
+sayd-kokoro.workspace = true
+sayd-g2p.workspace = true
 cpal = "0.18"
 rtrb = "0.3"
 wl-clipboard-rs = { version = "0.9", default-features = false, features = ["dlopen"] }
