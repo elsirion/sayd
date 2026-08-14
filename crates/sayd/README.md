@@ -9,11 +9,13 @@ runtime.
 
 ## Status
 
-M1 (engine and audio) and M2 (the `sh.sayd.Sayd1` D-Bus interface, the `say`
+M1 (engine and audio), M2 (the `sh.sayd.Sayd1` D-Bus interface, the `say`
 control CLI, PRIMARY selection and clipboard reading, single-instance
-handling) are done. Text in, chunk-streamed speech out, starting about a
-second after the keypress regardless of how much was selected. The tray
-icon, MPRIS integration and a settings window are still to come.
+handling), M3 (the StatusNotifierItem tray icon and MPRIS2) and M4 (the
+GTK4/libadwaita settings window, config write-through, and an inotify
+reload for hand edits) are done. Text in, chunk-streamed speech out,
+starting about a second after the keypress regardless of how much was
+selected. Notification narration is still to come.
 
 The workspace README (in the source repository, not shipped in this crate's
 package) has the sway keybinds, a sample systemd unit, and the full D-Bus
@@ -25,6 +27,9 @@ surface as a table.
   (sway 1.9+)
 - ONNX Runtime at `ORT_DYLIB_PATH`
 - espeak-ng, with `ESPEAK_DATA_PATH` set
+- GTK4 and libadwaita (>= 1.4) development headers, to build the in-process
+  settings window -- this is a build dependency with no cargo feature to
+  remove it, not a runtime-only one
 - Kokoro model weights and voice packs in `models/`
 
 ## Testing without an audio device

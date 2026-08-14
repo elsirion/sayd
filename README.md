@@ -25,6 +25,27 @@ building elsewhere means following
 [`crates/sayd-kokoro/README.md`](crates/sayd-kokoro/README.md) and
 [`crates/sayd-g2p/README.md`](crates/sayd-g2p/README.md) instead.
 
+GTK4 and libadwaita are a third: **build**, not optional, dependencies of the
+`sayd` binary itself. The settings window (see [Settings](#settings) below)
+runs in-process on the daemon's own glib main loop rather than as a separate
+process, so there is no cargo feature that leaves it out and no way to build
+`sayd` at all without their development headers present, even on a machine
+that will never open the window:
+
+    # Debian/Ubuntu
+    apt install libgtk-4-dev libadwaita-1-dev
+
+    # Nix
+    # already in flake.nix's devShell -- nothing to add
+
+`sayd`'s `Cargo.toml` pins libadwaita's Rust bindings to their `v1_4`
+feature, which is what makes `SpinRow`/`SwitchRow`/`EntryRow` exist in the
+bindings at all -- every type newer than 1.0 compiles out otherwise, since
+the bindings have no `default` feature to bring them in on their own. That
+is a Cargo feature requirement, not a ceiling on the system library: the
+*system* libadwaita only needs to be at least 1.4 at build time, and most
+current distributions ship considerably newer.
+
 ## Models
 
     ./scripts/fetch-models.sh
@@ -104,15 +125,13 @@ The menu, top to bottom:
 3. Speak selection, Speak clipboard -- the same actions the sway keybinds
    trigger.
 4. Mute, shown as a checkmark.
-5. Quit.
+5. Settings…, opening the window described in [Settings](#settings) below.
+6. Quit.
 
-**"Settings…" is deliberately absent.** The window it would open is M4,
-not yet built, and a menu entry that does nothing would be worse than no
-entry at all -- there is nothing to configure through the tray yet. Volume
-is absent too, on purpose: `sayd` registers as a named PipeWire client, so
-`pavucontrol` (or any per-application mixer) already controls its volume;
-duplicating that in the menu would just be two controls fighting over one
-knob.
+Volume is absent from the menu, on purpose: `sayd` registers as a named
+PipeWire client, so `pavucontrol` (or any per-application mixer) already
+controls its volume; duplicating that here would just be two controls
+fighting over one knob.
 
 One timing note, since it can look surprising: `State` flips to `speaking`
 on submit *before* the utterance text is populated into `current` (the
@@ -120,6 +139,68 @@ engine synthesises text in chunks and only knows what it is about to speak
 once the first chunk starts). For roughly one synthesis chunk, the menu can
 legitimately show "Speaking" with no current utterance yet. It is bounded
 and self-correcting, not a bug.
+
+## Settings
+
+`sayd` ships a GTK4/libadwaita settings window rather than asking you to
+hand-edit a config file for everyday changes -- open it from the tray's
+"Settings…" entry (see [Tray](#tray) above). It is built on demand and
+destroyed when closed, so the daemon carries no window, and no GTK
+resources, for the vast majority of its life.
+
+The window is a view over one file, `$XDG_CONFIG_HOME/sayd/config.toml`
+(falling back to `~/.config/sayd/config.toml`), never a second copy of the
+settings. Every change the window makes writes through to that file
+immediately -- debounced by 250ms so dragging a spin button does not write
+on every tick -- and applies to the next utterance. A hand edit to
+`config.toml`, made with an editor or a script while `sayd` is running, is
+picked up the same way and without a restart: the daemon watches the file
+with inotify, debounced the same 250ms, with its own writes suppressed so a
+save the settings window just made is never mistaken for an external edit
+and reloaded a second time.
+
+**One caveat.** Changing `model` or `threads` drops the loaded ONNX
+session -- every other setting is free. The dropped session is rebuilt on
+the next utterance, which then pays a one-off reload of the ~1.27 GB model
+(over a second) that no other field's change costs. That drop is deferred to
+the moment the utterance already playing actually finishes, rather than
+applied the instant the change lands, so switching models or thread counts
+mid-article does not cut the current sentence in half.
+
+`idle_unload_secs` behaves the other way around from what its name might
+suggest: `0` means the session is *never* unloaded while idle, not that it
+is unloaded immediately.
+
+The file is equally meant to be edited by hand, so here it is in full, with
+every default. Every key is optional -- a file naming only the two you care
+about is a complete config, and anything absent falls back to what is shown
+here:
+
+```toml
+voice = "af_heart"      # any voice pack in <models>/voices, without the .bin
+speed = 1.0             # 0.5 to 2.0
+model = "fp32"          # fp32 | fp16 | q8
+threads = 8             # measured peak; 16 and 24 both regress
+idle_unload_secs = 600  # seconds idle before the session is dropped; 0 = never
+muted = false
+max_chars = 20000       # submissions longer than this are refused
+
+[cleanup]
+collapse_whitespace = true
+rejoin_hyphenation = true
+urls = "link"           # link | domain | keep
+strip_markdown = true
+drop_code_blocks = true
+spell_acronyms = true
+
+[chunking]
+target_chars = 400
+lookahead_chunks = 2
+```
+
+A malformed file never wedges the daemon and is never overwritten: `sayd`
+keeps the settings it is already running, reports the parse error, and picks
+the file up the moment it parses again.
 
 ## `say`, the control CLI
 
@@ -297,8 +378,9 @@ a CI or agent environment. Walk this yourself once, after installing:
    an estimated remaining time.
 5. Open the tray menu -- the current utterance, any pending queue entries
    (up to five, with a count of the rest), and the transport/selection/mute
-   actions listed in the [Tray](#tray) section above should all be present.
-   There should be no "Settings…" entry.
+   actions listed in the [Tray](#tray) section above should all be present,
+   along with a "Settings…" entry. Clicking it is covered separately in
+   [Verify the settings window](#verify-the-settings-window) below.
 6. Click Pause in the menu -- the icon should switch to the paused icon.
    Click it again (now labelled Resume), then click Stop.
 7. Run `playerctl -p sayd status` at each of those points -- it should
@@ -306,6 +388,48 @@ a CI or agent environment. Walk this yourself once, after installing:
 8. Press the media play/pause key (`docs/sway.conf.example` binds it to
    `playerctl -p sayd play-pause`) -- playback should toggle the same way
    the tray's Pause/Resume entry does.
+
+## Verify the settings window
+
+Same reason as the section above: the window is not covered by automated
+tests (the design spec lists it under "not tested automatically" on
+purpose -- there is no display in a CI or agent environment to test it
+against), and reading `crates/sayd/src/settings/window.rs` cannot substitute
+for looking at it. Walk this yourself once, after installing:
+
+1. `cargo build --release`, put `sayd` and `say` on `$PATH`, start it (or
+   reload sway if `exec sayd` is already in your config).
+2. Open the tray menu, click **Settings…** -- the window appears.
+3. Change **Voice** to a different installed voice. Type into **Test** and
+   press Speak (or hit Enter) -- it speaks in the new voice.
+4. `cat ~/.config/sayd/config.toml` -- the new `voice` is already there,
+   with no restart and no further action.
+5. Move **Speed**, press Speak again -- audibly faster or slower.
+6. Speak something long enough to still be playing a few seconds later,
+   then, while it plays, change **Model** or **Threads**. The sentence
+   already in the air must finish uninterrupted -- no cut, no glitch, no
+   voice or pace change mid-sentence. Only the utterance *after* that one
+   should show the reload pause (a bit over a second) before it starts.
+7. Close the window -- `say status` (or `pgrep -c sayd`) should still show
+   the daemon alive and unaffected; closing the settings window must not be
+   mistakable for quitting the daemon.
+8. Reopen the window -- every value is as you left it.
+9. With the daemon running and the window closed, hand-edit
+   `~/.config/sayd/config.toml` directly (change `speed`, say) and save.
+   Reopen the window -- it shows the edited value, picked up without a
+   restart.
+10. Rename or move a voice pack's directory out from under a voice
+    `config.toml` currently names, then open **Voice** -- that entry must
+    show up clearly marked as missing (e.g. "'name' — no voice pack
+    installed"), not silently render as, or select, some other installed
+    voice instead.
+11. At the window's default width, check the **Idle unload** row's
+    subtitle -- it is a long sentence ("Seconds of silence before the
+    ~1.27 GB session is dropped; 0 never unloads") and should read in full,
+    wrapping onto more than one line, rather than being truncated with an
+    ellipsis.
+12. Restart `sayd` -- every setting from the steps above survives. This is
+    M4's stated done-when.
 
 ## Troubleshooting
 
@@ -335,11 +459,10 @@ primary selection; check with `sway --version`.
 ## Status
 
 M1 (engine and audio), M2 (D-Bus interface, `say` CLI, selection and
-clipboard reading, single-instance handling) and M3 (StatusNotifierItem
-tray, MPRIS2) are done. A settings window (M4) is what remains -- there is
-currently no GUI way to change the default voice, speed or other config;
-that happens through `sayd-core`'s config file or per-submission overrides
-(`say --voice`/`--speed`, or the D-Bus `opts` argument) instead.
+clipboard reading, single-instance handling), M3 (StatusNotifierItem tray,
+MPRIS2) and M4 (the GTK4/libadwaita settings window, config write-through,
+and an inotify reload for hand edits) are done. Notification narration
+(spec §12) is what remains, as a fifth milestone.
 
 ## Publishing
 
@@ -366,7 +489,11 @@ requirement` is expected at that stage, not a packaging error.
 
 Note that `sayd-g2p` will not build for anyone without espeak-ng, and
 `sayd-kokoro` will build but not run without ONNX Runtime; both say so up
-front in their own READMEs.
+front in their own READMEs. `sayd` itself is stricter still: without GTK4
+and libadwaita development headers present (see
+[Native dependencies](#native-dependencies)) it will not even compile, so
+`cargo publish --dry-run -p sayd` needs them on the publishing machine too,
+not just at runtime.
 
 ## Licence
 
