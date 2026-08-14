@@ -169,7 +169,15 @@ impl PlayerInterface for SaydPlayer {
     }
 
     async fn rate(&self) -> FdoResult<f64> {
-        Ok(self.engine.snapshot().speed as f64)
+        // I1: must read `configured_speed`, not `speed`. `speed` (Finding 1)
+        // deliberately tracks the *current utterance's* own speed override
+        // while one is playing, so a `SetSpeed` issued mid-utterance would
+        // not show up here until that utterance finished -- inside the
+        // advertised `[0.5, 2.0]` range, so not clamped, just silently not
+        // reflected, and indistinguishable from "ignored" to a client.
+        // `configured_speed` is what `SetSpeed` writes and is current the
+        // instant it lands (see `Snapshot::configured_speed`'s doc comment).
+        Ok(self.engine.snapshot().configured_speed as f64)
     }
     async fn set_rate(&self, rate: f64) -> ZResult<()> {
         self.engine.send(Command::SetSpeed(rate as f32));
@@ -281,5 +289,99 @@ mod tests {
     fn trackid_differs_between_utterances() {
         assert_ne!(trackid_for(1), trackid_for(2));
         assert_ne!(trackid_for(1), TrackId::NO_TRACK);
+    }
+
+    fn player() -> (SaydPlayer, EngineHandle) {
+        let h = EngineHandle::spawn(
+            sayd_core::config::Config::default(),
+            Box::new(sayd_core::synth::StubSynthesizer::new()),
+            Box::new(sayd_core::audio::VecSink::new(24_000 * 10)),
+        );
+        (SaydPlayer::new(h.clone()), h)
+    }
+
+    /// Poll a `PlayerInterface` read until `f` holds or the deadline passes.
+    async fn wait_for<T, F>(mut read: impl FnMut() -> F, f: impl Fn(&T) -> bool) -> T
+    where
+        F: std::future::Future<Output = FdoResult<T>>,
+    {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let v = read().await.expect("read must not error");
+            if f(&v) {
+                return v;
+            }
+            assert!(std::time::Instant::now() < deadline, "timed out waiting");
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn rate_reflects_configured_speed_not_the_playing_utterances_override() {
+        // I1, exercised end to end through `SaydPlayer`: a per-utterance
+        // speed override must not leak into `Rate`, and a `SetRate` issued
+        // while that utterance is still playing must be visible right away.
+        let (player, h) = player();
+        h.submit(
+            "An utterance with its own speed override.".into(),
+            sayd_core::engine::SayOpts {
+                speed: Some(1.8),
+                ..Default::default()
+            },
+        )
+        .expect("accepted");
+        wait_for(
+            || player.playback_status(),
+            |s| *s == PlaybackStatus::Playing,
+        )
+        .await;
+
+        let rate = player.rate().await.expect("rate must not error");
+        assert_eq!(
+            rate,
+            sayd_core::config::Config::default().speed as f64,
+            "Rate must report the configured default, not the playing utterance's 1.8 override"
+        );
+
+        player
+            .set_rate(1.75)
+            .await
+            .expect("set_rate must not error");
+        wait_for(|| player.rate(), |r| (*r - 1.75).abs() < 1e-6).await;
+
+        h.shutdown();
+    }
+
+    #[tokio::test]
+    async fn metadata_and_status_show_the_about_to_play_utterance_immediately() {
+        // I2, exercised through the real EngineHandle/mpris boundary. Only
+        // one utterance is ever submitted, so whether the engine thread has
+        // ticked `current` into place yet or is still relying on I2's
+        // queue-head fallback, both report the same id/text -- this is
+        // deterministic despite running against a real background thread,
+        // not a race against it.
+        let (player, h) = player();
+        h.submit(
+            "The utterance about to play.".into(),
+            sayd_core::engine::SayOpts::default(),
+        )
+        .expect("accepted");
+
+        wait_for(
+            || player.playback_status(),
+            |s| *s == PlaybackStatus::Playing,
+        )
+        .await;
+
+        let meta = player.metadata().await.expect("metadata must not error");
+        assert_ne!(
+            meta.trackid(),
+            Some(TrackId::NO_TRACK),
+            "must not be NoTrack while Playing"
+        );
+        let title = meta.title().unwrap_or_default();
+        assert!(title.contains("about to play"), "got {title:?}");
+
+        h.shutdown();
     }
 }

@@ -154,6 +154,22 @@ pub struct Snapshot {
     /// Same rule as `voice`: the current utterance's own speed while one is
     /// playing, the configured default otherwise.
     pub speed: f32,
+    /// The configured default speed (`Config::speed`), always -- regardless
+    /// of whether an utterance with its own per-submission override
+    /// (`SayOpts::speed`) is currently playing.
+    ///
+    /// I1: distinct from `speed` above on purpose. `speed` deliberately
+    /// tracks what is *audible* right now (Finding 1), but MPRIS's `Rate`
+    /// needs to track what `SetSpeed` actually controls: reading `speed`
+    /// there meant a `SetSpeed` issued while an utterance was playing was
+    /// invisible on `Rate` -- not clamped, not rejected, just silently not
+    /// reflected -- until that utterance finished, because `speed` does not
+    /// change again until the *next* utterance starts. A client cannot tell
+    /// "ignored" from "applied" in that gap. `configured_speed` is what
+    /// `SetSpeed` writes and is current the instant it lands, so a reader
+    /// that wants "did my write take" -- not "what is this utterance doing"
+    /// -- has a field to read.
+    pub configured_speed: f32,
     pub queue_len: usize,
     pub remaining_secs: f64,
     pub current_text: String,
@@ -705,6 +721,38 @@ impl Engine {
             Some(c) => (c.voice.clone(), c.speed),
             None => (self.cfg.voice.clone(), self.cfg.speed),
         };
+        // I2: `state` flips to `Speaking` synchronously in `submit` (and
+        // stays there when `Next`/`SkipSentence` discard `current` while the
+        // queue is still non-empty), but `current` itself is only populated
+        // once `tick` reaches the front of the queue -- up to one synthesis
+        // chunk later (measured 4.41-4.49s, constant across submission
+        // sizes). Every consumer that reads `current_id`/`current_text`
+        // during that gap -- the D-Bus control interface's `CurrentText`,
+        // the tray's status line, and MPRIS's `Metadata`/`PlaybackStatus` --
+        // otherwise shows nothing to describe an utterance that is, from
+        // `state`'s point of view, already playing. For MPRIS specifically
+        // that means `PlaybackStatus = Playing` alongside `mpris:trackid =
+        // .../NoTrack`, which the MPRIS2 spec reserves for "no current
+        // track" -- non-conformant while something genuinely is about to
+        // play, and the reason waybar's mpris module shows a blank title for
+        // the first few seconds of every utterance.
+        //
+        // Falling back to the queue head here -- the one place all three
+        // consumers read from -- fixes all of them at once rather than
+        // requiring each to reimplement (and risk disagreeing about) the
+        // same fallback. Only while `state == Speaking`: with nothing
+        // current and the queue empty too (e.g. `go_idle`'s "sink still
+        // draining" case, or genuinely idle/paused/errored), there is
+        // nothing to fall back to and `(0, "")` -- MPRIS's `NoTrack` case --
+        // is the honest answer.
+        let (current_id, current_text) = match self.current.as_ref() {
+            Some(c) => (c.id, c.text.clone()),
+            None if self.state == State::Speaking => match self.queue.iter().next() {
+                Some(u) => (u.id, u.text.clone()),
+                None => (0, String::new()),
+            },
+            None => (0, String::new()),
+        };
         let queue_heads = self
             .queue
             .iter()
@@ -716,18 +764,29 @@ impl Engine {
             muted: self.cfg.muted,
             voice,
             speed,
+            configured_speed: self.cfg.speed,
             queue_len: self.queue.len(),
             remaining_secs: self.remaining_secs(),
-            current_text: self
-                .current
-                .as_ref()
-                .map(|c| c.text.clone())
-                .unwrap_or_default(),
-            current_id: self.current.as_ref().map(|c| c.id).unwrap_or(0),
+            current_text,
+            current_id,
             queue_heads,
             error: self.error.clone(),
             error_kind: self.error_kind,
         }
+    }
+
+    /// The engine's live [`Config`], for a caller that needs what is
+    /// actually configured rather than what is currently audible --
+    /// `Snapshot::voice`/`Snapshot::speed` deliberately report the *current
+    /// utterance's* overrides while one is playing (Finding 1), which is
+    /// wrong for, say, a settings window's speed slider (I3: `EngineHandle::
+    /// config` is the intended caller of this).
+    ///
+    /// Cheap: `Config` is small and this is a plain clone, no I/O -- unlike
+    /// `Config::load()`, which would diverge from this in-memory copy the
+    /// moment `SetMuted`/`SetVoice`/`SetSpeed` runs.
+    pub fn config(&self) -> Config {
+        self.cfg.clone()
     }
 
     /// Three buckets, in decreasing order of certainty: exact for audio
@@ -1666,6 +1725,106 @@ mod tests {
             idle.speed,
             Config::default().speed,
             "must revert to the configured default once nothing is current"
+        );
+    }
+
+    #[test]
+    fn current_id_and_text_fall_back_to_the_queue_head_before_tick_populates_current() {
+        // I2: right after `submit`, `state` is already `Speaking` but
+        // `current` is still `None` -- `tick` has not run yet. Every
+        // consumer of `current_id`/`current_text` (D-Bus `CurrentText`, the
+        // tray, MPRIS's `Metadata`) must see the utterance that is about to
+        // play during that gap, not a placeholder.
+        let mut e = engine();
+        e.handle(say("The utterance about to play."));
+        // Deliberately no `e.tick()` here: this is exactly the gap I2
+        // covers -- `submit` has already run (flipping `state`), but the
+        // engine has not ticked, so `current` is genuinely still `None`.
+        let s = e.snapshot();
+        assert_eq!(
+            s.state,
+            State::Speaking,
+            "submit must flip state synchronously"
+        );
+        assert_ne!(
+            s.current_id, 0,
+            "current_id must fall back to the queued utterance's id, not 0/NoTrack"
+        );
+        assert_eq!(s.current_text, "The utterance about to play.");
+    }
+
+    #[test]
+    fn current_id_and_text_stay_at_the_no_track_sentinel_when_genuinely_idle() {
+        let e = engine();
+        let s = e.snapshot();
+        assert_eq!(s.state, State::Idle);
+        assert_eq!(
+            s.current_id, 0,
+            "nothing queued or playing: no fallback to give"
+        );
+        assert_eq!(s.current_text, "");
+    }
+
+    #[test]
+    fn current_id_and_text_fall_back_correctly_after_next_discards_current() {
+        // The other route into "Speaking with current == None": `Next`
+        // discards `current` but leaves `state` alone while the queue is
+        // still non-empty (see `Command::Next`'s handling).
+        let mut e = engine();
+        e.handle(say("first"));
+        e.handle(say("second"));
+        e.tick(); // "first" becomes current
+        e.handle(Command::Next);
+        let s = e.snapshot();
+        assert_eq!(s.state, State::Speaking);
+        assert_eq!(
+            s.current_text, "second",
+            "must show what is now queued next"
+        );
+    }
+
+    #[test]
+    fn configured_speed_reports_the_config_default_even_while_an_override_plays() {
+        // I1: unlike `speed` (which deliberately tracks the current
+        // utterance's own override -- Finding 1), `configured_speed` must
+        // always report `cfg.speed`, since MPRIS's `Rate` needs to reflect
+        // what `SetSpeed` controls, not what happens to be playing.
+        let mut e = engine();
+        e.handle(Command::Say {
+            text: "Hello there, this utterance overrides its speed.".into(),
+            opts: SayOpts {
+                speed: Some(1.8),
+                ..Default::default()
+            },
+        });
+        e.tick();
+        let s = e.snapshot();
+        assert_eq!(s.state, State::Speaking);
+        assert_eq!(
+            s.speed, 1.8,
+            "sanity: the per-utterance override is audible"
+        );
+        assert_eq!(
+            s.configured_speed,
+            Config::default().speed,
+            "configured_speed must stay at the config default, unaffected by the override"
+        );
+    }
+
+    #[test]
+    fn configured_speed_updates_immediately_on_set_speed_even_while_speaking() {
+        let mut e = engine();
+        e.handle(say(
+            "Something reasonably long to keep this busy for a bit.",
+        ));
+        e.tick();
+        assert_eq!(e.snapshot().state, State::Speaking);
+        e.handle(Command::SetSpeed(1.75));
+        assert_eq!(
+            e.snapshot().configured_speed,
+            1.75,
+            "SetSpeed must be visible on configured_speed right away, not only \
+             once the current utterance finishes"
         );
     }
 

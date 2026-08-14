@@ -91,9 +91,14 @@ fn status_lines(s: &Snapshot) -> Vec<String> {
             out.push(format!("{} remaining", human_secs(s.remaining_secs)));
         }
         // `State` flips to `speaking` on submit before the utterance is
-        // populated into `current` (see sayd-core's engine.rs), so for up
-        // to one synthesis chunk the tray can legitimately show "Speaking"
-        // with no current text yet. Expected, bounded, self-correcting.
+        // populated into `current` (see sayd-core's engine.rs), but
+        // `Engine::snapshot` (I2) falls back to the queue head for
+        // `current_text` during that gap, so this branch is only reached
+        // with nothing current *and* nothing queued -- the sink still
+        // draining the tail of the previous utterance after the queue has
+        // already emptied (see `Engine::go_idle`'s "stay Speaking" case).
+        // There is genuinely nothing to describe there, so the bare
+        // "Speaking" label is the honest fallback, not a display lag.
         _ => out.push("Speaking".to_string()),
     }
 
@@ -339,6 +344,7 @@ mod tests {
             muted: false,
             voice: "af_heart".into(),
             speed: 1.0,
+            configured_speed: 1.0,
             queue_len: 0,
             remaining_secs: 0.0,
             current_text: String::new(),
