@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use crate::audio::AudioSink;
 use crate::config::Config;
-use crate::engine::{Command, Engine, SayOpts, Snapshot};
+use crate::engine::{Command, Engine, SayOpts, Snapshot, Submitted};
 use crate::synth::Synthesizer;
 
 /// How long the engine thread waits for a command before ticking anyway.
@@ -28,7 +28,7 @@ use crate::synth::Synthesizer;
 const TICK_INTERVAL: Duration = Duration::from_millis(10);
 
 /// How long `submit` waits for the engine's synchronous answer before
-/// falling back to `Ok(None)` instead of continuing to block.
+/// falling back to `Ok(Submitted::TimedOut)` instead of continuing to block.
 ///
 /// `Engine::submit` itself is cheap -- it cleans the text, applies policy
 /// and queues -- and `run`'s loop answers it (and publishes the resulting
@@ -49,15 +49,19 @@ const TICK_INTERVAL: Duration = Duration::from_millis(10);
 /// fix: the message was already handed to the engine successfully (`send`
 /// below returned `Ok`), so the text *is* queued (or otherwise handled)
 /// regardless of whether this wait times out. An `Err` would tell the
-/// caller otherwise, inviting a retry that double-queues. `Ok(None)`
-/// already means "accepted, no id" for a muted/empty submission; folding a
-/// timed-out-but-queued submission into the same case costs a caller the
-/// ability to `Cancel` that one utterance by id later -- a narrower loss
-/// than a false failure.
+/// caller otherwise, inviting a retry that double-queues.
+///
+/// Finding 3: this used to collapse into the very same `Ok(None)` that
+/// means "accepted, no id" for a muted/empty submission -- but those are
+/// different situations. A muted/empty submission has nothing to cancel; a
+/// timed-out one *is* queued somewhere, just without an id its caller can
+/// `Cancel` it by. `Submitted::TimedOut` keeps that distinction visible
+/// instead of quietly reporting a queued utterance as if nothing had been
+/// queued at all.
 const SUBMIT_REPLY_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// A submission plus the channel its answer goes back on.
-type SubmitJob = (String, SayOpts, Sender<Result<Option<u64>, String>>);
+type SubmitJob = (String, SayOpts, Sender<Result<Submitted, String>>);
 
 enum Msg {
     Cmd(Command),
@@ -115,14 +119,14 @@ impl EngineHandle {
     /// Submit text and wait for the engine's answer, up to
     /// [`SUBMIT_REPLY_TIMEOUT`] -- see its doc comment for why this is
     /// bounded and what a timeout means.
-    pub fn submit(&self, text: String, opts: SayOpts) -> Result<Option<u64>, String> {
+    pub fn submit(&self, text: String, opts: SayOpts) -> Result<Submitted, String> {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.tx
             .send(Msg::Submit(Box::new((text, opts, reply_tx))))
             .map_err(|_| "engine thread is not running".to_string())?;
         match reply_rx.recv_timeout(SUBMIT_REPLY_TIMEOUT) {
             Ok(r) => r,
-            Err(RecvTimeoutError::Timeout) => Ok(None),
+            Err(RecvTimeoutError::Timeout) => Ok(Submitted::TimedOut),
             Err(RecvTimeoutError::Disconnected) => {
                 Err("engine thread stopped before answering".to_string())
             }
@@ -366,6 +370,19 @@ mod tests {
              -- that would recreate the exact double-queue bug this backstop \
              exists to avoid: {result:?}"
         );
+        // Finding 3: this is the one scenario that reliably produces a
+        // timeout (250ms backstop vs. a synthesis call known to still be
+        // running 2s in), so it is also the place to pin that the timeout
+        // case is a distinguishable outcome -- not the same `Discarded` a
+        // muted/empty submission gets, which would leave a caller unable to
+        // tell "nothing was queued" from "something was queued, but I have
+        // no id for it."
+        assert_eq!(
+            result,
+            Ok(Submitted::TimedOut),
+            "a submission the engine thread was too busy to confirm in time \
+             must be reported as TimedOut, not folded into Discarded"
+        );
         h.shutdown();
     }
 
@@ -394,10 +411,10 @@ mod tests {
     #[test]
     fn submit_returns_the_engines_answer() {
         let h = handle();
-        let id = h
+        let outcome = h
             .submit("hello there.".into(), SayOpts::default())
             .expect("accepted");
-        assert!(id.is_some());
+        assert!(matches!(outcome, Submitted::Queued(_)), "got {outcome:?}");
         h.shutdown();
     }
 
@@ -447,7 +464,8 @@ mod tests {
             h2.submit("from another thread.".into(), SayOpts::default())
         });
         let r = t.join().expect("thread panicked");
-        assert!(r.expect("accepted").is_some());
+        let outcome = r.expect("accepted");
+        assert!(matches!(outcome, Submitted::Queued(_)), "got {outcome:?}");
         h.shutdown();
     }
 
@@ -519,10 +537,10 @@ mod tests {
         wait_for(&h, "idle after replace_sink", |s| s.state == State::Idle);
 
         // max_chars is still 5, so keep this within the limit.
-        let id = h
+        let outcome = h
             .submit("hi.".into(), SayOpts::default())
             .expect("accepted");
-        assert!(id.is_some());
+        assert!(matches!(outcome, Submitted::Queued(_)), "got {outcome:?}");
         h.shutdown();
     }
 

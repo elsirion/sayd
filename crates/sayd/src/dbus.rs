@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use sayd_core::engine::{Command, SayOpts, State};
+use sayd_core::engine::{Command, SayOpts, State, Submitted};
 use sayd_core::handle::EngineHandle;
 use sayd_core::queue::{Policy, Source as QueueSource};
 use zbus::fdo;
@@ -69,14 +69,11 @@ impl SaydIface {
 
     /// Shared body of `Say`, `SaySelection` and `SayClipboard`.
     ///
-    /// Returns the queued id, or 0 when the submission was accepted but
-    /// nothing was queued (muted, or empty after cleanup). Safe to conflate
-    /// with "no id" because the queue never mints id 0 (`Queue::next_id`
-    /// starts at 1) and `CurrentId` already uses 0 to mean "nothing
-    /// playing", so 0 cannot collide with a real id on either side of the
-    /// interface. Also returned (id 0) when `EngineHandle::submit`'s own
-    /// bounded wait times out -- the submission is queued regardless (see
-    /// that method's doc comment), just without an id to report yet.
+    /// Returns the queued id; 0 when the submission was accepted but
+    /// nothing was queued (muted, or empty after cleanup); or `u32::MAX`
+    /// when `EngineHandle::submit`'s own bounded wait timed out before the
+    /// engine could confirm what happened -- see the `match` below for why
+    /// that is not also reported as 0.
     ///
     /// C2: `EngineHandle::submit` blocks the calling thread on a channel
     /// receive (bounded, but still potentially the full bound) waiting for
@@ -105,8 +102,36 @@ impl SaydIface {
             // in practice, but truncating silently would hand a client the
             // wrong id if it ever were. Fall back to 0 ("nothing queued")
             // rather than lie about which utterance this is.
-            Ok(Some(id)) => Ok(u32::try_from(id).unwrap_or(0)),
-            Ok(None) => Ok(0),
+            Ok(Submitted::Queued(id)) => Ok(u32::try_from(id).unwrap_or(0)),
+            Ok(Submitted::Discarded) => Ok(0),
+            // Finding 3: reporting a timeout as 0 conflated it with
+            // `Discarded` -- "nothing was queued" versus "something *was*
+            // queued, but the engine thread was too busy to confirm it in
+            // time." A caller cannot `Cancel` either way (no id came back),
+            // but the two are not the same fact, and the daemon can tell
+            // them apart internally (`Submitted::TimedOut` vs
+            // `Submitted::Discarded`), so silently erasing the difference
+            // on the wire would undo exactly the distinction Finding 3
+            // exists to preserve.
+            //
+            // `u32::MAX` is free to use as that sentinel the same way 0 is:
+            // `Queue::next_id` starts at 1 and climbs by one per accepted
+            // utterance, so colliding with a real id needs the same
+            // not-reachable-in-practice four billion utterances as the
+            // overflow fallback above.
+            //
+            // A `fdo::Error` was considered and rejected. The typical
+            // caller here is `sayd-cli`'s agent-narration loop, which fires
+            // and forgets (see its own doc comment) -- and unlike a genuine
+            // rejection, nothing is wrong with this submission: it *was*
+            // handled, just not confirmed in time. Turning that into a
+            // bus-level error would make a successfully-handled utterance
+            // look exactly like a failure to a caller that already ignores
+            // the return value, while costing the rarer caller that does
+            // check it nothing it does not already pay for the `Discarded`
+            // case: both are sentinels it is free to ignore, not errors it
+            // is forced to handle.
+            Ok(Submitted::TimedOut) => Ok(u32::MAX),
             Err(e) => Err(fdo::Error::Failed(e)),
         }
     }
@@ -114,17 +139,21 @@ impl SaydIface {
 
 #[interface(name = "sh.sayd.Sayd1")]
 impl SaydIface {
-    /// Speak `text`. Returns the utterance id, or 0 if nothing was queued
+    /// Speak `text`. Returns the utterance id; 0 if nothing was queued
     /// (muted, or empty after cleanup) -- safe, since the queue never mints
-    /// id 0 and `CurrentId` uses 0 for "nothing playing".
+    /// id 0 and `CurrentId` uses 0 for "nothing playing"; or `u32::MAX` if
+    /// the daemon accepted it but could not confirm an id in time (see
+    /// `submit`'s doc comment) -- also safe, since the queue does not reach
+    /// that id in practice either.
     async fn say(&self, text: String, opts: HashMap<String, OwnedValue>) -> fdo::Result<u32> {
         self.submit(text, say_opts_from(&opts, QueueSource::DBus))
             .await
     }
 
-    /// Speak the PRIMARY selection. Returns the utterance id, or 0 if
-    /// nothing was queued (muted, or empty after cleanup) -- safe, since the
-    /// queue never mints id 0 and `CurrentId` uses 0 for "nothing playing".
+    /// Speak the PRIMARY selection. Returns the utterance id; 0 if nothing
+    /// was queued (muted, or empty after cleanup); or `u32::MAX` if the
+    /// daemon could not confirm an id in time -- see `submit`'s doc
+    /// comment.
     async fn say_selection(&self, opts: HashMap<String, OwnedValue>) -> fdo::Result<u32> {
         let text = tokio::task::spawn_blocking(|| selection::read(selection::Source::Primary))
             .await
@@ -134,9 +163,9 @@ impl SaydIface {
             .await
     }
 
-    /// Speak the clipboard. Returns the utterance id, or 0 if nothing was
-    /// queued (muted, or empty after cleanup) -- safe, since the queue never
-    /// mints id 0 and `CurrentId` uses 0 for "nothing playing".
+    /// Speak the clipboard. Returns the utterance id; 0 if nothing was
+    /// queued (muted, or empty after cleanup); or `u32::MAX` if the daemon
+    /// could not confirm an id in time -- see `submit`'s doc comment.
     async fn say_clipboard(&self, opts: HashMap<String, OwnedValue>) -> fdo::Result<u32> {
         let text = tokio::task::spawn_blocking(|| selection::read(selection::Source::Clipboard))
             .await

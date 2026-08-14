@@ -21,6 +21,38 @@ use crate::synth::Synthesizer;
 /// Measured: 181.55 s of audio for 498 words in kokoro-eval's passage bench.
 pub const SECONDS_PER_WORD: f64 = 0.365;
 
+/// How many pending utterances `Snapshot::queue_heads` carries. The tray
+/// menu this feeds (M3) shows a handful of upcoming items plus a "+N more"
+/// count for the rest -- `queue_len` already carries the true total, so the
+/// head list only needs to cover what a menu can usefully display at once.
+pub const QUEUE_HEAD_LIMIT: usize = 5;
+
+/// How many characters of a queued utterance's text `Snapshot::queue_heads`
+/// keeps, per entry. `Snapshot` is cloned on every publish (once per tick,
+/// `handle.rs::publish`) and read by pollers on a fixed interval, so this is
+/// a menu label, not a paragraph -- 60 characters is enough to identify an
+/// utterance at a glance (comparable to a single line in a desktop tray
+/// menu) without a long queue of large submissions making every publish
+/// (and every diff against the previous snapshot) allocate and copy
+/// kilobytes of text nothing will read past the first few words of.
+pub const QUEUE_HEAD_TEXT_CHARS: usize = 60;
+
+/// Truncate `s` to at most `max_chars` characters, always on a character
+/// boundary. Byte-slicing at a fixed offset would panic on multi-byte text
+/// (e.g. an emoji or non-Latin script) whose boundaries don't land on
+/// `max_chars` bytes; counting chars first and collecting that many avoids
+/// it. Appends an ellipsis when truncation actually happened, so a
+/// truncated head is visibly distinct from a short utterance that just
+/// happens to fit.
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max_chars).collect();
+    out.push('\u{2026}'); // '…'
+    out
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum State {
     Idle,
@@ -57,6 +89,32 @@ pub enum ErrorKind {
     Synth,
 }
 
+/// The three distinguishable answers a submission can get back.
+///
+/// Finding 3: `EngineHandle::submit`'s backstop timeout used to fold into
+/// the same `Ok(None)` that means "accepted but nothing queued" (muted, or
+/// empty after cleanup). Those are different: a timed-out submission *is*
+/// queued (the message reached the engine; `Engine::submit` itself already
+/// returned before the timeout could even fire -- see `EngineHandle::
+/// submit`), just without an id the caller can `Cancel` it by. `Engine::
+/// submit` -- synchronous, no channel involved -- can only ever produce
+/// `Queued` or `Discarded`; `TimedOut` is minted solely by `EngineHandle::
+/// submit`'s timeout branch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Submitted {
+    /// Queued for synthesis with this id.
+    Queued(u64),
+    /// Accepted but nothing was queued: muted, or empty after cleanup. Not
+    /// an error -- see `Engine::submit`'s doc comment.
+    Discarded,
+    /// The engine already handled this submission (queued or discarded),
+    /// but the confirmation did not arrive before `EngineHandle::submit`'s
+    /// bounded wait gave up. There is no id to report, so a caller cannot
+    /// `Cancel` this one utterance specifically -- unlike `Discarded`, where
+    /// there is nothing to cancel in the first place.
+    TimedOut,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct SayOpts {
     pub policy: Option<Policy>,
@@ -87,12 +145,26 @@ pub enum Command {
 pub struct Snapshot {
     pub state: State,
     pub muted: bool,
+    /// The current utterance's own voice while one is playing (which may
+    /// differ from the configured default -- a submission can override it
+    /// per utterance via `SayOpts`); the configured default with nothing
+    /// current. MPRIS's `Rate`/`Metadata` (M3) read this, so it must track
+    /// what is actually audible, not just the config file.
     pub voice: String,
+    /// Same rule as `voice`: the current utterance's own speed while one is
+    /// playing, the configured default otherwise.
     pub speed: f32,
     pub queue_len: usize,
     pub remaining_secs: f64,
     pub current_text: String,
     pub current_id: u64,
+    /// Up to `QUEUE_HEAD_LIMIT` pending utterances, in play order, as
+    /// `(id, text)` with `text` truncated to `QUEUE_HEAD_TEXT_CHARS`
+    /// characters (see `truncate_chars`). Additive alongside `queue_len`,
+    /// which still counts the whole queue even when it is longer than this
+    /// list -- the tray menu (M3) wants both: a handful of visible entries
+    /// and an accurate "+N more".
+    pub queue_heads: Vec<(u64, String)>,
     pub error: Option<String>,
     /// `None` iff `error` is `None` -- see the invariant documented on
     /// `Engine::error`. Not exposed over D-Bus (the wire `Error` property
@@ -240,24 +312,28 @@ impl Engine {
         }
     }
 
-    /// Submit text for synthesis, returning the queued utterance's id on
-    /// acceptance, `None` if accepted but not queued (muted or empty after
-    /// cleanup), or the rejection reason on failure. This is the synchronous
-    /// answer a caller gets back for *its own* submission -- distinct from
-    /// `error`/`state`, which describe the engine as a whole and must not be
-    /// disturbed by a rejection that has nothing to do with whatever else is
-    /// legitimately in flight (see the busy check below).
+    /// Submit text for synthesis, returning a [`Submitted`] describing what
+    /// happened to *this* submission on acceptance, or the rejection reason
+    /// on failure. This is the synchronous answer a caller gets back for its
+    /// own submission -- distinct from `error`/`state`, which describe the
+    /// engine as a whole and must not be disturbed by a rejection that has
+    /// nothing to do with whatever else is legitimately in flight (see the
+    /// busy check below).
     ///
-    /// Returns `Ok(Some(id))` if the text was queued for synthesis.
-    /// Returns `Ok(None)` if the submission was accepted but nothing was
-    /// queued (muted, or empty after cleanup). This is not an error.
-    /// Returns `Err(reason)` if the submission was rejected (e.g. text too long).
+    /// Returns `Ok(Submitted::Queued(id))` if the text was queued for
+    /// synthesis. Returns `Ok(Submitted::Discarded)` if the submission was
+    /// accepted but nothing was queued (muted, or empty after cleanup) --
+    /// this is not an error. `Engine::submit` never returns
+    /// `Ok(Submitted::TimedOut)`: that variant exists for
+    /// `EngineHandle::submit`'s bounded wait, which this synchronous method
+    /// has no notion of. Returns `Err(reason)` if the submission was
+    /// rejected (e.g. text too long).
     ///
     /// `handle(Command::Say { .. })` calls this and discards the result, so
     /// the existing command path is unchanged for callers that do not care.
     /// A D-Bus `Say` method or a CLI entry point should call this directly
     /// to learn whether its own submission was accepted and queued.
-    pub fn submit(&mut self, text: String, opts: SayOpts) -> Result<Option<u64>, String> {
+    pub fn submit(&mut self, text: String, opts: SayOpts) -> Result<Submitted, String> {
         // Checked before `max_chars` (the reverse of this method's original
         // order): a systemic error (`Sink`/`Synth`) must persist and reject
         // *every* new submission while it holds, not just ones that happen
@@ -310,12 +386,12 @@ impl Engine {
             return Err(msg);
         }
         if self.cfg.muted {
-            return Ok(None); // accepted and discarded
+            return Ok(Submitted::Discarded);
         }
 
         let cleaned = clean(&text, &self.cfg.cleanup);
         if cleaned.trim().is_empty() {
-            return Ok(None);
+            return Ok(Submitted::Discarded);
         }
 
         let policy = opts.policy.unwrap_or_else(|| opts.source.default_policy());
@@ -339,7 +415,7 @@ impl Engine {
             self.idle_since = None;
         }
 
-        Ok(Some(id))
+        Ok(Submitted::Queued(id))
     }
 
     /// One unit of work: top up the sink, or advance the queue, or unload.
@@ -594,11 +670,27 @@ impl Engine {
     }
 
     pub fn snapshot(&self) -> Snapshot {
+        // Finding 1: report the utterance actually playing, not the
+        // configured default -- a submission can override voice and speed
+        // per utterance via `SayOpts` (see `submit`), and MPRIS's `Rate`/
+        // `Metadata` (M3) read these fields directly. With nothing current,
+        // the configured defaults are exactly right (that is what the next
+        // utterance will use absent its own override).
+        let (voice, speed) = match self.current.as_ref() {
+            Some(c) => (c.voice.clone(), c.speed),
+            None => (self.cfg.voice.clone(), self.cfg.speed),
+        };
+        let queue_heads = self
+            .queue
+            .iter()
+            .take(QUEUE_HEAD_LIMIT)
+            .map(|u| (u.id, truncate_chars(&u.text, QUEUE_HEAD_TEXT_CHARS)))
+            .collect();
         Snapshot {
             state: self.state,
             muted: self.cfg.muted,
-            voice: self.cfg.voice.clone(),
-            speed: self.cfg.speed,
+            voice,
+            speed,
             queue_len: self.queue.len(),
             remaining_secs: self.remaining_secs(),
             current_text: self
@@ -607,6 +699,7 @@ impl Engine {
                 .map(|c| c.text.clone())
                 .unwrap_or_default(),
             current_id: self.current.as_ref().map(|c| c.id).unwrap_or(0),
+            queue_heads,
             error: self.error.clone(),
             error_kind: self.error_kind,
         }
@@ -615,23 +708,30 @@ impl Engine {
     /// Three buckets, in decreasing order of certainty: exact for audio
     /// already accepted by the sink, exact for audio already synthesized
     /// but still parked in `carry` waiting for room in the sink, and
-    /// estimated (via `SECONDS_PER_WORD`) for text not yet spoken at all.
+    /// estimated (via `SECONDS_PER_WORD`) for text not yet spoken at all --
+    /// the last bucket at each utterance's *own* speed (current or queued),
+    /// not one engine-wide speed, since a submission can override it per
+    /// utterance (Finding 1).
     fn remaining_secs(&self) -> f64 {
         let sr = self.synth.sample_rate() as f64;
         let carried = self.current.as_ref().map(|c| c.carry.len()).unwrap_or(0) as f64;
         let buffered = (self.sink.pending() as f64 + carried) / sr;
 
-        let mut words = 0usize;
+        let mut estimate = 0.0f64;
         if let Some(c) = self.current.as_ref() {
+            let mut words = 0usize;
             for ch in &c.chunks[c.next_chunk.min(c.chunks.len())..] {
                 words += ch.text.split_whitespace().count();
             }
+            let speed = c.speed.max(0.1) as f64;
+            estimate += (words as f64 * SECONDS_PER_WORD) / speed;
         }
         for u in self.queue.iter() {
-            words += u.text.split_whitespace().count();
+            let words = u.text.split_whitespace().count();
+            let speed = u.speed.max(0.1) as f64;
+            estimate += (words as f64 * SECONDS_PER_WORD) / speed;
         }
-        let speed = self.cfg.speed.max(0.1) as f64;
-        buffered + (words as f64 * SECONDS_PER_WORD) / speed
+        buffered + estimate
     }
 
     // --- test helpers -------------------------------------------------
@@ -1385,6 +1485,202 @@ mod tests {
     }
 
     #[test]
+    fn current_utterance_reports_its_own_overridden_voice_and_speed_and_reverts_when_idle() {
+        // Finding 1, measured over D-Bus: `Say(text, {voice: "bf_emma"})`
+        // spoke in a British voice while `Voice` kept reporting the
+        // configured default, and `{speed: 2.0}` left `Speed`/
+        // `RemainingSeconds` unchanged. MPRIS's `Rate`/`Metadata` (M3) read
+        // these fields directly, so the snapshot must reflect what is
+        // actually playing, not `self.cfg`.
+        let (mut e, sink) = engine_with_drainable_sink(24_000 * 10);
+        e.handle(Command::Say {
+            text: "Hello there, this utterance overrides both.".into(),
+            opts: SayOpts {
+                voice: Some("bf_emma".into()),
+                speed: Some(1.8),
+                ..Default::default()
+            },
+        });
+        // One tick pops the utterance into `current` and synthesizes its
+        // (only, given how short this text is) chunk -- deliberately not
+        // more: further ticks would notice `next_chunk >= chunks.len()`,
+        // clear `current` and (with a big enough sink) go straight to
+        // `Idle`, defeating a test about what the snapshot says *while*
+        // this utterance is current.
+        e.tick();
+        let s = e.snapshot();
+        assert_eq!(
+            s.state,
+            State::Speaking,
+            "test is only meaningful while this utterance is current"
+        );
+        assert_ne!(
+            s.current_id, 0,
+            "test is only meaningful while this utterance is current"
+        );
+        assert_eq!(
+            s.voice, "bf_emma",
+            "must report the utterance's own voice while it plays"
+        );
+        assert_eq!(
+            s.speed, 1.8,
+            "must report the utterance's own speed while it plays"
+        );
+
+        // Drain the sink first so the following tick sees nothing left to
+        // play and can actually reach Idle, not just clear `current` while
+        // still draining (see `Engine::go_idle`).
+        sink.lock().unwrap().drain(usize::MAX);
+        e.tick();
+        let idle = e.snapshot();
+        assert_eq!(idle.state, State::Idle);
+        assert_eq!(
+            idle.voice,
+            Config::default().voice,
+            "must revert to the configured default once nothing is current"
+        );
+        assert_eq!(
+            idle.speed,
+            Config::default().speed,
+            "must revert to the configured default once nothing is current"
+        );
+    }
+
+    #[test]
+    fn remaining_seconds_halves_when_the_current_utterances_own_speed_is_doubled() {
+        // Companion to `remaining_seconds_halves_at_double_speed` above,
+        // which pins this for a *queued* utterance via `cfg.speed`
+        // (`SetSpeed`). This pins the same requirement for the *current*
+        // utterance's own per-submission override (`SayOpts::speed`) --
+        // both `cfg.speed` for both engines stay at the 1.0 default here, so
+        // this only passes if `remaining_secs` is actually reading the
+        // current utterance's own speed rather than the engine-wide config.
+        let mut cfg = Config::default();
+        cfg.chunking.target_chars = 20; // force several chunks so words remain uncounted after one tick
+        let text = "One two three four five. Six seven eight nine ten. \
+                     Eleven twelve thirteen fourteen fifteen.";
+
+        let mut fast = Engine::new(
+            cfg.clone(),
+            Box::new(StubSynthesizer::new()),
+            Box::new(VecSink::new(24_000 * 10)),
+        );
+        fast.handle(Command::Say {
+            text: text.into(),
+            opts: SayOpts {
+                speed: Some(2.0),
+                ..Default::default()
+            },
+        });
+        fast.tick(); // pop into current; synthesizes only the first chunk
+        let fast_secs = fast.snapshot().remaining_secs;
+
+        let mut normal = Engine::new(
+            cfg,
+            Box::new(StubSynthesizer::new()),
+            Box::new(VecSink::new(24_000 * 10)),
+        );
+        normal.handle(say(text));
+        normal.tick();
+        let normal_secs = normal.snapshot().remaining_secs;
+
+        assert!(
+            fast_secs < normal_secs * 0.75,
+            "fast {fast_secs} vs normal {normal_secs}"
+        );
+    }
+
+    #[test]
+    fn queue_heads_reports_the_first_few_pending_utterances_in_order() {
+        let mut e = engine();
+        e.handle(say("current"));
+        e.handle(say("queued one"));
+        e.handle(say("queued two"));
+        e.handle(say("queued three"));
+        e.tick(); // "current" leaves the queue, three remain
+
+        let s = e.snapshot();
+        assert_eq!(
+            s.queue_len, 3,
+            "queue_len must still count everything pending"
+        );
+        let texts: Vec<&str> = s.queue_heads.iter().map(|(_, t)| t.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec!["queued one", "queued two", "queued three"],
+            "heads must appear in play order"
+        );
+        let ids: Vec<u64> = s.queue_heads.iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            ids,
+            e.snapshot_queue_ids(),
+            "head ids must match the real queue, in order"
+        );
+    }
+
+    #[test]
+    fn queue_heads_truncates_to_the_head_limit_while_queue_len_counts_every_pending_utterance() {
+        let mut e = engine();
+        e.handle(say("current"));
+        let total_queued = QUEUE_HEAD_LIMIT + 3;
+        for i in 0..total_queued {
+            e.handle(say(&format!("queued {i}")));
+        }
+        e.tick(); // "current" leaves the queue
+
+        let s = e.snapshot();
+        assert_eq!(
+            s.queue_len, total_queued,
+            "a queue longer than the head limit must still report its true size"
+        );
+        assert_eq!(
+            s.queue_heads.len(),
+            QUEUE_HEAD_LIMIT,
+            "the head list must be capped even though more are queued"
+        );
+        for (i, (_, text)) in s.queue_heads.iter().enumerate() {
+            assert_eq!(text, &format!("queued {i}"));
+        }
+    }
+
+    #[test]
+    fn multi_byte_queued_text_does_not_panic_when_truncated_for_queue_heads() {
+        // Finding 2: truncation must land on a character boundary. Slicing
+        // at a fixed byte offset would panic here, since none of this
+        // text's multi-byte characters happen to end exactly at
+        // `QUEUE_HEAD_TEXT_CHARS` bytes in.
+        let mut e = engine();
+        e.handle(say("current"));
+        let long_multi_byte = "日本語のテキストです。".repeat(10);
+        assert!(
+            long_multi_byte.chars().count() > QUEUE_HEAD_TEXT_CHARS,
+            "test needs text longer than the truncation limit"
+        );
+        e.handle(say(&long_multi_byte));
+        e.tick(); // "current" leaves the queue
+
+        let s = e.snapshot(); // must not panic
+        assert_eq!(s.queue_heads.len(), 1);
+        assert!(
+            s.queue_heads[0].1.chars().count() <= QUEUE_HEAD_TEXT_CHARS + 1,
+            "truncated text (plus a possible ellipsis) must not exceed the limit"
+        );
+    }
+
+    #[test]
+    fn truncate_chars_is_a_no_op_under_the_limit() {
+        assert_eq!(truncate_chars("short", 60), "short");
+    }
+
+    #[test]
+    fn truncate_chars_cuts_multi_byte_text_on_a_character_boundary() {
+        let s = "日本語".repeat(5); // 15 chars, 3 bytes each
+        let truncated = truncate_chars(&s, 4);
+        assert_eq!(truncated.chars().count(), 5); // 4 chars + the appended ellipsis
+        assert!(truncated.ends_with('\u{2026}'));
+    }
+
+    #[test]
     fn cancel_removes_a_queued_utterance() {
         let mut e = engine();
         e.handle(say("First."));
@@ -1643,38 +1939,48 @@ mod tests {
     #[test]
     fn submit_accepted_returns_the_id_that_later_appears_as_current_id() {
         let mut e = engine();
-        let id = e
+        let outcome = e
             .submit("Hello there. This is a test.".into(), SayOpts::default())
-            .expect("well-formed text must be accepted")
-            .expect("well-formed text must be queued");
+            .expect("well-formed text must be accepted");
+        let id = match outcome {
+            Submitted::Queued(id) => id,
+            other => panic!("well-formed text must be queued, got {other:?}"),
+        };
         e.tick();
         assert_eq!(e.snapshot().current_id, id);
     }
 
     #[test]
-    fn submit_returns_none_when_muted() {
+    fn submit_returns_discarded_when_muted() {
         let mut e = engine();
         e.handle(Command::SetMuted(true));
         assert_eq!(
             e.submit("nobody hears this".into(), SayOpts::default()),
-            Ok(None)
+            Ok(Submitted::Discarded)
         );
     }
 
     #[test]
-    fn submit_returns_none_for_text_that_is_empty_after_cleanup() {
+    fn submit_returns_discarded_for_text_that_is_empty_after_cleanup() {
         let mut e = engine();
-        assert_eq!(e.submit("   ".into(), SayOpts::default()), Ok(None));
+        assert_eq!(
+            e.submit("   ".into(), SayOpts::default()),
+            Ok(Submitted::Discarded)
+        );
     }
 
     #[test]
-    fn submit_returns_some_nonzero_id_when_queued() {
+    fn submit_returns_a_nonzero_id_when_queued() {
         let mut e = engine();
-        let id = e
+        let outcome = e
             .submit("hello there.".into(), SayOpts::default())
             .expect("accepted");
-        assert!(id.is_some());
-        assert_ne!(id, Some(0), "id 0 is the nothing-is-playing sentinel");
+        match outcome {
+            Submitted::Queued(id) => {
+                assert_ne!(id, 0, "id 0 is the nothing-is-playing sentinel")
+            }
+            other => panic!("expected Queued, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2013,10 +2319,13 @@ mod tests {
         assert_eq!(s.state, State::Error);
         assert_eq!(s.error_kind, Some(ErrorKind::Rejected));
 
-        let id = e
+        let outcome = e
             .submit("ok.".into(), SayOpts::default())
-            .expect("a valid submission must be accepted")
-            .expect("must be queued");
+            .expect("a valid submission must be accepted");
+        let id = match outcome {
+            Submitted::Queued(id) => id,
+            other => panic!("must be queued, got {other:?}"),
+        };
         assert_ne!(id, 0);
         let after = e.snapshot();
         assert_eq!(after.error, None);
