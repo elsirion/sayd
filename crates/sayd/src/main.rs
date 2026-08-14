@@ -407,6 +407,9 @@ async fn main() -> std::process::ExitCode {
                     if now.queue_len != last.queue_len {
                         let _ = i.queue_length_changed(ctx).await;
                     }
+                    if now.queue_heads != last.queue_heads {
+                        let _ = i.queue_heads_changed(ctx).await;
+                    }
                     if now.current_id != last.current_id {
                         let _ = i.current_id_changed(ctx).await;
                         let _ = i.current_text_changed(ctx).await;

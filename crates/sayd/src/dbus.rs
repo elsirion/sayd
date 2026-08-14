@@ -257,6 +257,20 @@ impl SaydIface {
         self.engine.snapshot().current_id as u32
     }
 
+    /// Up to five pending utterances as `(id, leading text)`, in play order.
+    ///
+    /// Truncated for display; this is what the tray menu shows. `QueueLength`
+    /// is the true count and may be larger than this list.
+    #[zbus(property)]
+    async fn queue_heads(&self) -> Vec<(u32, String)> {
+        self.engine
+            .snapshot()
+            .queue_heads
+            .into_iter()
+            .map(|(id, text)| (u32::try_from(id).unwrap_or(0), text))
+            .collect()
+    }
+
     /// Empty unless `State` is `error`.
     #[zbus(property)]
     async fn error(&self) -> String {
@@ -385,6 +399,32 @@ mod tests {
             Box::new(VecSink::new(24_000)),
         ));
         assert!(i.say("far too long".into(), HashMap::new()).await.is_err());
+        i.engine.shutdown();
+    }
+
+    #[tokio::test]
+    async fn queue_heads_reports_pending_utterances_in_order() {
+        let i = iface();
+        // Fill the queue. The first becomes current; the rest stay pending.
+        for n in ["first one here.", "second one here.", "third one here."] {
+            i.say(n.into(), HashMap::new()).await.expect("accepted");
+        }
+        let heads = i.queue_heads().await;
+        assert!(!heads.is_empty(), "expected pending utterances, got none");
+        // Ids are positive and ascending; text is non-empty.
+        let mut last = 0u32;
+        for (id, text) in &heads {
+            assert!(*id > last, "ids must ascend: {id} after {last}");
+            assert!(!text.is_empty());
+            last = *id;
+        }
+        i.engine.shutdown();
+    }
+
+    #[tokio::test]
+    async fn queue_heads_is_empty_when_nothing_is_pending() {
+        let i = iface();
+        assert!(i.queue_heads().await.is_empty());
         i.engine.shutdown();
     }
 }
