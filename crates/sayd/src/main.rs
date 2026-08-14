@@ -5,6 +5,7 @@
 //! well-known name is taken, forwards its arguments to the running daemon,
 //! and exits -- so `sayd` is safe to put in a sway config that gets reloaded.
 
+mod config_watch;
 mod dbus;
 mod kokoro_synth;
 mod mpris;
@@ -363,6 +364,23 @@ async fn main() -> std::process::ExitCode {
     };
 
     let engine = EngineHandle::spawn(cfg, Box::new(synth), sink);
+
+    // Config is a two-way surface from here on: the settings window writes
+    // through this, and a hand edit comes back through the watcher. Both
+    // end at `Command::ApplyConfig`.
+    let store = std::sync::Arc::new(config_watch::ConfigStore::new(
+        Config::path(),
+        engine.clone(),
+    ));
+    // Held for the life of the process: dropping the watcher stops the
+    // watch, silently.
+    let _config_watcher = match config_watch::spawn(store.clone()) {
+        Ok(w) => Some(w),
+        Err(e) => {
+            eprintln!("warning: {e}; config changes will need a restart");
+            None
+        }
+    };
 
     let iface = dbus::SaydIface::new(engine.clone());
     if let Err(e) = connection.object_server().at(OBJECT_PATH, iface).await {

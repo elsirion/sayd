@@ -26,6 +26,12 @@ zbus = { version = "5", default-features = false, features = ["tokio"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
 ksni = "0.3"
 mpris-server = { version = "0.10", features = ["tokio"] }
+# Config file watching. `macos_fsevent`/other backends are irrelevant here;
+# on Linux this is inotify.
+notify = { version = "8", default-features = false, features = ["macos_kqueue"] }
+
+[dev-dependencies]
+tempfile = "3"
 
 [features]
 models = []
