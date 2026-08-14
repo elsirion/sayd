@@ -240,6 +240,17 @@ pub struct Engine {
     /// why this exists.
     error_kind: Option<ErrorKind>,
     idle_since: Option<Instant>,
+    /// A model/thread-count change (`Command::ApplyConfig`) that arrived
+    /// while `current` was `Some` -- i.e. mid-utterance -- so the unload was
+    /// deferred instead of dropping the session out from under whatever is
+    /// playing. Applied by `apply_pending_unload`, called from every place
+    /// `current` transitions back to `None`: that is the first moment the
+    /// session is no longer needed by anything in flight, whether the
+    /// utterance finished on its own, was skipped past its last chunk,
+    /// discarded (`Stop`/`Next`/a replacing submission/`SetMuted(true)`), or
+    /// lost to a synth/device error. See `ApplyConfig`'s handler for why
+    /// unloading immediately is wrong in the first place.
+    pending_unload: bool,
     shutdown: bool,
 }
 
@@ -255,6 +266,7 @@ impl Engine {
             error: None,
             error_kind: None,
             idle_since: Some(Instant::now()),
+            pending_unload: false,
             shutdown: false,
         }
     }
@@ -306,6 +318,7 @@ impl Engine {
                     c.carry.clear();
                     if c.next_chunk >= c.chunks.len() {
                         self.current = None;
+                        self.apply_pending_unload();
                         if self.queue.is_empty() {
                             self.dismiss_error_and_go_idle();
                         }
@@ -330,18 +343,42 @@ impl Engine {
             }
             Command::SetVoice(v) => self.cfg.voice = v,
             Command::SetSpeed(s) => self.cfg.speed = s.clamp(0.5, 2.0),
-            Command::ApplyConfig(cfg) => {
+            Command::ApplyConfig(mut cfg) => {
+                // Same clamp as `SetSpeed`, done before `cfg` moves into
+                // `self.cfg` below so an out-of-range speed is never even
+                // briefly stored: a hand-edited config file is untrusted.
+                cfg.speed = cfg.speed.clamp(0.5, 2.0);
                 // Only `model` and `threads` can invalidate a loaded ORT
                 // session; the synthesizer decides, since it owns those.
                 // Everything else here is read per-utterance from `self.cfg`
                 // and so takes effect on the next submission by assignment
                 // alone.
+                //
+                // IMPORTANT 1: an immediate `unload` here would drop the
+                // live session out from under whatever `current` is already
+                // playing -- `tick` would then have to rebuild a session
+                // (~1.27 GB, over a second) for the *remaining* chunks of
+                // the utterance already in progress, audibly switching
+                // model mid-sentence, or -- if the newly named model file
+                // isn't installed -- turning the rest of that utterance and
+                // everything queued behind it into a sticky
+                // `ErrorKind::Synth`. The brief's own rationale was "the
+                // next utterance picks up the new settings"; unloading only
+                // once nothing is in flight is what actually makes that
+                // true instead of "whichever utterance happens to be
+                // playing when the settings window is open". So: unload now
+                // when nothing is mid-utterance (`current.is_none()`,
+                // matching today's behaviour when idle), otherwise defer to
+                // the moment `current` next clears -- see
+                // `apply_pending_unload`.
                 if self.synth.reconfigure(&cfg) {
-                    self.synth.unload();
+                    if self.current.is_some() {
+                        self.pending_unload = true;
+                    } else {
+                        self.synth.unload();
+                    }
                 }
                 self.cfg = cfg;
-                // Same clamp as `SetSpeed`: a hand-edited file is untrusted.
-                self.cfg.speed = self.cfg.speed.clamp(0.5, 2.0);
             }
             Command::Shutdown => {
                 self.shutdown = true;
@@ -502,6 +539,7 @@ impl Engine {
             self.error = Some(e);
             self.error_kind = Some(ErrorKind::Sink);
             self.current = None;
+            self.apply_pending_unload();
             self.queue.clear();
             // This is a route out of `Paused` (see the pause invariant on
             // `error`'s doc comment): a device failure can arrive while
@@ -595,6 +633,7 @@ impl Engine {
         };
         if c.next_chunk >= c.chunks.len() {
             self.current = None;
+            self.apply_pending_unload();
             if self.queue.is_empty() {
                 self.go_idle();
             }
@@ -621,6 +660,7 @@ impl Engine {
                 self.error = Some(e);
                 self.error_kind = Some(ErrorKind::Synth);
                 self.current = None;
+                self.apply_pending_unload();
                 self.queue.clear();
             }
         }
@@ -650,6 +690,7 @@ impl Engine {
         // and this method always leaves `state == Idle`.
         self.sink.set_paused(false);
         self.current = None;
+        self.apply_pending_unload();
         self.error = None;
         self.error_kind = None;
         self.state = State::Idle;
@@ -719,7 +760,21 @@ impl Engine {
     /// utterance.
     fn discard_current(&mut self) {
         self.current = None;
+        self.apply_pending_unload();
         self.sink.clear();
+    }
+
+    /// Unload a session that `ApplyConfig` deferred while the utterance now
+    /// ending (or being discarded) was still in progress -- see the
+    /// `ApplyConfig` handler for why it can't unload at that point. A no-op
+    /// when nothing is pending, so every place `current` transitions to
+    /// `None` can call this unconditionally instead of each having to
+    /// re-check whether an unload is actually owed.
+    fn apply_pending_unload(&mut self) {
+        if self.pending_unload {
+            self.pending_unload = false;
+            self.synth.unload();
+        }
     }
 
     fn maybe_unload(&mut self) {
@@ -1746,24 +1801,57 @@ mod tests {
         assert!((e.snapshot().configured_speed - 0.5).abs() < f32::EPSILON);
     }
 
-    /// A model or thread-count change has to reach the synthesizer and drop
-    /// the loaded session; anything else must leave a loaded model alone,
-    /// because reloading costs ~1.27 GB and over a second of latency.
+    /// A model or thread-count change has to reach the synthesizer
+    /// eventually, and a voice-only change must never touch a loaded model
+    /// at all (reloading costs ~1.27 GB and over a second of latency) --
+    /// but IMPORTANT 1: while an utterance is actually in progress, even a
+    /// real model change must not drop the session out from under it. The
+    /// brief's own rationale was "the next utterance picks up the new
+    /// settings", which this test now pins literally: the session the
+    /// current utterance started on survives until that utterance finishes,
+    /// and only then does the deferred unload happen, in time for whatever
+    /// comes next.
+    ///
+    /// Also pins IMPORTANT 2, the brief's headline guarantee that
+    /// `ApplyConfig` touches nothing besides `cfg` and the synthesizer: an
+    /// implementation that routed a model change through
+    /// `dismiss_error_and_go_idle()` -- exactly what the neighbouring
+    /// `SetMuted(true)` arm does -- would satisfy every assertion above
+    /// while silently breaking `state`, `error`, `current_id` and the
+    /// queue, so all four are checked unchanged across the `ApplyConfig`
+    /// that lands mid-utterance.
     #[test]
-    fn a_model_change_unloads_but_a_voice_change_does_not() {
-        let mut e = engine();
+    fn a_model_change_defers_the_unload_until_the_utterance_in_progress_finishes() {
+        // Small `target_chars` so the utterance below splits into more than
+        // one chunk (same technique as `skip_sentence_stops_current_audio_
+        // promptly`) -- otherwise a single tick synthesizes the whole
+        // utterance in one shot and there is no "mid-utterance" moment left
+        // to test.
+        let mut cfg = Config::default();
+        cfg.chunking.target_chars = 25;
+        let mut e = Engine::new(
+            cfg,
+            Box::new(StubSynthesizer::new()),
+            Box::new(VecSink::new(24_000 * 10)),
+        );
 
-        // Force a load so there is something to unload -- same technique as
-        // `model_does_not_unload_while_speaking` below.
-        e.handle(say(
-            "A reasonably long sentence to keep it busy for a while.",
-        ));
-        e.tick();
-        e.tick();
+        e.handle(say("First sentence here. Second sentence here."));
+        e.tick(); // pops the utterance into `current` and synthesizes chunk 1 of 2
         assert!(
             e.is_model_loaded(),
             "the stub should be loaded after speaking"
         );
+        // A second utterance behind it, so the queue-length assertion below
+        // actually exercises something (an empty queue staying empty would
+        // pass trivially).
+        e.handle(say("A second utterance queued behind it."));
+
+        let before = e.snapshot();
+        assert_eq!(before.state, State::Speaking);
+        let current_id = before.current_id;
+        assert_ne!(current_id, 0, "test needs a genuine in-progress utterance");
+        let queue_len = before.queue_len;
+        assert_eq!(queue_len, 1, "sanity: the second utterance is queued");
 
         let voice_only = Config {
             voice: "am_fenrir".into(),
@@ -1781,9 +1869,40 @@ mod tests {
             ..Config::default()
         };
         e.handle(Command::ApplyConfig(new_model));
+
+        // IMPORTANT 1: chunk 2 of this utterance has not synthesized yet --
+        // still mid-utterance -- so the live session must survive.
+        assert!(
+            e.is_model_loaded(),
+            "a model change must not drop a session still in use \
+             mid-utterance"
+        );
+        // IMPORTANT 2: ApplyConfig touches only `cfg` and the synthesizer.
+        let after = e.snapshot();
+        assert_eq!(
+            after.state,
+            State::Speaking,
+            "ApplyConfig must not touch state"
+        );
+        assert_eq!(after.error, None, "ApplyConfig must not touch error");
+        assert_eq!(
+            after.current_id, current_id,
+            "ApplyConfig must not touch the utterance in progress"
+        );
+        assert_eq!(
+            after.queue_len, queue_len,
+            "ApplyConfig must not touch the queue"
+        );
+
+        // Drive the utterance to completion; only once `current` actually
+        // clears -- the deferred boundary -- does the unload happen.
+        while e.snapshot().current_id == current_id {
+            e.tick();
+        }
         assert!(
             !e.is_model_loaded(),
-            "a model change must drop the loaded model"
+            "the deferred model change must take effect once the \
+             utterance in progress finishes"
         );
     }
 
