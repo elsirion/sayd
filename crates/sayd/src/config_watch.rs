@@ -493,11 +493,25 @@ mod tests {
             ..Config::default()
         };
         store.save(&cfg).expect("save succeeds");
+        wait_for_voice(&engine, "am_fenrir");
+
+        // Something the file has never said, so that a bounced-back write
+        // shows up as the engine losing it. Asserting only on the returned
+        // `OwnWrite` would pass just as happily on an implementation that
+        // reported the echo and re-applied it anyway.
+        engine.send(Command::SetVoice("bm_george".into()));
+        wait_for_voice(&engine, "bm_george");
 
         assert_eq!(
             store.reload(),
             ReloadOutcome::OwnWrite,
             "the write we just made must be recognised as ours"
+        );
+        settle();
+        assert_eq!(
+            engine.snapshot().voice,
+            "bm_george",
+            "our own write must not come back as an edit and undo runtime state"
         );
         engine.shutdown();
     }
@@ -565,6 +579,10 @@ mod tests {
             ..Config::default()
         };
         store.save(&cfg).expect("save succeeds");
+        // Wait for the engine to actually be on this config before breaking
+        // the file: a fixed sleep afterwards would report a slow engine
+        // thread as "the malformed edit reset the config".
+        wait_for_voice(&engine, "am_fenrir");
 
         std::fs::write(&path, "voice = [this is not toml").expect("write");
         match store.reload() {
@@ -572,7 +590,7 @@ mod tests {
             other => panic!("expected a parse failure, got {other:?}"),
         }
 
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        settle();
         assert_eq!(
             engine.snapshot().voice,
             "am_fenrir",
@@ -783,7 +801,26 @@ mod tests {
         let path = dir.path().join("config.toml");
         let engine = engine();
         let store = ConfigStore::new(path.clone(), engine.clone(), Config::default());
+
+        // A config the engine is running that defaults would visibly undo.
+        // Reloading a *fresh* store is where "not applied as defaults" is
+        // unobservable: it is already on defaults, so nothing could show.
+        let cfg = Config {
+            voice: "am_fenrir".into(),
+            ..Config::default()
+        };
+        store.save(&cfg).expect("save succeeds");
+        wait_for_voice(&engine, "am_fenrir");
+
+        std::fs::remove_file(&path).expect("delete the config");
         assert_eq!(store.reload(), ReloadOutcome::Missing);
+
+        settle();
+        assert_eq!(
+            engine.snapshot().voice,
+            "am_fenrir",
+            "a deleted config must leave the running settings alone"
+        );
         engine.shutdown();
     }
 }
