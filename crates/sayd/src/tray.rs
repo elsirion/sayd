@@ -18,11 +18,22 @@
 
 use ksni::menu::{CheckmarkItem, StandardItem};
 use ksni::{Handle, MenuItem, Tray, TrayMethods};
-use sayd_core::engine::{Command, Snapshot, State};
+use sayd_core::engine::{Command, Snapshot, State, SayOpts};
 use sayd_core::handle::EngineHandle;
+use sayd_core::queue::Source;
 
 /// How much of an utterance to show in a menu label.
 const LABEL_CHARS: usize = 40;
+
+/// Build the `SayOpts` for a tray selection/clipboard speak action.
+/// The tray actions mirror the hotkey behavior, so they use `Source::Hotkey`
+/// which resolves to `Policy::Replace`.
+fn speak_opts() -> SayOpts {
+    SayOpts {
+        source: Source::Hotkey,
+        ..Default::default()
+    }
+}
 
 /// Stock freedesktop icon names, so the tray works with no install step and
 /// the host themes it. Shipping our own into `hicolor` would need an
@@ -257,7 +268,9 @@ impl SaydTray {
         let engine = self.engine.clone();
         tokio::task::spawn_blocking(move || match crate::selection::read(source) {
             Ok(text) => {
-                let _ = engine.submit(text, sayd_core::engine::SayOpts::default());
+                if let Err(e) = engine.submit(text, speak_opts()) {
+                    eprintln!("sayd: {e}");
+                }
             }
             Err(e) => eprintln!("sayd: {e}"),
         });
@@ -459,6 +472,21 @@ mod tests {
         assert!(
             !joined.contains("settings"),
             "a dead Settings entry is worse than none"
+        );
+    }
+
+    #[test]
+    fn speak_opts_uses_hotkey_source_for_replace_policy() {
+        use sayd_core::queue::Policy;
+        let opts = super::speak_opts();
+        assert_eq!(
+            opts.source, Source::Hotkey,
+            "tray speak actions must use Hotkey source"
+        );
+        assert_eq!(
+            opts.source.default_policy(),
+            Policy::Replace,
+            "Hotkey source must resolve to Replace policy"
         );
     }
 }
