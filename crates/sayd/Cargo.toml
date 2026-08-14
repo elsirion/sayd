@@ -16,7 +16,12 @@ sayd-g2p.workspace = true
 cpal = "0.18"
 rtrb = "0.3"
 libc = "0.2"
-wl-clipboard-rs = { version = "0.9", default-features = false, features = ["dlopen"] }
+# No features on purpose. `dlopen` (and `native_lib`) route the Wayland
+# connection through libwayland-client via FFI, which then has to be found at
+# runtime -- on NixOS it is not on the loader path, so the daemon fails to
+# reach the compositor on a machine whose compositor is running fine. Featureless,
+# wayland-backend speaks the wire protocol from Rust and needs no C library at all.
+wl-clipboard-rs = { version = "0.9", default-features = false }
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
 ksni = "0.3"

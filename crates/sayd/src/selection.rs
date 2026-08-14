@@ -9,9 +9,12 @@
 //! These calls open their own short-lived Wayland connection and block, so
 //! callers on an async runtime must run them on a blocking thread.
 
+use std::env;
+use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, RawFd};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use wl_clipboard_rs::paste::{get_contents, ClipboardType, Error, MimeType, Seat};
@@ -86,6 +89,79 @@ const SELECTION_READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// a single selection read.
 const SELECTION_READ_OVERALL_CAP: Duration =
     Duration::from_secs(SELECTION_READ_TIMEOUT.as_secs() * 6);
+
+/// Lowercase the first character of a message so it reads as a sentence
+/// fragment after our own `could not read the ...: ` prefix.
+///
+/// The libraries under this module capitalise their messages; we splice them
+/// into the middle of ours.
+fn lowercase_first(msg: String) -> String {
+    match msg.chars().next() {
+        Some(first) => format!("{}{}", first.to_lowercase(), &msg[first.len_utf8()..]),
+        None => msg,
+    }
+}
+
+/// Where a Wayland client looks for the compositor socket, given the two
+/// environment variables that decide it.
+///
+/// Mirrors `wayland_client::Connection::connect_to_env`: `WAYLAND_DISPLAY` is
+/// used as-is when absolute, and is otherwise resolved against
+/// `XDG_RUNTIME_DIR`. `None` means the environment does not name a socket at
+/// all.
+fn compositor_socket_path(
+    display: Option<&OsString>,
+    runtime_dir: Option<&OsString>,
+) -> Option<PathBuf> {
+    let display = PathBuf::from(display?);
+    if display.is_absolute() {
+        return Some(display);
+    }
+    let mut path = PathBuf::from(runtime_dir?);
+    if !path.is_absolute() {
+        return None;
+    }
+    path.push(display);
+    Some(path)
+}
+
+/// Explain a failed compositor connection in terms of what the operator can
+/// actually change.
+///
+/// `wl-clipboard-rs` reports every connection failure as the same sentence --
+/// "Couldn't connect to the Wayland compositor" -- whether the socket is
+/// missing, the environment never named one, or the client library could not
+/// be loaded. That is indistinguishable in a log, and the most common cause by
+/// far is the one this spells out: a `sayd` started outside the graphical
+/// session (a systemd user unit without the session environment imported, a
+/// bare TTY, an ssh shell) has no `WAYLAND_DISPLAY`, so there is nothing to
+/// connect to no matter how healthy the compositor is.
+///
+/// Takes the environment as arguments rather than reading it, so the tests can
+/// cover every branch without mutating process-global state.
+fn describe_wayland_env(display: Option<&OsString>, runtime_dir: Option<&OsString>) -> String {
+    let Some(display) = display else {
+        return "WAYLAND_DISPLAY is not set in sayd's environment, so no compositor \
+                could be found. sayd has to run inside the graphical session: start it \
+                from the sway config with `exec sayd`, or, from a systemd user unit, \
+                import the session environment first (see \
+                docs/sh.sayd.Sayd.service.example)"
+            .to_string();
+    };
+
+    match compositor_socket_path(Some(display), runtime_dir) {
+        Some(path) => format!(
+            "nothing is listening on {}, the socket WAYLAND_DISPLAY={} names",
+            path.display(),
+            Path::new(display).display()
+        ),
+        None => format!(
+            "WAYLAND_DISPLAY={} is a relative socket name and XDG_RUNTIME_DIR is not \
+             set to an absolute path, so it cannot be resolved to a socket",
+            Path::new(display).display()
+        ),
+    }
+}
 
 /// Convert raw bytes to a String, replacing invalid UTF-8 sequences lossily.
 fn bytes_to_string(bytes: Vec<u8>) -> String {
@@ -247,18 +323,25 @@ pub fn read(source: Source) -> Result<String, String> {
                  sway 1.9 or newer is required for the primary selection"
             ))
         }
-        Err(e) => {
-            let msg = e.to_string();
-            let lowercase_msg = if let Some(first_char) = msg.chars().next() {
-                format!(
-                    "{}{}",
-                    first_char.to_lowercase(),
-                    &msg[first_char.len_utf8()..]
+        Err(Error::WaylandConnection(cause)) => {
+            // The one failure worth diagnosing rather than just reporting:
+            // see `describe_wayland_env`. `cause` is printed too, since it is
+            // the library's own verdict and distinguishes a missing socket
+            // from a client library that would not load.
+            return Err(format!(
+                "could not read the {source}: {} -- {}",
+                lowercase_first(cause.to_string()),
+                describe_wayland_env(
+                    env::var_os("WAYLAND_DISPLAY").as_ref(),
+                    env::var_os("XDG_RUNTIME_DIR").as_ref(),
                 )
-            } else {
-                msg
-            };
-            return Err(format!("could not read the {source}: {lowercase_msg}"));
+            ));
+        }
+        Err(e) => {
+            return Err(format!(
+                "could not read the {source}: {}",
+                lowercase_first(e.to_string())
+            ));
         }
     };
 
@@ -295,6 +378,15 @@ mod tests {
         );
         let msg = r.unwrap_err();
         assert!(!msg.is_empty());
+        // Whichever way the connection failed here -- no variable, or a
+        // variable naming a socket nothing answers on -- the message has to
+        // name the environment it looked at. "Couldn't connect to the Wayland
+        // compositor" on its own sent a real debugging session hunting a
+        // healthy compositor.
+        assert!(
+            msg.contains("WAYLAND_DISPLAY"),
+            "the connection failure must say what environment it looked at: {msg:?}"
+        );
         assert!(
             msg.chars()
                 .next()
@@ -302,6 +394,72 @@ mod tests {
                 .unwrap_or(false),
             "error messages are sentence fragments, not capitalised: {msg:?}"
         );
+    }
+
+    /// The failure this diagnosis exists for: a daemon started outside the
+    /// graphical session. The library's own message is the same one it gives
+    /// for a dead socket, so the environment has to be named explicitly.
+    #[test]
+    fn no_wayland_display_is_reported_as_the_environment_problem_it_is() {
+        let msg = describe_wayland_env(None, Some(&OsString::from("/run/user/1000")));
+        assert!(
+            msg.contains("WAYLAND_DISPLAY is not set"),
+            "the missing variable must be named: {msg:?}"
+        );
+        assert!(
+            msg.contains("systemd") && msg.contains("exec sayd"),
+            "both ways of starting sayd inside the session should be pointed at: {msg:?}"
+        );
+    }
+
+    /// The other common case: the environment is fine, the socket is not.
+    /// Naming the path is what lets an operator check it.
+    #[test]
+    fn a_named_but_dead_socket_is_reported_with_its_resolved_path() {
+        let msg = describe_wayland_env(
+            Some(&OsString::from("wayland-1")),
+            Some(&OsString::from("/run/user/1000")),
+        );
+        assert!(
+            msg.contains("/run/user/1000/wayland-1"),
+            "the resolved socket path must appear: {msg:?}"
+        );
+        assert!(
+            !msg.contains("WAYLAND_DISPLAY is not set"),
+            "this is not the unset case: {msg:?}"
+        );
+    }
+
+    /// `WAYLAND_DISPLAY` may be an absolute path, in which case
+    /// `XDG_RUNTIME_DIR` plays no part -- matching `connect_to_env`.
+    #[test]
+    fn an_absolute_wayland_display_is_used_as_the_socket_path_directly() {
+        let path = compositor_socket_path(
+            Some(&OsString::from("/tmp/sway-socket")),
+            Some(&OsString::from("/run/user/1000")),
+        );
+        assert_eq!(path, Some(PathBuf::from("/tmp/sway-socket")));
+    }
+
+    /// A relative socket name with no runtime dir to resolve it against
+    /// cannot name a path at all; saying so beats printing a bare "wayland-1".
+    #[test]
+    fn a_relative_socket_name_without_a_runtime_dir_cannot_be_resolved() {
+        assert_eq!(
+            compositor_socket_path(Some(&OsString::from("wayland-1")), None),
+            None
+        );
+        let msg = describe_wayland_env(Some(&OsString::from("wayland-1")), None);
+        assert!(
+            msg.contains("XDG_RUNTIME_DIR"),
+            "the variable that would fix it must be named: {msg:?}"
+        );
+    }
+
+    #[test]
+    fn lowercase_first_leaves_an_empty_message_alone() {
+        assert_eq!(lowercase_first(String::new()), "");
+        assert_eq!(lowercase_first("Couldn't".to_string()), "couldn't");
     }
 
     #[test]

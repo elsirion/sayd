@@ -307,6 +307,31 @@ a CI or agent environment. Walk this yourself once, after installing:
    `playerctl -p sayd play-pause`) -- playback should toggle the same way
    the tray's Pause/Resume entry does.
 
+## Troubleshooting
+
+**`could not read the primary selection: ... -- WAYLAND_DISPLAY is not set`**
+
+`sayd` is running outside the graphical session, so there is no compositor
+for it to ask -- a systemd user unit that never received the session
+environment, a bare TTY, or an ssh shell. D-Bus, the tray and `say "text"`
+all keep working, which is why this shows up only on the selection
+keybinds. Start `sayd` from the sway config with `exec sayd`, or import the
+environment before the unit starts (see
+[`docs/sh.sayd.Sayd.service.example`](docs/sh.sayd.Sayd.service.example)).
+
+**`could not read the primary selection: ... -- nothing is listening on
+<path>`**
+
+The environment names a socket, but no compositor answers on it. Usually a
+stale `WAYLAND_DISPLAY` left over from an earlier session; compare it
+against `ls $XDG_RUNTIME_DIR/wayland-*`.
+
+**`this compositor does not support ... version N`**
+
+The compositor lacks `wlr-data-control`, which is how `sayd` reads the
+selection without keyboard focus. sway 1.9 or newer is required for the
+primary selection; check with `sway --version`.
+
 ## Status
 
 M1 (engine and audio), M2 (D-Bus interface, `say` CLI, selection and

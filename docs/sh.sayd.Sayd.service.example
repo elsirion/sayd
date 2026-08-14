@@ -4,6 +4,18 @@
 #
 # Install to ~/.config/systemd/user/sayd.service, then:
 #   systemctl --user enable --now sayd.service
+#
+# A systemd user unit does NOT inherit the compositor's environment. Without
+# WAYLAND_DISPLAY, sayd starts and serves D-Bus and the tray perfectly well but
+# every selection read fails with "could not read the primary selection". Give
+# sway the matching line so the session hands its environment to systemd
+# *before* this unit starts:
+#
+#   exec systemctl --user import-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR \
+#     SWAYSOCK XDG_CURRENT_DESKTOP
+#
+# (sway's own `exec sayd` needs none of this -- it inherits the environment
+# directly, which is why it is the default the README recommends.)
 
 [Unit]
 Description=sayd text-to-speech daemon
