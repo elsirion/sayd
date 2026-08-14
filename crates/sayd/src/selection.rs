@@ -367,26 +367,41 @@ mod tests {
         assert_eq!(Source::Clipboard.to_string(), "clipboard");
     }
 
+    /// End-to-end: `read` must never panic, whichever of its two legitimate
+    /// outcomes fires. A sandbox with no compositor reachable exercises the
+    /// error path below; a developer's real session -- the only kind of
+    /// machine this daemon is actually for -- has a live compositor, and a
+    /// successful read (of an empty selection or of real text) is exactly as
+    /// valid an outcome there as an error is in the sandbox. This used to
+    /// assert `is_err()` unconditionally, which is backwards: it passed only
+    /// on the machines `sayd` is *not* for and failed on the ones it is,
+    /// which is how a real desktop session got mistaken for a regression.
+    ///
+    /// Message-content assertions only make sense once there is a message,
+    /// so they run only on the error path and are skipped entirely on
+    /// success.
+    ///
+    /// Deliberately does not force one branch or the other by mutating
+    /// `WAYLAND_DISPLAY`: `std::env::set_var` is process-global, and every
+    /// other test in this binary would be racing it. The pure helpers
+    /// `describe_wayland_env` and `compositor_socket_path` above already
+    /// cover every shape that message can take, deterministically, against
+    /// explicit arguments rather than the real environment -- this test's
+    /// only remaining job is the thing they cannot cover: that the real,
+    /// end-to-end path through `wl_clipboard_rs::paste::get_contents` never
+    /// panics on either kind of machine, and produces a sane message on the
+    /// ones where it fails.
     #[test]
-    fn reading_without_a_wayland_display_is_an_error_not_a_panic() {
-        // No compositor is reachable in the test environment, so this
-        // exercises the failure path. It must return a readable reason.
+    fn reading_the_primary_selection_never_panics() {
         let r = read(Source::Primary);
-        assert!(
-            r.is_err(),
-            "expected an error with no compositor, got {r:?}"
-        );
-        let msg = r.unwrap_err();
+        let Err(msg) = r else {
+            // A live compositor answered -- the case this daemon exists
+            // for. Nothing further to check: whether the selection was
+            // empty or held text is not this test's concern.
+            return;
+        };
+
         assert!(!msg.is_empty());
-        // Whichever way the connection failed here -- no variable, or a
-        // variable naming a socket nothing answers on -- the message has to
-        // name the environment it looked at. "Couldn't connect to the Wayland
-        // compositor" on its own sent a real debugging session hunting a
-        // healthy compositor.
-        assert!(
-            msg.contains("WAYLAND_DISPLAY"),
-            "the connection failure must say what environment it looked at: {msg:?}"
-        );
         assert!(
             msg.chars()
                 .next()
@@ -394,6 +409,23 @@ mod tests {
                 .unwrap_or(false),
             "error messages are sentence fragments, not capitalised: {msg:?}"
         );
+
+        // A *connection* failure -- no compositor reachable at all, which
+        // is the only failure a sandbox with no `WAYLAND_DISPLAY` can ever
+        // produce -- is the one whose message `read` builds from two halves
+        // joined by " -- " (see its `Error::WaylandConnection` arm): the
+        // library's own cause, then `describe_wayland_env`'s verdict. No
+        // other failure `read` returns (an empty selection, an unsupported
+        // protocol, a stalled selection owner) joins two clauses that way,
+        // so this is how the test tells "the compositor could not even be
+        // reached" apart from every other reason a read can fail -- without
+        // needing `read` to expose which `Error` variant it saw.
+        if msg.contains(" -- ") {
+            assert!(
+                msg.contains("WAYLAND_DISPLAY"),
+                "a connection failure must say what environment it looked at: {msg:?}"
+            );
+        }
     }
 
     /// The failure this diagnosis exists for: a daemon started outside the
