@@ -74,9 +74,28 @@ impl SaydIface {
     /// with "no id" because the queue never mints id 0 (`Queue::next_id`
     /// starts at 1) and `CurrentId` already uses 0 to mean "nothing
     /// playing", so 0 cannot collide with a real id on either side of the
-    /// interface.
-    fn submit(&self, text: String, opts: SayOpts) -> fdo::Result<u32> {
-        match self.engine.submit(text, opts) {
+    /// interface. Also returned (id 0) when `EngineHandle::submit`'s own
+    /// bounded wait times out -- the submission is queued regardless (see
+    /// that method's doc comment), just without an id to report yet.
+    ///
+    /// C2: `EngineHandle::submit` blocks the calling thread on a channel
+    /// receive (bounded, but still potentially the full bound) waiting for
+    /// the engine's answer. Calling it directly from this `async fn` would
+    /// block whichever tokio worker thread happened to run it for that
+    /// whole wait; with only a handful of worker threads and every `Say`/
+    /// `SaySelection`/`SayClipboard` call doing this, a few concurrent
+    /// submissions were enough to exhaust the pool and stall *every* other
+    /// D-Bus method -- including fire-and-forget ones like `Stop`, whose own
+    /// handler never blocks on anything but still could not get scheduled.
+    /// `spawn_blocking` runs it on tokio's separate, much larger blocking
+    /// thread pool instead, so a slow submission no longer starves the
+    /// async runtime.
+    async fn submit(&self, text: String, opts: SayOpts) -> fdo::Result<u32> {
+        let engine = self.engine.clone();
+        let result = tokio::task::spawn_blocking(move || engine.submit(text, opts))
+            .await
+            .map_err(|e| fdo::Error::Failed(format!("submit task panicked: {e}")))?;
+        match result {
             // The queue's ids are `u64` and monotonically increasing, but the
             // wire type is `u32` (chosen to match `CurrentId` and `Cancel`,
             // and because a client has no use for ids beyond that range).
@@ -100,6 +119,7 @@ impl SaydIface {
     /// id 0 and `CurrentId` uses 0 for "nothing playing".
     async fn say(&self, text: String, opts: HashMap<String, OwnedValue>) -> fdo::Result<u32> {
         self.submit(text, say_opts_from(&opts, QueueSource::DBus))
+            .await
     }
 
     /// Speak the PRIMARY selection. Returns the utterance id, or 0 if
@@ -111,6 +131,7 @@ impl SaydIface {
             .map_err(|e| fdo::Error::Failed(format!("selection read panicked: {e}")))?
             .map_err(fdo::Error::Failed)?;
         self.submit(text, say_opts_from(&opts, QueueSource::Hotkey))
+            .await
     }
 
     /// Speak the clipboard. Returns the utterance id, or 0 if nothing was
@@ -122,6 +143,7 @@ impl SaydIface {
             .map_err(|e| fdo::Error::Failed(format!("clipboard read panicked: {e}")))?
             .map_err(fdo::Error::Failed)?;
         self.submit(text, say_opts_from(&opts, QueueSource::Hotkey))
+            .await
     }
 
     async fn pause(&self) {

@@ -27,6 +27,35 @@ use crate::synth::Synthesizer;
 /// synthesis, drains the sink, and runs the idle-unload check.
 const TICK_INTERVAL: Duration = Duration::from_millis(10);
 
+/// How long `submit` waits for the engine's synchronous answer before
+/// falling back to `Ok(None)` instead of continuing to block.
+///
+/// `Engine::submit` itself is cheap -- it cleans the text, applies policy
+/// and queues -- and `run`'s loop answers it (and publishes the resulting
+/// snapshot) before starting the next `tick()`, not after. The only way
+/// this wait runs long is if the run loop was already mid-`tick()` --
+/// synthesizing a whole chunk, measured 3.5-7.5s on real ONNX -- when the
+/// message arrived: that single call cannot be interrupted, so the message
+/// simply waits in the channel until it returns. This bound keeps a caller
+/// from waiting out the rest of a chunk that has nothing to do with its own
+/// request. In particular, the `sayd` binary's async D-Bus handler calls
+/// this from inside `tokio::task::spawn_blocking`, precisely so a long wait
+/// here blocks a blocking-pool thread instead of starving the async
+/// runtime's worker threads (which would otherwise stall unrelated,
+/// non-blocking calls like `Stop` too) -- but this bound is also what keeps
+/// the wait itself well under the CLI's own 3s call timeout.
+///
+/// Returning `Err` on timeout would recreate exactly the bug this exists to
+/// fix: the message was already handed to the engine successfully (`send`
+/// below returned `Ok`), so the text *is* queued (or otherwise handled)
+/// regardless of whether this wait times out. An `Err` would tell the
+/// caller otherwise, inviting a retry that double-queues. `Ok(None)`
+/// already means "accepted, no id" for a muted/empty submission; folding a
+/// timed-out-but-queued submission into the same case costs a caller the
+/// ability to `Cancel` that one utterance by id later -- a narrower loss
+/// than a false failure.
+const SUBMIT_REPLY_TIMEOUT: Duration = Duration::from_millis(250);
+
 /// A submission plus the channel its answer goes back on.
 type SubmitJob = (String, SayOpts, Sender<Result<Option<u64>, String>>);
 
@@ -83,15 +112,21 @@ impl EngineHandle {
         let _ = self.tx.send(Msg::Cmd(cmd));
     }
 
-    /// Submit text and wait for the engine's answer.
+    /// Submit text and wait for the engine's answer, up to
+    /// [`SUBMIT_REPLY_TIMEOUT`] -- see its doc comment for why this is
+    /// bounded and what a timeout means.
     pub fn submit(&self, text: String, opts: SayOpts) -> Result<Option<u64>, String> {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.tx
             .send(Msg::Submit(Box::new((text, opts, reply_tx))))
             .map_err(|_| "engine thread is not running".to_string())?;
-        reply_rx
-            .recv()
-            .map_err(|_| "engine thread stopped before answering".to_string())?
+        match reply_rx.recv_timeout(SUBMIT_REPLY_TIMEOUT) {
+            Ok(r) => r,
+            Err(RecvTimeoutError::Timeout) => Ok(None),
+            Err(RecvTimeoutError::Disconnected) => {
+                Err("engine thread stopped before answering".to_string())
+            }
+        }
     }
 
     /// The most recently published snapshot.
@@ -150,6 +185,21 @@ impl Drop for ShutDownOnDrop {
     }
 }
 
+/// Copy the engine's current snapshot into the published slot.
+///
+/// Called both right after handling a message and after every `tick()` (see
+/// `run`): a `submit`/`handle` state change must be visible the moment it
+/// happens, not deferred until the tick that happens to follow it -- `tick`
+/// synthesizes one whole chunk synchronously and can run for seconds on
+/// real ONNX, so "only after tick" meant every D-Bus property lagged a
+/// submission by a full chunk (C1).
+fn publish(published: &Arc<Mutex<Snapshot>>, engine: &Engine) {
+    match published.lock() {
+        Ok(mut g) => *g = engine.snapshot(),
+        Err(poisoned) => *poisoned.into_inner() = engine.snapshot(),
+    }
+}
+
 fn run(
     mut engine: Engine,
     rx: Receiver<Msg>,
@@ -160,13 +210,24 @@ fn run(
 
     loop {
         match rx.recv_timeout(TICK_INTERVAL) {
-            Ok(Msg::Cmd(c)) => engine.handle(c),
+            Ok(Msg::Cmd(c)) => {
+                engine.handle(c);
+                publish(&published, &engine);
+            }
             Ok(Msg::Submit(job)) => {
                 let (text, opts, reply) = *job;
                 let r = engine.submit(text, opts);
+                // Published before the reply is sent, not after: a caller
+                // waiting on `reply_rx` (in particular `EngineHandle::
+                // submit`) must never be able to observe a stale snapshot
+                // by polling immediately after its own call returns.
+                publish(&published, &engine);
                 let _ = reply.send(r);
             }
-            Ok(Msg::ReplaceSink(sink)) => engine.replace_sink(sink),
+            Ok(Msg::ReplaceSink(sink)) => {
+                engine.replace_sink(sink);
+                publish(&published, &engine);
+            }
             // An explicit `Msg::Shutdown` breaks immediately, skipping the
             // final `tick()` and publish below; a `Command::Shutdown` sent
             // through `send()` instead falls through to `tick()` and is
@@ -179,11 +240,7 @@ fn run(
         }
 
         engine.tick();
-
-        match published.lock() {
-            Ok(mut g) => *g = engine.snapshot(),
-            Err(poisoned) => *poisoned.into_inner() = engine.snapshot(),
-        }
+        publish(&published, &engine);
 
         if engine.is_shutdown() {
             break;
@@ -206,6 +263,110 @@ mod tests {
             Box::new(StubSynthesizer::new()),
             Box::new(VecSink::new(24_000 * 10)),
         )
+    }
+
+    /// A `Synthesizer` that sleeps before returning, modelling the 3.5-7.5s
+    /// measured per chunk on real ONNX. `StubSynthesizer` returns instantly,
+    /// which is exactly why the engine tests above never caught C1 or C2:
+    /// "published after tick" and "published immediately" are
+    /// indistinguishable when tick() itself takes no measurable time.
+    struct SlowSynthesizer {
+        delay: Duration,
+    }
+
+    impl SlowSynthesizer {
+        fn new(delay: Duration) -> Self {
+            SlowSynthesizer { delay }
+        }
+    }
+
+    impl crate::synth::Synthesizer for SlowSynthesizer {
+        fn phonemize(&mut self, text: &str, _voice: &str) -> String {
+            text.to_string()
+        }
+        fn fits(&mut self, _phonemes: &str) -> bool {
+            true
+        }
+        fn synth(&mut self, phonemes: &str, _voice: &str, _speed: f32) -> Result<Vec<f32>, String> {
+            std::thread::sleep(self.delay);
+            Ok(vec![0.0; phonemes.len() * 100])
+        }
+        fn unload(&mut self) {}
+        fn is_loaded(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn published_snapshot_reflects_a_submission_without_waiting_for_a_slow_synthesis() {
+        // C1, pinned with a synthesizer slow enough that "after tick" and
+        // "immediately" cannot be confused by timing noise: `Engine::
+        // submit` sets `state = Speaking` synchronously (see engine.rs), so
+        // the published snapshot must show it right away, not after the
+        // chunk of synthesis that submission triggers.
+        let delay = Duration::from_millis(600);
+        let h = EngineHandle::spawn(
+            Config::default(),
+            Box::new(SlowSynthesizer::new(delay)),
+            Box::new(VecSink::new(24_000 * 10)),
+        );
+        h.submit("hello there.".into(), SayOpts::default())
+            .expect("accepted");
+        let s = h.snapshot();
+        assert_eq!(
+            s.state,
+            State::Speaking,
+            "the snapshot must reflect the submission immediately, not after \
+             the {delay:?} synthesis it triggers; got {s:?}"
+        );
+        h.shutdown();
+    }
+
+    #[test]
+    fn submit_returns_promptly_even_while_a_slow_synthesis_is_in_flight() {
+        // C2, pinned directly: `EngineHandle::submit` used to block on an
+        // unbounded `reply_rx.recv()` that was only serviced between
+        // whole-chunk ticks, so a second submission arriving while the
+        // first's chunk was still synthesizing had to wait out that whole
+        // chunk -- measured 3.5-7.5s on real ONNX, blowing the CLI's 3s
+        // timeout. `SUBMIT_REPLY_TIMEOUT`'s bounded backstop is what
+        // actually guarantees this now; see its doc comment.
+        let delay = Duration::from_secs(2);
+        let h = EngineHandle::spawn(
+            Config::default(),
+            Box::new(SlowSynthesizer::new(delay)),
+            Box::new(VecSink::new(24_000 * 10)),
+        );
+        // Long enough that `chunk()` splits it into more than one chunk, so
+        // the engine thread is still inside `tick()`'s `synth()` call for
+        // the *second* submission below, not just idling between chunks.
+        h.submit(
+            "This is one sentence in a long batch of text. ".repeat(15),
+            SayOpts::default(),
+        )
+        .expect("accepted");
+        // Give the engine thread a moment to actually enter the slow
+        // `synth()` call before submitting again, so this reliably
+        // exercises "arrives mid-synthesis" rather than racing the first
+        // message's own handling.
+        std::thread::sleep(Duration::from_millis(100));
+
+        let start = Instant::now();
+        let result = h.submit("a second, unrelated utterance.".into(), SayOpts::default());
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < delay / 4,
+            "submit took {elapsed:?} while a {delay:?} synthesis was in flight -- \
+             it must not wait for it"
+        );
+        assert!(
+            result.is_ok(),
+            "a timed-out-but-queued submission must not be reported as an error \
+             -- that would recreate the exact double-queue bug this backstop \
+             exists to avoid: {result:?}"
+        );
+        h.shutdown();
     }
 
     /// Poll until `f` holds or the deadline passes.

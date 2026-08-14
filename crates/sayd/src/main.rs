@@ -17,7 +17,6 @@ use std::time::{Duration, Instant};
 
 use sayd_core::audio::AudioSink;
 use sayd_core::config::Config;
-use sayd_core::engine::State;
 use sayd_core::handle::EngineHandle;
 use zbus::fdo::{RequestNameFlags, RequestNameReply};
 use zbus::zvariant::OwnedValue;
@@ -301,24 +300,34 @@ async fn main() -> std::process::ExitCode {
                     last = now;
                 }
 
-                // Recover from *any* engine error by reacquiring the sink, not
-                // just ones whose message happens to mention "device".
-                //
-                // `Engine::tick`'s two failure paths (a `take_error()` from the
-                // sink, or a synth error) both set `state = Error` only after
-                // clearing the queue and dropping `current` in the same step
-                // (see sayd-core/src/engine.rs), and `submit`'s own
-                // Error-setting branch only fires when nothing was already
-                // playing or paused, so nothing legitimate is ever in flight
-                // while `state == Error`. Handing the engine a fresh sink is
-                // therefore always safe here, regardless of which cpal
-                // `StreamError` variant (or unrelated synth failure) produced
-                // the text in `error` -- cpal 0.17.1's `StreamInvalidated` and
+                // Recover from a *sink*-kind engine error by reacquiring the
+                // device, regardless of which cpal `StreamError` variant
+                // produced it -- not just ones whose message happens to
+                // mention "device". cpal 0.17.1's `StreamInvalidated` and
                 // `BufferUnderrun` messages don't contain "device" the way
-                // `DeviceNotAvailable`'s does, so matching on the string missed
-                // exactly the ordinary desktop hiccups (a PulseAudio restart,
-                // an XRUN) this loop exists to recover from.
-                if last.state == State::Error {
+                // `DeviceNotAvailable`'s does, so an earlier version of this
+                // loop that matched on the message text missed exactly the
+                // ordinary desktop hiccups (a PulseAudio restart, an XRUN)
+                // this loop exists to recover from -- hence gating on
+                // `error_kind == Sink` rather than the message string.
+                //
+                // Gating on `state == Error` alone (an even earlier version)
+                // was wrong in the other direction: `Engine::tick`'s
+                // *synthesis* failure path (bad model path, corrupt weights)
+                // sets the same `state == Error`, and reacquiring a sink that
+                // was never the problem would clear it via `replace_sink`
+                // every time, making the daemon look recovered while every
+                // submission kept failing the same way, silently. `Engine`
+                // now tags *why* it is in `Error` (`Snapshot::error_kind`,
+                // sayd-core/src/engine.rs); this loop only ever reacquires
+                // for `Sink`. A `Synth` (or rejected-submission) error is
+                // left alone: it persists, `Engine::submit` now rejects new
+                // submissions itself rather than silently clearing it (see
+                // `ErrorKind`'s doc comment), and an explicit Stop/Next/
+                // SkipSentence/SetMuted can still dismiss it.
+                let is_sink_error =
+                    matches!(last.error_kind, Some(sayd_core::engine::ErrorKind::Sink));
+                if is_sink_error {
                     let now_instant = Instant::now();
                     if now_instant >= next_recovery_attempt {
                         // Throttle to `RECOVERY_RETRY_INTERVAL` rather than

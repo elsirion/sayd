@@ -29,6 +29,34 @@ pub enum State {
     Error,
 }
 
+/// Where an `Error` came from, so a caller (in practice, the daemon's
+/// device-recovery loop) can react to *why* the engine is in `Error`
+/// instead of treating every cause alike.
+///
+/// C3: the daemon used to trigger audio-device reacquisition on `state ==
+/// Error` alone, which was right for a genuine device failure but wrong for
+/// a synthesis failure (bad model path, corrupt weights) or a rejected
+/// submission (text too long) -- reacquiring a perfectly fine device
+/// cleared the error and made the daemon look recovered while the real
+/// problem (a missing model file, say) was still there and every
+/// submission kept failing the same way, silently.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ErrorKind {
+    /// This submission alone was rejected on its own terms (e.g. over
+    /// `max_chars`); nothing about the engine as a whole is broken, so a
+    /// later, valid submission clears it -- see `Engine::submit`.
+    Rejected,
+    /// `AudioSink::take_error` reported a device failure. The only kind
+    /// that should arm a device-reacquisition loop.
+    Sink,
+    /// `Synthesizer::synth` itself failed. Reacquiring the audio device
+    /// would not fix this; it persists until an explicit "shut up" command
+    /// (`Stop`/`Next`/`SkipSentence`/`SetMuted`) dismisses it, and new
+    /// submissions are rejected rather than silently accepted while it
+    /// holds -- see `Engine::submit`.
+    Synth,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct SayOpts {
     pub policy: Option<Policy>,
@@ -66,6 +94,11 @@ pub struct Snapshot {
     pub current_text: String,
     pub current_id: u64,
     pub error: Option<String>,
+    /// `None` iff `error` is `None` -- see the invariant documented on
+    /// `Engine::error`. Not exposed over D-Bus (the wire `Error` property
+    /// stays a plain string); this is for in-process callers like the
+    /// daemon's recovery loop that need to know *why*, not just *that*.
+    pub error_kind: Option<ErrorKind>,
 }
 
 /// The utterance currently being spoken, decomposed into chunks.
@@ -104,6 +137,11 @@ pub struct Engine {
     /// `tick`'s device-failure branch (`Paused -> Error`) is the same kind
     /// of route and unpauses the sink for the same reason.
     error: Option<String>,
+    /// Third invariant, alongside the two above: `error_kind.is_some() <=>
+    /// error.is_some()`. Every place that sets or clears `error` must set or
+    /// clear this in the same step. See `ErrorKind`'s own doc comment for
+    /// why this exists.
+    error_kind: Option<ErrorKind>,
     idle_since: Option<Instant>,
     shutdown: bool,
 }
@@ -118,6 +156,7 @@ impl Engine {
             current: None,
             state: State::Idle,
             error: None,
+            error_kind: None,
             idle_since: Some(Instant::now()),
             shutdown: false,
         }
@@ -219,6 +258,39 @@ impl Engine {
     /// A D-Bus `Say` method or a CLI entry point should call this directly
     /// to learn whether its own submission was accepted and queued.
     pub fn submit(&mut self, text: String, opts: SayOpts) -> Result<Option<u64>, String> {
+        // Checked before `max_chars` (the reverse of this method's original
+        // order): a systemic error (`Sink`/`Synth`) must persist and reject
+        // *every* new submission while it holds, not just ones that happen
+        // to also be over-long. Checking `max_chars` first would let an
+        // over-long submission's own `Rejected` overwrite a standing
+        // `Sink`/`Synth` error, which is exactly the "submissions are
+        // silently swallowed" bug C3 fixes -- see `ErrorKind`'s doc comment.
+        if self.state == State::Error {
+            match self.error_kind {
+                Some(ErrorKind::Sink) | Some(ErrorKind::Synth) => {
+                    return Err(self
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "the engine is in an error state".to_string()));
+                }
+                // `Rejected` is about *this* submission trying again, not a
+                // systemic problem, so it clears the way `submit` always
+                // has. `None` is defensive only: the invariant on
+                // `error_kind` says it cannot happen alongside `state ==
+                // Error`, but treating it as "nothing worth persisting"
+                // rather than silently falling through to `Sink`/`Synth`'s
+                // reject-forever behaviour keeps this from becoming stuck.
+                Some(ErrorKind::Rejected) | None => {
+                    // Error only ever arises with nothing legitimately in
+                    // flight (see the branch below and `tick`'s
+                    // synth-failure path), so there is no `current` to
+                    // preserve here.
+                    self.state = State::Idle;
+                    self.error = None;
+                    self.error_kind = None;
+                }
+            }
+        }
         if text.chars().count() > self.cfg.max_chars {
             let msg = format!(
                 "text is {} characters, limit is {}",
@@ -233,15 +305,9 @@ impl Engine {
             if self.state != State::Speaking && self.state != State::Paused {
                 self.state = State::Error;
                 self.error = Some(msg.clone());
+                self.error_kind = Some(ErrorKind::Rejected);
             }
             return Err(msg);
-        }
-        if self.state == State::Error {
-            // Error only ever arises with nothing legitimately in flight
-            // (see the branch above and `tick`'s synth-failure path), so
-            // there is no `current` to preserve here.
-            self.state = State::Idle;
-            self.error = None;
         }
         if self.cfg.muted {
             return Ok(None); // accepted and discarded
@@ -295,6 +361,7 @@ impl Engine {
         if let Some(e) = self.sink.take_error() {
             self.state = State::Error;
             self.error = Some(e);
+            self.error_kind = Some(ErrorKind::Sink);
             self.current = None;
             self.queue.clear();
             // This is a route out of `Paused` (see the pause invariant on
@@ -359,6 +426,7 @@ impl Engine {
                     });
                     self.state = State::Speaking;
                     self.error = None;
+                    self.error_kind = None;
                     self.idle_since = None;
                 }
                 None => {
@@ -412,6 +480,7 @@ impl Engine {
             Err(e) => {
                 self.state = State::Error;
                 self.error = Some(e);
+                self.error_kind = Some(ErrorKind::Synth);
                 self.current = None;
                 self.queue.clear();
             }
@@ -420,7 +489,16 @@ impl Engine {
 
     /// Swap in a fresh sink after a device failure, clearing the error.
     ///
-    /// The daemon calls this when it manages to reacquire the audio device.
+    /// The daemon calls this when it manages to reacquire the audio device,
+    /// which it now only attempts for a `Sink`-kind error (see `ErrorKind`)
+    /// -- so in practice this is only ever called while `error_kind ==
+    /// Some(ErrorKind::Sink)`. It still clears whatever error is present
+    /// unconditionally rather than checking the kind itself: a fresh,
+    /// working sink is a reasonable "start clean" point regardless of how
+    /// it got here, and gating the *call site* in the daemon is enough to
+    /// keep a `Synth` error from being cleared by an unrelated device
+    /// reacquisition in the first place.
+    ///
     /// The queue was cleared when the failure surfaced, so this returns the
     /// engine to a clean idle state rather than resuming a half-played
     /// utterance whose audio is gone.
@@ -434,6 +512,7 @@ impl Engine {
         self.sink.set_paused(false);
         self.current = None;
         self.error = None;
+        self.error_kind = None;
         self.state = State::Idle;
         self.idle_since = Some(Instant::now());
     }
@@ -488,6 +567,7 @@ impl Engine {
     fn dismiss_error_and_go_idle(&mut self) {
         self.state = State::Idle;
         self.error = None;
+        self.error_kind = None;
         self.sink.set_paused(false);
         if self.idle_since.is_none() {
             self.idle_since = Some(Instant::now());
@@ -528,6 +608,7 @@ impl Engine {
                 .unwrap_or_default(),
             current_id: self.current.as_ref().map(|c| c.id).unwrap_or(0),
             error: self.error.clone(),
+            error_kind: self.error_kind,
         }
     }
 
@@ -1799,5 +1880,146 @@ mod tests {
             "the engine must work again after the sink is replaced, even though the failure \
              arrived while paused"
         );
+    }
+
+    /// A `Synthesizer` whose `synth` always fails, modelling a bad models
+    /// directory or a corrupt weight file: `sayd-kokoro`/`ort` themselves
+    /// report a failure like `onnxruntime: File at '.../model.onnx' does
+    /// not exist` from the first `synth` call, not from construction.
+    struct FailingSynth;
+    impl crate::synth::Synthesizer for FailingSynth {
+        fn phonemize(&mut self, t: &str, _voice: &str) -> String {
+            t.into()
+        }
+        fn fits(&mut self, _: &str) -> bool {
+            true
+        }
+        fn synth(&mut self, _: &str, _: &str, _: f32) -> Result<Vec<f32>, String> {
+            Err("onnxruntime: File at '/models/model.onnx' does not exist".into())
+        }
+        fn unload(&mut self) {}
+        fn is_loaded(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn synthesis_failure_persists_and_rejects_new_submissions_instead_of_being_silently_cleared() {
+        // C3: `Engine::submit` used to clear *any* stuck `Error`
+        // unconditionally on a new submission, and the daemon's recovery
+        // loop reacted to *any* `Error` by reacquiring the audio device --
+        // for a synthesis failure (bad model path, corrupt weights),
+        // neither is right: reacquiring a fine device does nothing about a
+        // broken model, and clearing the error on the next submission made
+        // the daemon look recovered while every submission kept failing the
+        // same way, silently. The design doc requires the error to persist
+        // and new submissions to be rejected.
+        let mut e = Engine::new(
+            Config::default(),
+            Box::new(FailingSynth),
+            Box::new(VecSink::new(24_000)),
+        );
+        e.handle(say("Anything."));
+        for _ in 0..20 {
+            e.tick();
+        }
+        let s = e.snapshot();
+        assert_eq!(s.state, State::Error);
+        assert_eq!(
+            s.error_kind,
+            Some(ErrorKind::Synth),
+            "a synthesis failure must be distinguishable from a device failure"
+        );
+
+        let result = e.submit("try again.".into(), SayOpts::default());
+        assert!(
+            result.is_err(),
+            "submissions must be rejected while a synthesis error persists, got {result:?}"
+        );
+        let after = e.snapshot();
+        assert_eq!(after.state, State::Error, "the error must persist");
+        assert!(after.error.is_some(), "the error must persist");
+        assert_eq!(after.error_kind, Some(ErrorKind::Synth));
+    }
+
+    #[test]
+    fn an_explicit_stop_still_dismisses_a_persistent_synthesis_error() {
+        // The design doc's escape hatch: submissions are rejected while a
+        // `Synth` error persists, but an explicit "shut up" command must
+        // still be able to clear it (e.g. after the operator fixes the
+        // models directory and wants the daemon usable again without a
+        // restart).
+        let mut e = Engine::new(
+            Config::default(),
+            Box::new(FailingSynth),
+            Box::new(VecSink::new(24_000)),
+        );
+        e.handle(say("Anything."));
+        for _ in 0..20 {
+            e.tick();
+        }
+        assert_eq!(e.snapshot().state, State::Error);
+        e.handle(Command::Stop);
+        let s = e.snapshot();
+        assert_eq!(s.state, State::Idle);
+        assert_eq!(s.error, None);
+        assert_eq!(s.error_kind, None);
+    }
+
+    #[test]
+    fn device_failure_is_tagged_as_a_sink_error_so_recovery_still_arms() {
+        // Mirror of the test above via the other route into `Error`: C3's
+        // fix must not undo the earlier fix that lets *any* device failure
+        // -- cpal's `StreamInvalidated`/`BufferUnderrun` included, neither
+        // of which mention "device" in their message -- arm the daemon's
+        // reacquisition loop.
+        let mut e = Engine::new(
+            Config::default(),
+            Box::new(StubSynthesizer::new()),
+            Box::new(FailingSink::new()),
+        );
+        e.submit(text_spanning_multiple_chunks(), SayOpts::default())
+            .expect("accepted");
+        for _ in 0..200 {
+            e.tick();
+        }
+        let s = e.snapshot();
+        assert_eq!(s.state, State::Error);
+        assert_eq!(
+            s.error_kind,
+            Some(ErrorKind::Sink),
+            "a device failure must arm the daemon's recovery loop"
+        );
+    }
+
+    #[test]
+    fn a_rejection_is_tagged_and_a_later_valid_submission_still_clears_it() {
+        // Pins `ErrorKind::Rejected`'s own behaviour directly: unlike
+        // `Sink`/`Synth`, a rejection is about the submission itself, not
+        // the engine, so it must keep auto-clearing on a later valid
+        // submission exactly as `a_later_successful_say_clears_the_error`
+        // (above) already pins by observable behaviour alone.
+        let cfg = Config {
+            max_chars: 10,
+            ..Config::default()
+        };
+        let mut e = Engine::new(
+            cfg,
+            Box::new(StubSynthesizer::new()),
+            Box::new(VecSink::new(24_000 * 10)),
+        );
+        e.handle(say("this is definitely longer than ten characters"));
+        let s = e.snapshot();
+        assert_eq!(s.state, State::Error);
+        assert_eq!(s.error_kind, Some(ErrorKind::Rejected));
+
+        let id = e
+            .submit("ok.".into(), SayOpts::default())
+            .expect("a valid submission must be accepted")
+            .expect("must be queued");
+        assert_ne!(id, 0);
+        let after = e.snapshot();
+        assert_eq!(after.error, None);
+        assert_eq!(after.error_kind, None);
     }
 }
