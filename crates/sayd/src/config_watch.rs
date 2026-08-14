@@ -53,11 +53,16 @@ pub struct ConfigStore {
 }
 
 impl ConfigStore {
-    pub fn new(path: PathBuf, engine: EngineHandle) -> Self {
+    /// `running` is the config the engine was spawned with -- i.e. what the
+    /// file said at startup. It is the stamp's first value because the
+    /// engine and the file already agree at that point: without it the
+    /// very first write of identical bytes (which is what most editor saves
+    /// are) looks like an external change and is applied as one.
+    pub fn new(path: PathBuf, engine: EngineHandle, running: Config) -> Self {
         ConfigStore {
             path,
             engine,
-            last_written: Mutex::new(None),
+            last_written: Mutex::new(Some(running)),
             applied_reloads: AtomicUsize::new(0),
         }
     }
@@ -299,8 +304,12 @@ mod tests {
     use sayd_core::synth::StubSynthesizer;
 
     fn engine() -> EngineHandle {
+        engine_with(Config::default())
+    }
+
+    fn engine_with(cfg: Config) -> EngineHandle {
         EngineHandle::spawn(
-            Config::default(),
+            cfg,
             Box::new(StubSynthesizer::new()),
             // Capacity large enough that nothing in this module's tests
             // (which only exercise config save/reload, never real
@@ -334,7 +343,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
         let engine = engine();
-        let store = ConfigStore::new(path.clone(), engine.clone());
+        let store = ConfigStore::new(path.clone(), engine.clone(), Config::default());
 
         let cfg = Config {
             voice: "am_fenrir".into(),
@@ -363,7 +372,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
         let engine = engine();
-        let store = ConfigStore::new(path.clone(), engine.clone());
+        let store = ConfigStore::new(path.clone(), engine.clone(), Config::default());
 
         let cfg = Config {
             voice: "am_fenrir".into(),
@@ -379,13 +388,41 @@ mod tests {
         engine.shutdown();
     }
 
+    /// At startup the engine is already running what the file says, so an
+    /// editor that writes the identical bytes back -- the common case for a
+    /// save with no change in it -- is not an edit and must not be applied
+    /// as one. That only holds if the store knows what the engine started
+    /// with.
+    #[test]
+    fn the_config_the_engine_started_with_is_not_an_external_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let cfg = Config {
+            voice: "am_fenrir".into(),
+            ..Config::default()
+        };
+        cfg.save_to(&path).expect("write");
+
+        let engine = engine_with(cfg.clone());
+        let store = ConfigStore::new(path.clone(), engine.clone(), cfg.clone());
+
+        // The bytes an editor would write back unchanged.
+        cfg.save_to(&path).expect("rewrite");
+        assert_eq!(
+            store.reload(),
+            ReloadOutcome::OwnWrite,
+            "the config the engine started on is not a change to apply"
+        );
+        engine.shutdown();
+    }
+
     /// A genuine hand edit must reach the engine.
     #[test]
     fn an_external_edit_is_applied() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
         let engine = engine();
-        let store = ConfigStore::new(path.clone(), engine.clone());
+        let store = ConfigStore::new(path.clone(), engine.clone(), Config::default());
 
         std::fs::write(&path, "voice = \"bm_george\"\nspeed = 1.5\n").expect("write");
         assert_eq!(store.reload(), ReloadOutcome::Applied);
@@ -407,7 +444,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
         let engine = engine();
-        let store = ConfigStore::new(path.clone(), engine.clone());
+        let store = ConfigStore::new(path.clone(), engine.clone(), Config::default());
 
         let cfg = Config {
             voice: "am_fenrir".into(),
@@ -440,7 +477,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
         let engine = engine();
-        let store = Arc::new(ConfigStore::new(path.clone(), engine.clone()));
+        let store = Arc::new(ConfigStore::new(path.clone(), engine.clone(), Config::default()));
         let _watcher = spawn(store).expect("watcher starts");
 
         std::fs::write(&path, "voice = \"bm_george\"\n").expect("write");
@@ -458,7 +495,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
         let engine = engine();
-        let store = Arc::new(ConfigStore::new(path.clone(), engine.clone()));
+        let store = Arc::new(ConfigStore::new(path.clone(), engine.clone(), Config::default()));
 
         let older = Config::default();
         let newer = Config {
@@ -512,7 +549,7 @@ mod tests {
         std::fs::write(&path, "voice = \"bm_george\"\nspeed = 1.5\n").expect("write");
 
         let engine = engine();
-        let store = Arc::new(ConfigStore::new(path.clone(), engine.clone()));
+        let store = Arc::new(ConfigStore::new(path.clone(), engine.clone(), Config::default()));
         let _watcher = spawn(store.clone()).expect("watcher starts");
 
         // What `cat > config.toml` looks like from the outside: empty, then
@@ -561,7 +598,7 @@ mod tests {
         std::fs::write(&path, "voice = \"bm_george\"\n").expect("write");
 
         let engine = engine();
-        let store = Arc::new(ConfigStore::new(path.clone(), engine.clone()));
+        let store = Arc::new(ConfigStore::new(path.clone(), engine.clone(), Config::default()));
         let _watcher = spawn(store).expect("watcher starts");
 
         engine.send(Command::SetVoice("am_fenrir".into()));
@@ -585,7 +622,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
         let engine = engine();
-        let store = ConfigStore::new(path.clone(), engine.clone());
+        let store = ConfigStore::new(path.clone(), engine.clone(), Config::default());
         assert_eq!(store.reload(), ReloadOutcome::Missing);
         engine.shutdown();
     }

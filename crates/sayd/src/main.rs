@@ -363,14 +363,17 @@ async fn main() -> std::process::ExitCode {
         }
     };
 
-    let engine = EngineHandle::spawn(cfg, Box::new(synth), sink);
+    let engine = EngineHandle::spawn(cfg.clone(), Box::new(synth), sink);
 
     // Config is a two-way surface from here on: the settings window writes
     // through this, and a hand edit comes back through the watcher. Both
-    // end at `Command::ApplyConfig`.
+    // end at `Command::ApplyConfig`. The store is told what the engine was
+    // spawned with so that the two agree from t=0 rather than from the
+    // first write.
     let store = std::sync::Arc::new(config_watch::ConfigStore::new(
         Config::path(),
         engine.clone(),
+        cfg,
     ));
     // Held for the life of the process: dropping the watcher stops the
     // watch, silently.
