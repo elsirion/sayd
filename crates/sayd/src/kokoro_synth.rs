@@ -115,6 +115,18 @@ impl Synthesizer for KokoroSynthesizer {
     fn is_loaded(&self) -> bool {
         self.session.is_some()
     }
+
+    /// A cheap filesystem check -- no session, no model load -- for whether
+    /// `voice` has an installed voice pack. Voice packs live at
+    /// `<models_dir>/voices/<voice>.bin` (see `load_voice`'s call site in
+    /// `sayd_kokoro::Kokoro`, which this mirrors); existence of that file is
+    /// exactly what `load_voice` itself needs to succeed.
+    fn voice_exists(&self, voice: &str) -> bool {
+        self.models_dir
+            .join("voices")
+            .join(format!("{voice}.bin"))
+            .is_file()
+    }
 }
 
 #[cfg(all(test, feature = "models"))]
@@ -152,6 +164,21 @@ mod models_tests {
             (0.5..20.0).contains(&seconds),
             "synthesized audio duration {seconds}s is not plausible for this text"
         );
+    }
+
+    /// M21: `voice_exists` must agree with what `load_voice`/`synth` would
+    /// actually accept, checked against the real `models/voices` directory
+    /// rather than a fake one -- a known voice pack exists there and an
+    /// obviously-bogus name does not.
+    #[test]
+    fn voice_exists_matches_the_real_voices_directory() {
+        let cfg = Config::default();
+        let s = KokoroSynthesizer::new(models_dir(), &cfg).expect("synthesizer constructs");
+        assert!(
+            s.voice_exists("af_heart"),
+            "af_heart.bin ships in models/voices"
+        );
+        assert!(!s.voice_exists("totally_bogus_name"));
     }
 
     /// Regression guard for Correction 1: American and British voices must

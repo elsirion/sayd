@@ -385,6 +385,31 @@ impl Engine {
             }
             return Err(msg);
         }
+
+        // M21: reject an unknown voice synchronously, before it can ever
+        // reach `tick`'s synth path and turn into a sticky `ErrorKind::Synth`
+        // error there (see that variant's doc comment) -- one that persists
+        // until an explicit dismiss and silently swallows every submission
+        // behind it, including ones that never named a bad voice themselves.
+        // `voice_exists` is a cheap, no-load check (`Synthesizer`'s doc
+        // comment), so there is no reason not to run it before doing any
+        // other work.
+        //
+        // Unlike the `max_chars` rejection above, this deliberately never
+        // touches `state`/`error`/`error_kind`, even when the engine is
+        // otherwise idle: nothing about the engine itself is wrong here --
+        // only this one submission's voice name -- so nothing should make
+        // `say status` report an error for it. The caller still learns the
+        // submission was refused, via this method's own `Err`.
+        let voice = opts.voice.as_deref().unwrap_or(&self.cfg.voice);
+        if !self.synth.voice_exists(voice) {
+            return Err(format!(
+                "unknown voice '{voice}'; check the voices installed in the \
+                 daemon's models directory (its voices/ subdirectory has one \
+                 file per installed voice) and pick one of those"
+            ));
+        }
+
         if self.cfg.muted {
             return Ok(Submitted::Discarded);
         }
@@ -1225,6 +1250,104 @@ mod tests {
             "no command was issued; the error must persist"
         );
         assert!(s.error.is_some());
+    }
+
+    #[test]
+    fn an_unknown_voice_is_rejected_synchronously_and_leaves_the_engine_idle() {
+        // M21: an unknown voice must be caught at submission, not left to
+        // surface later as a sticky `ErrorKind::Synth` error out of `tick`.
+        // The check must not touch engine state at all -- unlike the
+        // `max_chars` rejection, this must leave the engine idle and usable,
+        // not `Error`, so `say status` reports nothing wrong.
+        let mut e = Engine::new(
+            Config::default(),
+            Box::new(StubSynthesizer::with_known_voices(["af_heart"])),
+            Box::new(VecSink::new(24_000 * 10)),
+        );
+        let result = e.submit(
+            "hello there".into(),
+            SayOpts {
+                voice: Some("totally_bogus_name".into()),
+                ..Default::default()
+            },
+        );
+        let err = result.expect_err("an unknown voice must be rejected");
+        assert!(
+            err.contains("totally_bogus_name"),
+            "the error must name the bad voice: {err}"
+        );
+
+        let s = e.snapshot();
+        assert_eq!(
+            s.state,
+            State::Idle,
+            "a bad voice must not poison the engine into Error"
+        );
+        assert_eq!(s.error, None);
+        assert_eq!(s.queue_len, 0, "the rejected utterance must not be queued");
+
+        // A following normal submission -- no voice override at all -- must
+        // succeed, proving the engine was never actually wedged.
+        let ok = e.submit("hello there".into(), SayOpts::default());
+        assert!(
+            matches!(ok, Ok(Submitted::Queued(_))),
+            "a following plain submission must still work: {ok:?}"
+        );
+    }
+
+    #[test]
+    fn a_known_voice_is_still_accepted() {
+        let mut e = Engine::new(
+            Config::default(),
+            Box::new(StubSynthesizer::with_known_voices(["af_heart", "bf_emma"])),
+            Box::new(VecSink::new(24_000 * 10)),
+        );
+        let result = e.submit(
+            "hello there".into(),
+            SayOpts {
+                voice: Some("bf_emma".into()),
+                ..Default::default()
+            },
+        );
+        assert!(matches!(result, Ok(Submitted::Queued(_))), "got {result:?}");
+        assert_eq!(e.snapshot().state, State::Speaking);
+    }
+
+    #[test]
+    fn a_bad_configured_default_voice_is_rejected_per_submission_without_wedging() {
+        // The config-file-default half of M21: a bad *default* voice (no
+        // per-utterance override at all) must hit the same synchronous
+        // check as an explicit bad `--voice`, submission after submission,
+        // rather than queuing once and then wedging the engine via a sticky
+        // synth failure.
+        let cfg = Config {
+            voice: "totally_bogus_default".into(),
+            ..Config::default()
+        };
+        let mut e = Engine::new(
+            cfg,
+            Box::new(StubSynthesizer::with_known_voices(["af_heart"])),
+            Box::new(VecSink::new(24_000 * 10)),
+        );
+        let first = e.submit("hello there".into(), SayOpts::default());
+        assert!(first.is_err(), "the bad default must be rejected");
+        assert_eq!(e.snapshot().state, State::Idle, "must not wedge into Error");
+
+        // Retrying with the same bad default fails the same way, not
+        // differently -- there is nothing stuck to clear.
+        let second = e.submit("hello again".into(), SayOpts::default());
+        assert!(second.is_err());
+        assert_eq!(e.snapshot().state, State::Idle);
+
+        // But an explicit override to a known voice succeeds immediately.
+        let third = e.submit(
+            "hello there".into(),
+            SayOpts {
+                voice: Some("af_heart".into()),
+                ..Default::default()
+            },
+        );
+        assert!(matches!(third, Ok(Submitted::Queued(_))), "got {third:?}");
     }
 
     #[test]

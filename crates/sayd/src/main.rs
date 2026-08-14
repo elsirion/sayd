@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use sayd_core::audio::AudioSink;
 use sayd_core::config::Config;
 use sayd_core::handle::EngineHandle;
+use sayd_core::synth::Synthesizer;
 use zbus::fdo::{RequestNameFlags, RequestNameReply};
 use zbus::zvariant::OwnedValue;
 
@@ -283,6 +284,24 @@ async fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
+
+    // M21: a bad *configured* default voice (as opposed to a bad
+    // `--voice` on one submission) is the same footgun wearing a different
+    // hat. `Engine::submit` already rejects it synchronously, submission by
+    // submission, rather than wedging (see `sayd_core::engine`'s M21 doc
+    // comment) -- but that only surfaces once the first utterance is
+    // spoken. Checking here, once, at startup, lets an operator notice a
+    // typo'd config *before* every default-voice submission starts failing
+    // the same way.
+    if !synth.voice_exists(&cfg.voice) {
+        eprintln!(
+            "warning: configured default voice '{}' has no installed voice pack; \
+             every submission that does not override it with its own --voice will \
+             be rejected until this is fixed. Check {}/voices for installed voices.",
+            cfg.voice,
+            models_dir().display()
+        );
+    }
     let sink = match open_sink() {
         Ok(s) => s,
         Err(e) => {

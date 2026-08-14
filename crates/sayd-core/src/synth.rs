@@ -26,6 +26,23 @@ pub trait Synthesizer: Send {
     fn unload(&mut self);
 
     fn is_loaded(&self) -> bool;
+
+    /// Whether `voice` names something this synthesizer can actually
+    /// synthesize with -- checked cheaply, without loading a model or
+    /// session.
+    ///
+    /// `Engine::submit` (`sayd-core::engine`) calls this to reject an
+    /// unknown voice synchronously, at submission time, instead of letting
+    /// it reach `tick`'s synth path, where a failure becomes a sticky
+    /// `ErrorKind::Synth` error that persists until an explicit dismiss and
+    /// rejects every submission behind it -- including ones that never
+    /// named a bad voice themselves. A quick, no-op-until-overridden default
+    /// of `true` means test doubles that do not model a real voice list
+    /// (most of them: their purpose is exercising unrelated state-machine
+    /// behaviour) do not have to opt in just to keep compiling.
+    fn voice_exists(&self, _voice: &str) -> bool {
+        true
+    }
 }
 
 /// Test double. Emits silence at roughly the rate real speech occupies, so
@@ -35,6 +52,16 @@ pub struct StubSynthesizer {
     loaded: bool,
     pub synth_calls: usize,
     pub unload_calls: usize,
+    /// `None` (the default, from `new`/`with_token_budget`) means every
+    /// voice is treated as usable -- the vast majority of engine tests pass
+    /// an arbitrary voice string while exercising behaviour that has
+    /// nothing to do with voice validation, and making all of them
+    /// enumerate a voice list just to keep working would be exactly the
+    /// "every existing engine test starts rejecting submissions" failure
+    /// mode a real restriction must avoid. `Some(set)` restricts
+    /// `voice_exists` to that set, for tests that specifically exercise
+    /// unknown-voice rejection; see `with_known_voices`.
+    known_voices: Option<std::collections::HashSet<String>>,
 }
 
 impl StubSynthesizer {
@@ -48,6 +75,21 @@ impl StubSynthesizer {
             loaded: false,
             synth_calls: 0,
             unload_calls: 0,
+            known_voices: None,
+        }
+    }
+
+    /// A stub restricted to a specific voice list, for tests that exercise
+    /// `Engine::submit`'s unknown-voice rejection. Every other stub
+    /// constructor stays permissive (see `known_voices`'s doc comment).
+    pub fn with_known_voices<I, S>(voices: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        StubSynthesizer {
+            known_voices: Some(voices.into_iter().map(Into::into).collect()),
+            ..Self::new()
         }
     }
 }
@@ -83,6 +125,13 @@ impl Synthesizer for StubSynthesizer {
 
     fn is_loaded(&self) -> bool {
         self.loaded
+    }
+
+    fn voice_exists(&self, voice: &str) -> bool {
+        match &self.known_voices {
+            Some(known) => known.contains(voice),
+            None => true,
+        }
     }
 }
 
@@ -137,5 +186,20 @@ mod tests {
     fn stub_phonemize_is_identity_lowercased() {
         let mut s = StubSynthesizer::new();
         assert_eq!(s.phonemize("Hello There", "af_heart"), "hello there");
+    }
+
+    #[test]
+    fn stub_voice_exists_is_permissive_by_default() {
+        let s = StubSynthesizer::new();
+        assert!(s.voice_exists("af_heart"));
+        assert!(s.voice_exists("totally_bogus_name"));
+    }
+
+    #[test]
+    fn stub_with_known_voices_restricts_voice_exists() {
+        let s = StubSynthesizer::with_known_voices(["af_heart", "bf_emma"]);
+        assert!(s.voice_exists("af_heart"));
+        assert!(s.voice_exists("bf_emma"));
+        assert!(!s.voice_exists("totally_bogus_name"));
     }
 }
