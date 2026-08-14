@@ -54,6 +54,14 @@ pub trait Synthesizer: Send {
     /// Only `model` and `threads` can require a reload. Voice, speed and
     /// every text-processing setting are read per-utterance by the engine
     /// and never reach here.
+    ///
+    /// `#[must_use]`: a caller that drops this without acting on `true`
+    /// leaves the implementation's own bookkeeping (e.g.
+    /// `KokoroSynthesizer::model_file`) naming the new model while the
+    /// loaded session -- if any -- is still the old one, with nothing left
+    /// that will ever reconcile them. That is silently speaking with the
+    /// wrong model, the exact failure this method exists to prevent.
+    #[must_use]
     fn reconfigure(&mut self, _cfg: &crate::config::Config) -> bool {
         false
     }
@@ -68,16 +76,17 @@ pub struct StubSynthesizer {
     pub unload_calls: usize,
     /// What `reconfigure` was last handed, so tests can assert the engine
     /// forwards a config change rather than only storing it. Seeded from
-    /// `Config::default()`'s `(model, threads)` at construction, not `None`
-    /// -- `StubSynthesizer` implicitly starts out "as if" constructed under
-    /// the default config, mirroring how `KokoroSynthesizer::new` seeds its
-    /// own `model_file`/`threads` fields from the `cfg` it is built with.
-    /// Seeding this `None` instead would make the very first `reconfigure`
-    /// call after construction always report `changed = true`, even when
-    /// the config it is handed is the unchanged default -- indistinguishable
-    /// from an actual model change to any caller.
-    pub reconfigured_to: Option<(String, usize)>,
-    pub reconfigure_calls: usize,
+    /// `Config::default()`'s `(model, threads)` at construction, not an
+    /// `Option` starting at `None` -- `StubSynthesizer` implicitly starts
+    /// out "as if" constructed under the default config, mirroring how
+    /// `KokoroSynthesizer::new` seeds its own `model_file`/`threads` fields
+    /// from the `cfg` it is built with. A `None` baseline would make the
+    /// very first `reconfigure` call after construction always report
+    /// `changed = true`, even when the config it is handed is the unchanged
+    /// default -- indistinguishable from an actual model change to any
+    /// caller; since that baseline is always `Some` from construction
+    /// onward, the `Option` itself was dead weight, not just its `None` arm.
+    pub reconfigured_to: (String, usize),
     /// `None` (the default, from `new`/`with_token_budget`) means every
     /// voice is treated as usable -- the vast majority of engine tests pass
     /// an arbitrary voice string while exercising behaviour that has
@@ -102,8 +111,7 @@ impl StubSynthesizer {
             loaded: false,
             synth_calls: 0,
             unload_calls: 0,
-            reconfigured_to: Some((d.model, d.threads)),
-            reconfigure_calls: 0,
+            reconfigured_to: (d.model, d.threads),
             known_voices: None,
         }
     }
@@ -164,9 +172,9 @@ impl Synthesizer for StubSynthesizer {
     }
 
     fn reconfigure(&mut self, cfg: &crate::config::Config) -> bool {
-        self.reconfigure_calls += 1;
-        let changed = self.reconfigured_to.as_ref() != Some(&(cfg.model.clone(), cfg.threads));
-        self.reconfigured_to = Some((cfg.model.clone(), cfg.threads));
+        let next = (cfg.model.clone(), cfg.threads);
+        let changed = self.reconfigured_to != next;
+        self.reconfigured_to = next;
         changed
     }
 }
