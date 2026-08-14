@@ -7,8 +7,8 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use clap::{Parser, Subcommand};
-use zbus::zvariant::OwnedValue;
+use clap::{Parser, Subcommand, ValueEnum};
+use zbus::zvariant::{OwnedValue, Str};
 
 const BUS_NAME: &str = "sh.sayd.Sayd";
 const OBJECT_PATH: &str = "/sh/sayd/Sayd";
@@ -25,7 +25,7 @@ const IFACE: &str = "sh.sayd.Sayd1";
 /// tolerating a slow daemon.
 const TIMEOUT: Duration = Duration::from_secs(3);
 
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 #[command(
     name = "say",
     version,
@@ -33,19 +33,61 @@ const TIMEOUT: Duration = Duration::from_secs(3);
     long_about = "Speak text through the sayd daemon.\n\n\
                   With no subcommand, the arguments are spoken as text. A word \
                   that happens to match a subcommand name is treated as that \
-                  subcommand -- use `say -- stop` to speak it instead.",
-    args_conflicts_with_subcommands = true
+                  subcommand -- use `say -- stop` to speak it instead."
 )]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
+
+    /// Queueing policy for this submission -- how it interacts with
+    /// whatever is already playing or queued. Meaningless outside a
+    /// submission (bare text, `selection`, `clipboard`); ignored elsewhere.
+    /// Must come before the text/subcommand it applies to.
+    #[arg(long, global = true, value_enum)]
+    policy: Option<PolicyArg>,
+
+    /// Voice to speak this submission with, overriding the daemon's
+    /// default. Meaningless outside a submission; ignored elsewhere. Must
+    /// come before the text/subcommand it applies to.
+    #[arg(long, global = true)]
+    voice: Option<String>,
+
+    /// Playback speed multiplier for this submission, overriding the
+    /// daemon's default. Meaningless outside a submission; ignored
+    /// elsewhere. Must come before the text/subcommand it applies to.
+    #[arg(long, global = true)]
+    speed: Option<f64>,
 
     /// Text to speak. Use `--` first if it begins with a subcommand name.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     text: Vec<String>,
 }
 
-#[derive(Subcommand)]
+/// The `policy` values the daemon's `SayOpts` understands. Validated by
+/// clap rather than passed through as a bare string, so a typo is a clap
+/// error naming the bad value, not a silent fall-back to the default
+/// policy.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum PolicyArg {
+    Enqueue,
+    Interrupt,
+    Replace,
+    Front,
+}
+
+impl PolicyArg {
+    /// The wire string the daemon's `say_opts_from` matches on.
+    fn as_wire_str(self) -> &'static str {
+        match self {
+            PolicyArg::Enqueue => "enqueue",
+            PolicyArg::Interrupt => "interrupt",
+            PolicyArg::Replace => "replace",
+            PolicyArg::Front => "front",
+        }
+    }
+}
+
+#[derive(Subcommand, Debug)]
 enum Command {
     /// Speak the PRIMARY selection (whatever is selected with the mouse)
     Selection,
@@ -114,12 +156,15 @@ async fn main() -> std::process::ExitCode {
         }
     };
 
-    let empty: HashMap<String, OwnedValue> = HashMap::new();
+    // Built once: `--policy`/`--voice`/`--speed` matter only to the three
+    // submission paths (bare text, `selection`, `clipboard`), all of which
+    // share this dict. Every other command ignores it.
+    let opts = say_opts(&cli);
     let result = match cli.command {
-        Some(Command::Selection) => call(proxy.call_method("SaySelection", &(empty,)))
+        Some(Command::Selection) => call(proxy.call_method("SaySelection", &(opts,)))
             .await
             .map(|_| ()),
-        Some(Command::Clipboard) => call(proxy.call_method("SayClipboard", &(empty,)))
+        Some(Command::Clipboard) => call(proxy.call_method("SayClipboard", &(opts,)))
             .await
             .map(|_| ()),
         Some(Command::Pause) => call(proxy.call_method("Pause", &())).await.map(|_| ()),
@@ -148,7 +193,7 @@ async fn main() -> std::process::ExitCode {
         }
         None => {
             let text = cli.text.join(" ");
-            call(proxy.call_method("Say", &(text, empty)))
+            call(proxy.call_method("Say", &(text, opts)))
                 .await
                 .map(|_| ())
         }
@@ -161,6 +206,30 @@ async fn main() -> std::process::ExitCode {
             std::process::ExitCode::FAILURE
         }
     }
+}
+
+/// Build the D-Bus `opts` dict for a submission from the parsed CLI's
+/// `--policy`/`--voice`/`--speed`. Only keys the caller actually set are
+/// present -- the daemon's own `say_opts_from` already treats an absent key
+/// as "use the default," so there is no reason to send one explicitly.
+fn say_opts(cli: &Cli) -> HashMap<String, OwnedValue> {
+    let mut opts = HashMap::new();
+    if let Some(policy) = cli.policy {
+        opts.insert(
+            "policy".to_string(),
+            OwnedValue::from(Str::from(policy.as_wire_str())),
+        );
+    }
+    if let Some(voice) = &cli.voice {
+        opts.insert(
+            "voice".to_string(),
+            OwnedValue::from(Str::from(voice.as_str())),
+        );
+    }
+    if let Some(speed) = cli.speed {
+        opts.insert("speed".to_string(), OwnedValue::from(speed));
+    }
+    opts
 }
 
 /// Await a single D-Bus call, bounding it by [`TIMEOUT`] so a wedged daemon
@@ -227,26 +296,48 @@ fn describe_dbus_error(e: &zbus::Error) -> (String, Option<String>) {
     (e.to_string(), None)
 }
 
+/// Read every `sh.sayd.Sayd1` property in a single `GetAll`, rather than one
+/// `Get` per property.
+///
+/// The daemon's `Snapshot` (see `sayd-core::engine`) is assembled
+/// atomically, but the old per-property reads each ran as its own D-Bus
+/// round trip; a state transition landing between two of those round trips
+/// produced genuinely inconsistent output -- e.g. `State="speaking"`
+/// alongside `CurrentId=0`, or vice versa. A single `GetAll` reads one
+/// snapshot's worth of properties in one reply, so the tearing is gone by
+/// construction.
 async fn status(proxy: &zbus::Proxy<'_>, json: bool) -> Result<(), CallError> {
-    let state: String = call(proxy.get_property("State")).await?;
-    let muted: bool = call(proxy.get_property("Muted")).await.unwrap_or(false);
-    let voice: String = call(proxy.get_property("Voice")).await.unwrap_or_default();
-    let speed: f64 = call(proxy.get_property("Speed")).await.unwrap_or(1.0);
-    let queue: u32 = call(proxy.get_property("QueueLength")).await.unwrap_or(0);
-    let remaining: f64 = call(proxy.get_property("RemainingSeconds"))
-        .await
-        .unwrap_or(0.0);
-    let current: String = call(proxy.get_property("CurrentText"))
-        .await
-        .unwrap_or_default();
-    let error: String = call(proxy.get_property("Error")).await.unwrap_or_default();
+    let props = call(zbus::fdo::PropertiesProxy::new(
+        proxy.connection(),
+        BUS_NAME,
+        OBJECT_PATH,
+    ))
+    .await?;
+
+    // `IFACE` is a fixed, already-valid interface name -- the same constant
+    // used to build `proxy` itself in `main` -- so this cannot fail on any
+    // real invocation.
+    let iface = zbus::names::InterfaceName::from_static_str(IFACE)
+        .expect("IFACE is a valid interface name");
+    let map: HashMap<String, OwnedValue> =
+        call(async { props.get_all(iface).await.map_err(zbus::Error::from) }).await?;
+
+    let state = prop_string(&map, "State");
+    let muted = prop_bool(&map, "Muted", false);
+    let voice = prop_string(&map, "Voice");
+    let speed = prop_f64(&map, "Speed", 1.0);
+    let queue = prop_u32(&map, "QueueLength", 0);
+    let remaining = prop_f64(&map, "RemainingSeconds", 0.0);
+    let current = prop_string(&map, "CurrentText");
+    let current_id = prop_u32(&map, "CurrentId", 0);
+    let error = prop_string(&map, "Error");
 
     if json {
         // Hand-built so this crate need not depend on serde.
         println!(
             "{{\"state\":\"{}\",\"muted\":{},\"voice\":\"{}\",\"speed\":{},\
              \"queue_length\":{},\"remaining_seconds\":{:.2},\
-             \"current_text\":\"{}\",\"error\":\"{}\"}}",
+             \"current_text\":\"{}\",\"current_id\":{},\"error\":\"{}\"}}",
             escape(&state),
             muted,
             escape(&voice),
@@ -254,12 +345,16 @@ async fn status(proxy: &zbus::Proxy<'_>, json: bool) -> Result<(), CallError> {
             queue,
             remaining,
             escape(&current),
+            current_id,
             escape(&error),
         );
     } else {
         println!("state:     {state}{}", if muted { " (muted)" } else { "" });
         println!("voice:     {voice} at {speed:.2}x");
         println!("queue:     {queue} pending, {remaining:.1}s remaining");
+        if current_id != 0 {
+            println!("current:   id {current_id}");
+        }
         if !current.is_empty() {
             println!("speaking:  {current}");
         }
@@ -268,6 +363,34 @@ async fn status(proxy: &zbus::Proxy<'_>, json: bool) -> Result<(), CallError> {
         }
     }
     Ok(())
+}
+
+/// Extract a `String` property from a `GetAll` reply, defaulting to empty
+/// if the key is missing or holds an unexpected type -- a daemon reply
+/// should never make `status` fail on one odd field when the rest parsed
+/// fine.
+fn prop_string(map: &HashMap<String, OwnedValue>, key: &str) -> String {
+    map.get(key)
+        .and_then(|v| String::try_from(v.clone()).ok())
+        .unwrap_or_default()
+}
+
+fn prop_bool(map: &HashMap<String, OwnedValue>, key: &str, default: bool) -> bool {
+    map.get(key)
+        .and_then(|v| bool::try_from(v).ok())
+        .unwrap_or(default)
+}
+
+fn prop_f64(map: &HashMap<String, OwnedValue>, key: &str, default: f64) -> f64 {
+    map.get(key)
+        .and_then(|v| f64::try_from(v).ok())
+        .unwrap_or(default)
+}
+
+fn prop_u32(map: &HashMap<String, OwnedValue>, key: &str, default: u32) -> u32 {
+    map.get(key)
+        .and_then(|v| u32::try_from(v).ok())
+        .unwrap_or(default)
 }
 
 /// Minimal JSON string escaping, so `--json` output is always parseable.
@@ -331,6 +454,60 @@ mod tests {
     fn status_takes_a_json_flag() {
         let c = Cli::try_parse_from(["say", "status", "--json"]).expect("parses");
         assert!(matches!(c.command, Some(Command::Status { json: true })));
+    }
+
+    #[test]
+    fn speed_before_bare_text_is_parsed_and_the_rest_is_spoken() {
+        let c = Cli::try_parse_from(["say", "--speed", "1.5", "hello", "world"]).expect("parses");
+        assert!(c.command.is_none());
+        assert_eq!(c.speed, Some(1.5));
+        assert_eq!(c.text.join(" "), "hello world");
+    }
+
+    #[test]
+    fn voice_and_policy_before_a_subcommand_are_both_parsed() {
+        let c = Cli::try_parse_from([
+            "say",
+            "--voice",
+            "bf_emma",
+            "--policy",
+            "replace",
+            "selection",
+        ])
+        .expect("parses");
+        assert!(matches!(c.command, Some(Command::Selection)));
+        assert_eq!(c.voice.as_deref(), Some("bf_emma"));
+        assert!(matches!(c.policy, Some(PolicyArg::Replace)));
+    }
+
+    #[test]
+    fn options_after_a_subcommand_name_are_also_parsed() {
+        // `global = true` makes `--voice`/`--policy`/`--speed` valid on
+        // either side of a subcommand name, unlike bare text (see the next
+        // test): `Selection`/`Clipboard` have no trailing var-arg positional
+        // to swallow the flag as a word instead.
+        let c = Cli::try_parse_from(["say", "clipboard", "--speed", "0.8"]).expect("parses");
+        assert!(matches!(c.command, Some(Command::Clipboard)));
+        assert_eq!(c.speed, Some(0.8));
+    }
+
+    #[test]
+    fn an_option_after_bare_text_has_begun_is_spoken_rather_than_parsed() {
+        // Documents the one grammar limitation: `trailing_var_arg` +
+        // `allow_hyphen_values` means once the bare-text positional starts
+        // consuming, nothing after it is recognised as a flag any more --
+        // so `--speed` must precede the text it applies to, not follow it.
+        let c = Cli::try_parse_from(["say", "hello", "--speed", "1.5"]).expect("parses");
+        assert!(c.command.is_none());
+        assert_eq!(c.speed, None);
+        assert_eq!(c.text.join(" "), "hello --speed 1.5");
+    }
+
+    #[test]
+    fn an_invalid_policy_is_rejected_by_clap() {
+        let err = Cli::try_parse_from(["say", "--policy", "nonsense", "hello"])
+            .expect_err("an unknown policy value must not silently parse");
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
     }
 
     #[test]
