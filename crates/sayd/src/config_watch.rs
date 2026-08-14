@@ -723,6 +723,32 @@ mod tests {
         engine.shutdown();
     }
 
+    /// The daemon holds the handle for the life of the process because
+    /// dropping it stops the watch. That is only true if the thread the
+    /// watcher now lives on actually winds up with it.
+    #[test]
+    fn dropping_the_handle_stops_the_watch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let engine = engine();
+        let store = Arc::new(ConfigStore::new(
+            path.clone(),
+            engine.clone(),
+            Config::default(),
+        ));
+        let watcher = spawn(store).expect("watcher starts");
+        drop(watcher);
+
+        std::fs::write(&path, "voice = \"bm_george\"\n").expect("write");
+        settle();
+        assert_eq!(
+            engine.snapshot().voice,
+            Config::default().voice,
+            "a dropped watcher must not still be reloading"
+        );
+        engine.shutdown();
+    }
+
     /// A dotfile manager that replaces `~/.config/sayd` wholesale takes the
     /// watched directory's inode with it, and inotify has nothing more to
     /// say about the old one. Without re-arming, this is permanent and
