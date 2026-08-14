@@ -9,6 +9,7 @@ mod config_watch;
 mod dbus;
 mod kokoro_synth;
 mod mpris;
+mod notify;
 mod resample;
 mod ring;
 mod selection;
