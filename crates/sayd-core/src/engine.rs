@@ -1676,6 +1676,16 @@ mod tests {
                 Command::SetVoice("am_fenrir".into()),
                 Command::SetSpeed(1.5),
                 Command::ApplyConfig(Config::default()),
+                // MINOR 7 (M4 review): `Config::default().muted` is `false`,
+                // so without this the sweep never once exercised
+                // `ApplyConfig`'s false -> true silencing branch (see
+                // IMPORTANT 5's `muting` check above) from any of the five
+                // states below. Reviewer-verified to pass from idle,
+                // speaking, paused, error and device-failed-while-paused.
+                Command::ApplyConfig(Config {
+                    muted: true,
+                    ..Config::default()
+                }),
                 Command::Shutdown,
             ]
         }
