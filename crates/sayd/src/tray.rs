@@ -63,6 +63,23 @@ fn short(text: &str, limit: usize) -> String {
     out
 }
 
+/// The first line of a possibly multi-line diagnostic.
+///
+/// MINOR 3: `toml`'s parse-error `Display` is a multi-line caret diagram --
+/// measured against a real dbusmenu, the `Config:` line came through as
+/// `'Config: TOML parse error at line 1, column 10\n  |\n1 | voice = [this
+/// is not toml\n  |     …'`. `short`'s character-counting truncation
+/// preserves `\n` and happily spends the whole 80-character budget on the
+/// caret diagram, cutting away the one part that says *what* is wrong
+/// ("invalid string", "expected `"`"). `toml` puts that summary on its
+/// first line and the `|`-prefixed detail after it, so the first line is
+/// the part worth the budget; `store.status().get()` (and the log line
+/// built from it) still carries the whole thing for anyone who wants the
+/// caret diagram too.
+fn first_line(text: &str) -> &str {
+    text.lines().next().unwrap_or(text)
+}
+
 fn human_secs(s: f64) -> String {
     let s = s.max(0.0).round() as u64;
     if s >= 60 {
@@ -94,7 +111,7 @@ fn status_lines(s: &Snapshot, config_problem: Option<&str>) -> Vec<String> {
     // a config typo there would stop the daemon speaking over a file it is
     // perfectly able to ignore. See `config_watch::ConfigStatus`.
     if let Some(p) = config_problem {
-        out.push(format!("Config: {}", short(p, 80)));
+        out.push(format!("Config: {}", short(first_line(p), 80)));
     }
 
     match s.state {
@@ -555,6 +572,30 @@ mod tests {
         assert!(
             joined.to_lowercase().contains("config"),
             "and be labelled as a config problem, not just dumped: {joined}"
+        );
+    }
+
+    /// MINOR 3: measured against a real dbusmenu with `voice = [this is not
+    /// toml` on disk, the stored diagnostic is `toml`'s multi-line caret
+    /// picture, and truncating it by character count (rather than by line)
+    /// spent the whole 80-character budget on the diagram and cut away the
+    /// one line that says what is actually wrong.
+    #[test]
+    fn a_multiline_parse_error_shows_its_summary_not_its_caret_diagram() {
+        let measured = "TOML parse error at line 1, column 10\n  |\n1 | voice = [this is not toml\n  |          ^\ninvalid array\nexpected `]`\n";
+        let labels = menu_labels(&snap(State::Idle), Some(measured));
+        let joined = labels.join(" | ");
+        assert!(
+            joined.contains("TOML parse error at line 1, column 10"),
+            "the summary line must survive truncation: {joined}"
+        );
+        assert!(
+            !joined.contains('\n'),
+            "a menu label must not carry the caret diagram's embedded newlines: {joined:?}"
+        );
+        assert!(
+            !joined.contains("expected"),
+            "the 80-char budget must not still be spent past the first line: {joined}"
         );
     }
 
