@@ -4,6 +4,16 @@
 //! tidiness: the rate-limit window, the counting and the coalesced follow-up
 //! are the only real state in this milestone, and a test that had to sleep
 //! for a 30-second window would not be written.
+//!
+//! `compose` does no whitespace normalisation of its own: a body can carry
+//! runs of internal spaces or newlines straight through `strip_markup`, and
+//! joining a body onto a summary can leave a run of two spaces behind. That
+//! is fine, but only *because* the composed string is meant to be spoken
+//! through `sayd_core::cleanup::clean` before it reaches the speaker, and
+//! `CleanupConfig::default`'s `collapse_whitespace` is `true` -- Task 4 must
+//! route every announcement through `clean`. Making that dependency
+//! explicit here rather than leaving it implicit is the point of this
+//! paragraph: nothing in this module enforces it.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -19,8 +29,19 @@ pub enum Decision {
     /// Inside an open window: counted, and announced as "N more" when it
     /// closes.
     Count,
-    /// Not ours -- not allowed, or nothing to say.
-    Ignore,
+    /// `app_name` is not on the allowlist. Distinct from `NothingToSay`
+    /// because §4's discovery log has to tell them apart: an unrecognised
+    /// name is logged once per name per run so the user has something to
+    /// add to `allow`, but a recognised application that simply had nothing
+    /// to say this time must never hit that log, or a chat application with
+    /// the occasional empty-summary notification would flood the very log
+    /// the allowlist exists to keep quiet. Splitting the variant here means
+    /// Task 4's logging branch reads as what it is instead of branching on
+    /// a boolean, and it reuses `decide`'s own case-folded allowlist check
+    /// rather than re-implementing it against a private `is_allowed`.
+    NotAllowed,
+    /// Allowed, but composed to nothing worth speaking (see `compose`).
+    NothingToSay,
 }
 
 /// Per-application rate limiting.
@@ -40,15 +61,67 @@ pub struct Limiter {
     /// particular `Notify` call happened to spell it -- share one window
     /// rather than each getting to speak once.
     windows: HashMap<String, Window>,
+    /// Follow-up announcements for windows that were retired by `decide`
+    /// reopening them, rather than by `due` finding them expired.
+    ///
+    /// `decide` checks a window's own expiry before deciding whether this
+    /// notification counts against it or opens a fresh one -- it has to, or
+    /// an application that has been quiet for longer than `cooldown` would
+    /// wrongly `Count` against a window that closed minutes ago instead of
+    /// `Speak`ing again. That means `decide` can be the one to discover a
+    /// window has closed, up to a second before the next `due` tick would
+    /// have (Task 4 drives `due` on a one-second timer). When that happens
+    /// the closed window's count must not simply be dropped on the floor by
+    /// the fresh window overwriting it in the map -- it is queued here and
+    /// handed back on the next `due` call, so the announcement is only ever
+    /// delayed, never lost. This is what makes the ordering-independence
+    /// promised above true: whether `due` or `decide` notices the closed
+    /// window first, the follow-up still gets spoken.
+    pending: Vec<String>,
 }
 
 struct Window {
     opened: Instant,
     suppressed: u32,
-    /// The name as the application spells it, for the follow-up announcement:
-    /// the map is keyed by a lowercased name so matching is case-insensitive,
-    /// but "SIGNAL: 3 more notifications" is not what the user wants to hear.
+    /// The name as the application spells it, for the follow-up
+    /// announcement: the map is keyed by a lowercased name so matching and
+    /// counting are case-insensitive, but the follow-up itself echoes back
+    /// whichever spelling opened the window -- "signal: 3 more
+    /// notifications" if "signal" spoke first, "SIGNAL: ..." if "SIGNAL"
+    /// did. That matches §3: `app_name` is what the application calls
+    /// itself, and the allowlist, the discovery log and this follow-up are
+    /// all supposed to agree with it rather than each picking their own
+    /// canonical casing.
     display_name: String,
+}
+
+/// The follow-up line for a window being retired, or `None` when it saw no
+/// suppressed traffic -- a bare "0 more notifications" would be worse than
+/// silence, so a quiet window is retired without a word.
+fn announcement(w: &Window) -> Option<String> {
+    (w.suppressed > 0).then(|| {
+        let noun = if w.suppressed == 1 {
+            "notification"
+        } else {
+            "notifications"
+        };
+        format!("{}: {} more {noun}", w.display_name, w.suppressed)
+    })
+}
+
+/// Has the window that opened at `opened` closed by `now`, given `cooldown`?
+///
+/// `opened + cooldown` panics on overflow, and `cooldown` comes straight
+/// from hot-reloaded config: a fat-fingered `cooldown_secs` in the 20-digit
+/// range must not crash a running daemon. `Instant::checked_add` turns that
+/// into `None`; treating `None` as "not expired" is the only sane reading --
+/// a cooldown that overflows `Instant` arithmetic is, for any timeline a
+/// real clock will ever produce, one that never elapses.
+fn is_expired(opened: Instant, cooldown: Duration, now: Instant) -> bool {
+    match opened.checked_add(cooldown) {
+        Some(closes) => now >= closes,
+        None => false,
+    }
 }
 
 impl Limiter {
@@ -58,19 +131,27 @@ impl Limiter {
 
     /// Decide what happens to one notification, as of `now`.
     ///
-    /// In order: not on the allowlist, or nothing to say once composed, is
-    /// `Ignore` -- neither opens a window, because there was never going to
-    /// be anything to speak for it. `cooldown_secs == 0` means rate
-    /// limiting is off, not a zero-length window that nothing could ever
-    /// land inside: everything speaks. Otherwise, a still-open window from
-    /// this application counts against it; a closed or absent one opens
-    /// (or reopens) and speaks.
+    /// In order: not on the allowlist is `NotAllowed`; nothing to say once
+    /// composed is `NothingToSay` -- neither opens a window, because there
+    /// was never going to be anything to speak for it. `cooldown_secs == 0`
+    /// means rate limiting is off, not a zero-length window that nothing
+    /// could ever land inside: everything speaks. Otherwise, a still-open
+    /// window from this application counts against it; a closed or absent
+    /// one opens (or reopens) and speaks.
+    ///
+    /// A window `decide` finds already expired is retired right here rather
+    /// than left for the caller's next `due` tick to notice: overwriting it
+    /// in place with a fresh window would silently throw away whatever it
+    /// had counted, and by design `due` isn't the only place a window's
+    /// expiry gets checked (see the module doc and `Limiter::pending`). Its
+    /// follow-up, if it has one, is queued in `pending` and comes back out
+    /// of the next `due` call.
     pub fn decide(&mut self, n: &Notification, cfg: &NotificationConfig, now: Instant) -> Decision {
         if !is_allowed(&n.app_name, cfg) {
-            return Decision::Ignore;
+            return Decision::NotAllowed;
         }
         let Some(text) = compose(n, cfg) else {
-            return Decision::Ignore;
+            return Decision::NothingToSay;
         };
         if cfg.cooldown_secs == 0 {
             return Decision::Speak(text);
@@ -79,9 +160,12 @@ impl Limiter {
         let cooldown = Duration::from_secs(cfg.cooldown_secs);
         let key = n.app_name.to_lowercase();
         if let Some(window) = self.windows.get_mut(&key) {
-            if now < window.opened + cooldown {
+            if !is_expired(window.opened, cooldown, now) {
                 window.suppressed += 1;
                 return Decision::Count;
+            }
+            if let Some(w) = self.windows.remove(&key) {
+                self.pending.extend(announcement(&w));
             }
         }
         self.windows.insert(
@@ -95,39 +179,44 @@ impl Limiter {
         Decision::Speak(text)
     }
 
-    /// The coalesced "N more notifications" announcements whose windows have
-    /// closed as of `now`.
+    /// The coalesced "N more notifications" announcements due to be spoken
+    /// as of `now`: anything `decide` already retired into `pending` since
+    /// the last call, plus every window whose cooldown has newly elapsed.
     ///
     /// Every window whose cooldown has elapsed is removed here whether or
     /// not it produced a line -- a window that saw no follow-up traffic
     /// (`suppressed == 0`) is retired in silence rather than announced as
     /// "0 more notifications", which would be worse than nothing.
+    ///
+    /// A window is also dropped here, unannounced, if its application is no
+    /// longer on `cfg.allow`: §6 says a config change to `allow` takes
+    /// effect on the next notification, and this follow-up is spoken after
+    /// that change, not before it, so the user who just removed the
+    /// application must not hear one more thing from it. `decide` never
+    /// lets an unallowed application open a window in the first place, so
+    /// this only ever fires for a window that was allowed when it opened
+    /// and had its permission revoked while it was still counting.
     pub fn due(&mut self, cfg: &NotificationConfig, now: Instant) -> Vec<String> {
         let cooldown = Duration::from_secs(cfg.cooldown_secs);
         let mut expired: Vec<String> = self
             .windows
             .iter()
-            .filter(|(_, w)| now >= w.opened + cooldown)
+            .filter(|(_, w)| is_expired(w.opened, cooldown, now))
             .map(|(key, _)| key.clone())
             .collect();
         // Deterministic output: two windows closing on the same tick must
         // not depend on hash-map iteration order.
         expired.sort();
 
-        expired
-            .into_iter()
-            .filter_map(|key| {
-                let w = self.windows.remove(&key)?;
-                (w.suppressed > 0).then(|| {
-                    let noun = if w.suppressed == 1 {
-                        "notification"
-                    } else {
-                        "notifications"
-                    };
-                    format!("{}: {} more {noun}", w.display_name, w.suppressed)
-                })
-            })
-            .collect()
+        let mut out = std::mem::take(&mut self.pending);
+        out.extend(expired.into_iter().filter_map(|key| {
+            let w = self.windows.remove(&key)?;
+            if !is_allowed(&w.display_name, cfg) {
+                return None;
+            }
+            announcement(&w)
+        }));
+        out
     }
 }
 
@@ -165,7 +254,7 @@ pub fn compose(n: &Notification, cfg: &NotificationConfig) -> Option<String> {
             // gain a second full stop -- "Alice replied!" followed by ". See
             // you at five" would read as two sentences stuck together with
             // a stray period.
-            if summary.ends_with(['.', '!', '?']) {
+            if ends_with_sentence_punctuation(summary) {
                 format!("{summary} {body}")
             } else {
                 format!("{summary}. {body}")
@@ -177,11 +266,29 @@ pub fn compose(n: &Notification, cfg: &NotificationConfig) -> Option<String> {
         (true, None) => return None,
     };
 
-    Some(if cfg.speak_app_name {
-        format!("{}: {text}", n.app_name)
-    } else {
-        text
+    Some(match cfg.speak_app_name {
+        // An allowlist entry (or a `Notify` call) can hand back an empty or
+        // padded name -- the M5 settings window's editable list makes a
+        // stray blank row easy to produce. A blank prefix reads as a lone
+        // leading colon ("`: hi`"), which is worse than no prefix, so a
+        // name that is empty once trimmed is treated the same as
+        // `speak_app_name = false` rather than spoken.
+        true if !n.app_name.trim().is_empty() => format!("{}: {text}", n.app_name.trim()),
+        _ => text,
     })
+}
+
+/// Sentence-ending punctuation that means a summary already reads as a
+/// complete sentence, so joining a body onto it needs no separating full
+/// stop of its own.
+///
+/// A trailing closing quote or bracket is skipped first: `She said "hi."`
+/// ends the sentence at the period, not at the quote mark that happens to
+/// come after it.
+fn ends_with_sentence_punctuation(s: &str) -> bool {
+    const ENDERS: [char; 6] = ['.', '!', '?', '…', ':', ';'];
+    let s = s.trim_end_matches(['"', '\'', '”', '’', ')', ']', '}']);
+    s.ends_with(ENDERS)
 }
 
 /// The five named entities the freedesktop notification spec expects a body
@@ -210,6 +317,14 @@ pub fn strip_markup(s: &str) -> String {
 /// ("a < b and c" is a comparison, not markup), and swallowing everything
 /// from it to the end of the string would turn a notification about "5 < 6"
 /// into silence.
+///
+/// Known gap, not fixed: a `>` inside a quoted attribute value ends the tag
+/// early, e.g. `<a href="a > b">link</a>` strips to `` b">link"`` instead of
+/// `link`. A real HTML parser would track quote state to avoid this; this
+/// function does not, because the freedesktop notification spec requires
+/// senders to escape `>` as `&gt;` inside attribute values in the first
+/// place -- reaching this needs a sender that already violates the spec it
+/// is sending under, which is not worth a parser for.
 fn strip_tags(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
@@ -301,16 +416,27 @@ mod tests {
     }
 
     /// A summary that already ends in sentence punctuation must not gain a
-    /// second full stop.
+    /// second full stop -- across the whole set of enders, not just `!`,
+    /// and past a trailing closing quote.
     #[test]
     fn a_punctuated_summary_is_not_given_another_full_stop() {
         let mut c = cfg();
         c.speak_body = true;
-        let note = n("Signal", "Alice replied!", "See you at five");
-        assert_eq!(
-            compose(&note, &c).as_deref(),
-            Some("Signal: Alice replied! See you at five")
-        );
+        for summary in [
+            "Alice replied!",
+            "Did you see this?",
+            "Alice said:",
+            "Typing…",
+            "Backup complete;",
+            "She said \"hi.\"",
+        ] {
+            let note = n("Signal", summary, "See you at five");
+            assert_eq!(
+                compose(&note, &c).as_deref(),
+                Some(format!("Signal: {summary} See you at five").as_str()),
+                "summary: {summary:?}"
+            );
+        }
     }
 
     /// Nothing to say means nothing is spoken -- never a bare app name.
@@ -371,8 +497,36 @@ mod tests {
         ));
         assert!(matches!(
             Limiter::new().decide(&n("Fractal", "hi", ""), &c, t),
-            Decision::Ignore
+            Decision::NotAllowed
         ));
+    }
+
+    /// The map that keys windows is case-insensitive, not just the
+    /// allowlist check in front of it: a burst split across "signal" and
+    /// "SIGNAL" spellings is one application's worth of rate limiting, not
+    /// two. (Measured: keying on `n.app_name` verbatim instead of its
+    /// lowercased form still passes every other test in this file, because
+    /// none of them mixes case within one `Limiter` -- this is the only one
+    /// that would catch it.) It also pins the display-name rule at the same
+    /// time: the follow-up echoes back "signal", the spelling that opened
+    /// the window, not "SIGNAL".
+    #[test]
+    fn differently_cased_names_share_one_window() {
+        let c = cfg(); // allows "Signal"
+        let mut l = Limiter::new();
+        let t0 = Instant::now();
+        assert!(matches!(
+            l.decide(&n("signal", "first", ""), &c, t0),
+            Decision::Speak(_)
+        ));
+        assert!(matches!(
+            l.decide(&n("SIGNAL", "second", ""), &c, t0 + Duration::from_secs(1)),
+            Decision::Count
+        ));
+        assert_eq!(
+            l.due(&c, t0 + Duration::from_secs(31)),
+            vec!["signal: 1 more notification".to_string()]
+        );
     }
 
     /// The first notification speaks; the rest of the window counts. This is
@@ -488,7 +642,9 @@ mod tests {
     }
 
     /// A notification that composes to nothing must not open a window or be
-    /// counted -- it was never going to be spoken.
+    /// counted -- it was never going to be spoken. And it is `NothingToSay`,
+    /// not `NotAllowed`: "Signal" is on the allowlist, it just had nothing
+    /// to say this time, and Task 4's discovery log must not log it.
     #[test]
     fn an_empty_notification_is_ignored_not_counted() {
         let c = cfg();
@@ -496,11 +652,123 @@ mod tests {
         let t0 = Instant::now();
         assert!(matches!(
             l.decide(&n("Signal", "", ""), &c, t0),
-            Decision::Ignore
+            Decision::NothingToSay
         ));
         assert!(matches!(
             l.decide(&n("Signal", "real", ""), &c, t0),
             Decision::Speak(_)
         ));
+    }
+
+    /// CRITICAL: reopening an expired window inside `decide` must not throw
+    /// away what it had counted. Before this was fixed, `decide` overwrote
+    /// the closed window with a fresh one in place, and its 3 suppressed
+    /// notifications simply vanished -- no `due` call ever got a chance to
+    /// announce them, because there was nothing left in the map to find.
+    /// This test calls `decide` again on an expired window *without* an
+    /// intervening `due` -- unlike `the_window_reopens_after_it_closes`
+    /// above, which calls `due` first and so never exercises this path.
+    /// Task 4 ticks `due` on a one-second timer, so any notification that
+    /// arrives in the up-to-one-second gap after a window's cooldown elapses
+    /// hits exactly this.
+    #[test]
+    fn reopening_a_window_without_an_intervening_due_still_announces_it() {
+        let c = cfg(); // 30s window
+        let mut l = Limiter::new();
+        let t0 = Instant::now();
+        assert!(matches!(
+            l.decide(&n("Signal", "first", ""), &c, t0),
+            Decision::Speak(_)
+        ));
+        for i in 0..3 {
+            let t = t0 + Duration::from_secs(1 + i);
+            assert!(matches!(
+                l.decide(&n("Signal", "more", ""), &c, t),
+                Decision::Count
+            ));
+        }
+        // The window has closed; nothing has called `due` yet. `decide`
+        // itself notices the expiry, retires the old window's count, and
+        // opens a fresh one.
+        let reopened = t0 + Duration::from_secs(31);
+        assert!(matches!(
+            l.decide(&n("Signal", "next", ""), &c, reopened),
+            Decision::Speak(_)
+        ));
+        // The 3 notifications from the closed window are still owed --
+        // `due` hands them back even though it never saw that window expire
+        // itself.
+        assert_eq!(
+            l.due(&c, reopened),
+            vec!["Signal: 3 more notifications".to_string()]
+        );
+    }
+
+    /// An application removed from `allow` after its window opened must not
+    /// be heard from again: §6 says an `allow` change takes effect on the
+    /// next notification, and the follow-up is spoken strictly after that
+    /// change, so by the time `due` fires the user has already un-named this
+    /// application. The window is still dropped either way -- it must not
+    /// linger and leak a follow-up later if the application is re-added.
+    #[test]
+    fn due_does_not_announce_an_application_removed_from_allow() {
+        let mut c = cfg(); // allows "Signal"
+        let mut l = Limiter::new();
+        let t0 = Instant::now();
+        let _ = l.decide(&n("Signal", "first", ""), &c, t0);
+        let _ = l.decide(&n("Signal", "more", ""), &c, t0 + Duration::from_secs(1));
+
+        c.allow.clear();
+        assert!(l.due(&c, t0 + Duration::from_secs(31)).is_empty());
+
+        // And it does not linger: re-allowing the application does not
+        // resurrect the old window's count on a later tick.
+        c.allow = vec!["Signal".into()];
+        assert!(l.due(&c, t0 + Duration::from_secs(32)).is_empty());
+    }
+
+    /// A cooldown large enough to overflow `Instant` arithmetic must not
+    /// panic the daemon -- `cooldown_secs` is hot-reloaded config, so a
+    /// fat-fingered value here is one bad TOML edit away, not a programming
+    /// error. Such a window simply never closes.
+    #[test]
+    fn an_overflowing_cooldown_does_not_panic() {
+        let mut c = cfg();
+        c.cooldown_secs = u64::MAX;
+        let mut l = Limiter::new();
+        let t0 = Instant::now();
+        assert!(matches!(
+            l.decide(&n("Signal", "first", ""), &c, t0),
+            Decision::Speak(_)
+        ));
+        assert!(matches!(
+            l.decide(&n("Signal", "more", ""), &c, t0 + Duration::from_secs(1)),
+            Decision::Count
+        ));
+        assert!(l.due(&c, t0 + Duration::from_secs(1_000_000)).is_empty());
+    }
+
+    /// An empty or whitespace-only app name must not be spoken as a bare
+    /// leading colon, and a padded one must not carry its padding into the
+    /// announcement. Both are reachable from the M5 settings window's
+    /// editable allowlist, which does not stop the user typing either.
+    #[test]
+    fn compose_trims_and_skips_an_empty_app_name() {
+        let c = cfg();
+        assert_eq!(
+            compose(&n("", "hi", ""), &c).as_deref(),
+            Some("hi"),
+            "empty app name must not produce a leading colon"
+        );
+        assert_eq!(
+            compose(&n("   ", "hi", ""), &c).as_deref(),
+            Some("hi"),
+            "whitespace-only app name must not produce a leading colon"
+        );
+        assert_eq!(
+            compose(&n("Signal ", "hi", ""), &c).as_deref(),
+            Some("Signal: hi"),
+            "a padded app name must not carry its padding into the prefix"
+        );
     }
 }
