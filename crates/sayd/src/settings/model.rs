@@ -100,6 +100,20 @@ struct Pending {
     /// undebounced flush so a change made just before the window closed is
     /// not lost.
     stop: bool,
+    /// Set by `SettingsModel::flush` to skip the rest of `WRITE_DEBOUNCE`
+    /// without stopping the writer thread -- unlike `stop`, this is not the
+    /// end of the model's life, just a request that whatever is owed go out
+    /// now. Consumed (set back to `false`) by `write_loop` as soon as it
+    /// breaks out of the debounce wait, so it never causes a *later* burst
+    /// to skip its own debounce.
+    flush: bool,
+    /// The outcome of the most recently *finished* write attempt, kept so
+    /// `flush` can report success or failure to its caller after waiting for
+    /// `write` to clear -- `write` alone cannot tell the two apart, since
+    /// `write_loop` clears it on both a successful save and a failed one
+    /// (see the failure arm's comment). `None` until the first write
+    /// attempt finishes.
+    last_write_error: Option<String>,
 }
 
 /// The half of `SettingsModel` the writer thread also holds. Separate from
@@ -175,6 +189,8 @@ impl SettingsModel {
                 current,
                 write: None,
                 stop: false,
+                flush: false,
+                last_write_error: None,
             }),
             work: Condvar::new(),
             done: Condvar::new(),
@@ -318,6 +334,61 @@ impl SettingsModel {
         self.shared.writes.load(Ordering::Relaxed)
     }
 
+    /// Force whatever edit is still owed to disk out right now, skipping the
+    /// rest of `WRITE_DEBOUNCE`, and block up to `timeout` for that attempt
+    /// to finish.
+    ///
+    /// For the daemon's shutdown path (`run_daemon` in `main.rs`), called
+    /// there because nothing else ever would: this model lives in
+    /// `settings`'s own `OnceLock` for the process's whole life, so its
+    /// `Drop` -- which does exactly this same skip-the-debounce flush, see
+    /// `stop`'s doc comment -- never runs in production, only in tests that
+    /// build a standalone `SettingsModel` and let it go out of scope. A
+    /// settings change made in the last `WRITE_DEBOUNCE` before SIGTERM/
+    /// `Quit()`/`say quit` would otherwise still be sitting on the writer's
+    /// queue, shown to the user as applied, when the process exits.
+    ///
+    /// A no-op, immediately, when there is nothing owed: `write.is_none()`
+    /// is true both when no edit was ever made and when the debounce already
+    /// finished writing on its own, and shutdown must not wait out a fake
+    /// deadline for either.
+    ///
+    /// Returns the outcome of the forced write (or `Ok(())` for the no-op
+    /// case) rather than just whether it finished in time, so the shutdown
+    /// path can tell "nothing to do" and "wrote fine" apart from "a change
+    /// the user was told was saved did not make it" and say so. The writer
+    /// thread's own failure arm already puts the same message on stderr
+    /// unconditionally (there may be no window open to hear about it any
+    /// other way) -- this is for the caller that specifically needs to know
+    /// whether *its* flush attempt succeeded, not just that some write,
+    /// sometime, failed.
+    pub fn flush(&self, timeout: Duration) -> Result<(), String> {
+        let mut p = lock(&self.shared.pending);
+        if p.write.is_none() {
+            return Ok(());
+        }
+        p.flush = true;
+        drop(p);
+        self.shared.work.notify_one();
+
+        let mut p = lock(&self.shared.pending);
+        let deadline = std::time::Instant::now() + timeout;
+        while p.write.is_some() {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return Err(format!(
+                    "the write did not finish within {:.1}s",
+                    timeout.as_secs_f64()
+                ));
+            }
+            p = match self.shared.done.wait_timeout(p, left) {
+                Ok((g, _)) => g,
+                Err(poisoned) => poisoned.into_inner().0,
+            };
+        }
+        p.last_write_error.clone().map_or(Ok(()), Err)
+    }
+
     /// Block until nothing is owed to the disk. Test-only: production code
     /// on the glib thread must never wait on the writer.
     #[cfg(test)]
@@ -376,10 +447,13 @@ fn write_loop(shared: &Shared) {
         }
 
         // Debounce: hold off while edits keep arriving, so a held spin
-        // button is one write rather than one per repeat. A stop skips the
-        // wait entirely -- a change made just before the window closed must
-        // not be dropped on the floor to save 250 ms.
-        while !p.stop {
+        // button is one write rather than one per repeat. A stop or an
+        // explicit flush request (`SettingsModel::flush`) both skip the
+        // wait entirely -- a stop because a change made just before the
+        // window closed must not be dropped on the floor to save 250 ms, a
+        // flush because its caller is deliberately waiting on this write and
+        // has already decided the debounce should not apply to it.
+        while !p.stop && !p.flush {
             let (guard, timed_out) = match shared.work.wait_timeout(p, WRITE_DEBOUNCE) {
                 Ok((g, t)) => (g, t.timed_out()),
                 Err(poisoned) => {
@@ -392,6 +466,10 @@ fn write_loop(shared: &Shared) {
                 break;
             }
         }
+        // Consumed here, not left set: otherwise the *next* burst -- which
+        // owes nothing to the caller that requested this flush -- would also
+        // skip its own debounce.
+        p.flush = false;
 
         // Cloned, not taken: while `write` is set, `edit` seeds from it and
         // so stays off the store's stamp -- which is precisely what `save`
@@ -411,6 +489,10 @@ fn write_loop(shared: &Shared) {
                 if p.write.as_ref() == Some(&cfg) {
                     p.write = None;
                 }
+                // Recorded even when a newer write superseded this one: a
+                // `flush` waiting on that newer write should see the newest
+                // finished attempt's outcome, not this now-stale one.
+                p.last_write_error = None;
             }
             Err(e) => {
                 // The file still holds what it held before -- `save_to`
@@ -423,6 +505,7 @@ fn write_loop(shared: &Shared) {
                 let mut p = lock(&shared.pending);
                 p.write = None;
                 p.current = truth;
+                p.last_write_error = Some(e.clone());
                 drop(p);
                 // Always logged, because there may be no window listening --
                 // the debounce tail can outlive the one that made the edit.
@@ -878,6 +961,94 @@ mod tests {
         let (on_disk, err) = Config::load_from(&path);
         assert_eq!(err, None);
         assert_eq!(on_disk.voice, "am_fenrir");
+        engine.shutdown();
+    }
+
+    /// The shutdown-path counterpart to `dropping_the_model_flushes_what_is_
+    /// still_owed`: in production this model is never dropped (it lives in
+    /// `settings::HOST` for the daemon's whole life), so `flush` is the only
+    /// thing that can ever land an edit made in the last `WRITE_DEBOUNCE`
+    /// before the process exits. Flushing immediately after the edit, well
+    /// inside the 250ms debounce window, is the point -- without `flush`
+    /// skipping the debounce (or without `flush` existing at all), the file
+    /// would not hold the edit yet at the moment this asserts.
+    #[test]
+    fn flush_lands_a_pending_edit_without_waiting_out_the_debounce() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let models = models_dir_with(&["af_heart", "am_fenrir"], dir.path());
+        let path = dir.path().join("config.toml");
+        let (store, engine) = store_in(dir.path());
+        let m = SettingsModel::new(store, models, Config::default());
+
+        m.edit(|c| c.voice = "am_fenrir".into())
+            .expect("edit succeeds");
+        assert_eq!(
+            m.flush(Duration::from_secs(5)),
+            Ok(()),
+            "flush must report success for a write that lands"
+        );
+
+        let (on_disk, err) = Config::load_from(&path);
+        assert_eq!(err, None);
+        assert_eq!(
+            on_disk.voice, "am_fenrir",
+            "flush must have written the edit through, not merely waited"
+        );
+        engine.shutdown();
+    }
+
+    /// `flush` with nothing owed must return immediately rather than wait
+    /// out `timeout` -- called from the shutdown path on every exit,
+    /// including the overwhelmingly common case where the settings window
+    /// was never touched, this must never add a fixed delay to quitting.
+    #[test]
+    fn flush_with_nothing_pending_is_a_fast_no_op() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let models = models_dir_with(&["af_heart"], dir.path());
+        let (store, engine) = store_in(dir.path());
+        let m = SettingsModel::new(store, models, Config::default());
+
+        let start = std::time::Instant::now();
+        assert_eq!(m.flush(Duration::from_secs(5)), Ok(()));
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "a no-op flush must not wait out the timeout: took {:?}",
+            start.elapsed()
+        );
+        engine.shutdown();
+    }
+
+    /// A flush that cannot reach disk must say so, not report success for a
+    /// change that was in fact lost -- this is what lets the shutdown path
+    /// (`settings::flush_pending` in `mod.rs`) decide whether to warn.
+    #[test]
+    fn flush_reports_a_write_failure_rather_than_claiming_success() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let models = models_dir_with(&["af_heart", "am_fenrir"], dir.path());
+        let engine = EngineHandle::spawn(
+            Config::default(),
+            Box::new(StubSynthesizer::new()),
+            Box::new(VecSink::new(24_000 * 10)),
+        );
+        // Same trick as `a_failed_write_is_reported_and_does_not_change_the_
+        // model`: a path whose parent is a file, not a directory, so
+        // `save_to` fails for a reason that needs no permission games.
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"not a directory").expect("blocker");
+        let store = Arc::new(ConfigStore::new(
+            blocker.join("config.toml"),
+            engine.clone(),
+            Config::default(),
+        ));
+        let m = SettingsModel::new(store, models, Config::default());
+
+        m.edit(|c| c.voice = "am_fenrir".into())
+            .expect("valid, so it is accepted; the disk has not been touched yet");
+        let result = m.flush(Duration::from_secs(5));
+        assert!(
+            result.is_err(),
+            "a write that cannot reach disk must not be reported as flushed"
+        );
         engine.shutdown();
     }
 

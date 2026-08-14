@@ -782,6 +782,12 @@ async fn run_daemon() -> std::process::ExitCode {
     }
 
     eprintln!("sayd: shutting down");
+    // Before the engine goes away: a settings edit made in the last 250ms
+    // (`settings::model::WRITE_DEBOUNCE`) can still be sitting on the
+    // writer thread's queue, shown to the user as saved, and this model is
+    // never otherwise dropped in the daemon's lifetime -- see
+    // `settings::flush_pending`'s doc comment.
+    settings::flush_pending();
     engine.shutdown();
     std::process::ExitCode::SUCCESS
 }
