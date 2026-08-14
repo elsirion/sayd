@@ -69,6 +69,7 @@ pub struct Config {
     /// Measured peak at 8; 16 and 24 both regress.
     pub threads: usize,
     /// Seconds of an empty queue before the ~1.27 GB ORT session is dropped.
+    /// `0` disables idle unloading entirely (spec §8); see `maybe_unload`.
     pub idle_unload_secs: u64,
     pub muted: bool,
     /// Submissions longer than this are refused.

@@ -781,6 +781,19 @@ impl Engine {
         if !self.synth.is_loaded() {
             return;
         }
+        // `0` disables idle unloading, per spec §8 ("Idle unload -- seconds,
+        // 0 to disable") and §9. This early return is what makes that true:
+        // without it the comparison below reads `elapsed() >= 0`, which
+        // holds on the very first tick after the queue drains, so `0` would
+        // mean the *most* aggressive unloading there is rather than none at
+        // all. That is not a theoretical inversion -- it is one drag to the
+        // bottom of the settings window's Idle unload spinner, whose own
+        // subtitle promises the opposite, and the user who reaches for it is
+        // by definition the one trying to get rid of the ~1.27 GB reload
+        // pause before the first utterance.
+        if self.cfg.idle_unload_secs == 0 {
+            return;
+        }
         let Some(since) = self.idle_since else { return };
         if since.elapsed() >= Duration::from_secs(self.cfg.idle_unload_secs) {
             self.synth.unload();
@@ -905,6 +918,23 @@ impl Engine {
     #[cfg(test)]
     fn is_model_loaded(&self) -> bool {
         self.synth.is_loaded()
+    }
+
+    /// Pretend the engine went idle `ago` earlier than it actually did, so a
+    /// test can reach the far side of an idle-unload delay without sleeping
+    /// through it.
+    ///
+    /// This exists because `idle_unload_secs: 0` -- the obvious shortcut,
+    /// and what these tests used to use -- is no longer one: `0` now means
+    /// *never* unload (see `maybe_unload`). A no-op while something is
+    /// speaking, since `idle_since` is `None` then; that is precisely the
+    /// state `model_does_not_unload_while_speaking` asserts about, so it
+    /// backdates by an hour and still expects the model to be loaded.
+    #[cfg(test)]
+    fn backdate_idle(&mut self, ago: Duration) {
+        self.idle_since = self
+            .idle_since
+            .map(|t| t.checked_sub(ago).expect("monotonic clock predates the test"));
     }
 
     #[cfg(test)]
@@ -2510,11 +2540,17 @@ mod tests {
 
     #[test]
     fn idle_unload_drops_the_model_after_the_configured_delay() {
-        // unload as soon as idle. C1: as in `returns_to_idle_when_the_queue_
-        // empties`, actually reaching `Idle` -- the precondition this test
-        // is exercising -- now requires draining the sink first.
+        // A real, non-zero delay, reached with `backdate_idle` rather than
+        // by sleeping it out. This test used `idle_unload_secs: 0` as a
+        // "fire immediately" convenience until `0` was given its documented
+        // meaning of *never* unload; using it here would now assert the
+        // opposite of what the name says.
+        //
+        // C1: as in `returns_to_idle_when_the_queue_empties`, actually
+        // reaching `Idle` -- the precondition this test is exercising --
+        // requires draining the sink first.
         let cfg = Config {
-            idle_unload_secs: 0,
+            idle_unload_secs: 600,
             ..Config::default()
         };
         let sink = Arc::new(Mutex::new(VecSink::new(24_000 * 10)));
@@ -2531,18 +2567,58 @@ mod tests {
             "sanity: audio must still be pending before the drain below"
         );
         sink.lock().unwrap().drain(usize::MAX);
-        e.tick(); // reach Idle and trigger the unload check in the same tick
+        e.tick(); // reach Idle, which starts the idle clock
         assert_eq!(e.snapshot().state, State::Idle);
         assert!(
+            e.is_model_loaded(),
+            "the delay has not elapsed yet, so the model must still be loaded"
+        );
+
+        e.backdate_idle(Duration::from_secs(600));
+        e.tick();
+        assert!(
             !e.is_model_loaded(),
-            "expected the model to unload when idle"
+            "expected the model to unload once the delay elapsed"
+        );
+    }
+
+    /// Spec §8 and §9: "Idle unload -- seconds, 0 to disable", which the
+    /// settings window repeats to the user as "0 never unloads". `0` is the
+    /// bottom of that spinner's range and one drag away, so getting it
+    /// backwards turns the control a user reaches for to *avoid* reload
+    /// pauses into the one that guarantees one before every utterance.
+    #[test]
+    fn idle_unload_of_zero_never_unloads() {
+        let cfg = Config {
+            idle_unload_secs: 0,
+            ..Config::default()
+        };
+        let sink = Arc::new(Mutex::new(VecSink::new(24_000 * 10)));
+        let mut e = Engine::new(
+            cfg,
+            Box::new(StubSynthesizer::new()),
+            Box::new(SharedVecSink(sink.clone())),
+        );
+        e.handle(say("Hello."));
+        run(&mut e, 500);
+        sink.lock().unwrap().drain(usize::MAX);
+        e.tick();
+        assert_eq!(e.snapshot().state, State::Idle);
+
+        // A week idle. Nothing short of an explicit config change may drop
+        // the session.
+        e.backdate_idle(Duration::from_secs(7 * 24 * 3600));
+        e.tick();
+        assert!(
+            e.is_model_loaded(),
+            "idle_unload_secs = 0 must keep the session loaded indefinitely"
         );
     }
 
     #[test]
     fn model_does_not_unload_while_speaking() {
         let cfg = Config {
-            idle_unload_secs: 0,
+            idle_unload_secs: 1,
             ..Config::default()
         };
         let mut e = Engine::new(
@@ -2554,7 +2630,13 @@ mod tests {
             "A reasonably long sentence to keep it busy for a while.",
         ));
         e.tick();
+        // A no-op by construction: `idle_since` is `None` while an utterance
+        // is in flight, which is exactly the guard being tested. Backdating
+        // by an hour and still finding the model loaded says the unload
+        // depends on being idle, not merely on the delay having passed.
+        e.backdate_idle(Duration::from_secs(3600));
         e.tick();
+        assert_eq!(e.snapshot().state, State::Speaking, "sanity: still busy");
         assert!(e.is_model_loaded());
     }
 
