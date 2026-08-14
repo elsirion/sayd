@@ -131,7 +131,12 @@ fn list_voices(models_dir: &Path) -> Vec<String> {
         .filter_map(Result::ok)
         .filter_map(|e| {
             let path = e.path();
-            if path.extension()? != "bin" {
+            // `KokoroSynthesizer::voice_exists` rejects anything that is not
+            // a file at submit time, so a directory named e.g. `foo.bin/` --
+            // a partially-written download, say -- would only ever be a dead
+            // end once selected. Filtering it here keeps it out of the
+            // dropdown in the first place.
+            if path.extension()? != "bin" || !path.is_file() {
                 return None;
             }
             Some(path.file_stem()?.to_string_lossy().into_owned())
@@ -190,6 +195,23 @@ mod tests {
         let (store, engine) = store_in(dir.path());
         let m = SettingsModel::new(store, models, Config::default());
         assert_eq!(m.voices(), ["af_heart", "am_fenrir", "bm_george"]);
+        engine.shutdown();
+    }
+
+    /// A directory named like a voice pack -- a partially-written download
+    /// landing as `foo.bin/`, say -- must not appear in the dropdown.
+    /// `KokoroSynthesizer::voice_exists` checks `is_file()` and rejects it at
+    /// submit time regardless, so listing it here only gives the user a
+    /// selectable dead end instead of no entry at all.
+    #[test]
+    fn a_directory_named_like_a_voice_pack_is_not_listed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let models = models_dir_with(&["af_heart"], dir.path());
+        std::fs::create_dir_all(models.join("voices").join("partial.bin"))
+            .expect("partial voice directory");
+        let (store, engine) = store_in(dir.path());
+        let m = SettingsModel::new(store, models, Config::default());
+        assert_eq!(m.voices(), ["af_heart"]);
         engine.shutdown();
     }
 
