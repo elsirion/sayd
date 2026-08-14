@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use notify::event::{EventKind, ModifyKind};
 use notify::{Event, RecursiveMode, Watcher};
@@ -350,6 +350,17 @@ pub fn spawn(store: Arc<ConfigStore>) -> Result<ConfigWatcher, String> {
 }
 
 /// Coalesce ticks and reload once the file has been quiet for [`DEBOUNCE`].
+///
+/// "Quiet" is tracked as an explicit deadline, not as a `recv_timeout`
+/// restarted on every message. Only `Changed`/`Rewatch` -- an actual sign
+/// the file may be mid-edit -- push the deadline out; `Failed` is drained
+/// but never does. A naive "restart the timeout on any `Ok`" version
+/// starves indefinitely under a persistent error stream: notify's inotify
+/// loop re-reads after a failed non-`WouldBlock` read without pausing, so
+/// such a stream can arrive faster than DEBOUNCE for as long as the
+/// underlying problem lasts, and a pending edit would then never see its
+/// quiet window expire -- silently, since the log cap means only the first
+/// two of those errors are ever printed.
 fn debounce_loop(
     store: &ConfigStore,
     rx: &mpsc::Receiver<Tick>,
@@ -361,19 +372,31 @@ fn debounce_loop(
     // the dropped handle is the only way out.
     let mut errors = 0usize;
     loop {
-        match rx.recv() {
-            Ok(tick) => match handle(tick, watcher, dir, &mut errors) {
-                Next::Reload => {}
-                Next::Wait => continue,
-                Next::Stop => return,
-            },
-            Err(_) => return,
-        }
-        loop {
-            match rx.recv_timeout(DEBOUNCE) {
-                // Still being written. Restart the quiet period.
+        // Block for a tick that starts a pending edit. A lone `Failed`
+        // tick (nothing pending yet) loops back here rather than starting
+        // a quiet window over nothing.
+        let mut deadline = loop {
+            match rx.recv() {
                 Ok(tick) => match handle(tick, watcher, dir, &mut errors) {
-                    Next::Reload | Next::Wait => continue,
+                    Next::Reload => break Instant::now() + DEBOUNCE,
+                    Next::Wait => continue,
+                    Next::Stop => return,
+                },
+                Err(_) => return,
+            }
+        };
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            match rx.recv_timeout(deadline - now) {
+                // Still being written -- but only `Changed`/`Rewatch` push
+                // the deadline out; a `Failed` tick is drained in place so
+                // it cannot hold the window open forever.
+                Ok(tick) => match handle(tick, watcher, dir, &mut errors) {
+                    Next::Reload => deadline = Instant::now() + DEBOUNCE,
+                    Next::Wait => {}
                     Next::Stop => return,
                 },
                 Err(RecvTimeoutError::Timeout) => break,
@@ -436,6 +459,26 @@ fn handle(
 }
 
 /// Put the watch back after the directory it was on was removed or renamed.
+///
+/// This always arms a *new* kernel watch; it never assumes the old one is
+/// gone. For a delete (`IN_DELETE_SELF`) and for the `MOVED_FROM` half of a
+/// rename, notify's inotify backend has already retired the old watch
+/// descriptor itself (`remove_watch_by_event` covers exactly those two). A
+/// bare rename of the watched directory -- `IN_MOVE_SELF`, with no paired
+/// `MOVED_FROM` because nothing else in the tree moved -- is neither, so
+/// the old descriptor stays live under the now-stale path and this call
+/// arms a second one under the new path. The result is one leaked inotify
+/// watch and a spurious extra wakeup per future event on the old path --
+/// not a wedge, since `reload` always reads the real, current path no
+/// matter which watch fired. Left as-is rather than engineered around:
+/// closing it needs tracking watch descriptors ourselves, which is more
+/// machinery than a harmless leak justifies.
+///
+/// The `create_dir_all` below also means the watch survives its directory
+/// being deleted out from under it in a way that is easy to misread as
+/// robustness: `rm -rf ~/.config/sayd` does not stay gone. The next tick
+/// recreates it as an empty directory (config included -- it was in there)
+/// and the watch quietly resumes on nothing.
 fn rearm(watcher: &mut notify::RecommendedWatcher, dir: &Path) {
     if let Err(e) = std::fs::create_dir_all(dir) {
         eprintln!(
@@ -687,8 +730,16 @@ mod tests {
 
         // Several readers and a long run because the losing interleaving is
         // narrow -- the window is one file read -- and only the *last* one
-        // to lose shows up in the final state. This can only fail on code
-        // that has the bug, never on code that does not.
+        // to lose shows up in the final state. A pass here is evidence, not
+        // proof: on code with the bug reintroduced, this test has been
+        // observed to catch it on roughly half its runs (2 of 4 in one
+        // measurement), not every run, because only the very last reload to
+        // lose the race leaves a mark that survives to the final
+        // assertion -- earlier losers get overwritten by a later winner.
+        // 4000 iterations rather than 400 buys more chances for a losing
+        // interleaving to be the last one (about half a second here,
+        // instead of the ~0.05s the smaller count ran in); it narrows the
+        // odds of a false pass, it does not close them to zero.
         let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let readers: Vec<_> = (0..4)
             .map(|_| {
@@ -701,7 +752,7 @@ mod tests {
                 })
             })
             .collect();
-        for _ in 0..400 {
+        for _ in 0..4_000 {
             store.save(&older).expect("save succeeds");
             store.save(&newer).expect("save succeeds");
         }
@@ -982,6 +1033,63 @@ mod tests {
             starting,
             "the edit must settle on the content the writer finished with"
         );
+        engine.shutdown();
+    }
+
+    /// Regression for the Minor 2 finding: a persistent stream of watch
+    /// errors must not starve a pending edit forever. `debounce_loop` is
+    /// driven directly with hand-fed ticks -- a real inotify error takes
+    /// real broken input to produce, but the loop cannot tell a synthetic
+    /// `Tick::Failed` from a real one, so this exercises exactly the code
+    /// path notify's re-read-without-pausing behaviour hits.
+    #[test]
+    fn a_persistent_error_stream_does_not_starve_a_pending_reload() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        // Already on disk before the loop starts: this test drives ticks
+        // by hand rather than through real inotify events, so `reload`
+        // just needs something new to read once it decides to read.
+        let cfg = Config {
+            voice: "am_fenrir".into(),
+            ..Config::default()
+        };
+        cfg.save_to(&path).expect("write");
+
+        let engine = engine();
+        let store = Arc::new(ConfigStore::new(
+            path.clone(),
+            engine.clone(),
+            Config::default(),
+        ));
+
+        let (tx, rx) = mpsc::channel();
+        let mut watcher =
+            notify::recommended_watcher(|_res: notify::Result<Event>| {}).expect("watcher");
+        let watch_dir = dir.path().to_path_buf();
+        let loop_store = store.clone();
+        let loop_thread = std::thread::spawn(move || {
+            debounce_loop(&loop_store, &rx, &mut watcher, &watch_dir);
+        });
+
+        tx.send(Tick::Changed).expect("send");
+        // Faster than DEBOUNCE, and for well over DEBOUNCE in total: the
+        // arrival rate the finding describes for a persistent, non-
+        // `WouldBlock` inotify read failure. On the naive "restart
+        // recv_timeout(DEBOUNCE) on any Ok" version this fix replaced,
+        // ticks this close together keep the quiet window from ever
+        // expiring for as long as they keep arriving.
+        for _ in 0..40 {
+            tx.send(Tick::Failed("simulated".into())).expect("send");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            store.applied_reloads(),
+            1,
+            "the deadline set by Changed must expire on its own, even while errors keep arriving"
+        );
+
+        drop(tx);
+        loop_thread.join().expect("loop thread");
         engine.shutdown();
     }
 }
