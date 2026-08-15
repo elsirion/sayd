@@ -225,14 +225,26 @@ impl ResamplingProducer {
         if samples.is_empty() {
             return 0;
         }
-        // Device-rate room right now. Computed fresh on every call (not
-        // cached) because `fill`, running concurrently on the audio
+        // Device-rate room right now -- taken from the ring's *physical*
+        // free slots (`RingProducer::slots()`), not `capacity() -
+        // pending()`. The two are not interchangeable: after a `clear()`,
+        // `pending()` drops to 0 immediately by design, but the condemned
+        // samples still physically occupy ring slots until `fill` next
+        // runs and discards them, so `capacity() - pending()` overstates
+        // free room for as long as that discard is outstanding. Using it
+        // here let a `clear()` followed by a large push report full
+        // acceptance while `producer.push(&out)` below silently kept only
+        // what physically fit -- measured, release build, 48 kHz: 200 000
+        // of 200 000 input samples reported accepted, 6.67 s of audio
+        // actually dropped, with `carry` never retrying the loss because
+        // `push` had already claimed success. `slots()` can't be fooled
+        // by `clear()`'s marker (see its doc), so basing `room` on it
+        // makes that short accept structurally impossible instead of
+        // merely asserted against below. Computed fresh on every call
+        // (not cached) because `fill`, running concurrently on the audio
         // thread, can free room between calls -- same reasoning as the
         // engine's own `headroom` calculation in `engine.rs`.
-        let room = self
-            .producer
-            .capacity()
-            .saturating_sub(self.producer.pending());
+        let room = self.producer.slots();
         let prefix = resampler.largest_prefix_within(samples.len(), room);
         if prefix == 0 {
             return 0;
@@ -600,5 +612,89 @@ mod tests {
         // with the unconsumed remainder, not the original slice.
         let remainder = &input[n1..];
         assert!(!remainder.is_empty());
+    }
+
+    /// Regression test for the `capacity() - pending()` room bug fixed in
+    /// `push` above (see its doc comment): after a `clear()`, the ring is
+    /// still physically full of the condemned generation, but `pending()`
+    /// already reports 0, so `push` can compute a room figure far larger
+    /// than what's actually free and let its resampled output silently
+    /// overflow what `producer.push` can hold.
+    ///
+    /// **This test is only meaningful run under `--release`**
+    /// (`nix develop -c cargo test -p sayd --release
+    /// clear_then_immediate_push_never_reports_more_accepted_than_lands`).
+    /// Under a debug build, the buggy code path trips the
+    /// `debug_assert_eq!` inside `push` *before* this test's own
+    /// assertion ever runs -- so a debug run of this test does fail on
+    /// unfixed code, but only via that assert firing, which proves state
+    /// desynchronised, not that release builds silently drop audio
+    /// instead of panicking. The `debug_assert_eq!` is compiled out in
+    /// release, which is exactly the profile the original bug report
+    /// measured 6.67 s of dropped audio in and the profile every real
+    /// user runs -- so only `--release` exercises the failure this test
+    /// exists to catch. After the fix, this test passes in both profiles.
+    #[test]
+    fn clear_then_immediate_push_never_reports_more_accepted_than_lands() {
+        let device_rate = 48_000u32;
+        let input_rate = 24_000u32;
+        // Small enough that a second push can plausibly want the ring's
+        // whole nominal capacity; large enough that filler leaves only a
+        // sliver of physical room once resident.
+        let ring_capacity = 2_000usize;
+        let (raw, mut cons) = ring(ring_capacity);
+        let mut rp = ResamplingProducer::new(raw, input_rate, device_rate);
+
+        // Fill the ring close to capacity and never drain it: after this,
+        // its physical slots stay occupied even though nothing has played
+        // yet.
+        let filler = vec![1.0f32; 900];
+        let n_filler = rp.push(&filler);
+        assert!(n_filler > 0, "filler push must succeed");
+
+        // `clear()` zeroes `pending()` immediately, but -- by design --
+        // moves nothing physically: the filler samples still occupy their
+        // ring slots until `fill` (never called yet in this test) removes
+        // them.
+        rp.clear();
+        assert_eq!(rp.pending(), 0, "clear zeroes logical pending immediately");
+
+        // A second push, sized so an unbounded resample of it would need
+        // close to the ring's nominal capacity worth of device samples --
+        // far more than the handful of slots actually free right now.
+        let second = vec![5.0f32; 900];
+        let accepted = rp.push(&second);
+        assert!(accepted > 0, "second push must accept something");
+
+        // What `push` claims to have accepted, converted to how many
+        // device samples an unbounded resample of exactly that many input
+        // samples produces. (A fresh resampler, not `rp`'s live one, so
+        // this can be off by the ~1-sample "is there a carried tail"
+        // effect described in `StreamingResampler::output_len_for`'s doc
+        // -- negligible next to the scale of loss this test is checking
+        // for.)
+        let mut oneshot = StreamingResampler::new(input_rate, device_rate);
+        let expected_device_samples = oneshot.process(&second[..accepted]).len();
+
+        // Drain everything: first the discarded pre-clear filler (all
+        // 1.0s, condemned by `clear()` and never played), then whatever
+        // of the second push (all 5.0s, distinguishable from filler and
+        // from silence) actually landed.
+        let mut out = [0.0f32; 64];
+        let mut played_nonzero = 0usize;
+        for _ in 0..(ring_capacity * 4 / out.len() + 32) {
+            cons.fill(&mut out, 1);
+            played_nonzero += out.iter().filter(|&&s| s != 0.0).count();
+        }
+
+        assert!(
+            played_nonzero + 2 >= expected_device_samples,
+            "push() claimed {accepted} of {} input samples were accepted after clear() \
+             (implying {expected_device_samples} device samples), but only \
+             {played_nonzero} nonzero device samples were ever actually played back -- \
+             {} device samples were silently dropped and never retried",
+            second.len(),
+            expected_device_samples.saturating_sub(played_nonzero),
+        );
     }
 }

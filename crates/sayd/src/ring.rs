@@ -268,6 +268,29 @@ impl RingProducer {
     pub(crate) fn capacity(&self) -> usize {
         self.capacity
     }
+
+    /// Physical free room in the ring right now, in device-rate samples --
+    /// deliberately distinct from `capacity() - pending()`. After
+    /// `clear()`, `pending()` drops to 0 *immediately* (see its doc), but
+    /// the condemned samples still physically occupy ring slots until
+    /// `fill` next runs and discards them, so `capacity() - pending()`
+    /// overstates how much room there actually is for as long as that
+    /// discard is outstanding. `slots()` is rtrb's own free-slot count,
+    /// which nothing but this struct's own `push` ever shrinks (see its
+    /// doc) and `clear()` never touches at all, so it's always a safe,
+    /// race-free bound on what `push` can accept right now, unlike
+    /// `capacity() - pending()`.
+    ///
+    /// [`ResamplingProducer::push`](crate::resample::ResamplingProducer::push)
+    /// uses this instead of `capacity() - pending()` for exactly this
+    /// reason -- see its doc for the bug that motivated it: measured in a
+    /// release build, a `clear()` followed immediately by a large push
+    /// reported 200 000 of 200 000 input samples accepted while 6.67 s of
+    /// audio was silently dropped, because `capacity() - pending()`
+    /// treated a still-full ring as empty.
+    pub(crate) fn slots(&self) -> usize {
+        self.producer.slots()
+    }
 }
 
 impl RingConsumer {
@@ -808,5 +831,96 @@ mod tests {
             0,
             "everything pushed was eventually drained"
         );
+    }
+
+    /// The two `concurrent_*` tests above (and the two earlier module
+    /// designs they were written to catch regressions in) only ever check
+    /// *accounting* -- that `pending()`/`total_written()` add up -- never
+    /// the actual sample values that reach output. An investigation into
+    /// an unrelated audio bug noticed that gap, closed it locally with a
+    /// 200-utterance, content-checked concurrent run, and recommended
+    /// keeping it in the tree; this is that check.
+    ///
+    /// Each "utterance" is `samples_per_utterance` samples encoding both
+    /// its own generation id and its position within the generation
+    /// (`value = id * 10_000 + position`), so whatever of a generation
+    /// survives to output can be checked for the specific failure modes a
+    /// discard-boundary bug would cause: a **lost prefix** (a survivor run
+    /// not starting at position 0), **interior corruption** (positions
+    /// skipping or repeating), or **reordering/duplication** (the same
+    /// generation id reappearing in a second, non-adjacent run). A
+    /// generation racing the very next `clear()` and ending up partly or
+    /// wholly discarded is expected, not a bug -- that race is the entire
+    /// point of `Policy::Replace` -- so this does not require every
+    /// generation to survive in full, only that whatever does survive is
+    /// genuine, in-order, untruncated-from-the-front content.
+    #[test]
+    fn concurrent_clear_then_push_never_corrupts_survivor_content() {
+        use std::collections::HashSet;
+        use std::thread;
+
+        let (mut prod, mut cons) = ring(4096);
+        let utterances = 200usize;
+        let samples_per_utterance = 2_400usize;
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let stop_reader = stop.clone();
+        let consumer = thread::spawn(move || {
+            let mut out = [0f32; 64];
+            let mut played = Vec::new();
+            loop {
+                // Same ordering reasoning as the twin tests above: reading
+                // `stop` before `fill` guarantees that once it's observed
+                // true, every sample this test will ever push has already
+                // happened-before this call.
+                let stopped = stop_reader.load(Ordering::Acquire);
+                cons.fill(&mut out, 1);
+                played.extend(out.iter().copied().filter(|&s| s != 0.0));
+                if stopped && cons.debug_pending() == 0 {
+                    break;
+                }
+            }
+            played
+        });
+
+        for id in 1..=utterances {
+            let base = (id * 10_000) as f32;
+            let samples: Vec<f32> = (0..samples_per_utterance)
+                .map(|p| base + p as f32)
+                .collect();
+            prod.clear();
+            prod.push(&samples);
+        }
+        stop.store(true, Ordering::Release);
+        let played = consumer.join().expect("consumer thread panicked");
+
+        let mut seen_ids = HashSet::new();
+        let mut i = 0;
+        while i < played.len() {
+            let id = (played[i] / 10_000.0).floor() as usize;
+            assert!(
+                seen_ids.insert(id),
+                "generation {id} reappeared in a second, non-adjacent run of output -- \
+                 content was duplicated or reordered"
+            );
+            let base = (id * 10_000) as f32;
+            let mut expected_pos = 0.0f32;
+            while i < played.len() && (played[i] / 10_000.0).floor() as usize == id {
+                let pos = played[i] - base;
+                assert_eq!(
+                    pos, expected_pos,
+                    "generation {id}'s survivor run diverges from a consecutive prefix at \
+                     position {expected_pos} (found {pos}) -- lost prefix, gap, or \
+                     corruption in what should be intact survivor content"
+                );
+                expected_pos += 1.0;
+                i += 1;
+            }
+            assert!(
+                expected_pos as usize <= samples_per_utterance,
+                "generation {id} produced a run of {expected_pos} samples, longer than the \
+                 {samples_per_utterance} it was ever pushed with"
+            );
+        }
     }
 }
