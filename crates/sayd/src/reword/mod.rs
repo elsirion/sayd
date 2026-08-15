@@ -94,11 +94,10 @@ pub const REWORD_HTTP_CEILING: Duration = Duration::from_secs(10);
 /// hopeless. Equal to [`REWORD_HTTP_CEILING`] because the client's own
 /// ceiling is what actually ends the request; there is nothing to be gained
 /// by waiting longer and nothing to be gained by giving up sooner.
-// `#[allow(dead_code)]`: the settings window's Test row is a later task in
-// this milestone, and it is the only caller. Produced now because it is part
-// of the interface that task expects, and because its value is an argument
-// about `REWORD_HTTP_CEILING` that belongs beside it.
-#[allow(dead_code)]
+///
+/// Read by `settings::model::outcome_for_error`, which is what puts the
+/// number in front of a user: "No answer after 10.0 s", beside the deadline
+/// that was not waited.
 pub const REWORD_TEST_CEILING: Duration = REWORD_HTTP_CEILING;
 
 /// How many rewrites may be in flight at once, across every path --
@@ -695,11 +694,24 @@ impl RewordState {
     /// the settings window, which is the one event that proves the key
     /// works -- and the only way back when the key came from the
     /// environment.
-    // `#[allow(dead_code)]`: the settings window's Test row is its only
-    // caller and lands in a later task of this milestone.
-    #[allow(dead_code)]
-    pub fn clear_auth_latch(&self) {
-        lock(&self.inner).auth_latched_for = None;
+    ///
+    /// `settings::model::run_reword_test` is its only caller, and it calls
+    /// it on any answer at all -- including one §3's guard then throws away,
+    /// which still proves the key works.
+    ///
+    /// Takes the config the answer came back under, and clears the latch
+    /// only if that is the config it was set for. Clearing unconditionally
+    /// would let a successful test of *some other* endpoint re-arm a config
+    /// nothing had fixed -- and it buys nothing, because [`allow`] already
+    /// compares the latched config against the one being asked about, so a
+    /// latch held for a config nobody is running blocks nothing.
+    ///
+    /// [`allow`]: RewordState::allow
+    pub fn clear_auth_latch(&self, cfg: &RewordConfig) {
+        let mut i = lock(&self.inner);
+        if i.auth_latched_for.as_ref() == Some(cfg) {
+            i.auth_latched_for = None;
+        }
     }
 
     /// Announce where text is going, once per run per resolved endpoint,
@@ -742,8 +754,14 @@ impl RewordState {
         true
     }
 
-    // `#[allow(dead_code)]`: read by the settings window's Test row, which
-    // uses it to say that a first request includes connection setup.
+    /// Has this endpoint been announced this run?
+    ///
+    /// Read only by `dbus`'s own tests, which use it to check that a rewrite
+    /// really reached the provider before timing it. Production code that
+    /// wants this asks [`RewordState::note_endpoint`] instead, whose return
+    /// value is the same fact taken from the call that establishes it --
+    /// see `settings::model::run_reword_test`.
+    // `#[allow(dead_code)]`: that caller is behind `--features reword`.
     #[allow(dead_code)]
     pub fn endpoint_seen(&self, cfg: &RewordConfig) -> bool {
         lock(&self.inner)
@@ -1469,7 +1487,11 @@ mod tests {
         // is the only way to recover from a key supplied through the
         // environment: editing that does not change the config at all.
         assert_eq!(state.allow(&cfg, now), Err(Blocked::AuthLatched));
-        state.clear_auth_latch();
+        // ...and only for the config it was set for: a successful test of a
+        // different endpoint is not evidence about this one.
+        state.clear_auth_latch(&changed);
+        assert_eq!(state.allow(&cfg, now), Err(Blocked::AuthLatched));
+        state.clear_auth_latch(&cfg);
         assert_eq!(state.allow(&cfg, now), Ok(()));
     }
 

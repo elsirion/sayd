@@ -12,11 +12,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
-use sayd_core::config::Config;
+use sayd_core::config::{Config, RewordConfig};
 
 use crate::config_watch::ConfigStore;
 use crate::notify::seen::{self, SeenApp};
 use crate::notify::{truncate_chars, MAX_APP_NAME_LEN};
+use crate::reword::{RewordError, Rewriter};
 
 /// The model values, with the measured trade-off shown inline in the
 /// window. Numbers are from the benchmark recorded in the design doc; do
@@ -114,6 +115,32 @@ pub const REWORD_MAX_CHARS_MIN: f64 = 32.0;
 pub const REWORD_MAX_CHARS_MAX: f64 = 2000.0;
 #[allow(dead_code)]
 pub const REWORD_MAX_CHARS_STEP: f64 = 32.0;
+
+/// What the Test row starts with: the example this whole feature exists
+/// for, so pressing Test once without typing anything is already a
+/// meaningful test. A working setup answers with a recognisably better
+/// sentence, and a user who has never thought about what rewording *is*
+/// gets shown it.
+// `#[allow(dead_code)]`: the Test row's widgets are a later task in this
+// milestone and are its only consumer. Produced here because §6's rule is
+// that every string the window shows is decided in this module.
+#[allow(dead_code)]
+pub const REWORD_TEST_DEFAULT: &str = "Alice: where do you want to go for dinner";
+
+/// The six rows of §6's endpoint table, offered by the Endpoint row's
+/// preset menu. UI strings rather than config values -- a preset that goes
+/// stale costs nothing and adding one is a line -- but they live here, not
+/// in `window.rs`, for the reason [`MODELS`] and [`SPEED_MODES`] do: the
+/// window is the one layer with no test coverage.
+#[allow(dead_code)]
+pub const ENDPOINT_PRESETS: [(&str, &str); 6] = [
+    ("Ollama", "http://localhost:11434/v1"),
+    ("llama.cpp server", "http://localhost:8080/v1"),
+    ("LM Studio", "http://localhost:1234/v1"),
+    ("vLLM", "http://localhost:8000/v1"),
+    ("PPQ", "https://api.ppq.ai/v1"),
+    ("OpenAI", "https://api.openai.com/v1"),
+];
 
 /// How long a burst of edits is allowed to keep collapsing into one write.
 ///
@@ -232,6 +259,13 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     }
 }
 
+/// How the Test row builds its client. Injectable so every row of §6's Test
+/// table can be driven from a struct holding one canned answer and no
+/// network at all -- the same seam, and the same reason, as
+/// `crate::reword::Rewriter` itself.
+type RewriterFn = dyn Fn(&RewordConfig) -> Result<Arc<dyn Rewriter>, RewordError> + Send + Sync;
+type RewriterFactory = Arc<RewriterFn>;
+
 /// The window's view of the config, and the one path a change takes out of
 /// it.
 ///
@@ -259,10 +293,36 @@ pub struct SettingsModel {
     /// be reported as applied, and a shutdown flush must not wait out its
     /// whole timeout for a thread that was never there.
     writer: Option<std::thread::JoinHandle<()>>,
+    /// How the Test row builds a client: the real one in the daemon, a
+    /// canned answer in this module's own tests.
+    rewriter_factory: RewriterFactory,
+    /// The daemon's tokio runtime, so `test_reword` can put its blocking
+    /// request on the blocking pool exactly as §2's path does.
+    ///
+    /// `Option` because `new` is also called from unit tests with no
+    /// runtime in scope. In the daemon it is always `Some`: `new` is called
+    /// from `run_daemon`, which runs on the runtime.
+    runtime: Option<tokio::runtime::Handle>,
 }
 
 impl SettingsModel {
     pub fn new(store: Arc<ConfigStore>, models_dir: PathBuf, current: Config) -> Self {
+        Self::new_with_rewriter(
+            store,
+            models_dir,
+            current,
+            Arc::new(crate::reword::build_rewriter),
+        )
+    }
+
+    /// [`SettingsModel::new`] with the Test row's client injected, so every
+    /// row of §6's Test table can be driven with no network.
+    pub fn new_with_rewriter(
+        store: Arc<ConfigStore>,
+        models_dir: PathBuf,
+        current: Config,
+        rewriter_factory: RewriterFactory,
+    ) -> Self {
         let shared = Arc::new(Shared {
             store,
             pending: Mutex::new(Pending {
@@ -306,6 +366,8 @@ impl SettingsModel {
             shared,
             voices: list_voices(&models_dir),
             writer,
+            rewriter_factory,
+            runtime: tokio::runtime::Handle::try_current().ok(),
         }
     }
 
@@ -631,6 +693,66 @@ impl SettingsModel {
         p.last_write_error.clone().map_or(Ok(()), Err)
     }
 
+    /// The Reword group's description, against the real environment.
+    // `#[allow(dead_code)]`: the Reword group's widgets are a later task in
+    // this milestone and are the only caller. It is written here, with a
+    // test, because §6's rule is that the window decides nothing.
+    #[allow(dead_code)]
+    pub fn reword_description_now(&self) -> String {
+        let cfg = self.current().reword;
+        // The two halves of `resolve_api_key_with`'s environment rule, kept
+        // in step with it deliberately: an empty `api_key_env` names no
+        // variable and is never looked up (here), and a variable that is set
+        // but empty is not a key (in `reword_description`, which has to make
+        // that call anyway for the value a test hands it).
+        let from_env = if cfg.api_key_env.is_empty() {
+            None
+        } else {
+            std::env::var(&cfg.api_key_env).ok()
+        };
+        reword_description(&cfg, from_env.as_deref())
+    }
+
+    /// Run one rewrite against the *pending* config and report what
+    /// happened.
+    ///
+    /// Returns immediately with a receiver. The caller -- the glib main
+    /// thread -- awaits it with `glib::spawn_future_local`, so nothing
+    /// blocks the UI; the receiver being dropped when the window closes
+    /// mid-flight simply discards the delivery, and the blocking job ends on
+    /// its own at `REWORD_HTTP_CEILING` at the latest.
+    ///
+    /// The *pending* config, not the last-written file: otherwise a user who
+    /// types a key and immediately presses Test is told their old key is
+    /// rejected, which is the single most confusing thing this row could do.
+    // `#[allow(dead_code)]`: the Test row's widgets are a later task in this
+    // milestone and are the only caller.
+    #[allow(dead_code)]
+    pub fn test_reword(&self, text: String) -> async_channel::Receiver<TestOutcome> {
+        // Bounded at one: there is exactly one outcome, and the button is
+        // disabled until it arrives.
+        let (tx, rx) = async_channel::bounded(1);
+        let cfg = *self.current().reword;
+        let factory = self.rewriter_factory.clone();
+        let run = move || {
+            let _ = tx.try_send(run_reword_test(&cfg, text, factory.as_ref()));
+        };
+        match &self.runtime {
+            Some(handle) => {
+                handle.spawn_blocking(run);
+            }
+            // Unit tests only; the daemon always has a runtime. A named
+            // thread rather than an unnamed one so a stuck provider is
+            // identifiable in a backtrace.
+            None => {
+                let _ = std::thread::Builder::new()
+                    .name("reword-test".into())
+                    .spawn(run);
+            }
+        }
+        rx
+    }
+
     /// Block until nothing is owed to the disk. Test-only: production code
     /// on the glib thread must never wait on the writer.
     #[cfg(test)]
@@ -951,6 +1073,391 @@ pub fn normalize(cfg: &mut Config) -> Vec<String> {
         cfg.speed_mode = FALLBACK_SPEED_MODE.to_string();
     }
     warnings
+}
+
+/// One row of §6's Test table.
+///
+/// Every variant carries data, never a formatted sentence: [`TestOutcome::title`]
+/// and [`TestOutcome::subtitle`] are where the wording lives, and they are
+/// here rather than in `window.rs` because this is the layer with tests. §8's
+/// table governs what the *daemon* does; this governs what the *user* is
+/// told, and the two are not the same thing -- every row of §8 degrades to
+/// "speak the original", which is correct and indistinguishable from the
+/// feature being switched off. A typo in the endpoint, a stale key and a
+/// model the provider does not have all produce a daemon that behaves
+/// exactly as it did before, with nothing in the window to look at. These
+/// distinctions *are* the row: a rejected key, an unreachable host and a
+/// timeout have three different fixes.
+#[derive(Debug, Clone)]
+pub enum TestOutcome {
+    /// Answered, passed the guard, inside the configured deadline.
+    Rewritten {
+        text: String,
+        elapsed: Duration,
+        deadline: Duration,
+        /// The first request against this endpoint this run, so the number
+        /// includes DNS and a TLS handshake.
+        first: bool,
+    },
+    /// Answered and passed the guard, but slower than the deadline -- so a
+    /// real notification would have been spoken as written.
+    Slower {
+        text: String,
+        elapsed: Duration,
+        deadline: Duration,
+        /// As [`TestOutcome::Rewritten`]'s, and it matters more here: a
+        /// first request to a remote endpoint pays for DNS and a TLS
+        /// handshake, so without this the row would tell a user their
+        /// provider is too slow on the strength of a number that will not
+        /// happen again.
+        first: bool,
+    },
+    /// Answered, and §3's guard threw it away. The answer is still shown:
+    /// that is how a user discovers their model likes to explain itself.
+    Rejected {
+        answer: String,
+        reason: sayd_core::reword::Rejection,
+    },
+    AuthRejected {
+        status: u16,
+        host: String,
+        env_var: String,
+        message: Option<String>,
+    },
+    Unreachable {
+        detail: String,
+        endpoint: String,
+    },
+    NoSuchModel {
+        status: u16,
+        model: String,
+        message: Option<String>,
+    },
+    RateLimited {
+        retry_after: Option<Duration>,
+    },
+    /// The client's own ceiling was hit.
+    NoAnswer {
+        ceiling: Duration,
+        deadline: Duration,
+    },
+    /// `base_url` is empty or unusable.
+    NotConfigured {
+        reason: String,
+    },
+    /// Built without the `reword` feature.
+    Unavailable,
+    /// Both permits were in use. Rare, and only reachable by hammering the
+    /// button while notifications are being rewritten.
+    Busy,
+}
+
+/// `840 ms`, `2.4 s`. The crossover is at exactly one second: below it a
+/// whole number of milliseconds is the readable form, above it a decimal
+/// second is.
+fn human_elapsed(d: Duration) -> String {
+    if d < Duration::from_secs(1) {
+        format!("{} ms", d.as_millis())
+    } else {
+        format!("{:.1} s", d.as_secs_f64())
+    }
+}
+
+/// `1.5 s`. Always seconds, because a deadline is a setting the user chose
+/// in a spin row and reads as a number of seconds even when it is 200 ms.
+fn human_deadline(d: Duration) -> String {
+    format!("{:.1} s", d.as_secs_f64())
+}
+
+/// What a first-ever request against an endpoint owes the number beside it.
+///
+/// Appended to both timing rows rather than only the fast one: connection
+/// setup is exactly what makes a first request slow, so the row that says a
+/// provider missed its deadline is the one that most needs to say the
+/// measurement included a handshake.
+fn first_note(first: bool) -> &'static str {
+    if first {
+        " (first request — includes connection setup)"
+    } else {
+        ""
+    }
+}
+
+// `#[allow(dead_code)]`: the Test row's widgets are a later task in this
+// milestone and are the only caller of these two. They are written here,
+// with a test each, because `window.rs` is the one layer with no test
+// coverage and so must not decide anything -- it maps a variant onto two
+// labels and a visibility and holds no rule of its own.
+#[allow(dead_code)]
+impl TestOutcome {
+    /// The result row's title: the rewritten text where there is one,
+    /// because the rewritten text is the point.
+    pub fn title(&self) -> String {
+        match self {
+            TestOutcome::Rewritten { text, .. } | TestOutcome::Slower { text, .. } => text.clone(),
+            TestOutcome::Rejected { answer, .. } => answer.clone(),
+            TestOutcome::AuthRejected { .. } => "The provider rejected the API key".into(),
+            TestOutcome::Unreachable { .. } => "Could not reach the provider".into(),
+            TestOutcome::NoSuchModel { .. } => "The provider does not have that model".into(),
+            TestOutcome::RateLimited { .. } => "The provider is rate limiting".into(),
+            TestOutcome::NoAnswer { ceiling, .. } => {
+                format!("No answer after {}", human_elapsed(*ceiling))
+            }
+            TestOutcome::NotConfigured { .. } => "The endpoint is not usable".into(),
+            TestOutcome::Unavailable => "This build has no rewording client".into(),
+            TestOutcome::Busy => "Another rewrite is still running".into(),
+        }
+    }
+
+    /// The result row's subtitle: the number, and what it means.
+    pub fn subtitle(&self) -> String {
+        match self {
+            // The deadline is named on the *good* row too, and not only on
+            // `Slower`. "840 ms" alone does not answer the question the
+            // number is for -- a user who has never seen this before does
+            // not know what it is being measured against, and the row is the
+            // only place they could find out.
+            TestOutcome::Rewritten {
+                elapsed,
+                deadline,
+                first,
+                ..
+            } => format!(
+                "Rewritten in {}, inside the {} deadline{}",
+                human_elapsed(*elapsed),
+                human_deadline(*deadline),
+                first_note(*first)
+            ),
+            // The one sentence this whole row exists for. Nothing in this
+            // project has measured end-to-end provider latency and nothing
+            // else will: this is the only route by which anyone learns what
+            // their own provider costs on their own hardware, and the
+            // comparison against the configured deadline is the only thing
+            // that answers the question the number is for -- is my deadline
+            // long enough?
+            TestOutcome::Slower {
+                elapsed,
+                deadline,
+                first,
+                ..
+            } => format!(
+                "Rewritten in {} — longer than the {} deadline, so a real \
+                 notification would have been spoken as written{}",
+                human_elapsed(*elapsed),
+                human_deadline(*deadline),
+                first_note(*first)
+            ),
+            TestOutcome::Rejected { reason, .. } => {
+                format!("Rejected: {} — spoken as written", reason.phrase())
+            }
+            TestOutcome::AuthRejected {
+                status,
+                host,
+                env_var,
+                message,
+            } => {
+                format!(
+                    "HTTP {status} from {host}{} — check the key, or {env_var} if it is set",
+                    parenthesised(message)
+                )
+            }
+            TestOutcome::Unreachable { detail, endpoint } => format!("{detail} — {endpoint}"),
+            TestOutcome::NoSuchModel {
+                status,
+                model,
+                message,
+            } => {
+                format!(
+                    "HTTP {status}{} — sent as ‘{model}’",
+                    parenthesised(message)
+                )
+            }
+            TestOutcome::RateLimited { retry_after } => match retry_after {
+                Some(d) => format!("HTTP 429 — Retry-After: {} s", d.as_secs()),
+                None => "HTTP 429".to_string(),
+            },
+            TestOutcome::NoAnswer { deadline, .. } => format!(
+                "The deadline is {}, so this provider is not usable for notifications",
+                human_deadline(*deadline)
+            ),
+            TestOutcome::NotConfigured { reason } => reason.clone(),
+            TestOutcome::Unavailable => "Rebuild with --features reword to use this".to_string(),
+            TestOutcome::Busy => "Both rewrite slots are in use; try again in a moment".to_string(),
+        }
+    }
+}
+
+/// A provider's own message, in brackets, or nothing at all.
+///
+/// It has already been cut and de-fanged on the way out of `http.rs`, which
+/// is what makes it safe to put in front of a user at all.
+fn parenthesised(message: &Option<String>) -> String {
+    message
+        .as_deref()
+        .map(|m| format!(" ({m})"))
+        .unwrap_or_default()
+}
+
+/// The Reword group's description: where text goes, and where the key comes
+/// from.
+///
+/// `env_value` is passed in rather than read here so this can be tested
+/// without touching process-global environment state. It names the variable
+/// even when it is unset, because a user who exports `SAYD_REWORD_API_KEY`
+/// and then sees an empty password field would otherwise conclude the
+/// feature is unconfigured.
+///
+/// It also says, plainly, that Test is a network call: §7 requires the one
+/// send that happens with `enabled = false` to be named where the button is.
+fn reword_description(cfg: &RewordConfig, env_value: Option<&str>) -> String {
+    let destination = match sayd_core::reword::parse_base_url(&cfg.base_url) {
+        Ok(endpoint) => endpoint.host,
+        // Said here because §8 makes it a silent degradation everywhere
+        // else: an unparseable `base_url` speaks the text as written and
+        // logs one line the user is not reading.
+        Err(_) => {
+            return format!(
+                "‘{}’ is not a usable endpoint, so text is spoken as written. \
+                 Pressing Test below is itself a network call.",
+                cfg.base_url
+            )
+        }
+    };
+    let key = match (env_value.filter(|v| !v.is_empty()), cfg.api_key.is_empty()) {
+        (Some(_), _) => format!(
+            "The API key comes from {}, not from the field below.",
+            cfg.api_key_env
+        ),
+        (None, false) => "The API key comes from this config file.".to_string(),
+        (None, true) => "No API key is set; local servers ignore it.".to_string(),
+    };
+    format!(
+        "Sends the text about to be spoken to {destination}. {key} \
+         Pressing Test below is itself a network call."
+    )
+}
+
+/// One deliberate probe of the configured endpoint.
+///
+/// Four rules, all of them §6's:
+///
+/// - It bypasses §4's eligibility floor and ceiling. The user typed this
+///   text deliberately; refusing to test `Ping` because it is under twelve
+///   characters would be baffling.
+/// - It applies §3's guard, and reports a rejection as its own outcome with
+///   the answer that was rejected still shown -- that is how a user
+///   discovers their model likes to explain itself.
+/// - It bypasses the configured deadline, waiting the client's own
+///   [`crate::reword::REWORD_TEST_CEILING`] and reporting the real elapsed
+///   time. A test that gave up at `timeout_ms` could only ever say "too
+///   slow" and never *how much*, which is the number needed to choose a
+///   better deadline.
+/// - It **ignores and does not update the circuit breakers**, so a user who
+///   has just fixed a rejected key gets a real request rather than a cached
+///   verdict. Structurally: nothing here calls [`crate::reword::RewordState::allow`]
+///   or `record`. A *successful* test does call `clear_auth_latch`, which is
+///   the only way to recover from a key supplied through the environment:
+///   editing that does not change the config at all, so nothing else would
+///   ever clear it.
+///
+/// It does still take a permit from the same pool of two, so a user
+/// hammering the button cannot outrun the bound §2 establishes.
+fn run_reword_test(cfg: &RewordConfig, text: String, factory: &RewriterFn) -> TestOutcome {
+    let state = crate::reword::state();
+    let Some(_permit) = state.try_permit() else {
+        return TestOutcome::Busy;
+    };
+    let rewriter = match factory(cfg) {
+        Ok(r) => r,
+        Err(e) => return outcome_for_error(e, cfg),
+    };
+    // §7's privacy line, in front of the send and behind the permit, exactly
+    // where `crate::reword::attempt` puts it: a deliberate button press is a
+    // send like any other and is logged like one, and a run in which nothing
+    // left the machine must not contain the line. Its return value is what
+    // says whether this request pays for DNS and a handshake, taken from the
+    // same call rather than from a separate `endpoint_seen` -- two calls
+    // could disagree with a notification landing between them.
+    let first = state.note_endpoint(cfg);
+    let started = std::time::Instant::now();
+    let answer = rewriter.reword(&text);
+    let elapsed = started.elapsed();
+
+    let deadline = Duration::from_millis(cfg.timeout_ms);
+    match answer {
+        Ok(candidate) => {
+            // Before the guard, not after: an answer that the guard threw
+            // away still proves the key works, which is the only thing this
+            // latch is about.
+            state.clear_auth_latch(cfg);
+            match sayd_core::reword::check(&text, &candidate) {
+                Ok(text) if elapsed > deadline => TestOutcome::Slower {
+                    text,
+                    elapsed,
+                    deadline,
+                    first,
+                },
+                Ok(text) => TestOutcome::Rewritten {
+                    text,
+                    elapsed,
+                    deadline,
+                    first,
+                },
+                Err(reason) => TestOutcome::Rejected {
+                    answer: candidate,
+                    reason,
+                },
+            }
+        }
+        Err(e) => outcome_for_error(e, cfg),
+    }
+}
+
+/// Which row of §6's table a failure is. One variant per failure a user can
+/// actually do something about, because "error" tells them nothing.
+fn outcome_for_error(e: RewordError, cfg: &RewordConfig) -> TestOutcome {
+    match e {
+        RewordError::Auth {
+            status,
+            host,
+            message,
+        } => TestOutcome::AuthRejected {
+            status,
+            host,
+            // Named even when it is unset: a user who exported one and then
+            // edits the password field is editing the wrong thing.
+            env_var: cfg.api_key_env.clone(),
+            message,
+        },
+        RewordError::NoSuchModel {
+            status,
+            model,
+            message,
+        } => TestOutcome::NoSuchModel {
+            status,
+            model,
+            message,
+        },
+        RewordError::RateLimited { retry_after, .. } => TestOutcome::RateLimited { retry_after },
+        RewordError::Unreachable(detail) => TestOutcome::Unreachable {
+            detail,
+            endpoint: cfg.base_url.clone(),
+        },
+        RewordError::Ceiling => TestOutcome::NoAnswer {
+            ceiling: crate::reword::REWORD_TEST_CEILING,
+            deadline: Duration::from_millis(cfg.timeout_ms),
+        },
+        RewordError::NotConfigured(reason) => TestOutcome::NotConfigured { reason },
+        RewordError::Unavailable => TestOutcome::Unavailable,
+        // A body that came back and could not be used. Reported as an
+        // unreachable provider rather than as its own row because the fix is
+        // the same one -- look at what is answering on that endpoint -- and
+        // the detail, which is where the difference actually is, is shown.
+        RewordError::Malformed(detail) => TestOutcome::Unreachable {
+            detail,
+            endpoint: cfg.base_url.clone(),
+        },
+    }
 }
 
 /// Is `name` already on the notification allowlist?
@@ -2689,6 +3196,701 @@ mod tests {
         let before = seen.len();
         seen.dedup();
         assert_eq!(seen.len(), before, "the curated table has duplicates");
+    }
+
+    // ---- The Test row -------------------------------------------------
+    //
+    // Every string and every number §6's Test table shows is decided above
+    // and asserted here, because `window.rs` -- which maps a variant onto
+    // two labels and a visibility -- is the one layer with no tests.
+
+    /// A rewriter with one canned answer and, optionally, a sleep so a test
+    /// can drive the deadline. No network, no runtime: the same reason
+    /// `crate::reword`'s own `Stub` is a struct with a `Vec`.
+    struct Canned(
+        std::sync::Mutex<Option<Result<String, RewordError>>>,
+        Duration,
+    );
+
+    impl Canned {
+        fn new(outcome: Result<String, RewordError>) -> Arc<Canned> {
+            Arc::new(Canned(std::sync::Mutex::new(Some(outcome)), Duration::ZERO))
+        }
+        fn after(delay: Duration, outcome: Result<String, RewordError>) -> Arc<Canned> {
+            Arc::new(Canned(std::sync::Mutex::new(Some(outcome)), delay))
+        }
+    }
+
+    impl Rewriter for Canned {
+        fn reword(&self, _text: &str) -> Result<String, RewordError> {
+            if !self.1.is_zero() {
+                std::thread::sleep(self.1);
+            }
+            lock(&self.0)
+                .take()
+                .unwrap_or(Err(RewordError::Malformed("exhausted".into())))
+        }
+    }
+
+    /// A model whose Test row answers from `rewriter` rather than from a
+    /// provider.
+    fn model_with(dir: &Path, rewriter: Arc<dyn Rewriter>) -> (SettingsModel, EngineHandle) {
+        model_from(dir, move |_cfg: &RewordConfig| Ok(rewriter.clone()))
+    }
+
+    /// [`model_with`] with the whole factory handed in, for the tests that
+    /// care about the config it is called with or want it to fail.
+    fn model_from(
+        dir: &Path,
+        factory: impl Fn(&RewordConfig) -> Result<Arc<dyn Rewriter>, RewordError>
+            + Send
+            + Sync
+            + 'static,
+    ) -> (SettingsModel, EngineHandle) {
+        let (store, engine) = store_in(dir);
+        let model = SettingsModel::new_with_rewriter(
+            store,
+            dir.to_path_buf(),
+            Config::default(),
+            Arc::new(factory),
+        );
+        (model, engine)
+    }
+
+    /// Point a model's Test row at an endpoint no other test in this binary
+    /// uses.
+    ///
+    /// `crate::reword::state()` is process-wide and its "endpoints announced
+    /// this run" set is keyed `base_url|model`, so whether a request is the
+    /// *first* against an endpoint is only a deterministic fact about a key
+    /// nothing else touches. The `model` field rather than the URL because
+    /// two rows below assert on the endpoint string itself.
+    fn own_endpoint(m: &SettingsModel, name: &str) {
+        m.edit(|c| c.reword.model = format!("settings-test-{name}"))
+            .expect("a model name is not a validated field");
+    }
+
+    /// One outcome from the Test row.
+    ///
+    /// Retries `Busy`, which is not flakiness in the row but sharing in the
+    /// suite: the two permits are process-wide, and `dbus` and
+    /// `notify::monitor` each hold one for up to three seconds against a
+    /// deliberately silent provider. `Busy` is a real row with its own
+    /// wording (asserted separately, from the variant); what it is not is a
+    /// thing any of these tests is about.
+    fn outcome_of(model: &SettingsModel, text: &str) -> TestOutcome {
+        let deadline = std::time::Instant::now() + SETTLE;
+        loop {
+            let rx = model.test_reword(text.to_string());
+            let out = rx.recv_blocking().expect("the test thread answers");
+            if !matches!(out, TestOutcome::Busy) || std::time::Instant::now() > deadline {
+                return out;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// One case per row of §6's Test table. This is what keeps the wording
+    /// out of `window.rs`, which has no tests of its own.
+    #[test]
+    fn every_test_outcome_reports_its_own_row() {
+        // Success. The rewritten text is the title, because it is the point;
+        // the latency is the subtitle, because the question it answers is
+        // "is my deadline long enough".
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (model, engine) = model_with(
+            dir.path(),
+            Canned::new(Ok("Alice is asking about dinner".into())),
+        );
+        own_endpoint(&model, "success");
+        let out = outcome_of(&model, REWORD_TEST_DEFAULT);
+        assert_eq!(out.title(), "Alice is asking about dinner");
+        assert!(
+            out.subtitle().starts_with("Rewritten in "),
+            "subtitle was {:?}",
+            out.subtitle()
+        );
+        assert!(
+            out.subtitle().contains("first request"),
+            "a first-ever test says so, because it includes connection setup: {:?}",
+            out.subtitle()
+        );
+        drop(model);
+        engine.shutdown();
+
+        // The guard rejecting it: the model's answer is still shown, which
+        // is how a user discovers their model likes to explain itself. Three
+        // non-empty lines is two *extra* ones -- `Rejection::ExtraLines`
+        // counts the lines beyond the first, because a rewrite gets exactly
+        // one.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (model, engine) = model_with(
+            dir.path(),
+            Canned::new(Ok("Sure!\nHere you go:\nAlice is asking.".into())),
+        );
+        let out = outcome_of(&model, REWORD_TEST_DEFAULT);
+        assert_eq!(out.title(), "Sure!\nHere you go:\nAlice is asking.");
+        assert_eq!(
+            out.subtitle(),
+            "Rejected: 2 extra lines — spoken as written"
+        );
+        drop(model);
+        engine.shutdown();
+
+        // A rejected key names the environment variable, because a user who
+        // exported one and then edits the password field is editing the
+        // wrong thing.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (model, engine) = model_with(
+            dir.path(),
+            Canned::new(Err(RewordError::Auth {
+                status: 401,
+                host: "api.ppq.ai".into(),
+                message: None,
+            })),
+        );
+        let out = outcome_of(&model, REWORD_TEST_DEFAULT);
+        assert_eq!(out.title(), "The provider rejected the API key");
+        assert_eq!(
+            out.subtitle(),
+            "HTTP 401 from api.ppq.ai — check the key, or SAYD_REWORD_API_KEY if it is set"
+        );
+        drop(model);
+        engine.shutdown();
+
+        // The provider's own message, when it sent one, in brackets before
+        // the advice.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (model, engine) = model_with(
+            dir.path(),
+            Canned::new(Err(RewordError::Auth {
+                status: 403,
+                host: "api.ppq.ai".into(),
+                message: Some("insufficient credit".into()),
+            })),
+        );
+        assert_eq!(
+            outcome_of(&model, REWORD_TEST_DEFAULT).subtitle(),
+            "HTTP 403 from api.ppq.ai (insufficient credit) — check the key, or \
+             SAYD_REWORD_API_KEY if it is set"
+        );
+        drop(model);
+        engine.shutdown();
+
+        // Unreachable: the transport error, and the resolved endpoint.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (model, engine) = model_with(
+            dir.path(),
+            Canned::new(Err(RewordError::Unreachable(
+                "io: Connection refused".into(),
+            ))),
+        );
+        let out = outcome_of(&model, REWORD_TEST_DEFAULT);
+        assert_eq!(out.title(), "Could not reach the provider");
+        assert_eq!(
+            out.subtitle(),
+            "io: Connection refused — http://localhost:11434/v1"
+        );
+        drop(model);
+        engine.shutdown();
+
+        // No such model: the model string exactly as sent.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (model, engine) = model_with(
+            dir.path(),
+            Canned::new(Err(RewordError::NoSuchModel {
+                status: 404,
+                model: "llama3.2:3b".into(),
+                message: None,
+            })),
+        );
+        let out = outcome_of(&model, REWORD_TEST_DEFAULT);
+        assert_eq!(out.title(), "The provider does not have that model");
+        assert_eq!(out.subtitle(), "HTTP 404 — sent as ‘llama3.2:3b’");
+        drop(model);
+        engine.shutdown();
+
+        // Rate limited, with and without Retry-After.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (model, engine) = model_with(
+            dir.path(),
+            Canned::new(Err(RewordError::RateLimited {
+                retry_after: Some(Duration::from_secs(12)),
+                message: None,
+            })),
+        );
+        let out = outcome_of(&model, REWORD_TEST_DEFAULT);
+        assert_eq!(out.title(), "The provider is rate limiting");
+        assert_eq!(out.subtitle(), "HTTP 429 — Retry-After: 12 s");
+        drop(model);
+        engine.shutdown();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (model, engine) = model_with(
+            dir.path(),
+            Canned::new(Err(RewordError::RateLimited {
+                retry_after: None,
+                message: None,
+            })),
+        );
+        assert_eq!(
+            outcome_of(&model, REWORD_TEST_DEFAULT).subtitle(),
+            "HTTP 429"
+        );
+        drop(model);
+        engine.shutdown();
+
+        // The client's own ceiling: reported as the ceiling that was
+        // actually waited, next to the deadline that was not.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (model, engine) = model_with(dir.path(), Canned::new(Err(RewordError::Ceiling)));
+        let out = outcome_of(&model, REWORD_TEST_DEFAULT);
+        assert_eq!(out.title(), "No answer after 10.0 s");
+        assert_eq!(
+            out.subtitle(),
+            "The deadline is 1.5 s, so this provider is not usable for notifications"
+        );
+        drop(model);
+        engine.shutdown();
+
+        // An unusable endpoint, which is otherwise a silent degradation.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (model, engine) = model_from(dir.path(), |_| {
+            Err(RewordError::NotConfigured(
+                "reword.base_url \"nonsense\" has no scheme; expected http:// or https://".into(),
+            ))
+        });
+        let out = outcome_of(&model, REWORD_TEST_DEFAULT);
+        assert_eq!(out.title(), "The endpoint is not usable");
+        assert!(
+            out.subtitle().contains("expected http:// or https://"),
+            "the reason names the field and the fix: {:?}",
+            out.subtitle()
+        );
+        drop(model);
+        engine.shutdown();
+
+        // A body that came back and could not be used. Same row as an
+        // unreachable provider -- the fix is to look at what is answering on
+        // that endpoint -- with the detail that distinguishes them.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (model, engine) = model_with(
+            dir.path(),
+            Canned::new(Err(RewordError::Malformed("no choices[0]".into()))),
+        );
+        assert_eq!(
+            outcome_of(&model, REWORD_TEST_DEFAULT).subtitle(),
+            "no choices[0] — http://localhost:11434/v1"
+        );
+        drop(model);
+        engine.shutdown();
+
+        // A build with no client in it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (model, engine) = model_from(dir.path(), |_| Err(RewordError::Unavailable));
+        let out = outcome_of(&model, REWORD_TEST_DEFAULT);
+        assert_eq!(out.title(), "This build has no rewording client");
+        assert_eq!(out.subtitle(), "Rebuild with --features reword to use this");
+        drop(model);
+        engine.shutdown();
+
+        // The one row no test can provoke without taking both process-wide
+        // permits away from the rest of the suite, so it is asserted from
+        // the variant. It still has to say something a user can act on.
+        assert_eq!(
+            TestOutcome::Busy.title(),
+            "Another rewrite is still running"
+        );
+        assert_eq!(
+            TestOutcome::Busy.subtitle(),
+            "Both rewrite slots are in use; try again in a moment"
+        );
+    }
+
+    /// The only arithmetic in the row, and the branch that makes the latency
+    /// worth reporting at all.
+    #[test]
+    fn the_latency_is_formatted_and_measured_against_the_deadline() {
+        assert_eq!(human_elapsed(Duration::from_millis(0)), "0 ms");
+        assert_eq!(human_elapsed(Duration::from_millis(840)), "840 ms");
+        assert_eq!(human_elapsed(Duration::from_millis(999)), "999 ms");
+        assert_eq!(
+            human_elapsed(Duration::from_millis(1000)),
+            "1.0 s",
+            "the crossover is at exactly one second"
+        );
+        assert_eq!(human_elapsed(Duration::from_millis(2449)), "2.4 s");
+        assert_eq!(human_elapsed(Duration::from_millis(10_000)), "10.0 s");
+
+        assert_eq!(human_deadline(Duration::from_millis(1500)), "1.5 s");
+        assert_eq!(human_deadline(Duration::from_millis(200)), "0.2 s");
+        assert_eq!(human_deadline(Duration::from_millis(2000)), "2.0 s");
+
+        // Inside the deadline: the number, and nothing to worry about.
+        let inside = TestOutcome::Rewritten {
+            text: "Alice is asking about dinner".into(),
+            elapsed: Duration::from_millis(840),
+            deadline: Duration::from_millis(1500),
+            first: false,
+        };
+        assert_eq!(
+            inside.subtitle(),
+            "Rewritten in 840 ms, inside the 1.5 s deadline"
+        );
+
+        // Outside it: the number, the deadline, and what that means for a
+        // real notification. This sentence is the whole reason the row
+        // reports a latency.
+        let outside = TestOutcome::Slower {
+            text: "Alice is asking about dinner".into(),
+            elapsed: Duration::from_millis(2400),
+            deadline: Duration::from_millis(1500),
+            first: false,
+        };
+        assert_eq!(
+            outside.subtitle(),
+            "Rewritten in 2.4 s — longer than the 1.5 s deadline, so a real \
+             notification would have been spoken as written"
+        );
+        assert_eq!(outside.title(), "Alice is asking about dinner");
+
+        // ...and a *first* request that misses the deadline says why the
+        // number may not happen again, which is the difference between "your
+        // provider is too slow" and "press Test once more".
+        let first_time = TestOutcome::Slower {
+            text: "Alice is asking about dinner".into(),
+            elapsed: Duration::from_millis(2400),
+            deadline: Duration::from_millis(1500),
+            first: true,
+        };
+        assert_eq!(
+            first_time.subtitle(),
+            "Rewritten in 2.4 s — longer than the 1.5 s deadline, so a real \
+             notification would have been spoken as written (first request — \
+             includes connection setup)"
+        );
+    }
+
+    /// The first request against an endpoint pays for DNS and a handshake,
+    /// and the second does not. Both halves, because saying "first request"
+    /// on every test would be exactly as useless as saying it on none.
+    #[test]
+    fn only_the_first_request_against_an_endpoint_is_called_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (model, engine) = model_from(dir.path(), |_| {
+            Ok(Canned::new(Ok("Alice is asking about dinner".into())) as Arc<dyn Rewriter>)
+        });
+        own_endpoint(&model, "warmup");
+
+        let first = outcome_of(&model, REWORD_TEST_DEFAULT);
+        assert!(
+            first.subtitle().contains("first request"),
+            "{:?}",
+            first.subtitle()
+        );
+        let second = outcome_of(&model, REWORD_TEST_DEFAULT);
+        assert!(
+            second.subtitle().starts_with("Rewritten in ")
+                && !second.subtitle().contains("first request"),
+            "a warm endpoint's latency is reported without the caveat: {:?}",
+            second.subtitle()
+        );
+        drop(model);
+        engine.shutdown();
+    }
+
+    /// A slow answer that still arrives is `Slower`, not `Rewritten`: Test
+    /// waits the full ceiling on purpose, so it is the only place a user can
+    /// find out *how much* too slow their provider is.
+    #[test]
+    fn an_answer_past_the_deadline_is_still_reported_with_its_real_latency() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (model, engine) = model_with(
+            dir.path(),
+            Canned::after(
+                Duration::from_millis(300),
+                Ok("Alice is asking about dinner".into()),
+            ),
+        );
+        model
+            .edit(|c| c.reword.timeout_ms = 200)
+            .expect("a deadline shorter than the stub's delay");
+        let out = outcome_of(&model, REWORD_TEST_DEFAULT);
+        assert!(
+            matches!(out, TestOutcome::Slower { .. }),
+            "a 300 ms answer against a 200 ms deadline is Slower, not Rewritten: {out:?}"
+        );
+        assert!(
+            out.subtitle().contains("longer than the 0.2 s deadline"),
+            "{:?}",
+            out.subtitle()
+        );
+        assert_eq!(
+            out.title(),
+            "Alice is asking about dinner",
+            "the rewrite is still shown: it is what the provider can do, just \
+             not in time"
+        );
+        drop(model);
+        engine.shutdown();
+    }
+
+    /// §6: Test uses the config the window is *displaying*, not the last
+    /// value written to disk. Otherwise a user who types a key and
+    /// immediately presses Test is told their old key is rejected.
+    #[test]
+    fn test_reword_uses_the_pending_config_not_the_written_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seen = Arc::new(Mutex::new(String::new()));
+        let s = seen.clone();
+        let (model, engine) = model_from(dir.path(), move |cfg: &RewordConfig| {
+            *lock(&s) = cfg.api_key.clone();
+            Ok(Canned::new(Ok("fine".into())) as Arc<dyn Rewriter>)
+        });
+
+        // Edited but, thanks to WRITE_DEBOUNCE, certainly not on disk yet.
+        model
+            .edit(|c| c.reword.api_key = "sk-just-typed".into())
+            .expect("edit");
+        let _ = outcome_of(&model, REWORD_TEST_DEFAULT);
+        assert_eq!(
+            lock(&seen).clone(),
+            "sk-just-typed",
+            "the key the user is looking at is the key that gets tested"
+        );
+        drop(model);
+        engine.shutdown();
+    }
+
+    /// §4's eligibility floor is bypassed: the user typed this text
+    /// deliberately, and refusing to test `Ping` because it is under twelve
+    /// characters would be baffling.
+    #[test]
+    fn test_reword_sends_text_the_notification_path_would_refuse() {
+        assert!(
+            sayd_core::reword::eligible("Ping", RewordConfig::default().max_chars).is_err(),
+            "the premise: this text is ineligible on the automatic path"
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sent = Arc::new(Mutex::new(false));
+        let s = sent.clone();
+
+        struct Watching(Arc<Mutex<bool>>);
+        impl Rewriter for Watching {
+            fn reword(&self, _text: &str) -> Result<String, RewordError> {
+                *lock(&self.0) = true;
+                Ok("Ping".into())
+            }
+        }
+
+        let (model, engine) = model_from(dir.path(), move |_| {
+            Ok(Arc::new(Watching(s.clone())) as Arc<dyn Rewriter>)
+        });
+        let out = outcome_of(&model, "Ping");
+        assert!(*lock(&sent), "the request must actually have been made");
+        assert!(
+            matches!(out, TestOutcome::Rewritten { .. }),
+            "an answer identical to the original is the prompt's \"reply with \
+             it unchanged\" path working, not a rejection: {out:?}"
+        );
+        drop(model);
+        engine.shutdown();
+    }
+
+    /// A successful test clears the auth latch, which is the only way back
+    /// when the key came from the environment -- editing that does not change
+    /// the config, so nothing else would ever clear it. And a test never
+    /// *sets* a breaker: a user who has just fixed a key must get a real
+    /// request, not a cached verdict.
+    ///
+    /// Written as the transitions it drives rather than as absolute states:
+    /// `crate::reword::state()` is process-wide and this suite runs in
+    /// parallel, so what this can assert is what it changed, never what it
+    /// started from.
+    #[test]
+    fn a_successful_test_clears_the_auth_latch_and_a_failing_one_sets_nothing() {
+        let state = crate::reword::state();
+        let now = std::time::Instant::now();
+
+        // A failing test leaves the latch exactly as it found it and adds no
+        // breaker of its own.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (model, engine) = model_with(
+            dir.path(),
+            Canned::new(Err(RewordError::Unreachable("refused".into()))),
+        );
+        own_endpoint(&model, "latch-failing");
+        let cfg = *model.current().reword;
+        state.record(
+            &cfg,
+            &crate::reword::Attempt::Answered(Err(RewordError::Auth {
+                status: 401,
+                host: "h".into(),
+                message: None,
+            })),
+            now,
+        );
+        assert_eq!(
+            state.allow(&cfg, now),
+            Err(crate::reword::Blocked::AuthLatched),
+            "the premise: this config is latched"
+        );
+        let out = outcome_of(&model, REWORD_TEST_DEFAULT);
+        assert!(matches!(out, TestOutcome::Unreachable { .. }), "{out:?}");
+        assert_eq!(
+            state.allow(&cfg, now),
+            Err(crate::reword::Blocked::AuthLatched),
+            "a failing test must not record anything: it is a deliberate probe, \
+             not traffic -- and it must not clear what it did not fix"
+        );
+        drop(model);
+        engine.shutdown();
+
+        // ...and a working key un-latches. Asserted as "no longer latched"
+        // rather than as `Ok(())`: an unrelated test opening the transport
+        // breaker on the shared state would otherwise fail this for a reason
+        // that has nothing to do with the rule.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (model, engine) = model_with(dir.path(), Canned::new(Ok("fine".into())));
+        own_endpoint(&model, "latch-working");
+        let cfg = *model.current().reword;
+        state.record(
+            &cfg,
+            &crate::reword::Attempt::Answered(Err(RewordError::Auth {
+                status: 401,
+                host: "h".into(),
+                message: None,
+            })),
+            now,
+        );
+        assert_eq!(
+            state.allow(&cfg, now),
+            Err(crate::reword::Blocked::AuthLatched)
+        );
+        let _ = outcome_of(&model, REWORD_TEST_DEFAULT);
+        assert_ne!(
+            state.allow(&cfg, now),
+            Err(crate::reword::Blocked::AuthLatched),
+            "a working key un-latches; nothing else ever would when the key \
+             came from the environment"
+        );
+        drop(model);
+        engine.shutdown();
+
+        // And the half that costs the most if it is wrong: a 401 *during a
+        // test* must not latch the breaker for the daemon. The user is
+        // holding the key field open and is about to fix it; a latch set
+        // here would switch rewording off for the run and, since the config
+        // they are about to type is a different one, would then sit there
+        // blocking nothing and teaching them nothing.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (model, engine) = model_with(
+            dir.path(),
+            Canned::new(Err(RewordError::Auth {
+                status: 401,
+                host: "api.ppq.ai".into(),
+                message: None,
+            })),
+        );
+        own_endpoint(&model, "latch-never-set");
+        let cfg = *model.current().reword;
+        let out = outcome_of(&model, REWORD_TEST_DEFAULT);
+        assert!(matches!(out, TestOutcome::AuthRejected { .. }), "{out:?}");
+        assert_ne!(
+            state.allow(&cfg, now),
+            Err(crate::reword::Blocked::AuthLatched),
+            "a rejected key learned from a deliberate probe is reported, not \
+             recorded: the next request must be a real one"
+        );
+        drop(model);
+        engine.shutdown();
+    }
+
+    /// The group description names the destination host and says where the
+    /// key is coming from -- a user who exports SAYD_REWORD_API_KEY and then
+    /// sees an empty password field would otherwise conclude the feature is
+    /// unconfigured.
+    #[test]
+    fn the_group_description_names_the_destination_and_the_key_source() {
+        let mut cfg = RewordConfig::default();
+        assert_eq!(
+            reword_description(&cfg, None),
+            "Sends the text about to be spoken to localhost. \
+             No API key is set; local servers ignore it. \
+             Pressing Test below is itself a network call."
+        );
+
+        assert_eq!(
+            reword_description(&cfg, Some("sk-from-env")),
+            "Sends the text about to be spoken to localhost. \
+             The API key comes from SAYD_REWORD_API_KEY, not from the field below. \
+             Pressing Test below is itself a network call."
+        );
+
+        // A variable that is set but empty is not a key, which is exactly
+        // what `resolve_api_key_with` decides for the request itself.
+        assert_eq!(
+            reword_description(&cfg, Some("")),
+            reword_description(&cfg, None)
+        );
+
+        cfg.api_key = "sk-in-file".into();
+        cfg.base_url = "https://api.ppq.ai/v1".into();
+        assert_eq!(
+            reword_description(&cfg, None),
+            "Sends the text about to be spoken to api.ppq.ai. \
+             The API key comes from this config file. \
+             Pressing Test below is itself a network call."
+        );
+
+        cfg.base_url = "nonsense".into();
+        assert!(
+            reword_description(&cfg, None).contains("not a usable endpoint"),
+            "an unparseable base_url must say so here, since §8 makes it a \
+             silent degradation everywhere else"
+        );
+    }
+
+    /// The description a window actually shows, against the real
+    /// environment, is the same function -- so the plumbing cannot be the
+    /// part that is wrong.
+    #[test]
+    fn the_group_description_shown_is_the_one_that_was_tested() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (model, engine) = model_with(dir.path(), Canned::new(Ok("fine".into())));
+        // No environment is touched: `api_key_env` names no variable, which
+        // `resolve_api_key_with` treats as "never looked up".
+        model
+            .edit(|c| c.reword.api_key_env = String::new())
+            .expect("edit");
+        assert_eq!(
+            model.reword_description_now(),
+            reword_description(&model.current().reword, None)
+        );
+        drop(model);
+        engine.shutdown();
+    }
+
+    /// The presets are the six rows of §6's endpoint table. They live in
+    /// this module rather than in `window.rs` for the reason every other
+    /// table does: the window is the layer with no tests.
+    #[test]
+    fn the_endpoint_presets_are_the_documented_table() {
+        assert_eq!(ENDPOINT_PRESETS.len(), 6);
+        assert_eq!(ENDPOINT_PRESETS[0], ("Ollama", "http://localhost:11434/v1"));
+        for (name, url) in ENDPOINT_PRESETS {
+            assert!(
+                sayd_core::reword::parse_base_url(url).is_ok(),
+                "{name}'s preset must be a usable endpoint"
+            );
+        }
+        assert!(
+            ENDPOINT_PRESETS
+                .iter()
+                .any(|(_, url)| *url == RewordConfig::default().base_url),
+            "the default endpoint must be offered as a preset, so a user who \
+             wandered away from it can get back"
+        );
     }
 
     /// The cooldown floor was enforced on load and nowhere else, so the
