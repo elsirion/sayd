@@ -104,8 +104,8 @@ impl SaydIface {
     /// clamps that at `REWORD_TIMEOUT_MAX_MS`: `sayd-cli` bounds every D-Bus
     /// interaction at 3 s, and a rewrite that outlived the caller would turn
     /// an enhancement into "sayd is not responding". The ceiling is set
-    /// against that 3 s with the two 250 ms engine round trips on either side
-    /// of the rewrite subtracted -- see the constant.
+    /// against that 3 s with `EngineHandle::submit`'s own 250 ms round trip
+    /// subtracted -- see the constant.
     ///
     /// Every way this can fail ends in the original text being returned and
     /// therefore spoken -- no configured endpoint, no client in this build, a
@@ -113,19 +113,52 @@ impl SaydIface {
     /// keybind must not stop speaking because an optional enhancement is
     /// misconfigured; the diagnosis is in the log, once per run.
     ///
-    /// The config is fetched only *after* the opt has been seen, so an
-    /// ordinary `Say` pays nothing at all for this -- not even the 250 ms
-    /// round trip `EngineHandle::config` can cost.
+    /// **The config comes from [`ConfigStore::current`], not from
+    /// `EngineHandle::config()`.** IMPORTANT 1, and it was measured: that
+    /// round trip is bounded by `CONFIG_REPLY_TIMEOUT` at 250 ms, and an
+    /// engine thread that is mid-chunk simply does not answer inside it. The
+    /// `None` that came back was read as "no rewrite" and the original was
+    /// handed straight to `submit` -- no log line, no D-Bus error, nothing
+    /// the caller could see. With six long utterances queued, 3 of 3
+    /// `say --reword` runs were dropped after ~250 ms. That is not an exotic
+    /// state: the normal use of `say --reword selection` on a keybind is to
+    /// press it while the daemon is already speaking, so the feature worked
+    /// on an idle daemon and quietly stopped under exactly the load it exists
+    /// for. `ConfigStore::current` is the daemon's own last-known config and
+    /// needs no engine at all -- which is what `EngineHandle::config`'s own
+    /// doc tells a caller that needs *some* answer rather than none to fall
+    /// back to. The two agree on `[reword]` because every change to it
+    /// reaches the engine through this same store's `ApplyConfig`.
+    ///
+    /// Still on the blocking pool: `current` takes the stamp mutex, and
+    /// `ConfigStore::write_locked` holds that across an unbounded disk write
+    /// (see `ConfigStore::generation`, IMPORTANT 2 there). That is a far
+    /// rarer stall than a busy engine thread and it has no 250 ms cliff, but
+    /// it is still not something to hold a runtime worker on. C2 again.
+    ///
+    /// The config is read only *after* the opt has been seen, so an ordinary
+    /// `Say` pays nothing at all for this -- not even the mutex.
     async fn maybe_reword(&self, text: String, opts: &HashMap<String, OwnedValue>) -> String {
         if !wants_reword(opts) {
             return text;
         }
-        let engine = self.engine.clone();
-        // On the blocking pool for the reason every other `EngineHandle`
-        // round trip in this file is: it waits up to 250 ms on an engine
-        // thread that may be mid-chunk. C2 again.
-        let Ok(Some(cfg)) = tokio::task::spawn_blocking(move || engine.config()).await else {
-            return text;
+        let store = self.store.clone();
+        let cfg = match tokio::task::spawn_blocking(move || store.current()).await {
+            Ok(cfg) => cfg,
+            // The one remaining way this hands back the original without
+            // having tried, and the reason it is logged rather than silent:
+            // the drop above was invisible, and a drop nobody can see is the
+            // failure IMPORTANT 1 is about. `spawn_blocking` only fails if
+            // the closure panicked, which means the stamp mutex or a `Config`
+            // clone did -- not something to swallow, and not something that
+            // repeats often enough to need a once-per-run latch.
+            Err(e) => {
+                eprintln!(
+                    "warning: reword: could not read the daemon's own configuration \
+                     ({e}); speaking the text as written"
+                );
+                return text;
+            }
         };
         // `requested`, never `automatic`: `[reword] enabled` means "rewrite
         // my notifications without being asked", and this caller is asking.
@@ -138,6 +171,36 @@ impl SaydIface {
             Ok(plan) => plan.resolve().await,
             Err(text) => text,
         }
+    }
+
+    /// Shared body of `SaySelection` and `SayClipboard`: read, rewrite if the
+    /// caller asked, submit.
+    ///
+    /// IMPORTANT 4. The two methods used to spell all three steps out
+    /// themselves, and the middle one was pinned by nothing: deleting
+    /// `maybe_reword` from *both* of them passed 263 of 263, while the same
+    /// deletion in `Say` correctly failed a test. The missing compositor is
+    /// only half the reason -- the daemon-side line was simply untouched by
+    /// any test. One body means one line to delete and one test to fail; the
+    /// tests below drive `say_selection` and `say_clipboard` themselves,
+    /// through `selection::read`'s own seam, so both names stay pinned rather
+    /// than only the shared function they happen to call today.
+    ///
+    /// `read` is run on the blocking pool because it opens its own Wayland
+    /// connection and blocks -- see `selection`'s module doc.
+    async fn say_read(
+        &self,
+        read: impl FnOnce() -> Result<String, String> + Send + 'static,
+        what: &str,
+        opts: &HashMap<String, OwnedValue>,
+    ) -> fdo::Result<u32> {
+        let text = tokio::task::spawn_blocking(read)
+            .await
+            .map_err(|e| fdo::Error::Failed(format!("{what} read panicked: {e}")))?
+            .map_err(fdo::Error::Failed)?;
+        let text = self.maybe_reword(text, opts).await;
+        self.submit(text, say_opts_from(opts, QueueSource::Hotkey))
+            .await
     }
 
     /// Shared body of `Say`, `SaySelection` and `SayClipboard`.
@@ -229,26 +292,24 @@ impl SaydIface {
     /// daemon could not confirm an id in time -- see `submit`'s doc
     /// comment.
     async fn say_selection(&self, opts: HashMap<String, OwnedValue>) -> fdo::Result<u32> {
-        let text = tokio::task::spawn_blocking(|| selection::read(selection::Source::Primary))
-            .await
-            .map_err(|e| fdo::Error::Failed(format!("selection read panicked: {e}")))?
-            .map_err(fdo::Error::Failed)?;
-        let text = self.maybe_reword(text, &opts).await;
-        self.submit(text, say_opts_from(&opts, QueueSource::Hotkey))
-            .await
+        self.say_read(
+            || selection::read(selection::Source::Primary),
+            "selection",
+            &opts,
+        )
+        .await
     }
 
     /// Speak the clipboard. Returns the utterance id; 0 if nothing was
     /// queued (muted, or empty after cleanup); or `u32::MAX` if the daemon
     /// could not confirm an id in time -- see `submit`'s doc comment.
     async fn say_clipboard(&self, opts: HashMap<String, OwnedValue>) -> fdo::Result<u32> {
-        let text = tokio::task::spawn_blocking(|| selection::read(selection::Source::Clipboard))
-            .await
-            .map_err(|e| fdo::Error::Failed(format!("clipboard read panicked: {e}")))?
-            .map_err(fdo::Error::Failed)?;
-        let text = self.maybe_reword(text, &opts).await;
-        self.submit(text, say_opts_from(&opts, QueueSource::Hotkey))
-            .await
+        self.say_read(
+            || selection::read(selection::Source::Clipboard),
+            "clipboard",
+            &opts,
+        )
+        .await
     }
 
     async fn pause(&self) {
@@ -747,6 +808,177 @@ mod tests {
 
         i.engine.shutdown();
         provider.join().expect("the silent provider thread ends");
+    }
+
+    /// An interface whose `[reword]` names no endpoint at all, so nothing in
+    /// the tests below makes a network request in either build: `context`
+    /// refuses on `base_url` before a client is built. Every one of them is
+    /// about what happens *upstream* of that.
+    fn iface_with_no_reword_endpoint(dir: &std::path::Path) -> SaydIface {
+        let cfg = Config {
+            reword: Box::new(sayd_core::config::RewordConfig {
+                base_url: String::new(),
+                ..sayd_core::config::RewordConfig::default()
+            }),
+            ..Config::default()
+        };
+        let engine = sayd_core::handle::EngineHandle::spawn(
+            cfg.clone(),
+            Box::new(StubSynthesizer::new()),
+            Box::new(VecSink::new(24_000 * 10)),
+        );
+        let store = Arc::new(ConfigStore::new(
+            dir.join("config.toml"),
+            engine.clone(),
+            cfg,
+        ));
+        SaydIface::new(engine, store)
+    }
+
+    /// IMPORTANT 1: a `--reword` must not be silently dropped because the
+    /// engine is busy.
+    ///
+    /// `maybe_reword` used to fetch its config with `EngineHandle::config()`,
+    /// a channel round trip bounded by `CONFIG_REPLY_TIMEOUT` at 250 ms, and
+    /// read the `None` an engine thread mid-chunk returns as "no rewrite".
+    /// Measured with six long utterances queued: 3 of 3 `say --reword` runs
+    /// handed back the original after ~250 ms, with no log line, no D-Bus
+    /// error, and nothing at all the caller could see. Pressing a
+    /// `say --reword selection` keybind while the daemon is still speaking is
+    /// the *normal* use of it, so the feature worked when tested on an idle
+    /// daemon and quietly stopped under exactly the load it exists for.
+    ///
+    /// This stands the engine all the way down, which is that condition taken
+    /// to its limit and is deterministic rather than a race against a
+    /// synthesiser: `config()` cannot answer at all.
+    ///
+    /// `stamp_reads` is what is asserted because it is the mechanism itself,
+    /// and it is the same fact in a build with the `reword` feature and one
+    /// without: `maybe_reword` reads `ConfigStore::current` exactly once per
+    /// `--reword` and never otherwise, so 0 is "the request was dropped
+    /// before anything so much as looked at a configuration" and 1 is "it
+    /// reached `RewordPlan::requested`". What happens past that point belongs
+    /// to `crate::reword` and is pinned there. An `endpoint_seen` assertion
+    /// was considered and rejected: it needs a live provider and one of the
+    /// two process-wide permits, and this binary already runs two tests that
+    /// take one.
+    #[tokio::test]
+    async fn a_reword_is_not_dropped_when_the_engine_cannot_answer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let i = iface_with_no_reword_endpoint(dir.path());
+
+        i.engine.shutdown();
+        assert!(
+            i.engine.config().is_none(),
+            "the premise of this test is an engine that cannot answer; if this \
+             starts passing, the condition being reproduced is gone"
+        );
+
+        let before = i.store.stamp_reads();
+        // The submission itself fails -- there is no engine left to take it --
+        // and that is not what is under test here.
+        let _ = i
+            .say(
+                "Alice: where do you want to go for dinner".into(),
+                opts_with("reword", OwnedValue::from(true)),
+            )
+            .await;
+        assert_eq!(
+            i.store.stamp_reads(),
+            before + 1,
+            "a --reword whose engine cannot answer must still read the daemon's \
+             own last-known config and offer the text to the rewrite path"
+        );
+
+        // ...and the other half of the promise: an ordinary `Say` pays
+        // nothing for a feature it did not ask for, not even the mutex.
+        let before = i.store.stamp_reads();
+        let _ = i.say("hello there.".into(), HashMap::new()).await;
+        assert_eq!(
+            i.store.stamp_reads(),
+            before,
+            "a Say without the opt must not read the config at all"
+        );
+    }
+
+    /// IMPORTANT 4: the selection and clipboard wiring, pinned by name.
+    ///
+    /// Deleting `let text = self.maybe_reword(text, &opts).await;` from
+    /// *both* `say_selection` and `say_clipboard` passed 263 of 263, while
+    /// the same deletion in `say` correctly failed a test. The missing
+    /// compositor was only half the reason -- the daemon-side line was simply
+    /// untouched by anything. `selection::read`'s seam is what lets these two
+    /// methods be driven at all; see its doc comment for why the seam is
+    /// there rather than a reader injected into `SaydIface`.
+    ///
+    /// Asserted on `stamp_reads` for the reason
+    /// `a_reword_is_not_dropped_when_the_engine_cannot_answer` gives.
+    #[tokio::test]
+    async fn the_selection_paths_offer_their_text_to_the_rewrite() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let i = iface_with_no_reword_endpoint(dir.path());
+        let spoken = "Alice: where do you want to go for dinner";
+        let _seam = selection::test_seam::install(move |_source| Ok(spoken.to_string()));
+
+        // Without the opt: read and submitted, and the config never touched.
+        let before = i.store.stamp_reads();
+        let id = i.say_selection(HashMap::new()).await.expect("accepted");
+        assert_ne!(id, 0, "the selection was read and queued");
+        let id = i.say_clipboard(HashMap::new()).await.expect("accepted");
+        assert_ne!(id, 0, "the clipboard was read and queued");
+        assert_eq!(
+            i.store.stamp_reads(),
+            before,
+            "neither path may pay for a rewrite nobody asked for"
+        );
+
+        // With it: each one offers its text to the rewrite path exactly once.
+        let before = i.store.stamp_reads();
+        i.say_selection(opts_with("reword", OwnedValue::from(true)))
+            .await
+            .expect("accepted");
+        assert_eq!(
+            i.store.stamp_reads(),
+            before + 1,
+            "SaySelection dropped the --reword on the floor"
+        );
+        i.say_clipboard(opts_with("reword", OwnedValue::from(true)))
+            .await
+            .expect("accepted");
+        assert_eq!(
+            i.store.stamp_reads(),
+            before + 2,
+            "SayClipboard dropped the --reword on the floor"
+        );
+
+        i.engine.shutdown();
+    }
+
+    /// A failed selection read is still a D-Bus error, and still names which
+    /// of the two it was -- the shared `say_read` body must not blur them.
+    #[tokio::test]
+    async fn a_failed_selection_read_is_reported_as_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let i = iface_with_no_reword_endpoint(dir.path());
+        let _seam = selection::test_seam::install(|source| Err(format!("the {source} is empty")));
+
+        let e = i
+            .say_selection(HashMap::new())
+            .await
+            .expect_err("an empty selection is an error");
+        assert!(
+            e.to_string().contains("primary selection"),
+            "the error must say which one it was: {e}"
+        );
+        let e = i
+            .say_clipboard(HashMap::new())
+            .await
+            .expect_err("an empty clipboard is an error");
+        assert!(
+            e.to_string().contains("clipboard"),
+            "the error must say which one it was: {e}"
+        );
+        i.engine.shutdown();
     }
 
     #[tokio::test]

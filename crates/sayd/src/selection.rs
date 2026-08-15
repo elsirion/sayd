@@ -301,7 +301,80 @@ fn read_with_deadline<R: Read + AsRawFd>(
     }
 }
 
+/// Read `source`, or in a test whatever [`test_seam`] has installed.
+///
+/// IMPORTANT 4: `dbus::SaydIface::say_selection` and `say_clipboard` could
+/// not be driven from a test at all -- they end in a Wayland connection, and
+/// there is no compositor in a test run -- so the rewrite step in both of
+/// them was pinned by nothing and deleting it passed the whole suite. The
+/// seam is one branch, compiled only into the test binary, and it is here
+/// rather than as an injected reader on `SaydIface` because the thing under
+/// test is those two D-Bus methods by name: a reader threaded through the
+/// struct would let `say_selection` stop calling this and still pass.
 pub fn read(source: Source) -> Result<String, String> {
+    #[cfg(test)]
+    if let Some(canned) = test_seam::installed(source) {
+        return canned;
+    }
+    read_from_compositor(source)
+}
+
+/// A canned [`read`], for the tests that drive `SaySelection` and
+/// `SayClipboard` end to end.
+///
+/// Process-global, because `read` is called on a `spawn_blocking` thread and
+/// a thread-local would never be seen there. [`install`] therefore also holds
+/// a mutex for the lifetime of its guard, so two tests that install one
+/// cannot overlap; every other test in this binary is unaffected, because an
+/// empty slot is exactly today's behaviour.
+///
+/// [`install`]: test_seam::install
+#[cfg(test)]
+pub(crate) mod test_seam {
+    use super::Source;
+    use std::sync::{Mutex, MutexGuard};
+
+    type Reader = Box<dyn Fn(Source) -> Result<String, String> + Send + Sync>;
+
+    static INSTALLED: Mutex<Option<Reader>> = Mutex::new(None);
+    /// Held by [`Installed`], so the tests that install a reader run one at a
+    /// time.
+    static EXCLUSIVE: Mutex<()> = Mutex::new(());
+
+    fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+        match m.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// The installed reader's answer for `source`, or `None` when the real
+    /// one should run.
+    pub(super) fn installed(source: Source) -> Option<Result<String, String>> {
+        lock(&INSTALLED).as_ref().map(|f| f(source))
+    }
+
+    /// What `read` returns until the returned guard is dropped.
+    pub(crate) fn install(
+        f: impl Fn(Source) -> Result<String, String> + Send + Sync + 'static,
+    ) -> Installed {
+        let exclusive = lock(&EXCLUSIVE);
+        *lock(&INSTALLED) = Some(Box::new(f));
+        Installed(exclusive)
+    }
+
+    /// Uninstalls on drop, so a panicking test cannot leave a canned
+    /// selection behind for the rest of the run.
+    pub(crate) struct Installed(#[allow(dead_code)] MutexGuard<'static, ()>);
+
+    impl Drop for Installed {
+        fn drop(&mut self) {
+            *lock(&INSTALLED) = None;
+        }
+    }
+}
+
+fn read_from_compositor(source: Source) -> Result<String, String> {
     let clipboard = match source {
         Source::Primary => ClipboardType::Primary,
         Source::Clipboard => ClipboardType::Regular,
