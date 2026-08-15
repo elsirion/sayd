@@ -1007,6 +1007,19 @@ pub fn state() -> Arc<RewordState> {
     STATE.get_or_init(RewordState::new).clone()
 }
 
+/// What the last attempt to build a client for a given config produced,
+/// success *or* failure, and the exact config it was attempted for. Named
+/// because the pair is what makes "attempted again only when the config
+/// changes" checkable in one comparison.
+///
+/// `None` in the second slot -- a cached failure -- is the half that used to
+/// be missing, and the case it costs is not exotic: `enabled = true` in a
+/// build without the `reword` feature, where `build_rewriter` can never
+/// succeed. Every announcement re-entered it and took two global mutexes
+/// (this one, then `RewordState::inner` inside `record`), on the very
+/// `select!` arm the `Journal` split above exists to keep clear.
+type Cache = Mutex<Option<(RewordConfig, Option<Arc<dyn Rewriter>>)>>;
+
 /// The rewriter for `cfg`, or `None` when this build cannot make one or the
 /// configuration cannot be used.
 ///
@@ -1015,26 +1028,42 @@ pub fn state() -> Arc<RewordState> {
 /// `base_url`, `model` and the key are per-request inputs, not client
 /// state.
 pub fn context(cfg: &RewordConfig) -> Option<(Arc<dyn Rewriter>, Arc<RewordState>)> {
-    /// The client and the exact config it was built for. Named because the
-    /// pair is what makes "rebuilt only when the config changes" checkable
-    /// in one comparison.
-    type Cache = Mutex<Option<(RewordConfig, Arc<dyn Rewriter>)>>;
-
     static CACHE: OnceLock<Cache> = OnceLock::new();
-    let state = state();
-    let cell = CACHE.get_or_init(|| Mutex::new(None));
-    let mut guard = lock(cell);
-    if let Some((cached_cfg, rewriter)) = guard.as_ref() {
+    context_in(
+        CACHE.get_or_init(|| Mutex::new(None)),
+        state(),
+        cfg,
+        build_rewriter,
+    )
+}
+
+/// The body of [`context`] with its two globals -- the cache and the
+/// process-wide state -- and its builder handed in, so the caching rule can
+/// be tested without a process-wide cache no test can reset and without a
+/// client this build may not be able to make at all.
+fn context_in(
+    cache: &Cache,
+    state: Arc<RewordState>,
+    cfg: &RewordConfig,
+    build: impl FnOnce(&RewordConfig) -> Result<Arc<dyn Rewriter>, RewordError>,
+) -> Option<(Arc<dyn Rewriter>, Arc<RewordState>)> {
+    let mut guard = lock(cache);
+    if let Some((cached_cfg, outcome)) = guard.as_ref() {
         if cached_cfg == cfg {
-            return Some((rewriter.clone(), state));
+            return outcome.clone().map(|rewriter| (rewriter, state));
         }
     }
-    match build_rewriter(cfg) {
+    match build(cfg) {
         Ok(rewriter) => {
-            *guard = Some((cfg.clone(), rewriter.clone()));
+            *guard = Some((cfg.clone(), Some(rewriter.clone())));
             Some((rewriter, state))
         }
         Err(e) => {
+            // Recorded once, with the failure remembered, so the row §8 owes
+            // this config is still logged and still latches -- and the next
+            // announcement under the same config is a comparison rather than
+            // a rebuild and a second lock.
+            *guard = Some((cfg.clone(), None));
             drop(guard);
             state.record(cfg, &Attempt::Answered(Err(e)), Instant::now());
             None
@@ -2314,6 +2343,54 @@ mod tests {
             Ok(()),
             "and it must not switch the feature off for the life of the process"
         );
+    }
+
+    /// A build *failure* is remembered exactly like a success. It used not to
+    /// be, and the case that costs is not exotic: `enabled = true` in a build
+    /// without the `reword` feature, where `build_rewriter` can never
+    /// succeed. Every announcement then re-entered it and took two global
+    /// mutexes -- the cache, then `RewordState::inner` inside `record` --
+    /// on the `select!` arm `Journal` exists to keep clear.
+    #[test]
+    fn a_build_failure_is_remembered_as_firmly_as_a_client() {
+        let cache: Cache = Mutex::new(None);
+        let state = RewordState::new();
+        let cfg = cfg();
+        let builds = AtomicUsize::new(0);
+
+        let refuses = |_: &RewordConfig| {
+            builds.fetch_add(1, Ordering::SeqCst);
+            Err(RewordError::NotConfigured("base_url is empty".into()))
+        };
+        for _ in 0..5 {
+            assert!(context_in(&cache, state.clone(), &cfg, refuses).is_none());
+        }
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            1,
+            "a configuration that could not produce a client is asked once, \
+             not once per announcement"
+        );
+
+        // ...and a changed config is a fresh question, exactly as it is for a
+        // client that did build.
+        let mut other = cfg.clone();
+        other.base_url = "http://localhost:1234/v1".into();
+        assert!(context_in(&cache, state.clone(), &other, refuses).is_none());
+        assert_eq!(builds.load(Ordering::SeqCst), 2);
+
+        // The success half of the same rule, so the cache cannot be "fixed"
+        // by never caching anything.
+        let cache: Cache = Mutex::new(None);
+        let builds = AtomicUsize::new(0);
+        let succeeds = |_: &RewordConfig| {
+            builds.fetch_add(1, Ordering::SeqCst);
+            Ok(Stub::new(vec![Ok("a rewrite".into())]) as Arc<dyn Rewriter>)
+        };
+        for _ in 0..5 {
+            assert!(context_in(&cache, state.clone(), &cfg, succeeds).is_some());
+        }
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
     }
 
     /// One permit pool and one set of breakers for the process, so the
