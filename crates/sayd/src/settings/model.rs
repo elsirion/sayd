@@ -1005,9 +1005,22 @@ pub struct Suggestion {
 pub const CURATED: &[(&str, &str)] = &[
     ("Signal", "signal-desktop"),
     ("Element", "element"),
+    // `discord`, lowercase, and the same on stable, PTB and Canary --
+    // measured from the shipped `app.asar`s of four builds (0.0.10 through
+    // 0.0.700): the root `package.json` has no `productName`, so Electron
+    // falls back to `name`, which is `"discord"`. `Constants.js` really does
+    // build `'Discord' + channel_suffix`, but every use of it is a log line,
+    // the Windows AppUserModelId, or a `.lnk` filename -- never
+    // `app.setName`, which is what would reach `notify_init`. sayd matches
+    // case-insensitively so `Discord` would work too; this is the string the
+    // application actually sends, which is what this table promises.
+    // Unverified for the current 1.0.x host, which ships no `app.asar` and
+    // fetches itself at runtime.
     ("Fractal", "org.gnome.Fractal"),
     ("Telegram Desktop", "org.telegram.desktop"),
-    ("Discord", "discord"),
+    ("discord", "discord"),
+    // "Slack", capitalised: `productName` is present and is `"Slack"`,
+    // measured from the 4.51.180 .deb, and its .desktop `Name=` agrees.
     ("Slack", "slack"),
     ("Thunderbird", "org.mozilla.Thunderbird"),
     ("evolution-mail-notification", "evolution"),
