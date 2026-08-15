@@ -31,6 +31,7 @@
 //! and [`WeakUi`], which is where the whole arrangement is explained.
 
 use std::cell::{Cell, RefCell};
+use std::path::Path;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,10 +44,11 @@ use sayd_core::handle::EngineHandle;
 use sayd_core::queue::{Policy, Source as QueueSource};
 
 use super::model::{
-    allow_add, allow_contains, allow_remove, IconSource, SettingsModel, Suggestion, SuggestionKind,
-    COOLDOWN_MAX, COOLDOWN_MIN, COOLDOWN_STEP, IDLE_UNLOAD_MAX, IDLE_UNLOAD_MIN, IDLE_UNLOAD_STEP,
-    MAX_CHARS_MAX, MAX_CHARS_MIN, MAX_CHARS_STEP, MODELS, SPEED_MAX, SPEED_MIN, SPEED_STEP,
-    THREADS_MAX, THREADS_MIN, THREADS_STEP,
+    allow_add, allow_contains, allow_remove, icon_file_size_within_limit, icon_pixels_within_limit,
+    IconSource, SettingsModel, Suggestion, SuggestionKind, COOLDOWN_MAX, COOLDOWN_MIN,
+    COOLDOWN_STEP, IDLE_UNLOAD_MAX, IDLE_UNLOAD_MIN, IDLE_UNLOAD_STEP, MAX_CHARS_MAX,
+    MAX_CHARS_MIN, MAX_CHARS_STEP, MODELS, SPEED_MAX, SPEED_MIN, SPEED_STEP, THREADS_MAX,
+    THREADS_MIN, THREADS_STEP,
 };
 use crate::notify::seen;
 
@@ -169,7 +171,8 @@ const NOTIFICATION_SWITCHES: [(&str, &str, NotifyGet, NotifySet); 3] = [
 /// What lands here is every row for which no candidate drew: an application
 /// that sent no icon in any of the three fields it could have (`notify-send`
 /// sends none), a curated or seen icon *name* the user's theme does not
-/// have, and a path that is not there any more. `gtk::Image` would draw some of
+/// have, a path that is not there any more, and an image too large to decode
+/// on this thread (see [`image_from_file`]). `gtk::Image` would draw some of
 /// those as its own broken-image glyph, which is the wrong thing to say: the
 /// row is not broken, the icon is simply unknown, and a generic application
 /// icon says exactly that. Checked against the theme rather than assumed --
@@ -1471,7 +1474,7 @@ fn suggestion_icon(icons: &[IconSource]) -> gtk::Image {
     for candidate in icons {
         let drawn = match candidate {
             IconSource::Named(name) if theme_has(name) => Some(gtk::Image::from_icon_name(name)),
-            IconSource::File(path) if path.is_file() => Some(gtk::Image::from_file(path)),
+            IconSource::File(path) => image_from_file(path),
             _ => None,
         };
         if let Some(image) = drawn {
@@ -1482,6 +1485,55 @@ fn suggestion_icon(icons: &[IconSource]) -> gtk::Image {
     let image = gtk::Image::from_icon_name(FALLBACK_ICON);
     image.set_pixel_size(SUGGESTION_ICON_PX);
     image
+}
+
+/// Load an application-supplied image file, if it is one this thread can
+/// afford to decode.
+///
+/// CRITICAL 3: `gtk::Image::from_file` decodes whatever the path names,
+/// synchronously, on the glib main thread, at whatever size the file
+/// declares. `path` comes from a notification, which means the *sender*
+/// chose it. Measured through the same gdk-pixbuf path GTK uses: a 435 KB
+/// PNG declaring 12000x12000 decodes in 442 ms and 432 MB, and a group of
+/// `MAX_SEEN` such rows -- all alive at once, rebuilt on every redraw -- is
+/// tens of seconds and tens of gigabytes. Three things stop that here:
+///
+/// - the byte count comes from the `stat` this was already doing, and is
+///   checked first because it is the one that costs nothing.
+/// - `Pixbuf::file_info` reads only enough of the file to learn its format
+///   and declared size, so the decision costs a header rather than an image
+///   (20 ms for that PNG, against 238 ms and 432 MB to decode it).
+/// - `icon_pixels_within_limit` (the rules, in `model.rs`) rejects anything
+///   bigger than a real icon.
+/// - what is left is loaded with `from_file_at_scale`, which scales during
+///   decode, so the buffer that reaches the row is icon-sized rather than
+///   whatever the file declared and then scaled down for display.
+///
+/// A file that is not an image at all, or one whose header does not parse,
+/// is `None` and falls back like anything else -- `file_info` answering
+/// nothing is exactly the case a broken-image glyph used to be drawn for.
+/// The `is_file` check that used to guard this is kept, in the form of the
+/// metadata call: it correctly rejects a FIFO, which would otherwise block
+/// this thread on a reader that never comes.
+fn image_from_file(path: &Path) -> Option<gtk::Image> {
+    let metadata = std::fs::metadata(path).ok()?;
+    if !metadata.is_file() || !icon_file_size_within_limit(metadata.len()) {
+        return None;
+    }
+    let (_format, width, height) = gtk::gdk_pixbuf::Pixbuf::file_info(path)?;
+    if !icon_pixels_within_limit(width, height) {
+        return None;
+    }
+    let pixbuf = gtk::gdk_pixbuf::Pixbuf::from_file_at_scale(
+        path,
+        SUGGESTION_ICON_PX,
+        SUGGESTION_ICON_PX,
+        true,
+    )
+    .ok()?;
+    Some(gtk::Image::from_paintable(Some(
+        &gtk::gdk::Texture::for_pixbuf(&pixbuf),
+    )))
 }
 
 /// Does the display's icon theme actually have `name`?
@@ -1523,6 +1575,7 @@ fn theme_has(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::model::MAX_ICON_PIXELS;
     use gtk::gdk_pixbuf::{Colorspace, Pixbuf};
 
     /// Write a PNG of exactly `width`x`height` to `path`.
@@ -1673,6 +1726,26 @@ mod tests {
 
         let ordinary = dir.path().join("ordinary.png");
         png(&ordinary, 48, 48);
+        let drawn = image_from_file(&ordinary).expect("a real icon must still draw");
+        assert!(
+            drawn.paintable().is_some(),
+            "and must draw as an actual image rather than an empty widget"
+        );
+
+        let oversized = dir.path().join("oversized.png");
+        png(&oversized, MAX_ICON_PIXELS + 1, 64);
+        assert!(
+            image_from_file(&oversized).is_none(),
+            "an image past the pixel limit must not reach the decoder"
+        );
+        assert!(
+            image_from_file(&dir.path().join("not-there.png")).is_none(),
+            "a path that is not there is a fallback, not a broken-image glyph"
+        );
+        assert!(
+            image_from_file(dir.path()).is_none(),
+            "and neither is a directory"
+        );
 
         // A name no theme has, followed by a file that is there: the file
         // must win rather than the row settling for the fallback.
@@ -1684,6 +1757,17 @@ mod tests {
         assert!(
             image.icon_name().is_none(),
             "a drawable file must beat a theme name that does not resolve"
+        );
+
+        // An oversized file is not "usable but big": the walk must carry on
+        // past it to whatever else the sender offered.
+        let image = suggestion_icon(&[
+            IconSource::File(oversized.clone()),
+            IconSource::Named(FALLBACK_ICON.into()),
+        ]);
+        assert_eq!(
+            image.icon_name().map(|n| n.to_string()),
+            Some(FALLBACK_ICON.to_string())
         );
 
         // Nothing at all is the fallback, and so is a list of unusable

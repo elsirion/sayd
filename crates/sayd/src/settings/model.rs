@@ -1054,6 +1054,51 @@ fn push_candidate(out: &mut Vec<IconSource>, raw: &str) {
     }
 }
 
+/// Whether an icon file is small enough to decode on the main thread.
+///
+/// CRITICAL 3: the window loads a suggestion's icon from a path the
+/// *sending application* chose, synchronously, on the glib main thread, once
+/// per row. Measured through the same gdk-pixbuf path GTK uses, a 435 KB PNG
+/// declaring 12000x12000 pixels decodes in 442 ms and 432 MB; at `MAX_SEEN`
+/// rows that is a frozen desktop and tens of gigabytes, rebuilt on every
+/// redraw, and it costs the sender one line to arrange. A byte limit alone
+/// does not catch it -- that is what "435 KB" is doing in that sentence --
+/// so the pixel count is the limit that matters and the byte count is the
+/// cheap one that bounds everything else.
+///
+/// Both are far above any real icon: application icons top out at 512
+/// pixels a side in every theme this has been checked against, and the
+/// largest icon PNG in Adwaita is a few tens of kilobytes.
+///
+/// Pure, and here rather than in `window.rs`, for the reason everything else
+/// is: it is a rule, and the window is the layer with no test coverage. The
+/// two questions that need a filesystem -- how big is the file, what does
+/// its header say -- are the window's to ask.
+///
+/// Two functions rather than one because they are answered at different
+/// prices: `stat` gives the byte count, while learning the dimensions means
+/// handing the file to an image loader (20 ms for the bomb above, measured),
+/// so the window asks this one first and only pays for the second on a file
+/// that passed.
+pub fn icon_file_size_within_limit(bytes: u64) -> bool {
+    bytes <= MAX_ICON_FILE_BYTES
+}
+
+/// Is a declared image size one this thread can afford to decode? See
+/// [`icon_file_size_within_limit`], which is asked first.
+///
+/// A zero or negative dimension is out: it is not an image anybody can draw,
+/// and it is what a loader reports for a header it could not make sense of.
+pub fn icon_pixels_within_limit(width: i32, height: i32) -> bool {
+    width > 0 && height > 0 && width <= MAX_ICON_PIXELS && height <= MAX_ICON_PIXELS
+}
+
+/// Largest icon file, in bytes, [`icon_file_size_within_limit`] will accept.
+pub const MAX_ICON_FILE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Largest icon, in pixels a side, [`icon_pixels_within_limit`] will accept.
+pub const MAX_ICON_PIXELS: i32 = 1024;
+
 /// Which of `suggestions()`'s two sources a [`Suggestion`] came from.
 ///
 /// A two-variant enum rather than the bare `bool` this was, because both
@@ -2383,6 +2428,31 @@ mod tests {
             app_icon: String::new(),
         };
         assert!(icon_candidates(&nothing).is_empty());
+    }
+
+    /// CRITICAL 3: the size limits an application-supplied image has to be
+    /// inside before the main thread decodes it. The 12000x12000 PNG that
+    /// occasioned this is 435 KB on disk, so the byte limit alone would
+    /// have waved it straight through.
+    #[test]
+    fn an_oversized_icon_file_is_out_of_limits() {
+        assert!(icon_file_size_within_limit(40_000), "a real icon");
+        assert!(icon_pixels_within_limit(512, 512), "a real icon");
+        assert!(
+            icon_file_size_within_limit(32_840) && !icon_pixels_within_limit(12_000, 12_000),
+            "a decompression bomb is small on disk and enormous decoded, which \
+             is why the byte limit cannot be the only one"
+        );
+        assert!(
+            !icon_file_size_within_limit(MAX_ICON_FILE_BYTES + 1),
+            "and an enormous file is out regardless of its dimensions"
+        );
+        assert!(icon_pixels_within_limit(MAX_ICON_PIXELS, MAX_ICON_PIXELS));
+        assert!(!icon_pixels_within_limit(MAX_ICON_PIXELS + 1, 1));
+        assert!(
+            !icon_pixels_within_limit(0, 0),
+            "an image with no size at all is not one to draw"
+        );
     }
 
     /// CRITICAL 2's other half: nothing bounded what the window could write
