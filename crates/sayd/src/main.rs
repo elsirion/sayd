@@ -172,6 +172,75 @@ impl AudioSink for DiscardSink {
     }
 }
 
+/// Starts and stops the notification monitor (`notify::monitor::run`) to
+/// track `notifications.enabled` -- the one thing under `[notifications]`
+/// that actually needs a restart. `run` itself re-reads `allow`,
+/// `cooldown_secs`, `speak_app_name` and `speak_body` off its own
+/// one-second tick (see its doc comment), so this supervisor's whole job is
+/// the on/off switch.
+///
+/// A small struct beside the publish loop, not two more locals folded into
+/// it (a `JoinHandle` and a "was it enabled last tick" bool): `run_daemon`
+/// already carries a dozen pieces of tick-to-tick state for the tray/MPRIS
+/// fan-out and device recovery, all in loose local variables, and adding a
+/// thirteenth invisible one to that list buys nothing a named type does not
+/// already buy for free -- most of all, that the two tests §8 requires can
+/// drive `reconcile` directly instead of standing up the whole publish loop
+/// (a real bus connection, a real engine, a tray) just to prove a task did
+/// or did not get spawned.
+struct NotifyMonitorSupervisor {
+    /// `Some` exactly while the monitor task is (or was, until the next
+    /// reconcile notices a drop) running. Doubles as "what was enabled last
+    /// tick" -- `reconcile` needs no separate bool for that, since the two
+    /// facts are the same fact.
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl NotifyMonitorSupervisor {
+    fn new() -> Self {
+        Self { handle: None }
+    }
+
+    /// Start or stop the monitor task to match `enabled`. Called every
+    /// publish tick with the config's current value (see `run_daemon`), so
+    /// this has to be a no-op when nothing changed -- calling it with the
+    /// same `enabled` a hundred times running must neither spawn a second
+    /// task nor abort a task still meant to be running.
+    ///
+    /// Stopping is a plain `abort`, not a shutdown signal down some channel:
+    /// `notify::monitor::run` holds no state that needs flushing and no
+    /// resource that needs releasing in order (see its doc comment), so
+    /// aborting between messages loses nothing that the process exiting
+    /// would not already lose. The one gap that leaves, and it is a real
+    /// one: `abort` cannot cancel an in-flight `spawn_blocking` -- the
+    /// monitor's `speak`, mid-submission -- so a single announcement can
+    /// still land audibly shortly after `enabled` goes false. Accepted
+    /// rather than engineered around; there is no cheap way to make a
+    /// blocking-pool call cancellable, and the window is one utterance, not
+    /// a standing leak.
+    fn reconcile(&mut self, enabled: bool, engine: &EngineHandle) {
+        match (enabled, &self.handle) {
+            (true, None) => {
+                self.handle = Some(tokio::spawn(notify::monitor::run(engine.clone())));
+            }
+            (false, Some(_)) => {
+                // `.take()` before `.abort()`: `handle` must read `None` the
+                // instant this returns, not only once the aborted task has
+                // actually finished unwinding -- a `reconcile` that turns
+                // `enabled` back on next tick must see a clean slate to
+                // start into, not "an abort is already pending for this
+                // one."
+                if let Some(handle) = self.handle.take() {
+                    handle.abort();
+                }
+            }
+            // Already matches: (true, Some(_)) is already running,
+            // (false, None) is already stopped.
+            _ => {}
+        }
+    }
+}
+
 fn models_dir() -> PathBuf {
     if let Some(d) = std::env::var_os("SAYD_MODELS_DIR") {
         return PathBuf::from(d);
@@ -571,6 +640,10 @@ async fn run_daemon() -> std::process::ExitCode {
     // final value) instead of either silence or a steady stream of zeros.
     let mut next_remaining_publish = Instant::now();
     let mut remaining_was_active = false;
+    // M5 Task 5: owns the notification monitor's `JoinHandle`, started and
+    // stopped from `notifications.enabled` on every tick below. See
+    // `NotifyMonitorSupervisor::reconcile`'s doc comment.
+    let mut notify_supervisor = NotifyMonitorSupervisor::new();
     let mut ticker = tokio::time::interval(PUBLISH_INTERVAL);
     let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
     {
@@ -586,6 +659,20 @@ async fn run_daemon() -> std::process::ExitCode {
             _ = ticker.tick() => {
                 let now = engine.snapshot();
                 let now_instant = Instant::now();
+
+                // M5 Task 5: start/stop the notification monitor with
+                // `notifications.enabled`. `store.current()` is a plain
+                // mutex read, not a round trip through the engine thread
+                // (contrast `EngineHandle::config`, a bounded channel call) --
+                // it is safe to take on every 200ms tick because every
+                // config mutation in this daemon (a settings-window save, a
+                // hand edit picked up by `reload`, a tray mute, an MPRIS
+                // rate change) goes through `ConfigStore::write_locked`,
+                // which stamps it here *and* sends the engine's own
+                // `ApplyConfig` in the same critical section -- so this can
+                // never observe a config the engine itself has not also
+                // been told about. See `ConfigStore::current`'s doc comment.
+                notify_supervisor.reconcile(store.current().notifications.enabled, &engine);
 
                 // Finding 3: bounded `RemainingSeconds` publishing. "Active"
                 // means it is actually counting down -- `Speaking` with
@@ -950,4 +1037,95 @@ fn main() -> std::process::ExitCode {
     main_loop.run();
     let code = *exit.lock().expect("exit mutex");
     code
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sayd_core::synth::StubSynthesizer;
+
+    /// A real, spawned `EngineHandle` -- a stub synthesizer and a
+    /// [`DiscardSink`] so `NotifyMonitorSupervisor::reconcile` has a genuine
+    /// `EngineHandle` to clone into a spawned task, without touching a real
+    /// model or a real audio device.
+    fn test_engine() -> EngineHandle {
+        EngineHandle::spawn(
+            Config::default(),
+            Box::new(StubSynthesizer::new()),
+            Box::new(DiscardSink { paused: false }),
+        )
+    }
+
+    /// `enabled = false` must cost exactly nothing -- no second D-Bus
+    /// connection, no task. The cheap wrong implementation starts the
+    /// monitor unconditionally and filters `enabled` inside it, which looks
+    /// identical from the outside until someone counts connections.
+    ///
+    /// Deliberately a plain `#[test]`, not `#[tokio::test]`: no tokio
+    /// runtime is running underneath it. `tokio::spawn` panics when called
+    /// outside one, so if `reconcile` ever reached its `tokio::spawn` call
+    /// on the `enabled = false` path -- exactly the cheap wrong
+    /// implementation this test exists to catch -- this test would panic
+    /// instead of quietly passing.
+    #[test]
+    fn a_disabled_monitor_is_never_started() {
+        let engine = test_engine();
+        let mut sup = NotifyMonitorSupervisor::new();
+
+        sup.reconcile(false, &engine);
+        assert!(
+            sup.handle.is_none(),
+            "no monitor task may exist while notifications.enabled is false"
+        );
+
+        engine.shutdown();
+    }
+
+    /// Turning it on at runtime starts it; turning it off stops it -- and
+    /// "stops it" is checked against the task actually ending, not just the
+    /// handle being dropped.
+    #[tokio::test]
+    async fn toggling_enabled_starts_and_stops_the_monitor() {
+        let engine = test_engine();
+        let mut sup = NotifyMonitorSupervisor::new();
+
+        sup.reconcile(true, &engine);
+        let running = sup
+            .handle
+            .as_ref()
+            .expect("enabled = true must start a task");
+        assert!(!running.is_finished(), "the monitor must be running");
+        // Taken before the task is touched again, so it can prove the task
+        // itself ends below -- `sup.handle` is about to become `None`, which
+        // says nothing about whether the task it pointed at is still alive.
+        let abort_handle = running.abort_handle();
+
+        // Reconciling again with the same value must be a no-op: it must
+        // neither spawn a second task nor abort the one already running.
+        sup.reconcile(true, &engine);
+        assert!(
+            !abort_handle.is_finished(),
+            "reconcile must not restart an already-running monitor"
+        );
+
+        sup.reconcile(false, &engine);
+        assert!(
+            sup.handle.is_none(),
+            "the handle must be gone once disabled"
+        );
+
+        // `abort()` only requests cancellation; give the runtime a moment to
+        // actually schedule and finish tearing the task down before checking
+        // it, rather than asserting on a request that has not landed yet.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !abort_handle.is_finished() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            abort_handle.is_finished(),
+            "the monitor task must actually stop once disabled, not just lose its handle"
+        );
+
+        engine.shutdown();
+    }
 }
