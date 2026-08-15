@@ -78,6 +78,10 @@ pub const MAX_CHARS_STEP: f64 = 500.0;
 /// rate limiting off entirely, so every notification from an allowed
 /// application is spoken. See the Notifications group's subtitle, which says
 /// that rather than letting `0` read as "no wait between announcements".
+///
+/// `0` and then `NOTIFY_COOLDOWN_MIN_SECS`, with nothing in between: a typed
+/// `1` or `2` is raised by `clamp_ranges` before it is written, so the row
+/// snaps rather than saving a value the next load would silently change.
 pub const COOLDOWN_MIN: f64 = 0.0;
 /// An hour, the same ceiling `IDLE_UNLOAD_MAX` uses: past it the spinner is
 /// no longer a control anyone drives to the end, and a longer window is a
@@ -837,6 +841,24 @@ fn clamp_ranges(cfg: &mut Config) -> Vec<String> {
             cfg.reword.timeout_ms, REWORD_TIMEOUT_MIN as u64, REWORD_TIMEOUT_MAX as u64
         ));
         cfg.reword.timeout_ms = timeout;
+    }
+    // The one range in this table that is not about taste, and the one that
+    // was enforced in `Config::load_str` alone. Without it here the settings
+    // window could write a `cooldown_secs = 2` that silently became 3 the
+    // next time the file was read: a file that disagrees with the running
+    // config, which is the exact drift the `REWORD_TIMEOUT_MIN/MAX` pair
+    // above exists to prevent, in the same function. `0` is exempt because
+    // it means something else entirely -- `Limiter::decide`'s
+    // `cooldown_secs == 0` arm switches rate limiting off, so no coalescing
+    // window ever opens and the ordering the floor protects does not exist.
+    // See `sayd_core::config::NOTIFY_COOLDOWN_MIN_SECS` for what it protects.
+    let floor = sayd_core::config::NOTIFY_COOLDOWN_MIN_SECS;
+    if cfg.notifications.cooldown_secs != 0 && cfg.notifications.cooldown_secs < floor {
+        warnings.push(format!(
+            "notifications.cooldown_secs {} is shorter than a rewrite may take; using {floor}",
+            cfg.notifications.cooldown_secs
+        ));
+        cfg.notifications.cooldown_secs = floor;
     }
     let max_chars = cfg
         .reword
@@ -2667,5 +2689,42 @@ mod tests {
         let before = seen.len();
         seen.dedup();
         assert_eq!(seen.len(), before, "the curated table has duplicates");
+    }
+
+    /// The cooldown floor was enforced on load and nowhere else, so the
+    /// window could write a `cooldown_secs = 2` that silently became 3 the
+    /// next time the file was read -- a file that disagrees with the running
+    /// config.
+    #[test]
+    fn a_cooldown_shorter_than_a_rewrite_is_raised_before_it_is_written() {
+        use sayd_core::config::NOTIFY_COOLDOWN_MIN_SECS;
+
+        let mut cfg = Config::default();
+        cfg.notifications.cooldown_secs = 2;
+        let warnings = clamp_ranges(&mut cfg);
+        assert_eq!(cfg.notifications.cooldown_secs, NOTIFY_COOLDOWN_MIN_SECS);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+
+        // `0` means rate limiting is off, not "no wait": no coalescing window
+        // ever opens, so the ordering the floor protects does not exist.
+        let mut off = Config::default();
+        off.notifications.cooldown_secs = 0;
+        assert!(clamp_ranges(&mut off).is_empty());
+        assert_eq!(off.notifications.cooldown_secs, 0);
+
+        // And the two doors agree, which is the whole point of mirroring it:
+        // what the window writes is what a load of that file produces.
+        let mut written = Config::default();
+        written.notifications.cooldown_secs = 2;
+        validate(&mut written).expect("a short cooldown is clamped, not refused");
+        let (loaded, err) = sayd_core::config::Config::load_str(&format!(
+            "[notifications]\ncooldown_secs = {}\n",
+            written.notifications.cooldown_secs
+        ));
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!(
+            loaded.notifications.cooldown_secs,
+            written.notifications.cooldown_secs
+        );
     }
 }
