@@ -30,10 +30,16 @@ const IFACE: &str = "sh.sayd.Sayd1";
 /// rewrite afterwards -- so a `Say` carrying `reword` legitimately takes up
 /// to that ceiling to return. The daemon clamps it to
 /// `sayd_core::config::REWORD_TIMEOUT_MAX_MS` for this reason and no other,
-/// at a value chosen to leave room inside this bound for the two 250 ms
-/// engine round trips that bracket the rewrite.
-/// The two constants are in different binaries and neither can import the
-/// other, so the relationship is pinned by a test instead:
+/// at a value chosen to leave room inside this bound for the engine round
+/// trip that follows the rewrite.
+///
+/// `sayd-cli` is a binary and depends on no crate of this workspace, so the
+/// relationship cannot be an import in this direction. It is pinned in the
+/// other one instead: `sayd-core`'s `config.rs` restates this 3 s as
+/// `CLI_INTERACTION_BOUND_MS` and asserts at compile time that its own
+/// ceiling, the 250 ms `SUBMIT_REPLY_TIMEOUT` and a margin all fit inside it.
+/// **Changing this constant means changing that one.** End to end, the pair
+/// is exercised by
 /// `sayd::dbus::tests::a_reword_against_a_silent_provider_still_answers_inside_the_cli_bound`.
 const TIMEOUT: Duration = Duration::from_secs(3);
 

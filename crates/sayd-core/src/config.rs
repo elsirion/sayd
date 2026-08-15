@@ -107,20 +107,63 @@ pub const REWORD_TIMEOUT_MIN_MS: u64 = 200;
 /// is arithmetic, not taste, and it used to leave no margin at all.
 ///
 /// A `Say` carrying `reword` is answered inline, so what `sayd-cli` waits
-/// for is three things end to end: `EngineHandle::config()`, bounded by
-/// `CONFIG_REPLY_TIMEOUT` at 250 ms; the rewrite, bounded by this; and
-/// `EngineHandle::submit`, bounded by `SUBMIT_REPLY_TIMEOUT` at 250 ms. At
-/// 2500 that is 250 + 2500 + 250 = 3000 ms -- exactly `sayd-cli`'s own 3 s
-/// bound, which is to say zero theoretical margin for the bus round trip,
-/// for scheduling, or for the difference between a budget and the moment
-/// the runtime notices it has elapsed. The one failure this clamp exists to
-/// prevent was sitting on its own boundary.
+/// for is the rewrite, bounded by this, plus `EngineHandle::submit`, bounded
+/// by `SUBMIT_REPLY_TIMEOUT` at 250 ms. (There used to be a third: the
+/// daemon fetched its config with `EngineHandle::config()`, another 250 ms.
+/// It reads `ConfigStore::current` now -- see `dbus::SaydIface::maybe_reword`
+/// -- so that round trip is gone from this sum, and the margin below is
+/// larger than the one 2000 was chosen against.) At 2500 the sum was
+/// 250 + 2500 + 250 = 3000 ms -- exactly `sayd-cli`'s own 3 s bound, which is
+/// to say zero theoretical margin for the bus round trip, for scheduling, or
+/// for the difference between a budget and the moment the runtime notices it
+/// has elapsed. The one failure this clamp exists to prevent was sitting on
+/// its own boundary.
 ///
 /// 2000 leaves about a second of it. What that costs a user with a genuinely
 /// slower provider is visible to them: the settings window's Test row
 /// reports the latency it measured, which is how someone discovers they need
 /// a different provider rather than a larger number here.
+///
+/// MINOR 10: this arithmetic bounds `Say` and nothing else.
+/// `SaySelection`/`SayClipboard` read a selection first, and that read
+/// carries its own bounds -- `selection::SELECTION_READ_TIMEOUT` at 5 s of
+/// inactivity and `SELECTION_READ_OVERALL_CAP` at 30 s overall -- either of
+/// which is on its own past `sayd-cli`'s 3 s. A wedged selection owner is
+/// therefore a "sayd is not responding" no matter what this constant says;
+/// bounding that is the selection module's problem, not this one's.
 pub const REWORD_TIMEOUT_MAX_MS: u64 = 2000;
+
+/// `sayd-cli`'s own bound on any one D-Bus interaction, restated because
+/// `sayd-cli` is a *binary* and nothing can import a constant from it.
+///
+/// It exists only for the assertion below. MINOR 6: [`REWORD_TIMEOUT_MAX_MS`]
+/// derives its value from this number in prose, and nothing related the two
+/// -- the test named as the pin
+/// (`sayd::dbus::tests::a_reword_against_a_silent_provider_still_answers_inside_the_cli_bound`)
+/// asserts only `elapsed < 3 s`, which the old, zero-margin 2500 satisfied
+/// just as well. This is the relationship itself, checked at compile time in
+/// the same style [`NOTIFY_COOLDOWN_MIN_SECS`] uses: raise the ceiling past
+/// what the bound can carry, or lower `sayd-cli`'s `TIMEOUT` under it, and
+/// the workspace stops building rather than shipping a `--reword` that
+/// reports the daemon as dead.
+const CLI_INTERACTION_BOUND_MS: u64 = 3000;
+
+/// `SUBMIT_REPLY_TIMEOUT` from `crate::handle`, which is private there.
+/// The one bounded engine round trip still inside a `--reword` `Say`.
+const SUBMIT_REPLY_BOUND_MS: u64 = 250;
+
+/// The margin the ceiling is chosen to leave: enough for the bus round trip,
+/// for scheduling, and for the gap between a budget elapsing and the runtime
+/// noticing. Half a second, which is what 2000 buys today.
+const REWORD_CLI_MARGIN_MS: u64 = 500;
+
+const _: () = assert!(
+    REWORD_TIMEOUT_MAX_MS + SUBMIT_REPLY_BOUND_MS + REWORD_CLI_MARGIN_MS
+        <= CLI_INTERACTION_BOUND_MS,
+    "reword.timeout_ms's ceiling, plus the engine round trip that follows the \
+     rewrite, plus the margin, must fit inside sayd-cli's own D-Bus timeout -- \
+     or `say --reword` reports a daemon that is working fine as not responding"
+);
 
 /// The shortest non-zero `notifications.cooldown_secs` [`Config::load_str`]
 /// will honour, and the one range in this table that is not about taste.
