@@ -60,9 +60,10 @@ pub fn eligible(text: &str, max_chars: usize) -> Result<(), Ineligible> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Rejection {
     Empty,
-    /// More than two non-empty lines. A model that produced a list produced
-    /// an explanation.
-    TooManyLines(usize),
+    /// More than one non-empty line. Carries the count of lines *beyond*
+    /// the first, not the total -- see [`check`] for why a rewrite gets
+    /// exactly one.
+    ExtraLines(usize),
     CodeFence,
     TooLong {
         chars: usize,
@@ -71,11 +72,14 @@ pub enum Rejection {
 }
 
 impl Rejection {
-    /// The fragment a caller puts in a sentence, e.g. `"3 lines"`.
+    /// The fragment a caller puts in a sentence, e.g. `"1 extra line"`.
     pub fn phrase(&self) -> String {
         match self {
             Rejection::Empty => "empty".to_string(),
-            Rejection::TooManyLines(n) => format!("{n} lines"),
+            Rejection::ExtraLines(n) => {
+                let noun = if *n == 1 { "line" } else { "lines" };
+                format!("{n} extra {noun}")
+            }
             Rejection::CodeFence => "a code fence".to_string(),
             Rejection::TooLong { chars, limit } => {
                 format!("{chars} characters, over the {limit}-character ceiling")
@@ -112,9 +116,20 @@ pub fn check(original: &str, candidate: &str) -> Result<String, Rejection> {
     if candidate.is_empty() {
         return Err(Rejection::Empty);
     }
+    // DEPARTURE from §3, which draws the line at "more than two" non-empty
+    // lines. A rewrite is one sentence; a second line is the model adding
+    // commentary it was not asked for -- "Alice is asking about dinner." /
+    // "Note: I rephrased this as a question." is exactly the shape a chatty
+    // small model produces, and it is spec-compliant under "more than two"
+    // while still reading a fabricated note aloud to the user. Rejecting on
+    // the second line closes that gap, and it is free to be wrong about:
+    // every rejection here falls back to the original, which is the text
+    // that would have been spoken with no reword feature at all. There is
+    // no case where tightening this check costs the user anything; there is
+    // one where loosening it does.
     let lines = candidate.lines().filter(|l| !l.trim().is_empty()).count();
-    if lines > 2 {
-        return Err(Rejection::TooManyLines(lines));
+    if lines > 1 {
+        return Err(Rejection::ExtraLines(lines - 1));
     }
     if candidate.contains("```") {
         return Err(Rejection::CodeFence);
@@ -328,17 +343,60 @@ mod tests {
         // between them do not count.
         assert_eq!(
             check(original, "one\n\ntwo\n\nthree"),
-            Err(Rejection::TooManyLines(3))
+            Err(Rejection::ExtraLines(2))
         );
-        assert!(check(original, "one\n\ntwo").is_ok(), "two lines is fine");
 
         assert_eq!(
             check(original, "Here you go:\n```\ncode\n```"),
-            Err(Rejection::TooManyLines(4))
+            Err(Rejection::ExtraLines(3))
         );
         assert_eq!(
             check(original, "she said ```hi```"),
             Err(Rejection::CodeFence)
+        );
+    }
+
+    /// DEPARTURE from §3's literal "more than two" threshold, and the
+    /// reviewer-supplied case it exists to catch: a chatty small model
+    /// answers the question *and* narrates that it answered it, e.g.
+    ///
+    /// ```text
+    /// Alice is asking about dinner.
+    ///
+    /// Note: I rephrased this as a question.
+    /// ```
+    ///
+    /// which is two non-empty lines and so accepted -- and read aloud in
+    /// full -- under the letter of the spec. A rewrite is one sentence; a
+    /// second line is always commentary the model was not asked for, never
+    /// more of the answer. Rejecting it costs nothing: every rejection here
+    /// falls back to the original, so the user hears the notification as
+    /// written, which is what they would have heard with no reword feature
+    /// at all.
+    #[test]
+    fn a_rewrite_is_one_line_a_second_line_is_commentary_not_more_answer() {
+        let original = "Alice: where do you want to go for dinner";
+
+        assert_eq!(
+            check(original, "Alice is asking about dinner").as_deref(),
+            Ok("Alice is asking about dinner"),
+            "one non-empty line is still accepted"
+        );
+        assert_eq!(
+            check(original, "one\n\ntwo"),
+            Err(Rejection::ExtraLines(1)),
+            "a second non-empty line is now rejected, not just a third"
+        );
+        assert_eq!(
+            check(
+                original,
+                "Alice is asking about dinner.\n\nNote: I rephrased this as a question."
+            ),
+            Err(Rejection::ExtraLines(1)),
+            "the reviewer's reproduction: a fluent answer plus a trailing \
+             note about the rewrite, which is exactly the shape a chatty \
+             small model emits and the single most likely way a user would \
+             hear something absurd"
         );
     }
 
@@ -348,7 +406,8 @@ mod tests {
     #[test]
     fn a_rejection_names_itself() {
         assert_eq!(Rejection::Empty.phrase(), "empty");
-        assert_eq!(Rejection::TooManyLines(3).phrase(), "3 lines");
+        assert_eq!(Rejection::ExtraLines(1).phrase(), "1 extra line");
+        assert_eq!(Rejection::ExtraLines(3).phrase(), "3 extra lines");
         assert_eq!(Rejection::CodeFence.phrase(), "a code fence");
         assert_eq!(
             Rejection::TooLong {
