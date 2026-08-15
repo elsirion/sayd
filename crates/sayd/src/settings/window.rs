@@ -22,9 +22,15 @@
 //! The notification allowlist is the one part whose *number* of rows comes
 //! from the config, so its redraw closure rebuilds them rather than setting
 //! a value; see [`allowlist_group`].
+//!
+//! The second promise is a lifetime one, and it is not free: the window is
+//! built on demand and **freed** on close, so a daemon that opened the
+//! settings once is back to carrying no GTK resources at all. What that
+//! costs is that no handler may hold the state it is handed -- see [`Ui`]
+//! and [`WeakUi`], which is where the whole arrangement is explained.
 
 use std::cell::{Cell, RefCell};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
 use adw::prelude::*;
@@ -49,6 +55,10 @@ thread_local! {
     /// Thread-local rather than a static because `adw::PreferencesWindow` is
     /// not `Send`, and because there is exactly one thread -- the glib main
     /// thread -- that is ever allowed to touch it.
+    ///
+    /// This is the *only* strong [`Ui`] in the process: handlers hold a
+    /// [`WeakUi`]. Clearing it is therefore what frees the window, not
+    /// merely what forgets it -- see [`Ui`].
     static WINDOW: RefCell<Option<Ui>> = const { RefCell::new(None) };
 }
 
@@ -69,21 +79,19 @@ const URL_POLICIES: [(UrlPolicy, &str); 3] = [
 type CleanupGet = fn(&CleanupConfig) -> bool;
 type CleanupSet = fn(&mut CleanupConfig, bool);
 
-/// One row's "draw yourself from this config" closure; see [`Ui::rows`].
+/// One row's "draw yourself from this config" closure; see [`UiState::rows`].
 /// Boxed because they have as many different types as there are rows,
-/// `Rc<RefCell<_>>` because [`Ui`] is cloned into every handler and each of
-/// those may call [`Ui::redraw`].
+/// `RefCell` because a handler reached through a shared [`Ui`] may call
+/// [`Ui::redraw`].
 ///
 /// The [`Ui`] is handed *in* rather than captured, which matters for exactly
 /// one of these closures: the allowlist's, which builds fresh rows with
 /// fresh handlers every time it runs and so needs a `Ui` to give them. A
 /// closure that captured one would close a reference cycle through this very
-/// list -- list holds closure holds `Ui` holds list -- and unlike the cycle
-/// every row handler already makes through the window (broken when GTK
-/// disposes the widget tree on close), nothing would ever break that one, so
-/// each opening of the settings window would leak its whole `Ui`. Passing it
-/// as an argument makes that unrepresentable rather than merely discouraged.
-type Redraws = Rc<RefCell<Vec<Box<dyn Fn(&Ui, &Config)>>>>;
+/// list -- list holds closure holds `Ui` holds list -- which nothing would
+/// ever break. Passing it as an argument makes that unrepresentable rather
+/// than merely discouraged.
+type Redraws = RefCell<Vec<Box<dyn Fn(&Ui, &Config)>>>;
 
 /// The Text cleanup group, in the order spec §8 lists the transforms.
 const CLEANUP_SWITCHES: [(&str, &str, CleanupGet, CleanupSet); 5] = [
@@ -191,10 +199,16 @@ pub fn open() {
     ui.window.connect_close_request(move |_| {
         // Created on demand, destroyed on close, per the design: the daemon
         // spends most of its life with no window and should not hold one.
+        //
+        // This line is the whole of that promise. `WINDOW` holds the only
+        // strong `Ui` in the process (every handler holds a `WeakUi`), so
+        // clearing it here drops the state, the window reference it carries
+        // and every redraw closure's hold on a widget -- which is what lets
+        // the `gtk_window_destroy` that follows this handler actually
+        // finalize the tree rather than merely hide it. See `Ui`.
         WINDOW.with(|w| *w.borrow_mut() = None);
         // Drops the model's failure sender, which is what ends the drain
-        // task in `build` -- and with it the last reference that task holds
-        // to this window.
+        // task in `build`.
         model.stop_watching_write_failures();
         glib::Propagation::Proceed
     });
@@ -203,8 +217,58 @@ pub fn open() {
 }
 
 /// Everything a row's change handler needs, cheap to clone into each of them.
+///
+/// Shared behind an `Rc` so that a handler can hold a [`WeakUi`] rather than
+/// one of these. That indirection is what makes closing the settings window
+/// actually free it. Measured under a headless compositor against the
+/// version where handlers held a `Ui` directly: `close()` plus half a second
+/// of main loop freed *nothing at all* -- 21 live `Ui`s, the
+/// `AdwPreferencesWindow` itself and 533 of 533 widgets in its tree survived,
+/// once per opening, for the life of a daemon that is supposed to carry no
+/// GTK resources between openings. The same measurement after this change
+/// reads 0, 0 and 0 of 533.
+///
+/// Two reference cycles were doing it, and neither is one `gtk_window_destroy`
+/// can break:
+///
+/// - `Ui` holds the window, the window owns its widget tree, and every row
+///   in that tree holds a handler that held a `Ui`. Dispose does not help:
+///   the handlers keep the window's own refcount above zero, so it is never
+///   finalized and its widgets' closures are never dropped.
+/// - `rows` holds each row's widget -- that is what a redraw closure draws
+///   *to* -- and each of those widgets holds a handler that held a `Ui` that
+///   holds `rows`. GTK is not even involved in that one; it is a plain `Rc`
+///   cycle, and clearing `rows` on close does not fix the first one (also
+///   measured).
+///
+/// A weak handler reference cuts both, and puts the whole window's lifetime
+/// in one place: `WINDOW` holds the only strong `Ui` in the process, so
+/// clearing it on close is what drops the window reference, the redraw
+/// closures, and the widget references those carry.
 #[derive(Clone)]
-struct Ui {
+struct Ui(Rc<UiState>);
+
+/// A handler's reference to the [`Ui`] it belongs to.
+///
+/// Weak, because a strong one is a cycle GTK stores and cannot break -- see
+/// [`Ui`]. Upgrading is therefore allowed to fail, and doing nothing is the
+/// right answer when it does: the window has already been closed and its
+/// state released, so there is no row left to redraw and no toast left to
+/// show. It is not a *missed* edit either -- the config the user would have
+/// been editing is only reachable through a window that no longer exists.
+///
+/// That is not a theoretical branch. Measured, the one caller that reaches
+/// it in ordinary use is the write-failure drain task in [`build`]: the
+/// writer thread posts a failed write to the channel, and the task is not
+/// polled until the next turn of the main loop, which can be after the user
+/// has closed the window. Before this, that path toasted a destroyed window.
+/// Row handlers themselves were *not* observed to fire during teardown, but
+/// they are on the same footing and cost nothing to make safe.
+#[derive(Clone)]
+struct WeakUi(Weak<UiState>);
+
+/// The state a [`Ui`] shares. Never held by a handler; see [`WeakUi`].
+struct UiState {
     model: Arc<SettingsModel>,
     window: adw::PreferencesWindow,
     /// Raised while *this code* is setting a widget's value.
@@ -221,19 +285,59 @@ struct Ui {
     /// nine rows with one mechanism and does not require each handler to
     /// have been handed its own `SignalHandlerId` after the fact (which for
     /// a handler that must refer to itself means an `Rc<RefCell<Option<_>>>`
-    /// per row). `Rc<Cell<_>>` and not an atomic because every one of these
+    /// per row). A `Cell` and not an atomic because every one of these
     /// handlers runs on the glib main thread, one at a time.
-    quiet: Rc<Cell<bool>>,
+    quiet: Cell<bool>,
     /// One "draw yourself from this config" closure per row, in the order
     /// the rows were built.
     ///
-    /// These deliberately capture only their own widget, never a [`Ui`] --
-    /// one is passed to them instead, for the reason spelled out on
-    /// [`Redraws`].
+    /// These capture their own widget strongly, which is safe only because
+    /// nothing a widget stores holds this state back: handlers hold a
+    /// [`WeakUi`]. They deliberately do not capture a [`Ui`] -- one is
+    /// passed to them instead, for the reason spelled out on [`Redraws`].
     rows: Redraws,
 }
 
+/// So a `Ui` reads as the struct it stands in for. Nothing outside this
+/// module sees either type.
+impl std::ops::Deref for Ui {
+    type Target = UiState;
+
+    fn deref(&self) -> &UiState {
+        &self.0
+    }
+}
+
+impl WeakUi {
+    /// Run `f` against the live window, or do nothing at all if there is no
+    /// longer one. See [`WeakUi`] for why doing nothing is right.
+    fn with(&self, f: impl FnOnce(&Ui)) {
+        if let Some(state) = self.0.upgrade() {
+            f(&Ui(state));
+        }
+    }
+
+    /// Run `f` for a change the *user* made.
+    ///
+    /// [`WeakUi::with`] plus the `quiet` guard, in one place rather than
+    /// once per handler: every `notify::` handler in this file owes both
+    /// checks, and the cost of forgetting the second one is an infinite loop
+    /// of failed edits (see [`UiState::quiet`]).
+    fn on_user_change(&self, f: impl FnOnce(&Ui)) {
+        self.with(|ui| {
+            if ui.echo() {
+                return;
+            }
+            f(ui);
+        });
+    }
+}
+
 impl Ui {
+    fn downgrade(&self) -> WeakUi {
+        WeakUi(Rc::downgrade(&self.0))
+    }
+
     /// Whether this handler fired because of [`Ui::redraw`] rather than
     /// because the user did something. See `quiet`.
     fn echo(&self) -> bool {
@@ -314,12 +418,12 @@ fn build(model: Arc<SettingsModel>, engine: EngineHandle) -> Ui {
     window.set_title(Some("sayd Settings"));
     window.set_default_size(520, 700);
 
-    let ui = Ui {
+    let ui = Ui(Rc::new(UiState {
         model,
         window: window.clone(),
-        quiet: Rc::new(Cell::new(false)),
-        rows: Rc::new(RefCell::new(Vec::new())),
-    };
+        quiet: Cell::new(false),
+        rows: RefCell::new(Vec::new()),
+    }));
 
     let page = adw::PreferencesPage::new();
     page.add(&voice_group(&ui, &cfg, engine));
@@ -335,15 +439,21 @@ fn build(model: Arc<SettingsModel>, engine: EngineHandle) -> Ui {
     // logged and forgotten while the rows sit there showing it.
     //
     // The task ends when the sender is dropped, which `open`'s close handler
-    // arranges -- that is also what releases the `Ui` clone below, and with
-    // it this window.
+    // arranges. It holds a `WeakUi` rather than a `Ui` for the same reason
+    // every handler does -- a strong one here would keep the window alive
+    // for as long as the task took to notice the channel had closed, and
+    // that noticing needs a turn of the very main loop the close is
+    // happening on.
     let failures = ui.model.watch_write_failures();
-    let u = ui.clone();
+    let u = ui.downgrade();
     glib::spawn_future_local(async move {
         while let Ok(message) = failures.recv().await {
-            u.toast(&message);
-            // The model has already put itself back to what the file holds.
-            u.redraw(&u.model.current());
+            u.with(|ui| {
+                ui.toast(&message);
+                // The model has already put itself back to what the file
+                // holds.
+                ui.redraw(&ui.model.current());
+            });
         }
     });
 
@@ -402,7 +512,26 @@ impl Combo {
         for choice in choices {
             list.append(choice.as_ref());
         }
-        let row = adw::ComboRow::builder().title(title).model(&list).build();
+        // `use_markup(false)` for the reason the allowlist rows set it, one
+        // layer further in: the *subtitle* this row shows is built by
+        // `describe` out of a value from the config file or the models
+        // directory, and `AdwPreferencesRow:use-markup` governs the subtitle
+        // label as well as the title -- measured, a row left on the default
+        // renders both of them **blank** for a voice named `Ada & Co`, which
+        // is the one string the user needs to read in order to fix it.
+        //
+        // Belt and braces today rather than a fix: measured against
+        // libadwaita 1.9.3, `AdwComboRow` is the one row type that already
+        // overrides the property to `false` (`ActionRow`, `SpinRow`,
+        // `SwitchRow`, `EntryRow` and `PreferencesRow` itself all default to
+        // `true`). Nothing documents that asymmetry as API, and a row whose
+        // safety depends on which subclass it happens to be is a row that
+        // breaks silently when it is changed.
+        let row = adw::ComboRow::builder()
+            .title(title)
+            .use_markup(false)
+            .model(&list)
+            .build();
         Combo {
             row,
             list,
@@ -440,14 +569,20 @@ impl Combo {
         }
     }
 
-    /// Which choice the row is showing, or `None` when it is showing the
+    /// Which choice `row` is showing, or `None` when it is showing the
     /// synthetic entry (or nothing at all, for an empty list, where
     /// `selected()` is `INVALID_LIST_POSITION` and the subtraction below
     /// lands far past the end).
-    fn choice(&self) -> Option<usize> {
-        self.row
-            .selected()
-            .checked_sub(self.offset())
+    ///
+    /// An associated function over the row the signal handed back, rather
+    /// than a method reading `self.row`. A handler then needs only the
+    /// `synthetic` flag, and never a clone of the very row it is attached
+    /// to -- which would be a widget holding a handler holding that same
+    /// widget, a cycle nothing in GTK breaks and the one shape [`Ui`] cannot
+    /// protect against on its own.
+    fn choice(row: &adw::ComboRow, synthetic: &Cell<bool>) -> Option<usize> {
+        row.selected()
+            .checked_sub(u32::from(synthetic.get()))
             .map(|i| i as usize)
     }
 }
@@ -539,20 +674,20 @@ fn voice_group(ui: &Ui, cfg: &Config, engine: EngineHandle) -> adw::PreferencesG
     let c = voice.clone();
     let known = voices.clone();
     ui.row(move |_, cfg| c.show(&cfg.voice, known.iter().position(|v| *v == cfg.voice)));
-    let u = ui.clone();
-    let c = voice.clone();
+    let u = ui.downgrade();
+    let synthetic = voice.synthetic.clone();
     let known = voices.clone();
-    voice.row.connect_selected_notify(move |_| {
-        if u.echo() {
-            return;
-        }
-        match c.choice().and_then(|i| known.get(i).cloned()) {
-            Some(name) => u.apply(|cfg| cfg.voice = name),
-            // The synthetic entry, or an empty models directory: there is no
-            // voice to write. Redrawing rather than merely returning is what
-            // stops the row sitting on a selection nothing agrees with.
-            None => u.redraw(&u.model.current()),
-        }
+    voice.row.connect_selected_notify(move |row| {
+        u.on_user_change(|u| {
+            match Combo::choice(row, &synthetic).and_then(|i| known.get(i).cloned()) {
+                Some(name) => u.apply(|cfg| cfg.voice = name),
+                // The synthetic entry, or an empty models directory: there
+                // is no voice to write. Redrawing rather than merely
+                // returning is what stops the row sitting on a selection
+                // nothing agrees with.
+                None => u.redraw(&u.model.current()),
+            }
+        });
     });
     group.add(&voice.row);
 
@@ -568,13 +703,12 @@ fn voice_group(ui: &Ui, cfg: &Config, engine: EngineHandle) -> adw::PreferencesG
     speed.show(cfg.speed as f64);
     let s = speed.clone();
     ui.row(move |_, cfg| s.show(cfg.speed as f64));
-    let u = ui.clone();
+    let u = ui.downgrade();
     speed.row.connect_value_notify(move |row| {
-        if u.echo() {
-            return;
-        }
-        let value = row.value() as f32;
-        u.apply(|c| c.speed = value);
+        u.on_user_change(|u| {
+            let value = row.value() as f32;
+            u.apply(|c| c.speed = value);
+        });
     });
     group.add(&speed.row);
 
@@ -592,15 +726,22 @@ fn voice_group(ui: &Ui, cfg: &Config, engine: EngineHandle) -> adw::PreferencesG
     // that is not a view of the config, so there is nothing to redraw it
     // from -- and clobbering what the user typed on every edit elsewhere
     // would be its own bug.
-    let u = ui.clone();
+    let u = ui.downgrade();
     let e = engine.clone();
-    let entry = test.clone();
-    speak.connect_clicked(move |_| audition(&u, &e, &entry));
-    let u = ui.clone();
+    // Weak, because `speak` is a suffix *of* `test`: a strong clone here
+    // would be the row holding a button holding the row, which outlives the
+    // window that used to contain it. The same shape `Combo::choice` avoids,
+    // one widget further apart.
+    let field = test.downgrade();
+    speak.connect_clicked(move |_| {
+        let Some(field) = field.upgrade() else { return };
+        u.with(|ui| audition(ui, &e, &field));
+    });
+    let u = ui.downgrade();
     // Pressing Enter in the field is the same action as pressing the button;
     // a test row you have to reach for the mouse to use is a test row nobody
     // uses twice.
-    test.connect_entry_activated(move |row| audition(&u, &engine, row));
+    test.connect_entry_activated(move |row| u.with(|ui| audition(ui, &engine, row)));
     group.add(&test);
 
     group
@@ -659,19 +800,18 @@ fn engine_group(ui: &Ui, cfg: &Config) -> adw::PreferencesGroup {
     model_row.show(&cfg.model, position(&cfg.model));
     let c = model_row.clone();
     ui.row(move |_, cfg| c.show(&cfg.model, position(&cfg.model)));
-    let u = ui.clone();
-    let c = model_row.clone();
-    model_row.row.connect_selected_notify(move |_| {
-        if u.echo() {
-            return;
-        }
-        match c.choice().and_then(|i| MODELS.get(i)) {
-            Some((name, _)) => {
-                let name = (*name).to_string();
-                u.apply(|c| c.model = name);
-            }
-            None => u.redraw(&u.model.current()),
-        }
+    let u = ui.downgrade();
+    let synthetic = model_row.synthetic.clone();
+    model_row.row.connect_selected_notify(move |row| {
+        u.on_user_change(
+            |u| match Combo::choice(row, &synthetic).and_then(|i| MODELS.get(i)) {
+                Some((name, _)) => {
+                    let name = (*name).to_string();
+                    u.apply(|c| c.model = name);
+                }
+                None => u.redraw(&u.model.current()),
+            },
+        );
     });
     group.add(&model_row.row);
 
@@ -687,13 +827,12 @@ fn engine_group(ui: &Ui, cfg: &Config) -> adw::PreferencesGroup {
     threads.show(cfg.threads as f64);
     let s = threads.clone();
     ui.row(move |_, cfg| s.show(cfg.threads as f64));
-    let u = ui.clone();
+    let u = ui.downgrade();
     threads.row.connect_value_notify(move |row| {
-        if u.echo() {
-            return;
-        }
-        let value = row.value() as usize;
-        u.apply(|c| c.threads = value);
+        u.on_user_change(|u| {
+            let value = row.value() as usize;
+            u.apply(|c| c.threads = value);
+        });
     });
     group.add(&threads.row);
 
@@ -709,13 +848,12 @@ fn engine_group(ui: &Ui, cfg: &Config) -> adw::PreferencesGroup {
     idle.show(cfg.idle_unload_secs as f64);
     let s = idle.clone();
     ui.row(move |_, cfg| s.show(cfg.idle_unload_secs as f64));
-    let u = ui.clone();
+    let u = ui.downgrade();
     idle.row.connect_value_notify(move |row| {
-        if u.echo() {
-            return;
-        }
-        let value = row.value() as u64;
-        u.apply(|c| c.idle_unload_secs = value);
+        u.on_user_change(|u| {
+            let value = row.value() as u64;
+            u.apply(|c| c.idle_unload_secs = value);
+        });
     });
     group.add(&idle.row);
 
@@ -731,13 +869,12 @@ fn engine_group(ui: &Ui, cfg: &Config) -> adw::PreferencesGroup {
     max_chars.show(cfg.max_chars as f64);
     let s = max_chars.clone();
     ui.row(move |_, cfg| s.show(cfg.max_chars as f64));
-    let u = ui.clone();
+    let u = ui.downgrade();
     max_chars.row.connect_value_notify(move |row| {
-        if u.echo() {
-            return;
-        }
-        let value = row.value() as usize;
-        u.apply(|c| c.max_chars = value);
+        u.on_user_change(|u| {
+            let value = row.value() as usize;
+            u.apply(|c| c.max_chars = value);
+        });
     });
     group.add(&max_chars.row);
 
@@ -758,13 +895,12 @@ fn cleanup_group(ui: &Ui, cfg: &Config) -> adw::PreferencesGroup {
             .build();
         let r = row.clone();
         ui.row(move |_, cfg| r.set_active(get(&cfg.cleanup)));
-        let u = ui.clone();
+        let u = ui.downgrade();
         row.connect_active_notify(move |row| {
-            if u.echo() {
-                return;
-            }
-            let on = row.is_active();
-            u.apply(|c| set(&mut c.cleanup, on));
+            u.on_user_change(|u| {
+                let on = row.is_active();
+                u.apply(|c| set(&mut c.cleanup, on));
+            });
         });
         group.add(&row);
     }
@@ -782,19 +918,18 @@ fn cleanup_group(ui: &Ui, cfg: &Config) -> adw::PreferencesGroup {
     urls.show(&describe(cfg.cleanup.urls), position(cfg.cleanup.urls));
     let c = urls.clone();
     ui.row(move |_, cfg| c.show(&describe(cfg.cleanup.urls), position(cfg.cleanup.urls)));
-    let u = ui.clone();
-    let c = urls.clone();
-    urls.row.connect_selected_notify(move |_| {
-        if u.echo() {
-            return;
-        }
-        match c.choice().and_then(|i| URL_POLICIES.get(i)) {
-            Some((policy, _)) => {
-                let policy = *policy;
-                u.apply(|c| c.cleanup.urls = policy);
+    let u = ui.downgrade();
+    let synthetic = urls.synthetic.clone();
+    urls.row.connect_selected_notify(move |row| {
+        u.on_user_change(|u| {
+            match Combo::choice(row, &synthetic).and_then(|i| URL_POLICIES.get(i)) {
+                Some((policy, _)) => {
+                    let policy = *policy;
+                    u.apply(|c| c.cleanup.urls = policy);
+                }
+                None => u.redraw(&u.model.current()),
             }
-            None => u.redraw(&u.model.current()),
-        }
+        });
     });
     group.add(&urls.row);
 
@@ -807,6 +942,24 @@ fn notification_group(ui: &Ui, cfg: &Config) -> adw::PreferencesGroup {
         .description("Takes effect at once: turning this on starts watching the session bus")
         .build();
 
+    // The other rows here, and the allowlist below, stay *sensitive* when
+    // "Speak notifications" is off. Deliberately, and not an oversight:
+    //
+    // - Those values are not meaningless while announcements are off, they
+    //   are merely not in effect. The file keeps every one of them, and they
+    //   apply the instant the switch goes back on. A dimmed row says
+    //   "unset", which would be a lie about what the config holds -- the one
+    //   thing this file promises never to do.
+    // - Curating the list with announcements off is a real way to use this:
+    //   turn it off for an hour, tidy up, turn it back on.
+    // - It would be a rule, and rules do not live in this layer. There is no
+    //   config field that says these four depend on that one, so `model.rs`
+    //   has nothing to hang it on and the window would be deciding something
+    //   on its own.
+    //
+    // Cheap to revisit if it reads wrong on hardware; nothing else depends
+    // on it.
+
     for (title, subtitle, get, set) in NOTIFICATION_SWITCHES {
         let row = adw::SwitchRow::builder()
             .title(title)
@@ -815,13 +968,12 @@ fn notification_group(ui: &Ui, cfg: &Config) -> adw::PreferencesGroup {
             .build();
         let r = row.clone();
         ui.row(move |_, cfg| r.set_active(get(&cfg.notifications)));
-        let u = ui.clone();
+        let u = ui.downgrade();
         row.connect_active_notify(move |row| {
-            if u.echo() {
-                return;
-            }
-            let on = row.is_active();
-            u.apply(|c| set(&mut c.notifications, on));
+            u.on_user_change(|u| {
+                let on = row.is_active();
+                u.apply(|c| set(&mut c.notifications, on));
+            });
         });
         group.add(&row);
     }
@@ -843,13 +995,12 @@ fn notification_group(ui: &Ui, cfg: &Config) -> adw::PreferencesGroup {
     cooldown.show(cfg.notifications.cooldown_secs as f64);
     let s = cooldown.clone();
     ui.row(move |_, cfg| s.show(cfg.notifications.cooldown_secs as f64));
-    let u = ui.clone();
+    let u = ui.downgrade();
     cooldown.row.connect_value_notify(move |row| {
-        if u.echo() {
-            return;
-        }
-        let value = row.value() as u64;
-        u.apply(|c| c.notifications.cooldown_secs = value);
+        u.on_user_change(|u| {
+            let value = row.value() as u64;
+            u.apply(|c| c.notifications.cooldown_secs = value);
+        });
     });
     group.add(&cooldown.row);
 
@@ -890,12 +1041,18 @@ fn allowlist_group(ui: &Ui, cfg: &Config) -> adw::PreferencesGroup {
     // every unrelated edit would be its own bug.
     group.add(&entry);
 
-    let u = ui.clone();
-    let e = entry.clone();
-    add.connect_clicked(move |_| add_to_allowlist(&u, &e));
-    let u = ui.clone();
+    let u = ui.downgrade();
+    // Weak for the reason the Test row's Speak button is: `add` is a suffix
+    // *of* `entry`, so a strong clone would be the row holding a button
+    // holding the row, and the pair would outlive the window.
+    let field = entry.downgrade();
+    add.connect_clicked(move |_| {
+        let Some(field) = field.upgrade() else { return };
+        u.with(|ui| add_to_allowlist(ui, &field));
+    });
+    let u = ui.downgrade();
     // Enter in the field is the same action as the button, as in the Test row.
-    entry.connect_entry_activated(move |row| add_to_allowlist(&u, row));
+    entry.connect_entry_activated(move |row| u.with(|ui| add_to_allowlist(ui, row)));
 
     // The rows the closure below has put in the group, so a rebuild takes
     // away exactly what it added and never the entry row above.
@@ -936,7 +1093,7 @@ fn allowlist_group(ui: &Ui, cfg: &Config) -> adw::PreferencesGroup {
                 .build();
             remove.add_css_class("flat");
             row.add_suffix(&remove);
-            let u = ui.clone();
+            let u = ui.downgrade();
             let name = name.clone();
             remove.connect_clicked(move |_| {
                 // Cloned out of the closure's environment before the edit,
@@ -946,7 +1103,7 @@ fn allowlist_group(ui: &Ui, cfg: &Config) -> adw::PreferencesGroup {
                 // closure outlives the call either way -- taking the copy
                 // first means nothing here depends on knowing that.
                 let name = name.clone();
-                u.apply(move |c| allow_remove(c, &name));
+                u.with(|ui| ui.apply(move |c| allow_remove(c, &name)));
             });
             g.add(&row);
             shown.borrow_mut().push(row);
