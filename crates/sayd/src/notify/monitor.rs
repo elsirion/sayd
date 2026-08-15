@@ -44,6 +44,7 @@ use zbus::{MatchRule, MessageStream};
 
 use super::decode::{decode, Decoded};
 use super::policy::{Decision, Limiter};
+use super::seen;
 
 /// The interface a notification `Notify` call names, per the freedesktop
 /// notification specification.
@@ -307,6 +308,19 @@ async fn run_on(engine: EngineHandle, address: Option<String>) -> Outcome {
                                     }
                                 }
                                 Decoded::Notification(n) => {
+                                    // Recorded for every decoded notification,
+                                    // before the allowlist check below and
+                                    // regardless of what it decides: an
+                                    // application that is already allowed
+                                    // still notifies and still may change its
+                                    // icon, and the settings window -- not
+                                    // this registry -- is responsible for
+                                    // filtering out what is already allowed.
+                                    // After `decode`, not before, so a
+                                    // malformed body (handled in the arm
+                                    // above) records nothing -- there is no
+                                    // `app_icon` to record from one.
+                                    seen::record(&n.app_name, &n.app_icon);
                                     match limiter.decide(&n, &cfg.notifications, Instant::now()) {
                                         Decision::Speak(text) => {
                                             speak(&engine, text, cfg.max_chars, &mut submit_failure_logged).await;

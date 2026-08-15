@@ -1682,6 +1682,7 @@ mod tests {
 
         let notification = Notification {
             app_name: "signal".into(),
+            app_icon: String::new(),
             summary: "Ada: dinner?".into(),
             body: String::new(),
         };

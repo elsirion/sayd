@@ -395,6 +395,7 @@ mod tests {
     fn n(app: &str, summary: &str, body: &str) -> Notification {
         Notification {
             app_name: app.into(),
+            app_icon: String::new(),
             summary: summary.into(),
             body: body.into(),
         }

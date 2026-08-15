@@ -4,14 +4,21 @@ use std::collections::HashMap;
 
 use zbus::zvariant::OwnedValue;
 
-/// The three fields of a notification `sayd` has any use for.
+/// The four fields of a notification `sayd` has any use for.
 ///
-/// The other five in the `Notify` signature are for a notification *daemon* --
-/// an icon to draw, a timeout to honour, actions to offer, an id to replace.
-/// `sayd` draws nothing and answers nothing, so it keeps what can be spoken.
+/// The other four in the `Notify` signature -- a replaces-id, actions to
+/// offer, hints, a timeout to honour -- are for a notification *daemon*, and
+/// `sayd` is not one: it draws nothing and answers nothing. `app_icon` looks
+/// like it belongs in that discarded pile too, and until now it was, but it
+/// is kept for a reason that has nothing to do with drawing anything here --
+/// `notify::seen::record` remembers it against `app_name` so the settings
+/// window can suggest an application to allowlist next to the icon it
+/// actually notifies with, instead of a generic placeholder. `summary` and
+/// `body` remain the two fields that get spoken.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Notification {
     pub app_name: String,
+    pub app_icon: String,
     pub summary: String,
     pub body: String,
 }
@@ -74,13 +81,14 @@ pub fn decode(msg: &zbus::Message) -> Decoded {
         return Decoded::Skip;
     }
     let body = msg.body();
-    let Ok((app_name, _replaces_id, _icon, summary, text, _actions, _hints, _timeout)) =
+    let Ok((app_name, _replaces_id, app_icon, summary, text, _actions, _hints, _timeout)) =
         body.deserialize::<NotifyArgs>()
     else {
         return Decoded::Malformed;
     };
     Decoded::Notification(Notification {
         app_name,
+        app_icon,
         summary,
         body: text,
     })
@@ -92,7 +100,7 @@ mod tests {
     use std::collections::HashMap;
     use zbus::zvariant::Value;
 
-    fn notify_message(app: &str, summary: &str, body: &str) -> zbus::Message {
+    fn notify_message(app: &str, icon: &str, summary: &str, body: &str) -> zbus::Message {
         zbus::Message::method_call("/org/freedesktop/Notifications", "Notify")
             .expect("builder")
             .interface("org.freedesktop.Notifications")
@@ -100,7 +108,7 @@ mod tests {
             .build(&(
                 app,
                 0u32,
-                "",
+                icon,
                 summary,
                 body,
                 Vec::<String>::new(),
@@ -111,12 +119,18 @@ mod tests {
     }
 
     #[test]
-    fn a_notify_call_decodes_to_its_three_useful_fields() {
-        let m = notify_message("Signal", "Alice sent a message", "see you at five");
+    fn a_notify_call_decodes_to_its_four_useful_fields() {
+        let m = notify_message(
+            "Signal",
+            "signal-desktop",
+            "Alice sent a message",
+            "see you at five",
+        );
         let Decoded::Notification(n) = decode(&m) else {
             panic!("expected a decoded notification");
         };
         assert_eq!(n.app_name, "Signal");
+        assert_eq!(n.app_icon, "signal-desktop");
         assert_eq!(n.summary, "Alice sent a message");
         assert_eq!(n.body, "see you at five");
     }
