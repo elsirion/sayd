@@ -176,6 +176,21 @@ pub fn build_request(cfg: &RewordConfig, key: Option<&str>, text: &str) -> Reque
 /// either side of it may not be alphanumeric. Every real name clears this
 /// (`model 'llama3.2:3b' not found`, `failed to load model "gpt-4o-mini"`),
 /// because a server that names a model quotes or spaces it.
+///
+/// **This is not a sound test and is not asked to be one.** It still fires
+/// on `model 'gpt-4o-mini' not found` for a configured `gpt-4o`, on
+/// `claude-sonnet-5-thinking` for a configured `claude-sonnet-5`, and on
+/// `try again in 20 m` for a configured `m`. Requiring a delimiter around
+/// the name (`'x'`, `"x"`, `` `x` ``) would kill all three -- and was
+/// rejected, because it trades the cheap error for the expensive one. This
+/// rule now runs *only* on statuses that mean nothing on their own (see
+/// [`parse_response`]), where a false positive costs a misleading line on a
+/// request that failed anyway, and a false negative costs the entire §12
+/// mitigation: a server answering 200 or 500 for a missing model would go
+/// back to being undiagnosable. A server that names a model without
+/// quoting it -- `Model gpt-4o-mini does not exist` -- is one delimiter
+/// style away from real, and there is no list of them worth betting the
+/// diagnosis on.
 fn mentions_model(message: &str, model: &str) -> bool {
     if model.is_empty() {
         return false;
@@ -189,15 +204,38 @@ fn mentions_model(message: &str, model: &str) -> bool {
     })
 }
 
-/// Classify one response. **Body first, status second.**
+/// Classify one response. **A status that means one thing decides; a status
+/// that means nothing lets the body decide.**
 ///
-/// OpenAI-compatible servers are not consistent about which carries the
-/// reason, which is why `http_status_as_error` is off and every response is
-/// read. An `error.message` is used verbatim wherever one is present; the
-/// status only chooses the row -- and where the message names the configured
-/// model, it chooses the row too, whatever the status says. That last rule
-/// is what makes a server answering 500 or 200 for a missing model diagnose
-/// correctly (§12).
+/// OpenAI-compatible servers are not consistent about which of the two
+/// carries the reason, which is why `http_status_as_error` is off and every
+/// response is read whatever its status. But they are not equally
+/// inconsistent, and the split is what this function is:
+///
+/// * **401, 403 and 429 mean one thing on every server that speaks this
+///   protocol.** No body can improve on them, so they are classified first
+///   and the body is used only for its wording. Getting this backwards was
+///   measured and is not theoretical: OpenAI's real 429 body is `Rate limit
+///   reached for gpt-4o-mini in organization org-… on requests per min`,
+///   which *names the configured model*, space-delimited -- the exact
+///   boundary [`mentions_model`] accepts. Ordered the other way that 429
+///   became [`RewordError::NoSuchModel`], so `RewordState::record` never
+///   set the rate-limit backoff (only [`RewordError::RateLimited`] does),
+///   §8's "honour `Retry-After`, otherwise back off 60 s" never happened,
+///   and the daemon kept hammering a provider that was asking it to stop --
+///   while telling the user to go change a model name that was correct. The
+///   same ordering defeated the auth latch: `Your API key does not have
+///   access to model gpt-5.6-sol` is a 403 that names a model, so a key
+///   with no access to that model was retried for the life of the daemon
+///   instead of latching. Per-model key scoping is ordinary on gateways.
+/// * **200, 400, 404, 500 and everything else mean nothing on their own.**
+///   A missing model arrives as any of them depending on the server (§12),
+///   so here the body gets the vote: a message naming the configured model
+///   is a missing model whatever the status says. This is what keeps §12's
+///   mitigation -- 500-for-a-missing-model and 200-with-an-error-body --
+///   working.
+///
+/// A message is used for its wording wherever one is present.
 pub fn parse_response(
     status: u16,
     retry_after: Option<&str>,
@@ -215,27 +253,13 @@ pub fn parse_response(
         .and_then(|e| e.message)
         .filter(|m| !m.trim().is_empty());
 
-    // The body names the model: that is a missing model whatever the
-    // status is.
-    if message.as_deref().is_some_and(|m| mentions_model(m, model)) {
-        return Err(RewordError::NoSuchModel {
-            status,
-            model: model.to_string(),
-            message,
-        });
-    }
+    // Unambiguous statuses first: the body may say what happened, never
+    // which row it was.
     match status {
         401 | 403 => {
             return Err(RewordError::Auth {
                 status,
                 host: host.to_string(),
-                message,
-            })
-        }
-        404 => {
-            return Err(RewordError::NoSuchModel {
-                status,
-                model: model.to_string(),
                 message,
             })
         }
@@ -251,6 +275,15 @@ pub fn parse_response(
             });
         }
         _ => {}
+    }
+    // Everything below this line is a status that does not say what went
+    // wrong, so the body is the only evidence there is.
+    if message.as_deref().is_some_and(|m| mentions_model(m, model)) || status == 404 {
+        return Err(RewordError::NoSuchModel {
+            status,
+            model: model.to_string(),
+            message,
+        });
     }
     if let Some(message) = message {
         return Err(RewordError::Malformed(message));
@@ -559,6 +592,70 @@ mod tests {
         assert!(matches!(
             parse_response(503, None, b"", "m", "h"),
             Err(RewordError::Malformed(_))
+        ));
+    }
+
+    /// **The ordering rule, against the bodies that broke the old one.**
+    ///
+    /// 401, 403 and 429 mean one thing on every OpenAI-compatible server,
+    /// so a body that names the configured model may say *what* happened
+    /// and never *which row it was*. Classified body-first these two real
+    /// bodies both became [`RewordError::NoSuchModel`]: the 429 then set no
+    /// rate-limit backoff, because `RewordState::record` sets one only for
+    /// [`RewordError::RateLimited`], and the 403 never latched the auth
+    /// breaker, so a key with no access to that model was retried for the
+    /// life of the daemon.
+    #[test]
+    fn an_unambiguous_status_is_never_overruled_by_a_body_naming_the_model() {
+        // OpenAI's actual 429 body, verbatim. It names the model
+        // space-delimited -- exactly the boundary `mentions_model`
+        // accepts.
+        let limited = br#"{"error":{"message":"Rate limit reached for gpt-4o-mini in organization org-abc on requests per min (RPM): Limit 3, Used 3. Please try again in 20s."}}"#;
+        match parse_response(429, Some("20"), limited, "gpt-4o-mini", "api.openai.com") {
+            Err(RewordError::RateLimited {
+                retry_after,
+                message,
+            }) => {
+                assert_eq!(
+                    retry_after,
+                    Some(Duration::from_secs(20)),
+                    "§8's `Retry-After` is only honoured on the row that reads it"
+                );
+                assert!(message
+                    .expect("the provider said why")
+                    .starts_with("Rate limit reached for gpt-4o-mini"));
+            }
+            other => panic!("a 429 is a rate limit whatever its body says, got {other:?}"),
+        }
+
+        // Per-model key scoping, which is ordinary on gateways and on a
+        // proxy in front of a TEE.
+        let scoped =
+            br#"{"error":{"message":"Your API key does not have access to model gpt-5.6-sol"}}"#;
+        for status in [401u16, 403] {
+            assert_eq!(
+                parse_response(status, None, scoped, "gpt-5.6-sol", "gateway.example"),
+                Err(RewordError::Auth {
+                    status,
+                    host: "gateway.example".into(),
+                    message: Some("Your API key does not have access to model gpt-5.6-sol".into()),
+                }),
+                "a key the provider will not accept must latch, whatever it names"
+            );
+        }
+
+        // The other half of the trade, and the reason the model rule is
+        // kept at all: on a status that means nothing, the body still
+        // decides. 400 joins the 200 and 500 cases above.
+        assert!(matches!(
+            parse_response(
+                400,
+                None,
+                br#"{"error":{"message":"model 'gpt-5.6-sol' not found"}}"#,
+                "gpt-5.6-sol",
+                "localhost"
+            ),
+            Err(RewordError::NoSuchModel { status: 400, .. })
         ));
     }
 
