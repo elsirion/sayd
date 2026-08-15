@@ -95,6 +95,23 @@ impl Default for NotificationConfig {
 pub struct Config {
     pub voice: String,
     pub speed: f32,
+    /// `"model"` | `"stretch"`. How `speed` is realised. `"model"` (the
+    /// default) hands `speed` to Kokoro's own `speed` input, which is what
+    /// every prior release did. `"stretch"` synthesizes at `1.0` and
+    /// WSOLA-stretches the result (`sayd_kokoro::audio::time_stretch`)
+    /// instead.
+    ///
+    /// The default stays `"model"` on purpose: changing how everyone's audio
+    /// is produced is not something to do silently. Measured reason to opt
+    /// into `"stretch"` anyway -- at `speed = 1.3`, `af_heart`, "The quick
+    /// brown fox…", Kokoro's own `speed` input renders the leading "The" 10
+    /// dB quieter than at neighbouring speeds (it reads as the word being
+    /// skipped), and `speed` is not even a linear tempo control there (1.3
+    /// renders at roughly 1.17x, not 1.3x). `"stretch"` avoids both -- the
+    /// same word came back 10.4 dB louder and the render hit the requested
+    /// tempo -- but WSOLA has its own artifacts, so this is offered rather
+    /// than substituted.
+    pub speed_mode: String,
     /// `fp32` | `fp16` | `q8`. Measured: fp32 RTF 4.78, fp16 4.66, q8 1.40.
     pub model: String,
     /// Measured peak at 8; 16 and 24 both regress.
@@ -115,6 +132,7 @@ impl Default for Config {
         Config {
             voice: "af_heart".into(),
             speed: 1.0,
+            speed_mode: "model".into(),
             model: "fp32".into(),
             threads: 8,
             idle_unload_secs: 600,
@@ -195,6 +213,10 @@ mod tests {
         assert_eq!(c.model, "fp32");
         assert_eq!(c.threads, 8);
         assert_eq!(c.speed, 1.0);
+        assert_eq!(
+            c.speed_mode, "model",
+            "changing how everyone's audio is produced is opt-in, not silent"
+        );
         assert_eq!(c.idle_unload_secs, 600);
         assert!(!c.muted);
         assert_eq!(c.chunking.lookahead_chunks, 2);
@@ -272,6 +294,31 @@ mod tests {
         assert_eq!(err, None);
         assert_eq!(c.voice, "am_fenrir");
         assert!(!c.notifications.enabled);
+    }
+
+    /// A config written before this milestone has no `speed_mode` key at
+    /// all, and must keep loading at the pre-existing behaviour rather than
+    /// refusing to parse.
+    #[test]
+    fn a_config_without_speed_mode_still_loads_at_the_model_default() {
+        let (c, err) = Config::load_str("voice = \"am_fenrir\"\n");
+        assert_eq!(err, None);
+        assert_eq!(c.voice, "am_fenrir");
+        assert_eq!(c.speed_mode, "model");
+    }
+
+    #[test]
+    fn speed_mode_round_trips_through_toml() {
+        let c = Config {
+            speed_mode: "stretch".into(),
+            ..Config::default()
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("config.toml");
+        c.save_to(&p).expect("save");
+        let (back, err) = Config::load_from(&p);
+        assert_eq!(err, None);
+        assert_eq!(back, c);
     }
 
     #[test]

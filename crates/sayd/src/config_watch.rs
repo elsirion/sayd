@@ -610,6 +610,7 @@ fn merge_untouched(seed: &Config, next: &Config, fresh: &Config) -> Config {
     Config {
         voice: pick(&seed.voice, &next.voice, &fresh.voice),
         speed: pick(&seed.speed, &next.speed, &fresh.speed),
+        speed_mode: pick(&seed.speed_mode, &next.speed_mode, &fresh.speed_mode),
         model: pick(&seed.model, &next.model, &fresh.model),
         threads: pick(&seed.threads, &next.threads, &fresh.threads),
         idle_unload_secs: pick(

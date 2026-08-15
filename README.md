@@ -171,6 +171,21 @@ mid-article does not cut the current sentence in half.
 suggest: `0` means the session is *never* unloaded while idle, not that it
 is unloaded immediately.
 
+**When to reach for `speed_mode = "stretch"`.** `speed_mode` picks how
+`speed` is realised, and does not touch the loaded session at all (unlike
+`model`/`threads` above, toggling it is free). The default, `"model"`, hands
+`speed` straight to Kokoro's own `speed` input. Measured on `af_heart`, "The
+quick brown fox jumps over the lazy dog.": at `speed = 1.3` specifically,
+Kokoro renders the leading "The" about 10 dB quieter than at neighbouring
+speeds, which sounds like the word being skipped rather than spoken quietly
+-- and `speed` there is not even a linear tempo control (1.3 renders at
+roughly 1.17x). If a submission is losing its first word or two around a
+particular speed, that is this. `"stretch"` synthesizes at `1.0` -- where the
+dropout does not happen -- and time-stretches the result (WSOLA) to the
+requested factor instead, which keeps the leading word at its normal level
+and hits the tempo actually asked for. It has its own artifacts (WSOLA is not
+free of them), which is why it is opt-in rather than the default.
+
 The file is equally meant to be edited by hand, so here it is in full, with
 every default. Every key is optional -- a file naming only the two you care
 about is a complete config, and anything absent falls back to what is shown
@@ -179,6 +194,7 @@ here:
 ```toml
 voice = "af_heart"      # any voice pack in <models>/voices, without the .bin
 speed = 1.0             # 0.5 to 2.0; outside that it is clamped, with a warning
+speed_mode = "model"    # model | stretch; anything else runs model, with a warning
 model = "fp32"          # fp32 | fp16 | q8; anything else runs fp32, with a warning
 threads = 8             # measured peak; 16 and 24 both regress
 idle_unload_secs = 600  # seconds idle before the session is dropped; 0 = never
@@ -216,9 +232,10 @@ speaking), and picks the file up the moment it parses again.
 
 A file that parses but says something `sayd` cannot do is applied as the
 nearest thing it *can* do, and says so in the same place: an unrecognised
-`model` runs `fp32` (which is what would have loaded anyway) and `speed`
-outside `0.5`-`2.0` is clamped, each with a warning naming the value and
-what is actually being used. As above, your file is left exactly as you
+`model` runs `fp32` (which is what would have loaded anyway), an unrecognised
+`speed_mode` runs `model` the same way, and `speed` outside `0.5`-`2.0` is
+clamped, each with a warning naming the value and what is actually being
+used. As above, your file is left exactly as you
 wrote it -- the corrected value only reaches the disk when you next change a
 setting, at which point the window writes the whole config it is running.
 
@@ -579,30 +596,39 @@ for looking at it. Walk this yourself once, after installing:
 4. `cat ~/.config/sayd/config.toml` -- the new `voice` is already there,
    with no restart and no further action.
 5. Move **Speed**, press Speak again -- audibly faster or slower.
-6. Speak something long enough to still be playing a few seconds later,
+6. Set **Speed** to 1.3 and Speak the default Test sentence with **Speed
+   mode** on **model** -- listen for "The" at the start; it can render
+   noticeably quieter than "quick" right after it (the measured dropout, see
+   [Settings](#settings) above). Switch **Speed mode** to **stretch** and
+   speak the same sentence again at the same 1.3 -- "The" should be plainly
+   audible now, and the sentence should take longer (closer to the tempo
+   actually asked for). Changing this row must not pause or reload anything
+   -- unlike **Model**/**Threads** below, the change is audible on the very
+   next utterance.
+7. Speak something long enough to still be playing a few seconds later,
    then, while it plays, change **Model** or **Threads**. The sentence
    already in the air must finish uninterrupted -- no cut, no glitch, no
    voice or pace change mid-sentence. Only the utterance *after* that one
    should show the reload pause (a bit over a second) before it starts.
-7. Close the window -- `say status` (or `pgrep -c sayd`) should still show
+8. Close the window -- `say status` (or `pgrep -c sayd`) should still show
    the daemon alive and unaffected; closing the settings window must not be
    mistakable for quitting the daemon.
-8. Reopen the window -- every value is as you left it.
-9. With the daemon running and the window closed, hand-edit
-   `~/.config/sayd/config.toml` directly (change `speed`, say) and save.
-   Reopen the window -- it shows the edited value, picked up without a
-   restart.
-10. Rename or move a voice pack's directory out from under a voice
+9. Reopen the window -- every value is as you left it.
+10. With the daemon running and the window closed, hand-edit
+    `~/.config/sayd/config.toml` directly (change `speed`, say) and save.
+    Reopen the window -- it shows the edited value, picked up without a
+    restart.
+11. Rename or move a voice pack's directory out from under a voice
     `config.toml` currently names, then open **Voice** -- that entry must
     show up clearly marked as missing (e.g. "'name' — no voice pack
     installed"), not silently render as, or select, some other installed
     voice instead.
-11. At the window's default width, check the **Idle unload** row's
+12. At the window's default width, check the **Idle unload** row's
     subtitle -- it is a long sentence ("Seconds of silence before the
     ~1.27 GB session is dropped; 0 never unloads") and should read in full,
     wrapping onto more than one line, rather than being truncated with an
     ellipsis.
-12. Restart `sayd` -- every setting from the steps above survives. This is
+13. Restart `sayd` -- every setting from the steps above survives. This is
     M4's stated done-when.
 
 ## Verify notifications

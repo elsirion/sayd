@@ -27,6 +27,21 @@ pub const MODELS: [(&str, &str); 3] = [
     ("q8", "fastest, RTF 1.40, some quality loss"),
 ];
 
+/// The `speed_mode` values, with the measured trade-off shown inline the same
+/// way [`MODELS`] is. Numbers are from the leading-word investigation; do not
+/// adjust them without re-measuring. `"model"` is first so it stays
+/// [`FALLBACK_SPEED_MODE`], matching `Config::default`.
+pub const SPEED_MODES: [(&str, &str); 2] = [
+    (
+        "model",
+        "Kokoro's speed input; ~10 dB leading-word dropout near speed 1.3",
+    ),
+    (
+        "stretch",
+        "resynthesize at 1.0 and time-stretch; no dropout, own artifacts",
+    ),
+];
+
 /// Speed bounds, matching `Engine`'s clamp exactly. Two places enforcing
 /// different bounds would let the window write a value the engine then
 /// silently changed.
@@ -743,8 +758,22 @@ fn write_loop(shared: &Shared) {
 /// pins it against both `model_file_for` and `Config::default`.
 const FALLBACK_MODEL: &str = MODELS[0].0;
 
+/// What `speed_mode` runs as when it is left unset or holds a value this
+/// build does not know -- `"model"`, today's behaviour, matching
+/// `Config::default`. Taken from `SPEED_MODES[0]` for the same
+/// cannot-drift reason as [`FALLBACK_MODEL`].
+const FALLBACK_SPEED_MODE: &str = SPEED_MODES[0].0;
+
 fn known_models() -> String {
     MODELS
+        .iter()
+        .map(|(v, _)| *v)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn known_speed_modes() -> String {
+    SPEED_MODES
         .iter()
         .map(|(v, _)| *v)
         .collect::<Vec<_>>()
@@ -797,6 +826,13 @@ fn validate(cfg: &mut Config) -> Result<(), String> {
             known_models()
         ));
     }
+    if !SPEED_MODES.iter().any(|(v, _)| *v == cfg.speed_mode) {
+        return Err(format!(
+            "'{}' is not a speed mode this build knows; expected one of {}",
+            cfg.speed_mode,
+            known_speed_modes()
+        ));
+    }
     Ok(())
 }
 
@@ -835,6 +871,15 @@ pub fn normalize(cfg: &mut Config) -> Vec<String> {
             FALLBACK_MODEL
         ));
         cfg.model = FALLBACK_MODEL.to_string();
+    }
+    if !SPEED_MODES.iter().any(|(v, _)| *v == cfg.speed_mode) {
+        warnings.push(format!(
+            "'{}' is not a speed mode this build knows (expected one of {}); running {} instead",
+            cfg.speed_mode,
+            known_speed_modes(),
+            FALLBACK_SPEED_MODE
+        ));
+        cfg.speed_mode = FALLBACK_SPEED_MODE.to_string();
     }
     warnings
 }
@@ -1544,6 +1589,32 @@ mod tests {
         engine.shutdown();
     }
 
+    /// Same shape as `an_unknown_model_is_rejected_rather_than_silently_
+    /// downgraded`: the window is about to write the value, so it can refuse
+    /// one this build's `KokoroSynthesizer` would not recognise, rather than
+    /// letting the file claim a speed mode nothing honours.
+    #[test]
+    fn an_unknown_speed_mode_is_rejected_rather_than_silently_downgraded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let models = models_dir_with(&["af_heart"], dir.path());
+        let (store, engine) = store_in(dir.path());
+        let m = SettingsModel::new(store, models, Config::default());
+
+        let err = m
+            .edit(|c| c.speed_mode = "warp".into())
+            .expect_err("must be rejected");
+        assert!(
+            err.contains("warp"),
+            "the rejected value must appear: {err}"
+        );
+        assert_eq!(
+            m.current().speed_mode,
+            "model",
+            "a rejected edit must not stick"
+        );
+        engine.shutdown();
+    }
+
     /// A failed write must be reported rather than swallowed, and must not
     /// leave the model claiming a value the file does not have. This is the
     /// case M3's review flagged as needing "somewhere to surface a failed
@@ -1782,6 +1853,32 @@ mod tests {
         );
     }
 
+    /// Same shape as `normalize_names_an_unknown_model_and_what_will_run_
+    /// instead`, for `speed_mode`: the reload path cannot refuse a file the
+    /// user already wrote, so it says what will actually run instead of
+    /// silently falling back to `"model"`.
+    #[test]
+    fn normalize_names_an_unknown_speed_mode_and_what_will_run_instead() {
+        let mut cfg = Config {
+            speed_mode: "warp".into(),
+            ..Config::default()
+        };
+        let warnings = normalize(&mut cfg);
+        assert_eq!(
+            cfg.speed_mode, FALLBACK_SPEED_MODE,
+            "the config must say what runs"
+        );
+        assert_eq!(warnings.len(), 1, "one field, one warning: {warnings:?}");
+        assert!(
+            warnings[0].contains("warp"),
+            "the rejected value must be named: {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains(FALLBACK_SPEED_MODE),
+            "and what will actually be used: {warnings:?}"
+        );
+    }
+
     /// Finding 9: the engine clamps `speed` on `ApplyConfig` but the file
     /// keeps its out-of-range value, so `say status` and MPRIS disagree with
     /// the file indefinitely. Nothing said so; now the same warning that
@@ -1837,6 +1934,15 @@ mod tests {
             Config::default().model,
             "the fallback must also be what a config that says nothing gets"
         );
+    }
+
+    /// Same premise as `the_fallback_model_is_the_one_the_synthesizer_
+    /// actually_loads`, for `speed_mode`: `FALLBACK_SPEED_MODE` must be what
+    /// a config that says nothing about it gets, so normalising an unknown
+    /// value and defaulting a fresh one land on the same behaviour.
+    #[test]
+    fn the_fallback_speed_mode_matches_config_default() {
+        assert_eq!(FALLBACK_SPEED_MODE, Config::default().speed_mode);
     }
 
     /// The asymmetry between the two paths, stated as a test: the window

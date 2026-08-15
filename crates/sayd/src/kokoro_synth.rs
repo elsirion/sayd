@@ -8,12 +8,21 @@ use std::path::{Path, PathBuf};
 use sayd_core::config::Config;
 use sayd_core::synth::Synthesizer;
 use sayd_g2p::{Dialect, Phonemizer};
+use sayd_kokoro::audio::time_stretch;
 use sayd_kokoro::Kokoro;
 
 pub struct KokoroSynthesizer {
     models_dir: PathBuf,
     model_file: String,
     threads: usize,
+    /// `"model"` | `"stretch"`; see `Config::speed_mode`'s doc comment for
+    /// the measured trade-off. Stored verbatim rather than parsed into an
+    /// enum: anything other than `"stretch"` takes the `"model"` path, the
+    /// same forward-compatible "unrecognised falls back to today's
+    /// behaviour" shape `model_file_for` uses for `model`, so a config
+    /// written by a future `sayd` with a third mode still runs here instead
+    /// of refusing to load.
+    speed_mode: String,
     phonemizer: Phonemizer,
     session: Option<Kokoro>,
     /// Voices loaded into the live session.
@@ -50,6 +59,7 @@ impl KokoroSynthesizer {
             models_dir: models_dir.to_path_buf(),
             model_file: model_file_for(&cfg.model).to_string(),
             threads: cfg.threads,
+            speed_mode: cfg.speed_mode.clone(),
             phonemizer: Phonemizer::new(),
             session: None,
             loaded_voices: Vec::new(),
@@ -104,7 +114,19 @@ impl Synthesizer for KokoroSynthesizer {
             .session
             .as_mut()
             .ok_or_else(|| "session missing".to_string())?;
-        k.synth(phonemes, voice, speed).map_err(|e| e.to_string())
+
+        if self.speed_mode == "stretch" {
+            // Synthesize at the model's own native tempo, then stretch the
+            // result to the requested factor -- see `Config::speed_mode`'s
+            // doc comment for why this exists. `time_stretch` itself already
+            // returns its input unchanged within 1e-6 of `factor == 1.0`, so
+            // this costs nothing extra at the default speed beyond the
+            // wasted `speed` argument to `k.synth`.
+            let audio = k.synth(phonemes, voice, 1.0).map_err(|e| e.to_string())?;
+            Ok(time_stretch(&audio, speed))
+        } else {
+            k.synth(phonemes, voice, speed).map_err(|e| e.to_string())
+        }
     }
 
     fn sample_rate(&self) -> u32 {
@@ -137,6 +159,12 @@ impl Synthesizer for KokoroSynthesizer {
         let changed = file != self.model_file || cfg.threads != self.threads;
         self.model_file = file;
         self.threads = cfg.threads;
+        // Deliberately not part of `changed`: `speed_mode` only decides which
+        // branch `synth` takes on the *next* call, and does not touch the
+        // loaded ORT session at all -- dropping the ~1.27 GB session because
+        // someone toggled this would be a bug, the same one a model or
+        // thread-count change is right to cause and this is not.
+        self.speed_mode = cfg.speed_mode.clone();
         changed
     }
 }
@@ -225,6 +253,15 @@ mod models_tests {
         };
         assert!(!s.reconfigure(&same), "a voice change needs no reload");
 
+        let stretch = Config {
+            speed_mode: "stretch".into(),
+            ..Config::default()
+        };
+        assert!(
+            !s.reconfigure(&stretch),
+            "speed_mode picks a synth-time branch, not a session rebuild"
+        );
+
         let q8 = Config {
             model: "q8".into(),
             ..Config::default()
@@ -241,6 +278,196 @@ mod models_tests {
             !s.reconfigure(&threads),
             "reapplying the same config does not"
         );
+    }
+
+    /// Segments `audio` the way the leading-word investigation did: 10 ms RMS
+    /// windows, a voiced threshold at 6% of the utterance's own peak window
+    /// RMS, gaps under 40 ms merged into one segment. Returns each segment's
+    /// mean level in dB relative to the utterance's peak.
+    fn segment_levels_db(audio: &[f32]) -> Vec<f32> {
+        let win = sayd_kokoro::SAMPLE_RATE as usize / 100; // 10 ms
+        let rms: Vec<f32> = audio
+            .chunks(win)
+            .map(|c| (c.iter().map(|x| x * x).sum::<f32>() / c.len() as f32).sqrt())
+            .collect();
+        let peak = rms.iter().cloned().fold(0.0f32, f32::max);
+        let threshold = peak * 0.06;
+        let voiced: Vec<bool> = rms.iter().map(|&r| r > threshold).collect();
+
+        const MERGE_GAP_WINDOWS: usize = 4; // 40 ms at a 10 ms window
+        let mut segments: Vec<(usize, usize)> = Vec::new();
+        let mut i = 0;
+        while i < voiced.len() {
+            if !voiced[i] {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            let mut end = i + 1;
+            loop {
+                let gap_end = (end + MERGE_GAP_WINDOWS).min(voiced.len());
+                match voiced[end..gap_end].iter().position(|&v| v) {
+                    Some(offset) => end = end + offset + 1,
+                    None => break,
+                }
+            }
+            segments.push((start, end));
+            i = end;
+        }
+
+        segments
+            .into_iter()
+            .map(|(a, b)| {
+                let mean = rms[a..b].iter().sum::<f32>() / (b - a) as f32;
+                20.0 * (mean / peak).log10()
+            })
+            .collect()
+    }
+
+    /// Verifies the fix the whole feature exists for: at `speed = 1.3`,
+    /// `af_heart`, Kokoro's own `speed` input (`speed_mode = "model"`)
+    /// renders the pangram's leading "The" up to 10 dB quieter than the
+    /// following "quick" (see `Config::speed_mode`'s doc comment).
+    /// `speed_mode = "stretch"` synthesizes at 1.0 -- where "The" is not
+    /// suppressed -- and stretches the result instead, so it must not
+    /// reproduce the drop.
+    ///
+    /// Both modes are driven through the *same* `KokoroSynthesizer`,
+    /// `reconfigure`d in between: besides being the realistic path (the
+    /// window flips this live), it is also what proves `reconfigure` really
+    /// does leave `speed_mode` free of a session reload -- if it silently
+    /// reloaded, this test would still pass, but much more slowly.
+    #[test]
+    fn stretch_mode_keeps_the_leading_word_as_loud_as_model_mode_drops_it() {
+        let cfg = Config::default();
+        let mut s = KokoroSynthesizer::new(models_dir(), &cfg).expect("synthesizer constructs");
+        let text = "The quick brown fox jumps over the lazy dog.";
+        let phonemes = s.phonemize(text, "af_heart");
+
+        let model_audio = s
+            .synth(&phonemes, "af_heart", 1.3)
+            .expect("model-mode synth");
+
+        let stretch_cfg = Config {
+            speed_mode: "stretch".into(),
+            ..Config::default()
+        };
+        assert!(
+            !s.reconfigure(&stretch_cfg),
+            "speed_mode must not force a session reload"
+        );
+        let stretch_audio = s
+            .synth(&phonemes, "af_heart", 1.3)
+            .expect("stretch-mode synth");
+
+        let model_segs = segment_levels_db(&model_audio);
+        let stretch_segs = segment_levels_db(&stretch_audio);
+        assert!(
+            model_segs.len() >= 2 && stretch_segs.len() >= 2,
+            "expected at least 'The' and 'quick' as separate segments in both \
+             modes: model={model_segs:?} stretch={stretch_segs:?}"
+        );
+
+        // "The" relative to "quick" -- strongly negative means "The" all but
+        // vanished next to its neighbour, near zero means the two are
+        // comparable. This is the number the task's measurement table
+        // reports as roughly -10 dB for model mode at 1.3.
+        let model_gap = model_segs[0] - model_segs[1];
+        let stretch_gap = stretch_segs[0] - stretch_segs[1];
+        eprintln!(
+            "leading word ('The') relative to the next ('quick') at speed 1.3: \
+             model_mode={model_gap:.1} dB, stretch_mode={stretch_gap:.1} dB \
+             (model levels {model_segs:?}, stretch levels {stretch_segs:?})"
+        );
+
+        // Measured on this build/model at 5.2 dB (model -9.0 dB, stretch
+        // -3.8 dB); the bound below leaves headroom for a different ORT
+        // build or thread count to shift the exact figures without turning
+        // this into a flaky test, while still failing if the fix regresses
+        // to a difference too small to matter.
+        assert!(
+            stretch_gap > model_gap + 3.0,
+            "stretch mode should leave 'The' meaningfully louder relative to \
+             'quick' than model mode does: model={model_gap:.1} dB \
+             stretch={stretch_gap:.1} dB"
+        );
+    }
+
+    /// Utterances are synthesized chunk by chunk (`sayd_core::chunk::chunk`),
+    /// so `speed_mode = "stretch"` stretches per chunk, independently, and
+    /// the results are concatenated. `time_stretch`'s own fallback (see its
+    /// doc comment in `sayd_kokoro::audio`) keeps the very first sample of
+    /// each chunk from being forced to silence, but WSOLA re-anchors its
+    /// alignment search from scratch on every call, so nothing guarantees
+    /// chunk N's stretched tail lines up sample-for-sample with chunk N+1's
+    /// stretched head -- this measures how big that residual seam is on
+    /// real, two-sentence speech, rather than asserting a specific bound a
+    /// different voice or sentence pair could falsify.
+    #[test]
+    fn per_chunk_stretch_seam_on_real_speech_is_measured_not_assumed() {
+        let cfg = Config::default();
+        let mut s = KokoroSynthesizer::new(models_dir(), &cfg).expect("synthesizer constructs");
+        let stretch_cfg = Config {
+            speed_mode: "stretch".into(),
+            ..Config::default()
+        };
+        assert!(
+            !s.reconfigure(&stretch_cfg),
+            "speed_mode must not force a session reload"
+        );
+
+        // Two sentences, synthesized (and so stretched) as two separate
+        // chunks, exactly as `sayd_core::chunk::chunk` would split them with
+        // a `target_chars` short enough to force the split -- the same
+        // technique `engine.rs`'s own multi-chunk tests use.
+        let chunks = sayd_core::chunk::chunk(
+            "A package arrived for you this morning. The quick brown fox jumps over the lazy dog.",
+            25,
+        );
+        assert!(
+            chunks.len() >= 2,
+            "expected the text to split into >= 2 chunks"
+        );
+
+        let mut audio = Vec::new();
+        let mut boundaries = Vec::new();
+        for c in &chunks {
+            let phonemes = s.phonemize(&c.text, "af_heart");
+            let out = s
+                .synth(&phonemes, "af_heart", 1.3)
+                .expect("stretch-mode synth");
+            if !audio.is_empty() {
+                boundaries.push(audio.len());
+            }
+            audio.extend_from_slice(&out);
+        }
+
+        let max_delta = |a: &[f32]| -> f32 {
+            a.windows(2)
+                .map(|w| (w[1] - w[0]).abs())
+                .fold(0.0, f32::max)
+        };
+        // A generous window either side of each seam, and the same-sized
+        // window well inside the surrounding chunk, so the two are measuring
+        // like against like.
+        let radius = sayd_kokoro::SAMPLE_RATE as usize / 200; // 5 ms
+        for &b in &boundaries {
+            let lo = b.saturating_sub(radius);
+            let hi = (b + radius).min(audio.len());
+            let seam = max_delta(&audio[lo..hi]);
+            let interior_lo = lo.saturating_sub(4 * radius);
+            let interior_hi = lo.saturating_sub(2 * radius).max(interior_lo + 1);
+            let interior = max_delta(&audio[interior_lo..interior_hi]);
+            eprintln!(
+                "chunk boundary at sample {b}: seam max |delta|={seam:.4}, \
+                 nearby interior max |delta|={interior:.4} (ratio {:.1}x)",
+                if interior > 1e-6 {
+                    seam / interior
+                } else {
+                    f32::INFINITY
+                }
+            );
+        }
     }
 }
 

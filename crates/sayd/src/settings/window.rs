@@ -47,8 +47,8 @@ use super::model::{
     allow_add, allow_contains, allow_remove, icon_file_size_within_limit, icon_pixels_within_limit,
     IconSource, SettingsModel, Suggestion, SuggestionKind, COOLDOWN_MAX, COOLDOWN_MIN,
     COOLDOWN_STEP, IDLE_UNLOAD_MAX, IDLE_UNLOAD_MIN, IDLE_UNLOAD_STEP, MAX_CHARS_MAX,
-    MAX_CHARS_MIN, MAX_CHARS_STEP, MODELS, SPEED_MAX, SPEED_MIN, SPEED_STEP, THREADS_MAX,
-    THREADS_MIN, THREADS_STEP,
+    MAX_CHARS_MIN, MAX_CHARS_STEP, MODELS, SPEED_MAX, SPEED_MIN, SPEED_MODES, SPEED_STEP,
+    THREADS_MAX, THREADS_MIN, THREADS_STEP,
 };
 use crate::notify::seen;
 
@@ -916,6 +916,36 @@ fn voice_group(ui: &Ui, cfg: &Config, engine: EngineHandle) -> adw::PreferencesG
         });
     });
     group.add(&speed.row);
+
+    // --- Speed mode -------------------------------------------------------
+    // Same reasoning as the Model row below: the measured trade-off goes in
+    // the item text itself, visible while the dropdown is open and the user
+    // is choosing, not tucked into a subtitle they have already looked past.
+    let speed_mode_labels: Vec<String> = SPEED_MODES
+        .iter()
+        .map(|(name, note)| format!("{name} — {note}"))
+        .collect();
+    let speed_mode_row = Combo::new("Speed mode", &speed_mode_labels, |m| {
+        format!("‘{m}’ — not a speed mode this build knows")
+    });
+    let speed_mode_position = |name: &str| SPEED_MODES.iter().position(|(n, _)| *n == name);
+    speed_mode_row.show(&cfg.speed_mode, speed_mode_position(&cfg.speed_mode));
+    let c = speed_mode_row.clone();
+    ui.row(move |_, cfg| c.show(&cfg.speed_mode, speed_mode_position(&cfg.speed_mode)));
+    let u = ui.downgrade();
+    let synthetic = speed_mode_row.synthetic.clone();
+    speed_mode_row.row.connect_selected_notify(move |row| {
+        u.on_user_change(|u| {
+            match Combo::choice(row, &synthetic).and_then(|i| SPEED_MODES.get(i)) {
+                Some((name, _)) => {
+                    let name = (*name).to_string();
+                    u.apply(|c| c.speed_mode = name);
+                }
+                None => u.redraw(&u.model.current()),
+            }
+        });
+    });
+    group.add(&speed_mode_row.row);
 
     // --- Test -----------------------------------------------------------
     let test = adw::EntryRow::builder()
