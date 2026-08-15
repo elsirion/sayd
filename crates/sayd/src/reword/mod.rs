@@ -392,6 +392,37 @@ pub enum Blocked {
 pub struct RewordState {
     permits: Arc<tokio::sync::Semaphore>,
     inner: Mutex<Inner>,
+    /// How long [`RewordState::emit`] stalls before it prints, standing in
+    /// for an `eprintln!` that blocks in `write(2)`. Zero everywhere but the
+    /// one test that measures the rule below, and absent entirely from the
+    /// shipped binary.
+    #[cfg(test)]
+    emit_stall: Duration,
+}
+
+/// A line this module owes the journal, built while [`Inner`] is held and
+/// printed after the guard is dropped.
+///
+/// The rule it exists to enforce: **nothing under `RewordState::inner` may
+/// perform I/O.** `notify::monitor`'s `tokio::select!` arm reaches
+/// [`RewordState::allow`] on every notification and that takes this same
+/// mutex, while [`RewordState::record`] runs on a *blocking-pool* thread
+/// inside the rewrite job. An `eprintln!` into a pipe nobody is draining -- a
+/// stalled journald, a terminal whose reader has stopped -- blocks in
+/// `write(2)`, and held across that lock it holds the monitor's arm with it:
+/// the `MessageStream` stops being polled and `ticker.tick()` stops firing
+/// for as long as the write is stuck. Measured on the previous shape, with a
+/// 2000 ms stall standing in for the blocked write: the arm was held for
+/// 1.70 s. This daemon has already shipped two bugs of that shape.
+///
+/// So every branch that has something to say *builds* it under the lock,
+/// where the counters it names are consistent, and says it outside.
+enum Journal {
+    /// An `info:` or `warning:` line, printed unconditionally.
+    Line(String),
+    /// A `debug:` line, printed only when `SAYD_DEBUG` is set -- see
+    /// [`debug`].
+    Debug(String),
 }
 
 #[derive(Default)]
@@ -441,7 +472,39 @@ impl RewordState {
         Arc::new(RewordState {
             permits: Arc::new(tokio::sync::Semaphore::new(REWORD_MAX_INFLIGHT)),
             inner: Mutex::new(Inner::default()),
+            #[cfg(test)]
+            emit_stall: Duration::ZERO,
         })
+    }
+
+    /// A state whose journal writes take `stall` to complete, standing in for
+    /// an `eprintln!` blocked in `write(2)` on a pipe nobody is reading.
+    ///
+    /// Per instance rather than a global switch, so the test that measures
+    /// [`Journal`]'s rule cannot slow any other test down: this suite runs in
+    /// one process and every other test builds its own state.
+    #[cfg(test)]
+    fn with_stalled_journal(stall: Duration) -> Arc<RewordState> {
+        Arc::new(RewordState {
+            permits: Arc::new(tokio::sync::Semaphore::new(REWORD_MAX_INFLIGHT)),
+            inner: Mutex::new(Inner::default()),
+            emit_stall: stall,
+        })
+    }
+
+    /// Print what the lock was released for. See [`Journal`]: every caller
+    /// must have dropped its `MutexGuard` before it gets here.
+    fn emit(&self, journal: impl IntoIterator<Item = Journal>) {
+        for entry in journal {
+            #[cfg(test)]
+            if !self.emit_stall.is_zero() {
+                std::thread::sleep(self.emit_stall);
+            }
+            match entry {
+                Journal::Line(line) => eprintln!("{line}"),
+                Journal::Debug(line) => debug(format_args!("{line}")),
+            }
+        }
     }
 
     /// How many rewrites could start right now. Not a control -- the tests
@@ -506,8 +569,14 @@ impl RewordState {
     /// to call from inside the rewrite job: §2's rule is that a late
     /// *answer* is dropped unread, and an outcome is not a thing that can
     /// be spoken. See [`attempt`], the only caller for an attempt.
+    ///
+    /// Every line it owes is built under the lock and printed after it, for
+    /// the reason [`Journal`] gives: this method runs on a blocking-pool
+    /// thread and the mutex it takes is the one the notification monitor's
+    /// `select!` arm takes on every arrival.
     pub fn record(&self, cfg: &RewordConfig, outcome: &Attempt, now: Instant) {
         let mut i = lock(&self.inner);
+        let mut journal = None;
         match outcome {
             // Nothing was sent, so nothing was learned -- and if this
             // caller was holding §8's probe, it hands it back unspent
@@ -516,11 +585,11 @@ impl RewordState {
             Attempt::Deadline => {
                 i.deadlines += 1;
                 if i.deadlines == 1 || i.deadlines.is_multiple_of(DEADLINE_LOG_EVERY) {
-                    eprintln!(
+                    journal = Some(Journal::Line(format!(
                         "info: a rewrite did not answer within {} ms; spoke the text as \
                          written ({} so far this run)",
                         cfg.timeout_ms, i.deadlines
-                    );
+                    )));
                 }
             }
             Attempt::Answered(Ok(_)) => {
@@ -534,14 +603,14 @@ impl RewordState {
                     message,
                 } => {
                     if !i.auth_logged {
-                        eprintln!(
+                        journal = Some(Journal::Line(format!(
                             "warning: reword: {host} rejected the API key (HTTP {status}{}); \
                              speaking text as written until the configuration changes",
                             message
                                 .as_deref()
                                 .map(|m| format!(": {m}"))
                                 .unwrap_or_default()
-                        );
+                        )));
                         i.auth_logged = true;
                     }
                     i.auth_latched_for = Some(cfg.clone());
@@ -553,14 +622,14 @@ impl RewordState {
                     message,
                 } => {
                     if !i.model_logged {
-                        eprintln!(
+                        journal = Some(Journal::Line(format!(
                             "warning: reword: the provider does not have model {model:?} \
                              (HTTP {status}{}); speaking text as written",
                             message
                                 .as_deref()
                                 .map(|m| format!(": {m}"))
                                 .unwrap_or_default()
-                        );
+                        )));
                         i.model_logged = true;
                     }
                     i.transport_answered();
@@ -579,30 +648,36 @@ impl RewordState {
                 }
                 RewordError::Unreachable(detail) => {
                     if !i.outage_logged {
-                        eprintln!("warning: reword: could not reach the provider: {detail}");
+                        journal = Some(Journal::Line(format!(
+                            "warning: reword: could not reach the provider: {detail}"
+                        )));
                         i.outage_logged = true;
                     }
                     i.fail_transport(now);
                 }
                 RewordError::Ceiling => {
                     if !i.outage_logged {
-                        eprintln!(
+                        journal = Some(Journal::Line(format!(
                             "warning: reword: the provider did not answer within {:.0} s",
                             REWORD_HTTP_CEILING.as_secs_f64()
-                        );
+                        )));
                         i.outage_logged = true;
                     }
                     i.fail_transport(now);
                 }
                 RewordError::NotConfigured(reason) => {
                     if !i.not_configured_logged {
-                        eprintln!("warning: reword: {reason}; speaking text as written");
+                        journal = Some(Journal::Line(format!(
+                            "warning: reword: {reason}; speaking text as written"
+                        )));
                         i.not_configured_logged = true;
                     }
                 }
                 RewordError::Unavailable => {}
                 RewordError::Malformed(detail) => {
-                    debug(format_args!("reword: unusable response: {detail}"));
+                    journal = Some(Journal::Debug(format!(
+                        "reword: unusable response: {detail}"
+                    )));
                     // The transport did its job -- something came back and
                     // the client could not use it -- so this resolves a
                     // probe as an answer, and the next notification still
@@ -611,6 +686,8 @@ impl RewordState {
                 }
             },
         }
+        drop(i);
+        self.emit(journal);
     }
 
     /// Forget a latched auth failure. Called only by a *successful* test in
@@ -638,24 +715,29 @@ impl RewordState {
         if !i.announced.insert(key) {
             return false;
         }
-        eprintln!(
+        // Built here, printed below the `drop` -- see [`Journal`]. Two lines
+        // rather than one, so a `Vec` rather than an `Option`.
+        let mut journal = vec![Journal::Line(format!(
             "info: reword: sending text to {} (model {})",
             cfg.base_url, cfg.model
-        );
+        ))];
         if !i.plain_http_logged {
             if let Ok(endpoint) = sayd_core::reword::parse_base_url(&cfg.base_url) {
                 if endpoint.scheme == "http" && !sayd_core::reword::is_loopback(&endpoint.host) {
                     // A security statement rather than a trust judgement:
                     // cleartext on the wire is a fact about the transport,
                     // not an opinion about the operator.
-                    eprintln!(
+                    journal.push(Journal::Line(
                         "warning: reword: base_url is plain HTTP to a non-loopback host; \
                          text will cross the network unencrypted"
-                    );
+                            .to_string(),
+                    ));
                     i.plain_http_logged = true;
                 }
             }
         }
+        drop(i);
+        self.emit(journal);
         true
     }
 
@@ -675,13 +757,19 @@ impl RewordState {
             return;
         }
         let mut i = lock(&self.inner);
-        if !i.too_long_logged {
-            eprintln!(
-                "info: reword: some text is longer than reword.max_chars and is spoken \
-                 as written (said once per run)"
-            );
-            i.too_long_logged = true;
+        if i.too_long_logged {
+            return;
         }
+        i.too_long_logged = true;
+        drop(i);
+        // Outside the lock, for the reason [`Journal`] gives -- and this one
+        // is reached straight from `will_reword`, which the notification
+        // monitor's `select!` arm calls on every arrival.
+        self.emit([Journal::Line(
+            "info: reword: some text is longer than reword.max_chars and is spoken \
+             as written (said once per run)"
+                .to_string(),
+        )]);
     }
 }
 
@@ -1790,6 +1878,77 @@ mod tests {
             state.note_endpoint(&other),
             "a different model is a different line"
         );
+    }
+
+    /// IMPORTANT 1: nothing under `RewordState::inner` may perform I/O.
+    ///
+    /// `notify::monitor`'s `tokio::select!` arm reaches
+    /// [`RewordState::allow`] -- and this mutex -- on every notification,
+    /// while [`RewordState::record`] runs on a blocking-pool thread inside
+    /// the rewrite job. An `eprintln!` into a pipe nobody is draining (a
+    /// stalled journald, a terminal whose reader has stopped) blocks in
+    /// `write(2)`, and held across the lock it holds the arm with it: the
+    /// `MessageStream` stops being polled and `ticker.tick()` stops firing
+    /// for as long as the write is stuck. Measured on the previous shape
+    /// with a 2000 ms stall standing in for the blocked write, the arm was
+    /// held for 1.70 s.
+    ///
+    /// The stall is a per-instance field, so this test slows nothing else in
+    /// the suite down, and it is `#[cfg(test)]`, so it is not in the shipped
+    /// binary at all.
+    #[test]
+    fn a_stalled_journal_never_holds_the_lock_the_monitors_arm_needs() {
+        const STALL: Duration = Duration::from_millis(500);
+        let cfg = cfg();
+
+        // One case per *kind* of printing branch, reached the way the daemon
+        // reaches it: `record`'s six lines share one body and one `drop`, and
+        // the two `note_` methods have bodies of their own.
+        /// One printing branch: what to call it, and how the daemon gets
+        /// there.
+        type Case = (&'static str, fn(&RewordState, &RewordConfig));
+
+        let cases: [Case; 4] = [
+            ("record: a missed deadline", |s, cfg| {
+                s.record(cfg, &Attempt::Deadline, Instant::now())
+            }),
+            ("record: an unreachable provider", |s, cfg| {
+                s.record(
+                    cfg,
+                    &Attempt::Answered(Err(RewordError::Unreachable("refused".into()))),
+                    Instant::now(),
+                )
+            }),
+            ("note_endpoint", |s, cfg| {
+                s.note_endpoint(cfg);
+            }),
+            ("note_ineligible", |s, _cfg| {
+                s.note_ineligible(Ineligible::TooLong)
+            }),
+        ];
+
+        for (what, printing) in cases {
+            let state = RewordState::with_stalled_journal(STALL);
+            let printer = {
+                let state = state.clone();
+                let cfg = cfg.clone();
+                std::thread::spawn(move || printing(&state, &cfg))
+            };
+            // Long enough for the printer to be inside the stalled write,
+            // far short of the stall itself.
+            std::thread::sleep(STALL / 5);
+
+            let started = Instant::now();
+            let _ = state.allow(&cfg, Instant::now());
+            let waited = started.elapsed();
+            printer.join().expect("the printing thread must not panic");
+
+            assert!(
+                waited < STALL / 5,
+                "{what}: the monitor's arm waited {waited:?} for a journal write \
+                 that had not finished, so the lock was held across the print"
+            );
+        }
     }
 
     /// §7's privacy line is what a user greps to find out where their text
