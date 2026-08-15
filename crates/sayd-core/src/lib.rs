@@ -12,4 +12,5 @@ pub mod config;
 pub mod engine;
 pub mod handle;
 pub mod queue;
+pub mod reword;
 pub mod synth;
