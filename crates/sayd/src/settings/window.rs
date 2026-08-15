@@ -19,9 +19,10 @@
 //! - A row that cannot express what the config holds says so, rather than
 //!   quietly showing something else -- see [`Combo`] and [`Spin`].
 //!
-//! The notification allowlist is the one part whose *number* of rows comes
-//! from the config, so its redraw closure rebuilds them rather than setting
-//! a value; see [`allowlist_group`].
+//! The notification allowlist and the suggestion groups beneath it are the
+//! parts whose *number* of rows is not fixed, so their redraw closures
+//! rebuild them rather than setting a value; see [`allowlist_group`] and
+//! [`suggestions_group`].
 //!
 //! The second promise is a lifetime one, and it is not free: the window is
 //! built on demand and **freed** on close, so a daemon that opened the
@@ -41,7 +42,7 @@ use sayd_core::handle::EngineHandle;
 use sayd_core::queue::{Policy, Source as QueueSource};
 
 use super::model::{
-    allow_add, allow_contains, allow_remove, SettingsModel, COOLDOWN_MAX, COOLDOWN_MIN,
+    allow_add, allow_contains, allow_remove, IconSource, SettingsModel, COOLDOWN_MAX, COOLDOWN_MIN,
     COOLDOWN_STEP, IDLE_UNLOAD_MAX, IDLE_UNLOAD_MIN, IDLE_UNLOAD_STEP, MAX_CHARS_MAX,
     MAX_CHARS_MIN, MAX_CHARS_STEP, MODELS, SPEED_MAX, SPEED_MIN, SPEED_STEP, THREADS_MAX,
     THREADS_MIN, THREADS_STEP,
@@ -158,6 +159,73 @@ const NOTIFICATION_SWITCHES: [(&str, &str, NotifyGet, NotifySet); 3] = [
         "Read the body after the summary; many applications only restate the summary there",
         |c| c.speak_body,
         |c, v| c.speak_body = v,
+    ),
+];
+
+/// What a suggestion whose icon cannot be drawn shows instead.
+///
+/// Three things land here: an application that sent no `app_icon` at all
+/// (`IconSource::None`), a curated or seen icon *name* the user's theme does
+/// not have, and a path that is not there any more. `gtk::Image` would draw
+/// the last two as its own broken-image glyph, which is the wrong thing to
+/// say: the row is not broken, the icon is simply unknown, and a generic
+/// application icon says exactly that. Checked against the theme rather than
+/// assumed -- see [`suggestion_icon`], which is also the only place in this
+/// file that can ask, since the answer depends on the display.
+///
+/// The *symbolic* variant, and that was worth looking at: the full-colour
+/// `application-x-executable` is a blue gem, and a list where nine of
+/// thirteen rows carry the same saturated blue gem beside Element's green
+/// and Firefox's orange reads as thirteen applications whose logos happen to
+/// look alike, rather than as four that have an icon and nine that do not.
+/// The symbolic version is drawn in the label's own colour, so it recedes
+/// exactly as far as "we do not know this one" should. Compared side by side
+/// under a headless compositor against Adwaita 49; both names resolve there,
+/// and have for a decade.
+const FALLBACK_ICON: &str = "application-x-executable-symbolic";
+
+/// How large a suggestion's icon is drawn, in pixels.
+///
+/// 32 rather than the 16 a `gtk::Image` prefix defaults to: these are
+/// application icons, and at 16px the ones that carry a real logo (Signal's,
+/// Firefox's) are indistinguishable from each other and from the fallback,
+/// which is the entire reason for showing an icon rather than a name alone.
+/// It is also what libadwaita's own `AdwActionRow` list of applications uses.
+const SUGGESTION_ICON_PX: i32 = 32;
+
+/// The two suggestion groups, in the order the page shows them: what has
+/// actually notified, then the built-in guesses.
+///
+/// Two groups rather than one "Suggestions" heading, because the difference
+/// between the two kinds is a *sentence* rather than a word. A seen entry is
+/// a fact -- that application sent that name, on this machine, this run, and
+/// adding it is guaranteed to match. A curated entry is a guess at what an
+/// application passes as its `app_name`, and a wrong guess silently never
+/// matches anything (see `CURATED`'s doc comment in `model.rs`), which is
+/// precisely the failure a user cannot diagnose from the row itself. Saying
+/// so once, in a group description, costs one line; saying it on every
+/// curated row costs thirteen subtitles that all read the same, and saying it
+/// nowhere would present a guess as a fact.
+///
+/// It also makes the "hide when there is nothing to suggest" rule fall out
+/// per kind rather than for the pair: a user who has allowed every curated
+/// application still gets the seen group, and a fresh daemon that has watched
+/// nothing notify still gets the curated one.
+const SUGGESTION_GROUPS: [(bool, &str, &str); 2] = [
+    (
+        true,
+        "Seen notifying",
+        "Applications that have notified since sayd started, most recent first, \
+         with the icon each one sent. These names are exactly what the application \
+         passes, so adding one is certain to match it.",
+    ),
+    (
+        false,
+        "Common applications",
+        "A short built-in list, offered before anything has notified. Each name is \
+         sayd's best guess at what the application passes, not a name it has seen: \
+         if adding one turns out to announce nothing, the application uses some \
+         other name, and the daemon's log has the real one.",
     ),
 ];
 
@@ -431,6 +499,9 @@ fn build(model: Arc<SettingsModel>, engine: EngineHandle) -> Ui {
     page.add(&cleanup_group(&ui, &cfg));
     page.add(&notification_group(&ui, &cfg));
     page.add(&allowlist_group(&ui, &cfg));
+    for (kind, title, description) in SUGGESTION_GROUPS {
+        page.add(&suggestions_group(&ui, &cfg, kind, title, description));
+    }
     window.add(&page);
 
     // A write that fails does so long after the click that caused it, on the
@@ -1138,4 +1209,143 @@ fn add_to_allowlist(ui: &Ui, entry: &adw::EntryRow) {
         // way of saying so.
         ui.quietly(|| entry.set_text(""));
     }
+}
+
+/// One half of the suggestions: a row per application of `kind`, each with
+/// its icon, its name, and a button that puts it on the allowlist above.
+///
+/// `kind` is `Suggestion::seen` -- see [`SUGGESTION_GROUPS`] for why the two
+/// halves are drawn as separate groups and what each says for itself.
+///
+/// Which applications those are, in what order, with what already filtered
+/// out and what an icon string means, is entirely `SettingsModel::
+/// suggestions`'s. This function decides only what a row looks like, which is
+/// the one question that cannot be answered without a display.
+fn suggestions_group(
+    ui: &Ui,
+    cfg: &Config,
+    kind: bool,
+    title: &str,
+    description: &str,
+) -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::builder()
+        .title(title)
+        .description(description)
+        .build();
+
+    // The rows this closure has put in the group, so a rebuild takes away
+    // exactly what it added -- the same bookkeeping `allowlist_group` does,
+    // and needed here for the same reason even though this group has no
+    // permanent row of its own to protect: a `PreferencesGroup` offers no
+    // "remove everything" call.
+    let shown: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
+    let g = group.clone();
+    let draw = move |ui: &Ui, _cfg: &Config| {
+        // `_cfg` is unused because `suggestions()` reads the model's own
+        // `current()` rather than taking a config -- it has to, since the
+        // filter it applies is against the allowlist *and* the seen registry,
+        // which no `Config` carries. That is not a second source of truth:
+        // every caller of `Ui::redraw` passes the config the model is
+        // currently holding (see the four call sites), so the two agree.
+        //
+        // Rebuilt wholesale rather than diffed, as the allowlist is, and
+        // safe to re-enter for the same two reasons: every redraw closure
+        // runs inside `Ui::quietly`, and building an `ActionRow` emits
+        // nothing that writes. The one path that looks circular -- an Add
+        // button whose click redraws and so destroys the very row it is
+        // attached to -- is the shape `allowlist_group`'s Remove button
+        // already has, and is safe because the emission holds its own
+        // reference to the button for the length of the call.
+        for row in shown.borrow_mut().drain(..) {
+            g.remove(&row);
+        }
+        let mut any = false;
+        for s in ui
+            .model
+            .suggestions()
+            .into_iter()
+            .filter(|s| s.seen == kind)
+        {
+            any = true;
+            let row = adw::ActionRow::builder()
+                .title(&s.app_name)
+                // `AdwPreferencesRow:use-markup` defaults to true and this
+                // title is a string an *application* chose, which is the
+                // worst possible pair: an `app_name` of `Ada & Co` makes GTK
+                // refuse the title outright and render the row blank. The
+                // allowlist rows set it for the same reason, one step later
+                // in the same string's life.
+                .use_markup(false)
+                .build();
+            row.add_prefix(&suggestion_icon(&s.icon));
+            let add = gtk::Button::builder()
+                .icon_name("list-add-symbolic")
+                .valign(gtk::Align::Center)
+                .tooltip_text(format!("Announce notifications from {}", s.app_name))
+                .build();
+            add.add_css_class("flat");
+            row.add_suffix(&add);
+            let u = ui.downgrade();
+            let name = s.app_name.clone();
+            add.connect_clicked(move |_| {
+                // The same call the entry row's Add makes, deliberately: a
+                // suggestion and a typed name are one operation, and every
+                // rule about what adding means (the trim, the duplicate, the
+                // empty name) stays in `allow_add` rather than being decided
+                // twice. Cloned out of the environment first because the
+                // edit redraws, and the redraw destroys this row.
+                let name = name.clone();
+                u.with(|ui| ui.apply(move |c| allow_add(c, &name)));
+            });
+            g.add(&row);
+            shown.borrow_mut().push(row);
+        }
+        // Hidden rather than shown empty: a group heading and a paragraph
+        // about applications, over nothing at all, is what a user sees the
+        // moment they have allowed everything -- which is the state this
+        // whole feature is meant to lead to, so it is the state it must not
+        // look broken in.
+        g.set_visible(any);
+    };
+    // Populated before the closure is handed over, in the order every other
+    // row here uses.
+    draw(ui, cfg);
+    ui.row(draw);
+
+    group
+}
+
+/// The image shown beside a suggestion.
+///
+/// Every fallback lands on [`FALLBACK_ICON`], including the two cases
+/// `gtk::Image` would otherwise draw as its own broken-image glyph: a theme
+/// that does not have the named icon, and a file that is no longer there.
+/// Both are asked about rather than assumed, because both are questions only
+/// this layer can answer -- one needs the display's icon theme, the other the
+/// filesystem, and `model.rs` deliberately classifies the *string* without
+/// touching either.
+///
+/// The `is_file` check is a `stat` on the glib main thread, once per row of a
+/// group of at most `MAX_SEEN` rows, and it is the cheaper half of a call
+/// that is about to decode a PNG on that same thread anyway.
+fn suggestion_icon(icon: &IconSource) -> gtk::Image {
+    let image = match icon {
+        IconSource::Named(name) if theme_has(name) => gtk::Image::from_icon_name(name),
+        IconSource::File(path) if path.is_file() => gtk::Image::from_file(path),
+        _ => gtk::Image::from_icon_name(FALLBACK_ICON),
+    };
+    image.set_pixel_size(SUGGESTION_ICON_PX);
+    image
+}
+
+/// Does the display's icon theme actually have `name`?
+///
+/// `true` with no display at all, which cannot happen while a window is being
+/// drawn: it keeps the answer identical to what `gtk::Image::from_icon_name`
+/// would have done on its own, rather than inventing a fallback for a case
+/// where nothing is being shown to anybody.
+fn theme_has(name: &str) -> bool {
+    gtk::gdk::Display::default()
+        .map(|display| gtk::IconTheme::for_display(&display).has_icon(name))
+        .unwrap_or(true)
 }
