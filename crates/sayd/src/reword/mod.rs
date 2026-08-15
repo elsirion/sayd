@@ -724,9 +724,11 @@ impl Inner {
 ///
 /// Both callers -- `notify::monitor::speak` and `dbus.rs` -- gate on this
 /// and only detach or await when it says yes.
-// `#[allow(dead_code)]`: those two callers are a later task in this
-// milestone. Everything they will call is here and tested.
-#[allow(dead_code)]
+///
+/// **Call it once per arrival, then attempt.** It is not a pure predicate:
+/// past an expired transport cooldown [`RewordState::allow`] mints and
+/// spends §8's one half-open probe, so a caller that asks twice and attempts
+/// once costs the run a probe until [`TRANSPORT_PROBE_TTL`] expires.
 pub fn will_reword(text: &str, cfg: &RewordConfig, state: &RewordState) -> bool {
     if let Err(why) = eligible(text, cfg.max_chars) {
         state.note_ineligible(why);
@@ -742,9 +744,11 @@ pub fn will_reword(text: &str, cfg: &RewordConfig, state: &RewordState) -> bool 
 /// the drop rule: the caller submits, so a late answer has nowhere to go.
 /// Do not add a submit callback to this signature.
 ///
-/// Assumes [`will_reword`] has already said yes.
-// `#[allow(dead_code)]`: as `will_reword`.
-#[allow(dead_code)]
+/// Assumes [`will_reword`] has already said yes -- and does not check, which
+/// is why `notify::monitor` reaches this only through a `RewordPlan` whose
+/// sole constructor calls `will_reword`. Nothing here consults
+/// [`RewordState::allow`], so a caller that skips it bypasses the auth
+/// latch, the transport breaker and the rate limiter entirely.
 pub async fn reword_or_original(
     text: String,
     cfg: &RewordConfig,
@@ -790,8 +794,6 @@ pub fn state() -> Arc<RewordState> {
 /// agent is cached separately and outlives config changes entirely --
 /// `base_url`, `model` and the key are per-request inputs, not client
 /// state.
-// `#[allow(dead_code)]`: as `will_reword`.
-#[allow(dead_code)]
 pub fn context(cfg: &RewordConfig) -> Option<(Arc<dyn Rewriter>, Arc<RewordState>)> {
     /// The client and the exact config it was built for. Named because the
     /// pair is what makes "rebuilt only when the config changes" checkable

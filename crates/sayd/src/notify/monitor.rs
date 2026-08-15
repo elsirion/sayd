@@ -32,9 +32,11 @@
 
 use std::collections::HashSet;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use sayd_core::config::Config;
+use sayd_core::config::{Config, RewordConfig};
 use sayd_core::engine::SayOpts;
 use sayd_core::handle::EngineHandle;
 use sayd_core::queue::Source;
@@ -191,7 +193,9 @@ async fn run_on(engine: EngineHandle, address: Option<String>) -> Outcome {
     // device recovery: the first failure is worth a line, the two hundredth
     // is not.
     let mut outage_logged = false;
-    let mut submit_failure_logged = false;
+    // An `Arc<AtomicBool>` rather than a local `bool`: `speak` may now hand
+    // the submission to a detached task, which cannot borrow a local.
+    let submit_failure_logged = Arc::new(AtomicBool::new(false));
     let mut malformed_logged = false;
     let mut malformed_count: u64 = 0;
 
@@ -317,7 +321,10 @@ async fn run_on(engine: EngineHandle, address: Option<String>) -> Outcome {
                                     seen::record(&n);
                                     match limiter.decide(&n, &cfg.notifications, Instant::now()) {
                                         Decision::Speak(text) => {
-                                            speak(&engine, text, cfg.max_chars, &mut submit_failure_logged).await;
+                                            // `true`: an application's own
+                                            // notification is what §1's
+                                            // rewrite is for.
+                                            speak(&engine, text, &cfg, true, &submit_failure_logged).await;
                                         }
                                         // Counted against an open window; the
                                         // follow-up comes out of `due` below
@@ -372,7 +379,12 @@ async fn run_on(engine: EngineHandle, address: Option<String>) -> Outcome {
                     let due = limiter.due(&cfg.notifications, Instant::now());
                     if cfg.notifications.enabled {
                         for text in due {
-                            speak(&engine, text, cfg.max_chars, &mut submit_failure_logged).await;
+                            // `false`: a coalesced follow-up is never
+                            // reworded. See `speak`'s doc comment -- with
+                            // `Policy::Front` a follow-up that skipped the
+                            // rewrite would be spoken before the
+                            // notification that opened its window.
+                            speak(&engine, text, &cfg, false, &submit_failure_logged).await;
                         }
                     }
                 }
@@ -567,8 +579,102 @@ fn notification_opts() -> SayOpts {
     }
 }
 
-/// Submit one announcement, logging only the first failure of a standing run
-/// of them.
+/// A rewrite that the breakers have already cleared, and the only way this
+/// module can reach [`crate::reword::reword_or_original`].
+///
+/// The breakers are *advisory*: neither `attempt` nor `reword_or_original`
+/// consults [`crate::reword::RewordState::allow`], so a call site that
+/// reaches `reword_or_original` without going through
+/// [`crate::reword::will_reword`] first silently bypasses the auth latch,
+/// the transport breaker and the rate limiter -- and would keep hammering a
+/// provider that has already answered 401 for every notification that
+/// arrives. Nothing in the signature of `reword_or_original` prevents that,
+/// so the protection is structural here instead: this type's fields are
+/// private, [`RewordPlan::admit`] is its only constructor and calls
+/// `will_reword` on the way, and [`RewordPlan::resolve`] -- which consumes
+/// `self` -- is the only place in this file that names
+/// `reword_or_original`. A future edit cannot reorder or drop the check
+/// without deleting the type that carries it.
+///
+/// `will_reword` is called exactly *once* per announcement, and then the
+/// attempt is made. Past an expired transport cooldown `allow` mints and
+/// spends §8's one half-open probe, so asking twice and attempting once
+/// would burn a probe the run does not get back until the TTL expires.
+struct RewordPlan {
+    rewriter: Arc<dyn crate::reword::Rewriter>,
+    state: Arc<crate::reword::RewordState>,
+    /// The exact config the decision was taken under, cloned once here
+    /// rather than read again later: the monitor's cached `Config` is
+    /// refreshed on every tick, and an attempt judged eligible under one
+    /// `max_chars` must not then be made under another.
+    cfg: RewordConfig,
+}
+
+impl RewordPlan {
+    /// Will this announcement be rewritten, and with what?
+    ///
+    /// Every step is synchronous and cheap -- a pass over a short string and
+    /// one mutex -- so an announcement that is not going to be rewritten
+    /// costs no allocation, no clone of the config, and above all no
+    /// `tokio::spawn`. That is what keeps the feature-off path exactly what
+    /// it was: with `enabled = false` this returns on the first line, and in
+    /// a build without the `reword` feature
+    /// [`crate::reword::build_rewriter`] cannot make a client at all, so
+    /// `context` returns `None` and this returns `None` on the second.
+    fn admit(text: &str, cfg: &Config, may_reword: bool) -> Option<RewordPlan> {
+        if !may_reword || !cfg.reword.enabled {
+            return None;
+        }
+        let (rewriter, state) = crate::reword::context(&cfg.reword)?;
+        if !crate::reword::will_reword(text, &cfg.reword, &state) {
+            return None;
+        }
+        Some(RewordPlan {
+            rewriter,
+            state,
+            cfg: cfg.reword.as_ref().clone(),
+        })
+    }
+
+    /// The text to speak. Consumes the plan, so the single `will_reword`
+    /// that admitted it buys exactly one attempt.
+    async fn resolve(self, text: String) -> String {
+        crate::reword::reword_or_original(text, &self.cfg, self.rewriter, self.state).await
+    }
+}
+
+/// Submit one announcement, rewriting it first when §1 asks for that, and
+/// logging only the first failure of a standing run of them.
+///
+/// Returns as soon as it has either submitted or handed the whole sequence
+/// to a detached task. It must never wait for a rewrite: this is called from
+/// `run_on`'s `tokio::select!` arm, and holding that arm for a 1.5-second
+/// budget would stop the `MessageStream` being polled and stop
+/// `ticker.tick()` firing for the duration -- the coalescing timer would
+/// drift by a budget per notification, and the daemon has already shipped
+/// one bug of exactly that shape.
+///
+/// The detach is **conditional**, narrowing §2's "spawns a detached task
+/// that owns the whole sequence". Taken unconditionally it would detach the
+/// non-rewriting path too, and two announcements from different
+/// applications arriving back to back could then be submitted out of order
+/// with rewording switched *off* -- a behaviour change in a path this
+/// milestone was not asked to touch. Every announcement that is not going to
+/// be reworded therefore takes today's awaited path byte for byte. §2's
+/// requirement holds in full: the rewrite never blocks the `select!` arm.
+///
+/// `may_reword` is `false` for a coalesced `"N more notifications"`
+/// follow-up (§2). It is already a sentence written for the ear, rewriting
+/// it can only make it worse and cost money, and -- the real reason -- a
+/// follow-up that skipped the rewrite would be submitted instantly while the
+/// notification that opened the window was still in flight, and with
+/// `Policy::Front` it would be spoken *first*.
+///
+/// The detached task is not a child of the monitor task, so
+/// `NotifyMonitorSupervisor`'s `handle.abort()` does not cancel it. Same
+/// caveat as the in-flight `spawn_blocking` documented on the supervisor,
+/// and bounded the same way: an announcement can land at most `timeout_ms`
+/// after `enabled` goes false.
 ///
 /// The composed text is *not* cleaned here, even though `policy::compose`
 /// leaves runs of whitespace and newlines behind and its module doc says the
@@ -579,10 +685,14 @@ fn notification_opts() -> SayOpts {
 /// engine through exactly that call. Cleaning here as well would run the
 /// whole regex pipeline twice per notification for an identical result, and
 /// -- worse -- would leave two places claiming responsibility for an
-/// invariant only one of them actually enforces.
+/// invariant only one of them actually enforces. The rewrite sits between
+/// the two cleans, which is sound because `clean` is idempotent -- pinned by
+/// `cleanup::tests::clean_is_idempotent`.
 ///
 /// `max_chars` is checked here, against the *live* config's own limit,
-/// before the text is ever handed to `submit` (Important 3). `Engine::submit`
+/// before the text is ever handed to `submit` (Important 3), and before the
+/// rewrite rather than after it: an announcement the engine is going to
+/// refuse must not cost a network round trip first. `Engine::submit`
 /// already rejects an over-long text on its own, but for a source that is
 /// `Idle` or `Speaking`/`Paused`-adjacent it also *sets global `State::Error`*
 /// with that rejection as the reason (`engine.rs:476-492`) -- and a
@@ -595,15 +705,55 @@ fn notification_opts() -> SayOpts {
 /// would make every caller of `submit` safe by construction rather than
 /// leaving each one to guard itself -- out of scope for this file, noted
 /// here so it is not lost.
-async fn speak(engine: &EngineHandle, text: String, max_chars: usize, failure_logged: &mut bool) {
+async fn speak(
+    engine: &EngineHandle,
+    text: String,
+    cfg: &Config,
+    may_reword: bool,
+    failure_logged: &Arc<AtomicBool>,
+) {
     let len = text.chars().count();
-    if len > max_chars {
+    if len > cfg.max_chars {
         eprintln!(
             "warning: a notification's announcement is {len} characters, over the \
-             {max_chars}-character limit; skipping it rather than submitting it"
+             {max_chars}-character limit; skipping it rather than submitting it",
+            max_chars = cfg.max_chars
         );
         return;
     }
+
+    let Some(plan) = RewordPlan::admit(&text, cfg, may_reword) else {
+        // Today's path exactly, awaited: nothing was spawned, so two
+        // announcements arriving back to back are still submitted in the
+        // order they arrived.
+        submit_announcement(engine, text, failure_logged).await;
+        return;
+    };
+
+    let engine = engine.clone();
+    let failure_logged = failure_logged.clone();
+    tokio::spawn(async move {
+        // `resolve` holds no `EngineHandle`: it returns the text to speak
+        // and this scope submits it. That is what makes a late answer
+        // unreachable rather than merely unwanted -- a rewrite that lands
+        // past the deadline is dropped, never spoken second.
+        let text = plan.resolve(text).await;
+        submit_announcement(&engine, text, &failure_logged).await;
+    });
+}
+
+/// Hand one announcement to the engine, logging only the first failure of a
+/// standing run of them.
+///
+/// Split out of [`speak`] so the immediate path and the detached one share
+/// it verbatim. `failure_logged` is an `Arc<AtomicBool>` rather than the
+/// `&mut bool` it used to be for exactly that reason: a detached task cannot
+/// borrow `run_on`'s local.
+async fn submit_announcement(
+    engine: &EngineHandle,
+    text: String,
+    failure_logged: &Arc<AtomicBool>,
+) {
     let e = engine.clone();
     let result = tokio::task::spawn_blocking(move || e.submit(text, notification_opts())).await;
     match result {
@@ -614,17 +764,15 @@ async fn speak(engine: &EngineHandle, text: String, max_chars: usize, failure_lo
         // comment. Clearing `failure_logged` on it is therefore right, the
         // same as any other success, rather than treating a merely slow
         // confirmation as a reason to start (or keep) logging failures.
-        Ok(Ok(_)) => *failure_logged = false,
+        Ok(Ok(_)) => failure_logged.store(false, Ordering::Relaxed),
         Ok(Err(reason)) => {
-            if !*failure_logged {
+            if !failure_logged.swap(true, Ordering::Relaxed) {
                 eprintln!("warning: could not speak a notification: {reason}");
-                *failure_logged = true;
             }
         }
         Err(e) => {
-            if !*failure_logged {
+            if !failure_logged.swap(true, Ordering::Relaxed) {
                 eprintln!("warning: the notification submission task failed: {e}");
-                *failure_logged = true;
             }
         }
     }
@@ -809,8 +957,12 @@ mod tests {
     #[tokio::test]
     async fn an_overlong_announcement_is_skipped_without_erroring_the_engine() {
         let (engine, spoken) = engine_allowing("Signal");
-        let mut logged = false;
-        speak(&engine, "a".repeat(30), 10, &mut logged).await;
+        let cfg = Config {
+            max_chars: 10,
+            ..Config::default()
+        };
+        let logged = Arc::new(AtomicBool::new(false));
+        speak(&engine, "a".repeat(30), &cfg, true, &logged).await;
 
         assert!(
             spoken.lock().expect("spoken mutex").is_empty(),
@@ -822,6 +974,182 @@ mod tests {
             "a notification's own length must not put the whole engine into Error"
         );
         engine.shutdown();
+    }
+
+    /// A `Config` with rewording switched on and everything else default.
+    ///
+    /// The two tests below call `RewordPlan::admit` twice -- once for the
+    /// rule under test and once as a positive control. That would be wrong
+    /// in `run_on`: `will_reword` is not a pure predicate, and past an
+    /// expired transport cooldown it spends §8's one half-open probe. Here
+    /// no cooldown is ever open (a probe is only minted while
+    /// `transport_open_until` is set, which takes three failures), so the
+    /// second ask is a plain read of the breakers and costs the run nothing.
+    fn rewording_on() -> Config {
+        Config {
+            reword: Box::new(RewordConfig {
+                enabled: true,
+                ..RewordConfig::default()
+            }),
+            ..Config::default()
+        }
+    }
+
+    /// With rewording off the announcement path is what it always was:
+    /// `admit` returns `None`, so `speak` is the awaited submission it has
+    /// always been and nothing at all is spawned. The two halves of "off"
+    /// are separate rows on purpose -- `enabled = false` is a promise the
+    /// *configuration* keeps, and a build without the `reword` feature is
+    /// one the *compiler* keeps, and the second must not depend on the
+    /// first.
+    #[test]
+    fn nothing_is_admitted_with_rewording_off() {
+        let text = "Alice: where do you want to go for dinner";
+        let off = Config::default();
+        assert!(!off.reword.enabled, "the shipped default is off");
+        assert!(
+            RewordPlan::admit(text, &off, true).is_none(),
+            "`enabled = false` must not even look for a client"
+        );
+        // And in a build with no client in it, not even `enabled = true`
+        // can produce a plan.
+        #[cfg(not(feature = "reword"))]
+        assert!(
+            RewordPlan::admit(text, &rewording_on(), true).is_none(),
+            "a build without the `reword` feature has nothing to rewrite with"
+        );
+    }
+
+    /// §2: a coalesced "N more notifications" follow-up is never reworded.
+    /// It is already a sentence written for the ear, and -- the real reason
+    /// -- a follow-up that skipped the rewrite would be submitted instantly
+    /// while the notification that opened the window was still in flight,
+    /// and with `Policy::Front` it would be spoken first.
+    ///
+    /// Asserted on `RewordPlan::admit` rather than by counting calls into a
+    /// stub `Rewriter`: `speak` reaches its rewriter through
+    /// `crate::reword::context`, a process-wide cache no test can inject
+    /// into, so a stub handed to this test would record zero calls whatever
+    /// `speak` did and the assertion would pass for the wrong reason.
+    /// `admit` *is* the gate -- it is `RewordPlan`'s only constructor, and
+    /// `RewordPlan` is the only route from this module to
+    /// `reword_or_original` -- so `None` here is exactly "never reworded".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_coalesced_followup_reaches_the_engine_without_being_reworded() {
+        let (engine, spoken) = engine_allowing("Signal");
+        let cfg = rewording_on();
+
+        // The exact string `Limiter::due` produces, and long enough to clear
+        // the eligibility floor -- so the *only* thing keeping it away from
+        // the rewriter is the rule under test, not an accident of how long
+        // it happens to be.
+        let followup = "Signal: 3 more notifications".to_string();
+        assert!(
+            sayd_core::reword::eligible(&followup, cfg.reword.max_chars).is_ok(),
+            "the follow-up is eligible on length; the exclusion must be the rule"
+        );
+        assert!(
+            RewordPlan::admit(&followup, &cfg, false).is_none(),
+            "a follow-up must never be admitted to a rewrite"
+        );
+        // The positive control: the same text under the same config *is*
+        // admitted once `may_reword` is true, in a build that has a client
+        // to admit it to. Without this the assertion above would also pass
+        // against a config that could never rewrite anything.
+        assert_eq!(
+            RewordPlan::admit(&followup, &cfg, true).is_some(),
+            cfg!(feature = "reword"),
+            "only `may_reword` should decide this, and only a build with a client \
+             can say yes at all"
+        );
+
+        let logged = Arc::new(AtomicBool::new(false));
+        speak(&engine, followup.clone(), &cfg, false, &logged).await;
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !engine_has(&spoken, &followup) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let arrived = engine_has(&spoken, &followup);
+        engine.shutdown();
+        assert!(arrived, "...and it must still be spoken, as written");
+    }
+
+    /// A loopback server that accepts a connection and then says nothing
+    /// for `hold`, then closes it. Returns a `base_url` pointing at it.
+    ///
+    /// A *refused* connection would not do: it fails in well under a
+    /// millisecond, so an inline `.await` on the rewrite would return as
+    /// fast as a detached one and the timing assertion below would pass
+    /// against the very bug it exists to catch. Measured: with the
+    /// `tokio::spawn` in `speak` removed and `base_url` pointed at a closed
+    /// port, `speak_returns_at_once_when_a_rewrite_is_in_flight` still
+    /// passed. Against this, the same mutation takes the whole `timeout_ms`.
+    ///
+    /// Non-blocking accept with a deadline so the thread always ends and
+    /// can be joined: joining it is what closes the socket, which is what
+    /// lets the runtime's own shutdown -- which waits on the blocking pool,
+    /// where the rewrite's `ureq` call lives -- finish promptly.
+    fn silent_provider(hold: Duration) -> (String, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        listener
+            .set_nonblocking(true)
+            .expect("non-blocking listener");
+        let handle = std::thread::spawn(move || {
+            let until = Instant::now() + hold;
+            // Held, not dropped: a socket dropped straight away would let
+            // the client's read fail at once, which is the refused-fast
+            // case again.
+            let mut accepted = Vec::new();
+            while Instant::now() < until {
+                match listener.accept() {
+                    Ok((sock, _)) => accepted.push(sock),
+                    Err(_) => std::thread::sleep(Duration::from_millis(10)),
+                }
+            }
+        });
+        (format!("http://127.0.0.1:{port}/v1"), handle)
+    }
+
+    /// The `select!` arm must not be held for the budget. An announcement
+    /// that *is* being reworded returns from `speak` immediately, so the
+    /// `MessageStream` keeps being polled and `ticker.tick()` keeps firing.
+    ///
+    /// Without the `reword` feature `context` returns `None` (there is no
+    /// client to build), so this takes the non-detached path and still
+    /// passes -- which is itself the point in that build: the announcement
+    /// never goes near the provider and costs nothing. `--features reword`
+    /// is the configuration where it can actually fail.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn speak_returns_at_once_when_a_rewrite_is_in_flight() {
+        let (engine, _spoken) = engine_allowing("Signal");
+        let (base_url, provider) = silent_provider(Duration::from_millis(1500));
+        let mut cfg = rewording_on();
+        cfg.reword.base_url = base_url;
+        cfg.reword.timeout_ms = 800;
+
+        let text = "Alice: where do you want to go for dinner".to_string();
+        assert_eq!(
+            RewordPlan::admit(&text, &cfg, true).is_some(),
+            cfg!(feature = "reword"),
+            "the case under test is the detaching one; in a build with a client \
+             this announcement must be admitted, or the timing below proves nothing"
+        );
+
+        let logged = Arc::new(AtomicBool::new(false));
+        let started = Instant::now();
+        speak(&engine, text, &cfg, true, &logged).await;
+        let elapsed = started.elapsed();
+
+        provider.join().expect("the silent provider thread ends");
+        engine.shutdown();
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "speak held the select! arm for {elapsed:?} against a {} ms budget; the \
+             coalescing timer would drift by a budget per notification",
+            cfg.reword.timeout_ms
+        );
     }
 
     /// A bus policy that forbids monitoring is answered once and never

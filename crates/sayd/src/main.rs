@@ -838,6 +838,17 @@ async fn run_daemon() -> std::process::ExitCode {
         cfg,
     ));
     store.status().set(cfg_problem);
+    // §8: `enabled = true` in a build with no client in it is not an error
+    // -- everything is spoken as written, exactly as it was before this
+    // feature existed -- but it must not be silent, or a user who set the
+    // switch would have no way at all to discover why nothing changed.
+    #[cfg(not(feature = "reword"))]
+    if store.current().reword.enabled {
+        eprintln!(
+            "info: [reword] enabled = true, but this build has no rewording client \
+             (rebuild with --features reword); text will be spoken as written"
+        );
+    }
     // The settings window is built and destroyed on demand, so the model it
     // edits has to outlive every window: it lives behind `settings`'s own
     // `OnceLock` from here on.
