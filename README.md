@@ -267,7 +267,9 @@ itself, two suggestion groups offer names to add with one click:
   application itself sent. A row here is exactly right: it is the name the
   application really passed on this machine, not a guess, so adding it is
   certain to match. It appears only after that application has notified at
-  least once -- there is nothing to show before that.
+  least once -- there is nothing to show before that -- and it appears while
+  the window is open, so triggering a notification from the application you
+  are looking for is a way to find its name on the spot.
 - **Common applications** -- a short built-in list, offered so there is
   something to click before anything has notified. Unlike a seen entry,
   each one is `sayd`'s guess at what the application calls itself as
@@ -279,12 +281,22 @@ itself, two suggestion groups offer names to add with one click:
 Either group disappears when it has nothing to offer -- all curated names
 already allowed, say, or nothing seen yet.
 
-The icons in both groups come from the notification itself (`app_icon`),
-never from a lookup `sayd` does on its own: what you see is what the
-application supplied. On a sparse icon theme, many rows -- especially in
-Common applications, where nothing has actually run yet to confirm the icon
-name is even installed -- fall back to a generic placeholder instead; that
-just means the theme has nothing by that name, not that anything is wrong.
+A **Seen notifying** row's icon comes from the notification itself, never
+from a lookup `sayd` does on its own: what you see is what the application
+supplied. Applications supply it in three different places, and `sayd` tries
+them in the order most likely to resolve -- the `desktop-entry` hint (an
+app-id, which is what every GTK/GNOME application sends), then the
+`image-path` hint (what `notify-send -i` sends), then the `app_icon`
+argument. **Common applications** rows are not from a notification at all;
+their icon is a name `sayd` ships for the row, since nothing has run yet to
+supply one.
+
+A row shows a generic placeholder glyph when none of that produced an image:
+the application sent no icon in any of the three places (`notify-send` sends
+none at all, so its own row is always a placeholder), or your icon theme has
+nothing by the name it did send, or the file it pointed at is gone. It never
+means the row is broken -- adding the application works exactly the same
+either way.
 
 **Without the window**, or for anything Common applications missed, `sayd`
 also logs the `app_name` of every notification it declines to speak, once
@@ -628,14 +640,16 @@ Walk this yourself once, after installing, with `notify-send` available
 7. Turn **Speak notifications** off again and run
    `notify-send -a "Test App" "hello"` once more -- the popup still
    appears, but `sayd` stays silent.
-8. Send one notification from an application that is *not* on the
-   allowlist yet -- `notify-send -a "Another App" "hi"` works, or use
-   whatever step 3 declined. Open **Settings…** -- **Another App** should
-   now appear as a row under **Seen notifying**, with the icon that
-   `notify-send` call carried (or the fallback glyph, if your icon theme
-   has nothing by that name -- see [Notifications](#notifications) above).
-   Click its **Add** button -- the row should move out of Seen notifying
-   and appear as a new row under **Applications to announce** instead.
+8. Open **Settings…**, leave it open, and send one notification from an
+   application that is *not* on the allowlist yet --
+   `notify-send -a "Another App" -i dialog-information "hi"` works, or use
+   whatever step 3 declined. Within a second or so, **Another App** should
+   appear in the open window as a row under **Seen notifying**, carrying
+   the `dialog-information` icon that call supplied (or the placeholder
+   glyph, if you sent no `-i` or your theme has nothing by that name -- see
+   [Notifications](#notifications) above). Click its **Add** button -- the
+   row should move out of Seen notifying and appear as a new row under
+   **Applications to announce** instead.
 
 ## Troubleshooting
 

@@ -45,6 +45,7 @@ use zbus::{MatchRule, MessageStream};
 use super::decode::{decode, Decoded};
 use super::policy::{Decision, Limiter};
 use super::seen;
+use super::{truncate_chars, MAX_APP_NAME_LEN};
 
 /// The interface a notification `Notify` call names, per the freedesktop
 /// notification specification.
@@ -125,13 +126,6 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// the right response is the one §4 already gives a chatty *allowed*
 /// application -- say it once and stop.
 const MAX_ANNOUNCED: usize = 256;
-
-/// Longest `app_name` prefix the discovery log will remember or print.
-///
-/// Bounds the cost of one entry, not just the count of them: a name a
-/// kilobyte long costs as much to hash, store and print as a short one
-/// otherwise, and the freedesktop spec places no length limit on it.
-const MAX_APP_NAME_LEN: usize = 256;
 
 /// Why [`run`] stopped.
 ///
@@ -320,7 +314,7 @@ async fn run_on(engine: EngineHandle, address: Option<String>) -> Outcome {
                                     // malformed body (handled in the arm
                                     // above) records nothing -- there is no
                                     // `app_icon` to record from one.
-                                    seen::record(&n.app_name, &n.app_icon);
+                                    seen::record(&n);
                                     match limiter.decide(&n, &cfg.notifications, Instant::now()) {
                                         Decision::Speak(text) => {
                                             speak(&engine, text, cfg.max_chars, &mut submit_failure_logged).await;
@@ -652,18 +646,6 @@ async fn speak(engine: &EngineHandle, text: String, max_chars: usize, failure_lo
 struct Announced {
     names: HashSet<String>,
     cap_logged: bool,
-}
-
-/// Truncate `s` to at most `max_chars` characters, on a `char` boundary.
-///
-/// Plain byte slicing can land inside a multi-byte UTF-8 sequence and panic;
-/// `app_name` is attacker-controlled text off the bus (`decode`'s doc
-/// comment), so this has to be correct for arbitrary input, not just ASCII.
-fn truncate_chars(s: &str, max_chars: usize) -> &str {
-    match s.char_indices().nth(max_chars) {
-        Some((byte_idx, _)) => &s[..byte_idx],
-        None => s,
-    }
 }
 
 /// §4's discovery log: every application whose notifications are declined for
@@ -1151,6 +1133,47 @@ mod tests {
             .expect("an id");
     }
 
+    /// `Notify` from `app_name`, shaped exactly as a GLib `GNotification`
+    /// puts it on the wire: no `app_icon`, an app-id in `desktop-entry` and
+    /// an icon name in `image-path`. Measured from a real `GApplication`
+    /// against a stub notification server on a private `dbus-daemon`.
+    async fn call_notify_as_gnotification(app: &zbus::Connection, app_name: &str) {
+        let hints = HashMap::from([
+            (
+                "desktop-entry".to_string(),
+                zbus::zvariant::Value::from("org.gnome.Fractal"),
+            ),
+            (
+                "image-path".to_string(),
+                zbus::zvariant::Value::from("mail-unread"),
+            ),
+            ("urgency".to_string(), zbus::zvariant::Value::from(1u8)),
+        ]);
+        let args = (
+            app_name,
+            0u32,
+            "",
+            "Alice sent a message",
+            "",
+            Vec::<String>::new(),
+            hints,
+            5000i32,
+        );
+        let _: u32 = app
+            .call_method(
+                Some("org.freedesktop.Notifications"),
+                "/org/freedesktop/Notifications",
+                Some("org.freedesktop.Notifications"),
+                "Notify",
+                &args,
+            )
+            .await
+            .expect("the stub daemon answers")
+            .body()
+            .deserialize()
+            .expect("an id");
+    }
+
     /// A stub notification daemon *and* an application connection on a fresh
     /// `TestBus`, the pair every bus-backed test in this file needs before it
     /// can do anything else. `None` when `dbus-daemon` is not on `PATH`.
@@ -1213,6 +1236,58 @@ mod tests {
         assert!(
             arrived,
             "a Notify call on the bus never reached the engine as 'Signal: hello'"
+        );
+    }
+
+    /// CRITICAL 1, end to end on a real bus: the icon a real sender
+    /// actually supplies arrives in the `desktop-entry` and `image-path`
+    /// hints, not in `app_icon`, and it has to survive `decode` and reach
+    /// the registry the settings window suggests from. Measured against a
+    /// stub notification server, a GLib `GNotification` sends exactly the
+    /// shape below -- an empty `app_icon`, its app-id and its icon in the
+    /// two hints -- and every "Seen notifying" row rendered the fallback
+    /// glyph while `decode` was dropping the hints map on the floor.
+    ///
+    /// A name nothing else in this binary records, because the registry is
+    /// process-global; see `seen`'s own tests for that hazard.
+    #[tokio::test]
+    async fn the_icon_hints_a_real_sender_uses_reach_the_seen_registry() {
+        let Some((bus, _daemon, app)) = stub_daemon_and_app().await else {
+            eprintln!("skipping: dbus-daemon not on PATH");
+            return;
+        };
+
+        let (engine, _spoken) = engine_allowing("Signal");
+        let monitor = tokio::spawn(run_on(engine.clone(), Some(bus.address.clone())));
+
+        // Retried for the reason every bus test here retries: `run_on`
+        // becomes a monitor asynchronously, so a call sent immediately can
+        // legitimately predate the match rule.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut recorded = None;
+        while Instant::now() < deadline {
+            call_notify_as_gnotification(&app, "mon-icon-hints").await;
+            recorded = seen::snapshot()
+                .into_iter()
+                .find(|a| a.app_name == "mon-icon-hints");
+            if recorded.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        monitor.abort();
+        engine.shutdown();
+
+        let recorded = recorded.expect("a Notify call on the bus never reached the seen registry");
+        assert_eq!(
+            recorded.desktop_entry, "org.gnome.Fractal",
+            "the app-id a GNotification sends must survive to the suggestion list"
+        );
+        assert_eq!(recorded.image_path, "mail-unread");
+        assert_eq!(
+            recorded.app_icon, "",
+            "and app_icon is empty, which is why it cannot be the only field read"
         );
     }
 

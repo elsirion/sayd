@@ -4,20 +4,51 @@ use std::collections::HashMap;
 
 use zbus::zvariant::OwnedValue;
 
-/// The four fields of a notification `sayd` has any use for.
+/// The fields of a notification `sayd` has any use for.
 ///
-/// The other four in the `Notify` signature -- a replaces-id, actions to
-/// offer, hints, a timeout to honour -- are for a notification *daemon*, and
-/// `sayd` is not one: it draws nothing and answers nothing. `app_icon` looks
-/// like it belongs in that discarded pile too, and until now it was, but it
-/// is kept for a reason that has nothing to do with drawing anything here --
-/// `notify::seen::record` remembers it against `app_name` so the settings
-/// window can suggest an application to allowlist next to the icon it
-/// actually notifies with, instead of a generic placeholder. `summary` and
-/// `body` remain the two fields that get spoken.
+/// The rest of the `Notify` signature -- a replaces-id, actions to offer, a
+/// timeout to honour -- is for a notification *daemon*, and `sayd` is not
+/// one: it draws nothing and answers nothing. `summary` and `body` remain
+/// the two fields that get spoken; the other three are kept for a reason
+/// that has nothing to do with speaking anything -- `notify::seen::record`
+/// remembers them against `app_name` so the settings window can suggest an
+/// application to allowlist next to the icon it actually notifies with,
+/// instead of a generic placeholder.
+///
+/// Three icon fields rather than one, because `app_icon` alone is almost
+/// never the icon. Measured against a real notification server (a private
+/// `dbus-daemon` with a stub owning `org.freedesktop.Notifications`):
+///
+/// - `notify-send -a X "hi"` sends `app_icon = ""`.
+/// - `notify-send -a X -i dialog-information "hi"` sends `app_icon = ""`
+///   and puts `dialog-information` in the **`image-path`** hint.
+/// - A GLib `GNotification` -- which is every GTK4/GNOME application, and
+///   what Firefox and the Electron applications end up going through --
+///   sends `app_icon = ""`, the application's own app-id in the
+///   **`desktop-entry`** hint, and its icon in `image-path`.
+///
+/// Only `notify-send -n/--app-icon` (rare) and some Qt applications fill
+/// `app_icon` at all, so a window drawn from `app_icon` alone shows the
+/// fallback glyph for essentially every real sender. `desktop-entry` comes
+/// first of the three because it is an app-id that can be handed straight to
+/// an icon theme, and it is the one an application is least likely to have
+/// pointed at a temporary file it then deletes.
+///
+/// What is *not* kept is as deliberate: the `hints` map goes no further than
+/// this function, because `image-data` is a raw pixel buffer -- a whole
+/// decoded image per notification -- and retaining a map to reach two
+/// strings in it would retain that too.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Notification {
     pub app_name: String,
+    /// The `desktop-entry` hint: an application id (`org.gnome.Fractal`),
+    /// resolvable through the icon theme. Empty when the sender sent none.
+    pub desktop_entry: String,
+    /// The `image-path` hint: an icon *name* or a path, either shape (see
+    /// `settings::model::icon_source`). Empty when the sender sent none.
+    pub image_path: String,
+    /// The `app_icon` argument, the field the spec nominally puts this in
+    /// and the field almost nothing fills. Empty when the sender sent none.
     pub app_icon: String,
     pub summary: String,
     pub body: String,
@@ -81,17 +112,39 @@ pub fn decode(msg: &zbus::Message) -> Decoded {
         return Decoded::Skip;
     }
     let body = msg.body();
-    let Ok((app_name, _replaces_id, app_icon, summary, text, _actions, _hints, _timeout)) =
+    let Ok((app_name, _replaces_id, app_icon, summary, text, _actions, hints, _timeout)) =
         body.deserialize::<NotifyArgs>()
     else {
         return Decoded::Malformed;
     };
     Decoded::Notification(Notification {
         app_name,
+        desktop_entry: hint_str(&hints, "desktop-entry"),
+        image_path: hint_str(&hints, "image-path"),
         app_icon,
         summary,
         body: text,
     })
+}
+
+/// One hint, if it is present *and* a string.
+///
+/// Anything else -- a hint of the wrong type, or one absent entirely -- is
+/// the empty string rather than an error: hints are optional by
+/// construction, every sender sends a different subset of them, and a
+/// notification whose `desktop-entry` arrived as an integer is still a
+/// notification worth speaking. The two this asks for (`desktop-entry`,
+/// `image-path`) are both `s` per the freedesktop specification.
+///
+/// The borrowed `&str` is copied out here rather than returned: the value it
+/// points into belongs to the `hints` map, which this function is the last
+/// place to hold (see [`Notification`]'s doc comment on `image-data`).
+fn hint_str(hints: &HashMap<String, OwnedValue>, key: &str) -> String {
+    hints
+        .get(key)
+        .and_then(|v| v.downcast_ref::<&str>().ok())
+        .unwrap_or_default()
+        .to_string()
 }
 
 #[cfg(test)]
@@ -101,6 +154,16 @@ mod tests {
     use zbus::zvariant::Value;
 
     fn notify_message(app: &str, icon: &str, summary: &str, body: &str) -> zbus::Message {
+        notify_message_with_hints(app, icon, summary, body, HashMap::new())
+    }
+
+    fn notify_message_with_hints(
+        app: &str,
+        icon: &str,
+        summary: &str,
+        body: &str,
+        hints: HashMap<String, Value<'_>>,
+    ) -> zbus::Message {
         zbus::Message::method_call("/org/freedesktop/Notifications", "Notify")
             .expect("builder")
             .interface("org.freedesktop.Notifications")
@@ -112,14 +175,14 @@ mod tests {
                 summary,
                 body,
                 Vec::<String>::new(),
-                HashMap::<String, Value>::new(),
+                hints,
                 5000i32,
             ))
             .expect("message")
     }
 
     #[test]
-    fn a_notify_call_decodes_to_its_four_useful_fields() {
+    fn a_notify_call_decodes_to_its_useful_fields() {
         let m = notify_message(
             "Signal",
             "signal-desktop",
@@ -133,6 +196,48 @@ mod tests {
         assert_eq!(n.app_icon, "signal-desktop");
         assert_eq!(n.summary, "Alice sent a message");
         assert_eq!(n.body, "see you at five");
+    }
+
+    /// CRITICAL 1: the shape a GLib `GNotification` actually puts on the
+    /// bus -- an empty `app_icon`, the application's app-id in
+    /// `desktop-entry` and its icon in `image-path`. Measured against a
+    /// stub notification server on a private `dbus-daemon`; see
+    /// [`Notification`]'s doc comment for the other senders measured the
+    /// same way. Decoding only `app_icon` from this leaves the settings
+    /// window nothing to draw but the fallback glyph, which is what every
+    /// row rendered before this.
+    #[test]
+    fn the_icon_hints_a_real_sender_uses_are_decoded() {
+        let hints = HashMap::from([
+            (
+                "desktop-entry".to_string(),
+                Value::from("org.gnome.Fractal"),
+            ),
+            ("image-path".to_string(), Value::from("mail-unread")),
+            ("urgency".to_string(), Value::from(1u8)),
+        ]);
+        let m = notify_message_with_hints("gnotif", "", "Alice", "hi", hints);
+        let Decoded::Notification(n) = decode(&m) else {
+            panic!("expected a decoded notification");
+        };
+        assert_eq!(n.desktop_entry, "org.gnome.Fractal");
+        assert_eq!(n.image_path, "mail-unread");
+        assert_eq!(n.app_icon, "");
+    }
+
+    /// A hint that is absent, or present with a type the spec does not give
+    /// it, is no icon rather than a decode failure: hints are optional and
+    /// every sender sends a different subset, so a notification carrying an
+    /// odd one is still a notification worth speaking.
+    #[test]
+    fn a_missing_or_mistyped_hint_is_empty_not_a_failure() {
+        let hints = HashMap::from([("desktop-entry".to_string(), Value::from(7u32))]);
+        let m = notify_message_with_hints("odd", "", "Alice", "hi", hints);
+        let Decoded::Notification(n) = decode(&m) else {
+            panic!("a mistyped hint must not make the message malformed");
+        };
+        assert_eq!(n.desktop_entry, "");
+        assert_eq!(n.image_path, "");
     }
 
     /// A monitor connection receives its own bus traffic -- the first message

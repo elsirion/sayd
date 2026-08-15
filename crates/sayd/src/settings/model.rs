@@ -15,7 +15,8 @@ use std::time::Duration;
 use sayd_core::config::Config;
 
 use crate::config_watch::ConfigStore;
-use crate::notify::seen;
+use crate::notify::seen::{self, SeenApp};
+use crate::notify::{truncate_chars, MAX_APP_NAME_LEN};
 
 /// The model values, with the measured trade-off shown inline in the
 /// window. Numbers are from the benchmark recorded in the design doc; do
@@ -327,9 +328,9 @@ impl SettingsModel {
                 continue;
             }
             out.push(Suggestion {
-                icon: icon_source(&app.app_icon),
+                icons: icon_candidates(&app),
                 app_name: app.app_name,
-                seen: true,
+                kind: SuggestionKind::Seen,
             });
         }
 
@@ -342,8 +343,12 @@ impl SettingsModel {
             }
             out.push(Suggestion {
                 app_name: (*name).to_string(),
-                icon: icon_source(icon),
-                seen: false,
+                icons: {
+                    let mut icons = Vec::new();
+                    push_candidate(&mut icons, icon);
+                    icons
+                },
+                kind: SuggestionKind::Curated,
             });
         }
 
@@ -874,7 +879,16 @@ pub fn allow_contains(cfg: &Config, name: &str) -> bool {
 /// back the list I drew" would silently revert an entry added by a hand edit
 /// (or removed by one) since the window last redrew.
 pub fn allow_add(cfg: &mut Config, name: &str) {
-    let name = name.trim();
+    // Bounded here because this is where an entry is *added*, and nothing
+    // downstream bounds it: `sayd-core`'s `Config` takes whatever string it
+    // is handed, so an `app_name` off the bus -- which is where a suggestion
+    // row's name comes from, and which the sender chooses -- could be
+    // written into `config.toml` a megabyte long and read back every time
+    // the file is parsed. `MAX_APP_NAME_LEN` and not a number of its own:
+    // the discovery log and the seen registry already truncate at that
+    // length, so a suggestion row shows a bounded name and adding it stores
+    // exactly the name that was shown.
+    let name = truncate_chars(name.trim(), MAX_APP_NAME_LEN);
     if name.is_empty() || allow_contains(cfg, name) {
         return;
     }
@@ -956,7 +970,17 @@ pub fn icon_source(app_icon: &str) -> IconSource {
         return IconSource::None;
     }
     if let Some(rest) = trimmed.strip_prefix("file://") {
-        let path = rest.strip_prefix("localhost").unwrap_or(rest);
+        // `"localhost/"` and not `"localhost"` (Minor): the authority ends
+        // at the slash that begins the path, so stripping the bare word
+        // also matched `file://localhostile/x` -- a URI naming the host
+        // `localhostile` -- and handed back `/x`, a path on this machine
+        // that the sender never named. Matching the slash as part of the
+        // prefix and keeping it is what makes the result an absolute path
+        // rather than a relative one.
+        let path = match rest.strip_prefix("localhost") {
+            Some(after_host) if after_host.starts_with('/') => after_host,
+            _ => rest,
+        };
         return IconSource::File(PathBuf::from(path));
     }
     if trimmed.contains('/') {
@@ -965,20 +989,102 @@ pub fn icon_source(app_icon: &str) -> IconSource {
     IconSource::Named(trimmed.to_string())
 }
 
+/// Every icon string a seen application has given us, classified, best
+/// first, with the ones that name nothing dropped.
+///
+/// CRITICAL 1: `app_icon` alone is empty for essentially every real sender
+/// -- see `notify::decode::Notification`, which records what was measured
+/// against a real bus -- so a window drawn from it showed the fallback glyph
+/// for every row, forever. The order is what a sender is most likely to have
+/// filled with something that resolves:
+///
+/// 1. `desktop-entry`, an application id (`org.gnome.Fractal`) that icon
+///    themes are indexed by, sent by every GLib `GNotification`. It names
+///    the *application*, which is exactly what a suggestion row is about,
+///    and it cannot be a temporary file the sender has already deleted.
+/// 2. `image-path`, which is what `notify-send -i` and `GNotification`'s
+///    own icon end up in. Either shape -- it carries a bare theme name as
+///    often as a path, which is why it goes through `icon_source` like
+///    everything else here rather than being assumed to be a file.
+/// 3. `app_icon`, the argument the specification nominally puts this in.
+///    Last because the applications that do fill it are, measurably, the
+///    ones most likely to have filled it with a generic dialog glyph or a
+///    temporary file they then delete.
+///
+/// A list rather than one winner, because "does this resolve?" is not a
+/// question this layer can answer: whether the theme has a name and whether
+/// a path is still there both need the display and the filesystem, which is
+/// `window.rs`'s half of the job. This decides what to try and in what
+/// order; the window takes the first that draws.
+pub fn icon_candidates(app: &SeenApp) -> Vec<IconSource> {
+    let mut out = Vec::new();
+    for candidate in [&app.desktop_entry, &app.image_path, &app.app_icon] {
+        push_candidate(&mut out, candidate);
+    }
+    out
+}
+
+/// Classify one icon string onto the end of `out`, skipping what names
+/// nothing and what is already there.
+///
+/// A theme *name* is pushed twice: as sent, and then with `-symbolic`
+/// appended. That is not speculative -- measured against Adwaita 50, the
+/// theme has `mail-unread-symbolic` and `dialog-information-symbolic` but
+/// neither `mail-unread` nor `dialog-information`, and those are exactly the
+/// strings a GLib `GNotification` and a `notify-send -i` put in `image-path`.
+/// Without the second form, a sender that named a perfectly ordinary
+/// freedesktop icon still gets the fallback glyph on a stock GNOME desktop,
+/// which is most of what CRITICAL 1 was about. Second and not first, because
+/// where a theme has both, the application's own full-colour icon is the one
+/// worth showing.
+fn push_candidate(out: &mut Vec<IconSource>, raw: &str) {
+    let source = icon_source(raw);
+    if let IconSource::Named(name) = &source {
+        let symbolic = IconSource::Named(format!("{name}-symbolic"));
+        if !out.contains(&source) {
+            out.push(source.clone());
+        }
+        if !name.ends_with("-symbolic") && !out.contains(&symbolic) {
+            out.push(symbolic);
+        }
+        return;
+    }
+    if source != IconSource::None && !out.contains(&source) {
+        out.push(source);
+    }
+}
+
+/// Which of `suggestions()`'s two sources a [`Suggestion`] came from.
+///
+/// A two-variant enum rather than the bare `bool` this was, because both
+/// this type and the window's group table read as a question with no
+/// question mark otherwise -- `s.seen == kind`, and a `[(bool, &str, &str)]`
+/// whose first column has to be looked up to be understood.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuggestionKind {
+    /// An application `sayd` has actually watched notify this run (see
+    /// `notify::seen`).
+    Seen,
+    /// One drawn from [`CURATED`].
+    Curated,
+}
+
 /// One row the notification allowlist editor's "add an application" picker
 /// could offer.
 ///
-/// `seen` is which of `suggestions()`'s two sources this came from: `true`
-/// for an application `sayd` has actually watched notify this run (see
-/// `notify::seen`), `false` for one drawn from [`CURATED`]. The window uses
-/// it to label the two differently rather than the model picking a
-/// rendering, which would put a rule back in the one layer meant to hold
-/// none.
+/// The window uses `kind` to label the two sources differently rather than
+/// the model picking a rendering, which would put a rule back in the one
+/// layer meant to hold none.
+///
+/// `icons` is every icon string this suggestion could be drawn from, best
+/// first -- see [`icon_candidates`] for why there is more than one and what
+/// decides the order. It can be empty: not every application sends an icon
+/// in any of the three fields, and `notify-send` sends none in any of them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Suggestion {
     pub app_name: String,
-    pub icon: IconSource,
-    pub seen: bool,
+    pub icons: Vec<IconSource>,
+    pub kind: SuggestionKind,
 }
 
 /// A short, hand-checked list of applications worth suggesting even when
@@ -986,22 +1092,37 @@ pub struct Suggestion {
 /// `notify::seen` has actually observed (see `SettingsModel::suggestions`),
 /// never in place of it.
 ///
-/// Each pair is `(app_name, icon name)` exactly as the *application* itself
-/// passes them to `Notify`, not a marketing name: matching against the
-/// allowlist is literal and case-insensitive (`allow_contains`'s rule), so a
-/// plausible-looking guess that is not what the application actually sends
-/// would silently never match anything -- worse than not suggesting the
-/// application at all, because it looks like it worked. Checked against
-/// upstream `.desktop` files, the packaging that ships them, and -- where
-/// the application is open source -- the code that actually calls
-/// `Notify`/`notify_init`, rather than trusted as given; Task 2's report
-/// says what was verified against what and where a name is a reasoned guess
-/// instead.
+/// Each `app_name` is exactly what the *application* itself passes to
+/// `Notify`, not a marketing name: matching against the allowlist is literal
+/// and case-insensitive (`allow_contains`'s rule), so a plausible-looking
+/// guess that is not what the application actually sends would silently
+/// never match anything -- worse than not suggesting the application at all,
+/// because it looks like it worked. Checked against upstream `.desktop`
+/// files, the packaging that ships them, and -- where the application is
+/// open source -- the code that actually calls `Notify`/`notify_init`,
+/// rather than trusted as given; Task 2's report says what was verified
+/// against what and where a name is a reasoned guess instead.
+///
+/// The second column is a *theme icon name to draw the row with*, and that
+/// is a weaker claim than the first column makes. It deliberately no longer
+/// claims to be what the application passes as `app_icon`: measured against
+/// a real bus, almost nothing passes `app_icon` at all (see
+/// `notify::decode::Notification`). An empty second column means "this
+/// application has no icon worth guessing", and the row falls back to the
+/// generic glyph -- which is honest, where naming an icon that does not
+/// exist is not.
 ///
 /// `notify-send` is here deliberately: it is what a user reaches for to
-/// test the feature, and it is the one entry guaranteed correct, because
-/// `notify-send` really does pass its own program name (`g_get_prgname()`,
-/// i.e. `"notify-send"`) as `app_name` whenever `-a` is not given.
+/// test the feature, and it is the one entry whose *name* is guaranteed
+/// correct, because `notify-send` really does pass its own program name
+/// (`g_get_prgname()`, i.e. `"notify-send"`) as `app_name` whenever `-a` is
+/// not given -- measured again here against a stub notification server. Its
+/// icon column is empty for the same measurement's other half: it passes no
+/// `app_icon`, so it has no icon of its own to show, and the
+/// `utilities-terminal` this used to name was fiction twice over -- nothing
+/// sends it, and Adwaita has not shipped an icon by that name in years
+/// (checked against Adwaita 50, where the fallback
+/// `application-x-executable-symbolic` does resolve).
 pub const CURATED: &[(&str, &str)] = &[
     ("Signal", "signal-desktop"),
     ("Element", "element"),
@@ -1028,7 +1149,7 @@ pub const CURATED: &[(&str, &str)] = &[
     ("Nextcloud", "Nextcloud"),
     ("KeePassXC", "keepassxc"),
     ("Spotify", "spotify-client"),
-    ("notify-send", "utilities-terminal"),
+    ("notify-send", ""),
 ];
 
 /// Voice-pack names from `<models_dir>/voices/*.bin`, sorted.
@@ -1878,17 +1999,37 @@ mod tests {
         cfg.notifications.enabled = true;
         allow_add(&mut cfg, "  Signal  ");
 
-        let notification = Notification {
-            app_name: "signal".into(),
+        let notification = |app_name: &str| Notification {
+            app_name: app_name.into(),
+            desktop_entry: String::new(),
+            image_path: String::new(),
             app_icon: String::new(),
             summary: "Ada: dinner?".into(),
             body: String::new(),
         };
         let mut limiter = Limiter::new();
         assert_ne!(
-            limiter.decide(&notification, &cfg.notifications, std::time::Instant::now()),
+            limiter.decide(
+                &notification("signal"),
+                &cfg.notifications,
+                std::time::Instant::now()
+            ),
             Decision::NotAllowed,
             "a name the window added must be one the daemon speaks for"
+        );
+        // IMPORTANT 4: including the padded spelling the *bus* accepts, not
+        // only the tidy one. `allow_contains` said "Signal " was already
+        // allowed and `allow_add` stored "Signal"; if `is_allowed` did not
+        // trim, the user's click removed the suggestion row and bought
+        // nothing.
+        assert_ne!(
+            limiter.decide(
+                &notification("Signal "),
+                &cfg.notifications,
+                std::time::Instant::now()
+            ),
+            Decision::NotAllowed,
+            "the name the bus actually delivers must match the entry that was added for it"
         );
 
         // And so the other casing is a duplicate rather than a second entry
@@ -1955,6 +2096,19 @@ mod tests {
         assert!(joined.contains("q8") && joined.contains("1.40"));
     }
 
+    /// A sighting of `app_name` carrying `app_icon` and no hints, for the
+    /// tests here that only care that *some* icon survived.
+    fn notified(app_name: &str, app_icon: &str) -> crate::notify::Notification {
+        crate::notify::Notification {
+            app_name: app_name.to_string(),
+            desktop_entry: String::new(),
+            image_path: String::new(),
+            app_icon: app_icon.to_string(),
+            summary: "s".into(),
+            body: "b".into(),
+        }
+    }
+
     /// The three shapes `app_icon` can actually arrive in, per the
     /// notification spec: a freedesktop icon name, an absolute path, or a
     /// `file://` URI wrapping one -- plus nothing at all, which is not a
@@ -2002,7 +2156,7 @@ mod tests {
         let (store, engine) = store_in(dir.path());
         let m = SettingsModel::new(store, models, Config::default());
 
-        seen::record("sug1-JustNotified", "sug1-icon");
+        seen::record(&notified("sug1-JustNotified", "sug1-icon"));
 
         let suggestions = m.suggestions();
         let seen_pos = suggestions
@@ -2018,8 +2172,8 @@ mod tests {
             seen_pos < curated_pos,
             "a seen app must be listed before curated entries: seen at {seen_pos}, curated at {curated_pos}"
         );
-        assert!(suggestions[seen_pos].seen);
-        assert!(!suggestions[curated_pos].seen);
+        assert_eq!(suggestions[seen_pos].kind, SuggestionKind::Seen);
+        assert_eq!(suggestions[curated_pos].kind, SuggestionKind::Curated);
         engine.shutdown();
     }
 
@@ -2037,7 +2191,7 @@ mod tests {
         let (store, engine) = store_in(dir.path());
         let m = SettingsModel::new(store, models, Config::default());
 
-        seen::record("sug2-Already", "sug2-icon");
+        seen::record(&notified("sug2-Already", "sug2-icon"));
         m.edit(|c| {
             c.notifications.allow = vec!["SUG2-ALREADY".into(), "signal".into()];
         })
@@ -2078,7 +2232,7 @@ mod tests {
         let (store, engine) = store_in(dir.path());
         let m = SettingsModel::new(store, models, Config::default());
 
-        seen::record("nextcloud", "sug3-custom-icon");
+        seen::record(&notified("nextcloud", "sug3-custom-icon"));
 
         let suggestions = m.suggestions();
         let matches: Vec<&Suggestion> = suggestions
@@ -2091,8 +2245,9 @@ mod tests {
             1,
             "must appear once, not once per source: {matches:?}"
         );
-        assert!(
-            matches[0].seen,
+        assert_eq!(
+            matches[0].kind,
+            SuggestionKind::Seen,
             "the seen entry must win, not the curated one"
         );
         assert_eq!(
@@ -2100,11 +2255,149 @@ mod tests {
             "and keep its own spelling"
         );
         assert_eq!(
-            matches[0].icon,
-            IconSource::Named("sug3-custom-icon".into()),
+            matches[0].icons,
+            vec![
+                IconSource::Named("sug3-custom-icon".into()),
+                IconSource::Named("sug3-custom-icon-symbolic".into()),
+            ],
             "must keep the icon the application actually sent, not CURATED's guess"
         );
         engine.shutdown();
+    }
+
+    /// A `file://` URI's authority ends at the slash that starts the path
+    /// (Minor). Stripping the bare word `localhost` also matched a URI
+    /// naming the host `localhostile`, and handed back a path on *this*
+    /// machine that the sender never named.
+    #[test]
+    fn only_a_real_localhost_authority_is_stripped_from_a_file_uri() {
+        assert_eq!(
+            icon_source("file://localhost/usr/share/icons/x.png"),
+            IconSource::File("/usr/share/icons/x.png".into()),
+            "a localhost authority is stripped, and the path stays absolute"
+        );
+        assert_eq!(
+            icon_source("file://localhostile/x.png"),
+            IconSource::File("localhostile/x.png".into()),
+            "some other host is not localhost and must not become /x.png"
+        );
+    }
+
+    /// CRITICAL 1: the icon a real sender actually supplies is in the
+    /// `desktop-entry` or `image-path` hint, and `app_icon` -- the field
+    /// this used to draw from alone -- is empty for essentially every one
+    /// of them. Measured against a stub notification server on a private
+    /// bus: a GLib `GNotification` from an application whose app-id is
+    /// `org.gnome.Fractal` sends `app_icon = ""`, `desktop-entry =
+    /// "org.gnome.Fractal"` and `image-path = "mail-unread"`.
+    #[test]
+    fn a_gnotification_style_sender_resolves_to_its_desktop_entry() {
+        let app = SeenApp {
+            app_name: "gnotif".into(),
+            desktop_entry: "org.gnome.Fractal".into(),
+            image_path: "mail-unread".into(),
+            app_icon: String::new(),
+        };
+        assert_eq!(
+            icon_candidates(&app),
+            vec![
+                IconSource::Named("org.gnome.Fractal".into()),
+                IconSource::Named("org.gnome.Fractal-symbolic".into()),
+                IconSource::Named("mail-unread".into()),
+                IconSource::Named("mail-unread-symbolic".into()),
+            ],
+            "the app-id must be tried first, then the image the sender named -- \
+             each in the two forms a theme may have it under"
+        );
+    }
+
+    /// The whole order, and what falls out of it: `app_icon` is still used
+    /// when it is the only thing there (Qt applications, `notify-send -n`),
+    /// an empty field is not a candidate, and a sender that repeats itself
+    /// across two fields does not produce the same candidate twice.
+    #[test]
+    fn icon_candidates_are_ordered_deduplicated_and_never_empty_strings() {
+        let all = SeenApp {
+            app_name: "a".into(),
+            desktop_entry: "org.example.App".into(),
+            image_path: "/tmp/x.png".into(),
+            app_icon: "dialog-information".into(),
+        };
+        assert_eq!(
+            icon_candidates(&all),
+            vec![
+                IconSource::Named("org.example.App".into()),
+                IconSource::Named("org.example.App-symbolic".into()),
+                IconSource::File("/tmp/x.png".into()),
+                IconSource::Named("dialog-information".into()),
+                IconSource::Named("dialog-information-symbolic".into()),
+            ]
+        );
+
+        let only_app_icon = SeenApp {
+            app_name: "a".into(),
+            desktop_entry: String::new(),
+            image_path: "   ".into(),
+            app_icon: "keepassxc".into(),
+        };
+        assert_eq!(
+            icon_candidates(&only_app_icon),
+            vec![
+                IconSource::Named("keepassxc".into()),
+                IconSource::Named("keepassxc-symbolic".into()),
+            ],
+            "app_icon is still the last resort, and a blank field is not one"
+        );
+
+        let repeated = SeenApp {
+            app_name: "a".into(),
+            desktop_entry: "signal-desktop".into(),
+            image_path: "signal-desktop".into(),
+            app_icon: "signal-desktop".into(),
+        };
+        assert_eq!(
+            icon_candidates(&repeated),
+            vec![
+                IconSource::Named("signal-desktop".into()),
+                IconSource::Named("signal-desktop-symbolic".into()),
+            ],
+            "one name repeated across three fields is one name, not three"
+        );
+
+        let already_symbolic = SeenApp {
+            app_name: "a".into(),
+            desktop_entry: String::new(),
+            image_path: String::new(),
+            app_icon: "mail-unread-symbolic".into(),
+        };
+        assert_eq!(
+            icon_candidates(&already_symbolic),
+            vec![IconSource::Named("mail-unread-symbolic".into())],
+            "a name that is already symbolic does not get a second suffix"
+        );
+
+        let nothing = SeenApp {
+            app_name: "a".into(),
+            desktop_entry: String::new(),
+            image_path: String::new(),
+            app_icon: String::new(),
+        };
+        assert!(icon_candidates(&nothing).is_empty());
+    }
+
+    /// CRITICAL 2's other half: nothing bounded what the window could write
+    /// into `config.toml`. A suggestion row's name comes off the bus, where
+    /// the sender chooses it and no length limit applies, so Add could put
+    /// a megabyte of it in the config file to be parsed on every load.
+    #[test]
+    fn an_added_name_is_length_bounded() {
+        let mut cfg = Config::default();
+        allow_add(&mut cfg, &"a".repeat(1_000_000));
+        assert_eq!(
+            cfg.notifications.allow[0].chars().count(),
+            MAX_APP_NAME_LEN,
+            "an entry must be bounded where it is added"
+        );
     }
 
     /// Every curated entry must be a plausible `app_name`, not a marketing
@@ -2114,8 +2407,11 @@ mod tests {
     fn the_curated_table_is_well_formed() {
         for (name, icon) in CURATED {
             assert!(!name.trim().is_empty());
-            assert!(!icon.trim().is_empty());
             assert_eq!(*name, name.trim());
+            // An empty icon column is allowed and means "no icon worth
+            // guessing" (see CURATED's doc comment); a *blank* one is a
+            // typo that would classify as `IconSource::None` by accident.
+            assert_eq!(*icon, icon.trim());
         }
         // No duplicates, case-insensitively.
         let mut seen: Vec<String> = CURATED.iter().map(|(n, _)| n.to_lowercase()).collect();

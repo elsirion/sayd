@@ -33,6 +33,7 @@
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
+use std::time::Duration;
 
 use adw::prelude::*;
 use gtk4 as gtk;
@@ -42,11 +43,12 @@ use sayd_core::handle::EngineHandle;
 use sayd_core::queue::{Policy, Source as QueueSource};
 
 use super::model::{
-    allow_add, allow_contains, allow_remove, IconSource, SettingsModel, COOLDOWN_MAX, COOLDOWN_MIN,
-    COOLDOWN_STEP, IDLE_UNLOAD_MAX, IDLE_UNLOAD_MIN, IDLE_UNLOAD_STEP, MAX_CHARS_MAX,
-    MAX_CHARS_MIN, MAX_CHARS_STEP, MODELS, SPEED_MAX, SPEED_MIN, SPEED_STEP, THREADS_MAX,
-    THREADS_MIN, THREADS_STEP,
+    allow_add, allow_contains, allow_remove, IconSource, SettingsModel, Suggestion, SuggestionKind,
+    COOLDOWN_MAX, COOLDOWN_MIN, COOLDOWN_STEP, IDLE_UNLOAD_MAX, IDLE_UNLOAD_MIN, IDLE_UNLOAD_STEP,
+    MAX_CHARS_MAX, MAX_CHARS_MIN, MAX_CHARS_STEP, MODELS, SPEED_MAX, SPEED_MIN, SPEED_STEP,
+    THREADS_MAX, THREADS_MIN, THREADS_STEP,
 };
+use crate::notify::seen;
 
 thread_local! {
     /// The live window, if one is open. Re-presenting an open window is what
@@ -164,14 +166,15 @@ const NOTIFICATION_SWITCHES: [(&str, &str, NotifyGet, NotifySet); 3] = [
 
 /// What a suggestion whose icon cannot be drawn shows instead.
 ///
-/// Three things land here: an application that sent no `app_icon` at all
-/// (`IconSource::None`), a curated or seen icon *name* the user's theme does
-/// not have, and a path that is not there any more. `gtk::Image` would draw
-/// the last two as its own broken-image glyph, which is the wrong thing to
-/// say: the row is not broken, the icon is simply unknown, and a generic
-/// application icon says exactly that. Checked against the theme rather than
-/// assumed -- see [`suggestion_icon`], which is also the only place in this
-/// file that can ask, since the answer depends on the display.
+/// What lands here is every row for which no candidate drew: an application
+/// that sent no icon in any of the three fields it could have (`notify-send`
+/// sends none), a curated or seen icon *name* the user's theme does not
+/// have, and a path that is not there any more. `gtk::Image` would draw some of
+/// those as its own broken-image glyph, which is the wrong thing to say: the
+/// row is not broken, the icon is simply unknown, and a generic application
+/// icon says exactly that. Checked against the theme rather than assumed --
+/// see [`suggestion_icon`], which is also the only place in this file that
+/// can ask, since the answer depends on the display.
 ///
 /// The *symbolic* variant, and that was worth looking at: the full-colour
 /// `application-x-executable` is a blue gem, and a list where nine of
@@ -193,6 +196,17 @@ const FALLBACK_ICON: &str = "application-x-executable-symbolic";
 /// It is also what libadwaita's own `AdwActionRow` list of applications uses.
 const SUGGESTION_ICON_PX: i32 = 32;
 
+/// How often an open window asks whether a new application has notified.
+///
+/// The same cadence `notify::monitor`'s own `DUE_INTERVAL` runs at, and for
+/// a comparable reason: it is the shortest interval at which "nothing is
+/// happening" costs nothing worth measuring -- one relaxed atomic load --
+/// and it is fast enough that a user who triggers a notification to see it
+/// appear does not conclude the feature is broken and close the window.
+/// What it does *not* do is redraw once a second; see
+/// [`Ui::redraw_suggestions_if_changed`].
+const SEEN_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
 /// The two suggestion groups, in the order the page shows them: what has
 /// actually notified, then the built-in guesses.
 ///
@@ -211,16 +225,16 @@ const SUGGESTION_ICON_PX: i32 = 32;
 /// per kind rather than for the pair: a user who has allowed every curated
 /// application still gets the seen group, and a fresh daemon that has watched
 /// nothing notify still gets the curated one.
-const SUGGESTION_GROUPS: [(bool, &str, &str); 2] = [
+const SUGGESTION_GROUPS: [(SuggestionKind, &str, &str); 2] = [
     (
-        true,
+        SuggestionKind::Seen,
         "Seen notifying",
         "Applications that have notified since sayd started, most recent first, \
          with the icon each one sent. These names are exactly what the application \
          passes, so adding one is certain to match it.",
     ),
     (
-        false,
+        SuggestionKind::Curated,
         "Common applications",
         "A short built-in list, offered before anything has notified. Each name is \
          sayd's best guess at what the application passes, not a name it has seen: \
@@ -364,6 +378,29 @@ struct UiState {
     /// [`WeakUi`]. They deliberately do not capture a [`Ui`] -- one is
     /// passed to them instead, for the reason spelled out on [`Redraws`].
     rows: Redraws,
+    /// The two suggestion groups' redraw closures, kept apart from `rows`.
+    ///
+    /// Separate because they are the only rows that can need redrawing
+    /// while the *config* has not changed at all: an application notifying
+    /// while the window sits open changes what they should show and nothing
+    /// else (IMPORTANT 7). [`Ui::redraw`] runs both lists; the seen-registry
+    /// poll in [`build`] runs only this one, so noticing a new application
+    /// cannot clobber the allowlist entry field the user is halfway through
+    /// typing into, or any other row.
+    suggestion_rows: Redraws,
+    /// What those closures draw: computed once per redraw rather than once
+    /// per group.
+    ///
+    /// IMPORTANT 6: each group used to call `SettingsModel::suggestions`
+    /// itself, so a `seen::record` landing between the two calls could show
+    /// an application in neither -- absent from the seen group (not yet
+    /// recorded when it ran) and deduplicated out of the curated one (seen
+    /// by the time *it* ran). One call, partitioned by the groups, cannot
+    /// disagree with itself.
+    suggestions: RefCell<Vec<Suggestion>>,
+    /// The `notify::seen` generation `suggestions` was computed from. See
+    /// [`Ui::refresh_suggestions`].
+    seen_generation: Cell<u64>,
 }
 
 /// So a `Ui` reads as the struct it stands in for. Nothing outside this
@@ -434,6 +471,12 @@ impl Ui {
         self.rows.borrow_mut().push(Box::new(draw));
     }
 
+    /// Register a suggestion group's redraw closure. See
+    /// [`UiState::suggestion_rows`] for why these are a separate list.
+    fn suggestion_row(&self, draw: impl Fn(&Ui, &Config) + 'static) {
+        self.suggestion_rows.borrow_mut().push(Box::new(draw));
+    }
+
     /// Put every row back to what `cfg` says.
     ///
     /// All rows and not just the one that changed, because a config is a
@@ -441,6 +484,10 @@ impl Ui {
     /// an asynchronous write failure has no row to blame, and a re-present
     /// after a hand edit can move any of them.
     fn redraw(&self, cfg: &Config) {
+        // Before the rows are drawn, not inside one of them: both
+        // suggestion groups draw from this one list. See
+        // [`UiState::suggestions`].
+        self.refresh_suggestions();
         self.quietly(|| {
             // Borrowed, not `borrow_mut`: the allowlist's closure rebuilds
             // widgets while this iteration is live, and a row registering
@@ -448,6 +495,56 @@ impl Ui {
             // at build time) would otherwise be a panic rather than a
             // question.
             for draw in self.rows.borrow().iter() {
+                draw(self, cfg);
+            }
+            for draw in self.suggestion_rows.borrow().iter() {
+                draw(self, cfg);
+            }
+        });
+    }
+
+    /// Recompute the suggestion cache, and say whether it changed.
+    ///
+    /// The `notify::seen` generation is recorded whether or not anything
+    /// changed: it is a "have I looked at this state yet" marker for the
+    /// poll in [`build`], not a description of what the cache holds.
+    fn refresh_suggestions(&self) -> bool {
+        self.seen_generation.set(seen::generation());
+        let fresh = self.model.suggestions();
+        if *self.suggestions.borrow() == fresh {
+            return false;
+        }
+        *self.suggestions.borrow_mut() = fresh;
+        true
+    }
+
+    /// Redraw the two suggestion groups, and nothing else, if what they
+    /// should show has changed.
+    ///
+    /// IMPORTANT 7: "Seen notifying" never updated while the window was
+    /// open, because every other `redraw` call site is driven by a config
+    /// change and an application notifying is not one. That made the
+    /// README's own walkthrough work only in the order it happened to
+    /// prescribe -- leave Settings open, trigger a notification, watch
+    /// nothing appear -- which is precisely the discovery loop these
+    /// suggestions exist to close.
+    ///
+    /// Two guards against that becoming a redraw storm, since this runs on
+    /// a timer: the generation is an atomic load that answers "has anything
+    /// been recorded at all" without taking the registry's lock, and the
+    /// cache comparison answers "and would it look any different" without
+    /// touching a widget. A chatty allowlisted application passes neither
+    /// (see `notify::seen::GENERATION`), so the common case costs one
+    /// atomic load a second and nothing else.
+    fn redraw_suggestions_if_changed(&self, cfg: &Config) {
+        if self.seen_generation.get() == seen::generation() {
+            return;
+        }
+        if !self.refresh_suggestions() {
+            return;
+        }
+        self.quietly(|| {
+            for draw in self.suggestion_rows.borrow().iter() {
                 draw(self, cfg);
             }
         });
@@ -491,7 +588,14 @@ fn build(model: Arc<SettingsModel>, engine: EngineHandle) -> Ui {
         window: window.clone(),
         quiet: Cell::new(false),
         rows: RefCell::new(Vec::new()),
+        suggestion_rows: RefCell::new(Vec::new()),
+        suggestions: RefCell::new(Vec::new()),
+        seen_generation: Cell::new(0),
     }));
+    // Seeded before any group is built, because `suggestions_group` draws
+    // itself once on the way past. Every later refresh goes through
+    // `Ui::redraw` or the poll below.
+    ui.refresh_suggestions();
 
     let page = adw::PreferencesPage::new();
     page.add(&voice_group(&ui, &cfg, engine));
@@ -515,6 +619,33 @@ fn build(model: Arc<SettingsModel>, engine: EngineHandle) -> Ui {
     // for as long as the task took to notice the channel had closed, and
     // that noticing needs a turn of the very main loop the close is
     // happening on.
+    // IMPORTANT 7: the one thing this window shows that no config change
+    // announces itself through. `notify::seen` is written from a tokio task
+    // and read here; there is no signal to connect to and nothing to make
+    // one out of that would not be a channel across the two runtimes, for a
+    // list of at most `MAX_SEEN` names.
+    //
+    // The poll itself is an atomic load, and it does nothing further unless
+    // the answer changed -- see `Ui::redraw_suggestions_if_changed`, which
+    // is also where the guard against a chatty application rebuilding
+    // identical rows lives. `timeout_add_local` and not a tokio timer
+    // because everything it touches is a widget, and widgets belong to this
+    // thread.
+    //
+    // Ends with the window: a `WeakUi` that no longer upgrades is the
+    // window having been closed, and `ControlFlow::Break` is what takes the
+    // source off the main loop rather than leaving it ticking for the life
+    // of a daemon that no longer has a window at all.
+    let u = ui.downgrade();
+    glib::timeout_add_local(SEEN_POLL_INTERVAL, move || {
+        let Some(state) = u.0.upgrade() else {
+            return glib::ControlFlow::Break;
+        };
+        let ui = Ui(state);
+        ui.redraw_suggestions_if_changed(&ui.model.current());
+        glib::ControlFlow::Continue
+    });
+
     let failures = ui.model.watch_write_failures();
     let u = ui.downgrade();
     glib::spawn_future_local(async move {
@@ -1224,7 +1355,7 @@ fn add_to_allowlist(ui: &Ui, entry: &adw::EntryRow) {
 fn suggestions_group(
     ui: &Ui,
     cfg: &Config,
-    kind: bool,
+    kind: SuggestionKind,
     title: &str,
     description: &str,
 ) -> adw::PreferencesGroup {
@@ -1241,12 +1372,13 @@ fn suggestions_group(
     let shown: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
     let g = group.clone();
     let draw = move |ui: &Ui, _cfg: &Config| {
-        // `_cfg` is unused because `suggestions()` reads the model's own
-        // `current()` rather than taking a config -- it has to, since the
-        // filter it applies is against the allowlist *and* the seen registry,
-        // which no `Config` carries. That is not a second source of truth:
-        // every caller of `Ui::redraw` passes the config the model is
-        // currently holding (see the four call sites), so the two agree.
+        // `_cfg` is unused because what this group shows comes from the
+        // suggestion cache, which the model computed from its own
+        // `current()` -- it has to, since the filter it applies is against
+        // the allowlist *and* the seen registry, which no `Config` carries.
+        // That is not a second source of truth: every caller of
+        // `Ui::redraw` passes the config the model is currently holding
+        // (see the call sites), so the two agree.
         //
         // Rebuilt wholesale rather than diffed, as the allowlist is, and
         // safe to re-enter for the same two reasons: every redraw closure
@@ -1259,14 +1391,20 @@ fn suggestions_group(
         for row in shown.borrow_mut().drain(..) {
             g.remove(&row);
         }
-        let mut any = false;
-        for s in ui
-            .model
-            .suggestions()
-            .into_iter()
-            .filter(|s| s.seen == kind)
-        {
-            any = true;
+        // Collected out of the cache rather than iterated in place: the Add
+        // button below redraws, and a redraw refreshes that very cache
+        // (`Ui::refresh_suggestions`), so holding the borrow across the
+        // loop would make the click a panic waiting for a coincidence
+        // rather than a plain sequence of calls.
+        let mine: Vec<Suggestion> = ui
+            .suggestions
+            .borrow()
+            .iter()
+            .filter(|s| s.kind == kind)
+            .cloned()
+            .collect();
+        let any = !mine.is_empty();
+        for s in mine {
             let row = adw::ActionRow::builder()
                 .title(&s.app_name)
                 // `AdwPreferencesRow:use-markup` defaults to true and this
@@ -1277,7 +1415,7 @@ fn suggestions_group(
                 // in the same string's life.
                 .use_markup(false)
                 .build();
-            row.add_prefix(&suggestion_icon(&s.icon));
+            row.add_prefix(&suggestion_icon(&s.icons));
             let add = gtk::Button::builder()
                 .icon_name("list-add-symbolic")
                 .valign(gtk::Align::Center)
@@ -1310,30 +1448,38 @@ fn suggestions_group(
     // Populated before the closure is handed over, in the order every other
     // row here uses.
     draw(ui, cfg);
-    ui.row(draw);
+    ui.suggestion_row(draw);
 
     group
 }
 
-/// The image shown beside a suggestion.
+/// The image shown beside a suggestion: the first of its candidates that
+/// actually draws, or [`FALLBACK_ICON`].
 ///
-/// Every fallback lands on [`FALLBACK_ICON`], including the two cases
-/// `gtk::Image` would otherwise draw as its own broken-image glyph: a theme
-/// that does not have the named icon, and a file that is no longer there.
-/// Both are asked about rather than assumed, because both are questions only
-/// this layer can answer -- one needs the display's icon theme, the other the
-/// filesystem, and `model.rs` deliberately classifies the *string* without
-/// touching either.
+/// `model.rs` decides which strings to try and in what order (see
+/// `icon_candidates`); this walks them, because the two questions that
+/// separate a candidate that draws from one that does not are the two only
+/// this layer can ask -- does the display's icon theme have this name, and
+/// is this path a readable image of a sane size. `model.rs` deliberately
+/// classifies the *string* without touching either.
 ///
-/// The `is_file` check is a `stat` on the glib main thread, once per row of a
-/// group of at most `MAX_SEEN` rows, and it is the cheaper half of a call
-/// that is about to decode a PNG on that same thread anyway.
-fn suggestion_icon(icon: &IconSource) -> gtk::Image {
-    let image = match icon {
-        IconSource::Named(name) if theme_has(name) => gtk::Image::from_icon_name(name),
-        IconSource::File(path) if path.is_file() => gtk::Image::from_file(path),
-        _ => gtk::Image::from_icon_name(FALLBACK_ICON),
-    };
+/// Falling through to `FALLBACK_ICON` covers the cases `gtk::Image` would
+/// otherwise draw as its own broken-image glyph -- a theme that does not have
+/// the named icon, a file that is no longer there -- and now also the case
+/// where every candidate a sender offered was unusable.
+fn suggestion_icon(icons: &[IconSource]) -> gtk::Image {
+    for candidate in icons {
+        let drawn = match candidate {
+            IconSource::Named(name) if theme_has(name) => Some(gtk::Image::from_icon_name(name)),
+            IconSource::File(path) if path.is_file() => Some(gtk::Image::from_file(path)),
+            _ => None,
+        };
+        if let Some(image) = drawn {
+            image.set_pixel_size(SUGGESTION_ICON_PX);
+            return image;
+        }
+    }
+    let image = gtk::Image::from_icon_name(FALLBACK_ICON);
     image.set_pixel_size(SUGGESTION_ICON_PX);
     image
 }
@@ -1348,4 +1494,215 @@ fn theme_has(name: &str) -> bool {
     gtk::gdk::Display::default()
         .map(|display| gtk::IconTheme::for_display(&display).has_icon(name))
         .unwrap_or(true)
+}
+
+/// The one thing in this file that can be tested without a user in front of
+/// it, and the one thing in it that must be: what an application-supplied
+/// image file is allowed to cost.
+///
+/// Everything else here is a widget arrangement whose correctness is "does
+/// it look right", which is why this file otherwise has no tests and every
+/// rule lives in `model.rs`. [`image_from_file`] is different -- it decides
+/// whether to hand a stranger's file to an image decoder on the main
+/// thread, and that is a decision with a measurable answer.
+///
+/// **One test function, deliberately**, and one that skips unless it can
+/// have the main thread. GTK may only be initialised once and only from the
+/// thread that will use it (gtk4-rs panics with "attempted to initialize GTK
+/// from two different threads" otherwise), and the default test harness runs
+/// each test on a worker thread, where `gtk::init` fails -- so under a plain
+/// `cargo test` this skips, exactly as `notify::monitor`'s tests skip a
+/// machine with no `dbus-daemon`. To actually run it, give it the main
+/// thread and a compositor:
+///
+/// ```text
+/// WLR_BACKENDS=headless WLR_RENDERER=pixman sway &
+/// WAYLAND_DISPLAY=wayland-1 cargo test -p sayd --bin sayd \
+///     settings::window -- --test-threads=1
+/// ```
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gtk::gdk_pixbuf::{Colorspace, Pixbuf};
+
+    /// Write a PNG of exactly `width`x`height` to `path`.
+    fn png(path: &std::path::Path, width: i32, height: i32) {
+        let pixbuf = Pixbuf::new(Colorspace::Rgb, false, 8, width, height).expect("a pixbuf");
+        pixbuf.fill(0x4444_44ff);
+        pixbuf.savev(path, "png", &[]).expect("writing a png");
+    }
+
+    /// A model backed by a temporary config file, and the engine it writes
+    /// through. The engine is returned so the caller can shut it down.
+    fn model_in(dir: &std::path::Path) -> (Arc<SettingsModel>, EngineHandle) {
+        let engine = EngineHandle::spawn(
+            Config::default(),
+            Box::new(sayd_core::synth::StubSynthesizer::new()),
+            Box::new(sayd_core::audio::VecSink::new(24_000 * 10)),
+        );
+        let store = Arc::new(crate::config_watch::ConfigStore::new(
+            dir.join("config.toml"),
+            engine.clone(),
+            Config::default(),
+        ));
+        let model = Arc::new(SettingsModel::new(
+            store,
+            dir.to_path_buf(),
+            Config::default(),
+        ));
+        (model, engine)
+    }
+
+    /// Every `AdwActionRow` title anywhere under `widget`.
+    fn row_titles(widget: &gtk::Widget) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(row) = widget.downcast_ref::<adw::ActionRow>() {
+            out.push(row.title().to_string());
+        }
+        let mut child = widget.first_child();
+        while let Some(w) = child {
+            out.extend(row_titles(&w));
+            child = w.next_sibling();
+        }
+        out
+    }
+
+    /// Turn the main loop for up to `limit`, stopping as soon as `done`.
+    fn spin_until(limit: Duration, done: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + limit;
+        let ctx = glib::MainContext::default();
+        while std::time::Instant::now() < deadline {
+            while ctx.iteration(false) {}
+            if done() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// IMPORTANT 7: an application that notifies while the window is open
+    /// must appear under "Seen notifying" without the window being closed
+    /// and reopened. Every `Ui::redraw` call site is driven by a config
+    /// change, and an application notifying is not one -- so the README's
+    /// own walkthrough (leave Settings open, trigger a notification) showed
+    /// nothing at all, which is exactly the discovery loop these
+    /// suggestions exist to close.
+    ///
+    /// Drives the real window: `build` puts the real groups together and
+    /// registers the real poll, `seen::record` is the same call the monitor
+    /// makes off the bus, and the assertion walks the actual widget tree
+    /// for the row rather than asking the cache whether it thinks a row
+    /// exists.
+    ///
+    /// IMPORTANT 6 rides along: with the two groups drawing from one
+    /// partitioned list, an application that is both seen and curated
+    /// appears exactly once, where the two independent `suggestions()`
+    /// calls this replaced could show it in neither.
+    fn a_newly_seen_application_appears_while_the_window_is_open(dir: &std::path::Path) {
+        let (model, engine) = model_in(dir);
+        let ui = build(model, engine.clone());
+
+        let before = row_titles(ui.window.upcast_ref());
+        assert!(
+            !before.iter().any(|t| t == "win1-JustNotified"),
+            "the application has not notified yet, so there must be no row for it"
+        );
+        assert_eq!(
+            before.iter().filter(|t| *t == "Signal").count(),
+            1,
+            "a curated application appears once, from one of the two groups"
+        );
+
+        seen::record(&crate::notify::Notification {
+            app_name: "win1-JustNotified".into(),
+            desktop_entry: String::new(),
+            image_path: String::new(),
+            app_icon: String::new(),
+            summary: "s".into(),
+            body: "b".into(),
+        });
+
+        spin_until(SEEN_POLL_INTERVAL * 5, || {
+            row_titles(ui.window.upcast_ref())
+                .iter()
+                .any(|t| t == "win1-JustNotified")
+        });
+
+        let after = row_titles(ui.window.upcast_ref());
+        assert!(
+            after.iter().any(|t| t == "win1-JustNotified"),
+            "an application that notified while the window was open must show up in it"
+        );
+        assert_eq!(
+            after.iter().filter(|t| *t == "Signal").count(),
+            1,
+            "and the two groups must still not disagree about a curated one"
+        );
+
+        drop(ui);
+        engine.shutdown();
+    }
+
+    /// Two properties, in one test for the reason the module doc gives.
+    ///
+    /// CRITICAL 3: `Image::from_file` decoded whatever the *sender* named,
+    /// synchronously, on this thread, at whatever size the file declared.
+    /// Measured through the same gdk-pixbuf entry points: a 32 KB PNG
+    /// declaring 12000x12000 takes 238 ms and 432 MB to decode, once per
+    /// row, with every row alive at the same time and rebuilt on every
+    /// redraw. An image past the limit must not be loaded at all -- the row
+    /// falls back to the generic glyph, which is what it already did for a
+    /// file that is not there.
+    ///
+    /// CRITICAL 1: and the candidate walk that replaced the single
+    /// `app_icon` -- the first icon that actually draws wins, an unusable
+    /// one is skipped rather than being the row's answer, and a list with
+    /// nothing usable in it is the fallback glyph. That last case is what
+    /// every row of this feature drew, for every real application, while
+    /// the icon hints were being discarded.
+    #[test]
+    fn a_suggestion_draws_its_first_usable_icon_and_never_an_oversized_one() {
+        if gtk::init().is_err() {
+            eprintln!(
+                "skipping: GTK needs the main thread and a display -- see this \
+                 module's doc comment for how to run this test"
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let ordinary = dir.path().join("ordinary.png");
+        png(&ordinary, 48, 48);
+
+        // A name no theme has, followed by a file that is there: the file
+        // must win rather than the row settling for the fallback.
+        let image = suggestion_icon(&[
+            IconSource::Named("sayd-no-such-icon-anywhere".into()),
+            IconSource::File(ordinary.clone()),
+        ]);
+        assert_eq!(image.pixel_size(), SUGGESTION_ICON_PX);
+        assert!(
+            image.icon_name().is_none(),
+            "a drawable file must beat a theme name that does not resolve"
+        );
+
+        // Nothing at all is the fallback, and so is a list of unusable
+        // candidates.
+        for icons in [
+            Vec::new(),
+            vec![IconSource::Named("sayd-no-such-icon-anywhere".into())],
+            vec![IconSource::File(dir.path().join("gone.png"))],
+        ] {
+            assert_eq!(
+                suggestion_icon(&icons).icon_name().map(|n| n.to_string()),
+                Some(FALLBACK_ICON.to_string()),
+                "an unusable candidate list is the generic glyph, not a broken image"
+            );
+        }
+
+        // The rest of what needs a real window, run from here rather than
+        // from a `#[test]` of its own for the same one-init reason.
+        adw::init().expect("libadwaita initialises once GTK has");
+        a_newly_seen_application_appears_while_the_window_is_open(dir.path());
+    }
 }

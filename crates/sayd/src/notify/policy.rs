@@ -169,7 +169,12 @@ impl Limiter {
         }
 
         let cooldown = Duration::from_secs(cfg.cooldown_secs);
-        let key = n.app_name.to_lowercase();
+        // Trimmed as well as lowercased, for the reason `is_allowed` trims
+        // (IMPORTANT 4): an application that pads its own name differently
+        // between two calls is still one application, and a key that kept
+        // the padding would hand it a second window -- and so a second
+        // immediate utterance -- inside the cooldown it had already used up.
+        let key = n.app_name.trim().to_lowercase();
         if let Some(window) = self.windows.get_mut(&key) {
             if !is_expired(window.opened, cooldown, now) {
                 window.suppressed += 1;
@@ -186,7 +191,10 @@ impl Limiter {
             Window {
                 opened: now,
                 suppressed: 0,
-                display_name: n.app_name.clone(),
+                // Trimmed, like `compose` trims before speaking it: the
+                // follow-up echoes the application's own spelling, not its
+                // own stray whitespace ("Signal : 3 more notifications").
+                display_name: n.app_name.trim().to_string(),
             },
         );
         Decision::Speak(text)
@@ -244,13 +252,22 @@ impl Limiter {
     }
 }
 
-/// Is `app_name` on the config's allowlist? Compared case-insensitively,
-/// like the map `Limiter` keys its windows by: an application does not get
-/// to lose its rate limit, or its place on the allowlist, by capitalising
-/// its name differently between two calls.
+/// Is `app_name` on the config's allowlist? Compared case-insensitively and
+/// ignoring surrounding whitespace, like the map `Limiter` keys its windows
+/// by: an application does not get to lose its rate limit, or its place on
+/// the allowlist, by capitalising its name differently between two calls, or
+/// by padding it.
+///
+/// IMPORTANT 4: this function is the authority on what "allowed" means, and
+/// every other layer already trimmed. The bus accepts an `app_name` of
+/// `"Signal "`; the settings window's `allow_contains` said that name was
+/// already allowed and its `allow_add` stored the trimmed `"Signal"`, so a
+/// user who clicked Add on the suggestion watched the row disappear and
+/// still heard nothing, forever, with no toast and no log line to say why --
+/// because this comparison, and only this one, kept the space.
 fn is_allowed(app_name: &str, cfg: &NotificationConfig) -> bool {
-    let name = app_name.to_lowercase();
-    cfg.allow.iter().any(|a| a.to_lowercase() == name)
+    let name = app_name.trim().to_lowercase();
+    !name.is_empty() && cfg.allow.iter().any(|a| a.trim().to_lowercase() == name)
 }
 
 /// The announcement for one notification, or `None` when there is nothing to
@@ -395,6 +412,8 @@ mod tests {
     fn n(app: &str, summary: &str, body: &str) -> Notification {
         Notification {
             app_name: app.into(),
+            desktop_entry: String::new(),
+            image_path: String::new(),
             app_icon: String::new(),
             summary: summary.into(),
             body: body.into(),
@@ -407,6 +426,58 @@ mod tests {
             allow: vec!["Signal".into()],
             ..NotificationConfig::default()
         }
+    }
+
+    /// IMPORTANT 4: `is_allowed` is the authority on what "allowed" means,
+    /// and it is the only layer that did not trim. The bus accepts an
+    /// `app_name` of `"Signal "` (measured -- `notify-send -a "Signal "`
+    /// goes through untouched), the settings window's `allow_contains`
+    /// answered "already allowed" for it, and `allow_add` stored the
+    /// trimmed `"Signal"` -- so clicking Add made the suggestion row vanish
+    /// and changed nothing about whether the application was ever spoken
+    /// for, with no toast and no log line to say so.
+    #[test]
+    fn a_padded_name_off_the_bus_matches_a_trimmed_allowlist_entry() {
+        let mut limiter = Limiter::new();
+        assert_ne!(
+            limiter.decide(&n("Signal ", "Alice", ""), &cfg(), Instant::now()),
+            Decision::NotAllowed,
+            "an allowlist entry must match the padded name the bus accepts"
+        );
+    }
+
+    /// The other half of the same rule: a padded spelling must not be a
+    /// second rate-limit window either, or an application that alternates
+    /// `"Signal"` and `"Signal "` speaks twice per cooldown.
+    #[test]
+    fn a_padded_name_shares_the_rate_limit_window_of_the_trimmed_one() {
+        let mut limiter = Limiter::new();
+        let now = Instant::now();
+        assert!(matches!(
+            limiter.decide(&n("Signal", "first", ""), &cfg(), now),
+            Decision::Speak(_)
+        ));
+        assert_eq!(
+            limiter.decide(&n(" Signal ", "second", ""), &cfg(), now),
+            Decision::Count,
+            "padding must not buy a second window inside one cooldown"
+        );
+    }
+
+    /// A blank name is on no allowlist, even one carrying a blank entry --
+    /// which a hand-edited file or a stray settings row can produce
+    /// (IMPORTANT 5). `compose` already refuses to speak a blank prefix;
+    /// this is the same judgement one layer earlier.
+    #[test]
+    fn a_blank_name_is_never_allowed() {
+        let mut c = cfg();
+        c.allow.push("   ".into());
+        let mut limiter = Limiter::new();
+        assert_eq!(
+            limiter.decide(&n("  ", "Alice", ""), &c, Instant::now()),
+            Decision::NotAllowed,
+            "a blank name must not be matched by a blank allowlist entry"
+        );
     }
 
     /// All four combinations of the two switches, which is the whole of the
