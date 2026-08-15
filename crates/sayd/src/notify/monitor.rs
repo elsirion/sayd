@@ -269,6 +269,25 @@ async fn run_on(engine: EngineHandle, address: Option<String>) -> Outcome {
                 message = next_message(&mut stream) => {
                     match message {
                         Some(Ok(msg)) => {
+                            // MINOR 3: fail closed on `enabled`, rather than
+                            // relying entirely on the supervisor's `abort` to
+                            // stop narration. This loop reads every other
+                            // field of `cfg.notifications` (`allow`,
+                            // `cooldown_secs`, `speak_*`) and ignored the one
+                            // that says whether to speak at all -- so the
+                            // window between the config changing and the
+                            // abort landing was narration the user had just
+                            // switched off (measured: notifications at +7ms
+                            // and +358ms after the change were still spoken).
+                            // Normally sub-second; unbounded if the publish
+                            // loop's own read of the store is stalled, which
+                            // is exactly the state CRITICAL 1 is about.
+                            // Checked before `decode` so a disabled monitor
+                            // is silent in the discovery log too, not merely
+                            // in the speaker.
+                            if !cfg.notifications.enabled {
+                                continue;
+                            }
                             match decode(&msg) {
                                 Decoded::Skip => {}
                                 // Spec §2: "skip that message and count it".
@@ -338,8 +357,15 @@ async fn run_on(engine: EngineHandle, address: Option<String>) -> Outcome {
                     if let Some(fresh) = fetch_config(&engine).await {
                         cfg = fresh;
                     }
-                    for text in limiter.due(&cfg.notifications, Instant::now()) {
-                        speak(&engine, text, cfg.max_chars, &mut submit_failure_logged).await;
+                    // MINOR 3, the other half: a coalesced follow-up is owed
+                    // from before the config changed, so a disabled monitor
+                    // must not speak it either. Drained from the limiter
+                    // regardless, so nothing accumulates to be said later.
+                    let due = limiter.due(&cfg.notifications, Instant::now());
+                    if cfg.notifications.enabled {
+                        for text in due {
+                            speak(&engine, text, cfg.max_chars, &mut submit_failure_logged).await;
+                        }
                     }
                 }
             }
@@ -1351,6 +1377,65 @@ mod tests {
             "run_on must return Outcome::Refused within 10s against a bus that \
              denies BecomeMonitor -- returning at all is not enough, the \
              supervisor cannot latch on a value it is not given"
+        );
+    }
+
+    /// MINOR 3: the monitor reads every other field of `cfg.notifications`
+    /// and used to ignore `enabled`, so it narrated for as long as it took
+    /// the supervisor's `abort` to land -- normally sub-second, unbounded
+    /// while the publish loop's own read of the config store is stalled
+    /// (CRITICAL 1's precondition). Here the supervisor is deliberately not
+    /// in the picture at all: nothing aborts this task, and the *only* thing
+    /// that can stop it speaking is its own check of `enabled` against the
+    /// config it re-reads on its tick.
+    ///
+    /// `cooldown_secs = 0` so the rate limiter cannot be what makes the
+    /// second notification silent -- with the default 30s window it would be
+    /// counted rather than spoken whether or not this was fixed, and the
+    /// test would pass on the broken code too.
+    #[tokio::test]
+    async fn a_monitor_stops_speaking_when_the_config_disables_notifications() {
+        let Some((bus, _daemon, app)) = stub_daemon_and_app().await else {
+            eprintln!("skipping: dbus-daemon not on PATH");
+            return;
+        };
+
+        let (engine, spoken) = engine_with(vec!["Signal".to_string()], 0);
+        let monitor = tokio::spawn(run_on(engine.clone(), Some(bus.address.clone())));
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut active = false;
+        while Instant::now() < deadline {
+            call_notify(&app, "Signal", "while enabled").await;
+            if engine_has(&spoken, "Signal: while enabled") {
+                active = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(active, "the monitor never became active");
+
+        // Exactly what `ConfigStore::write_locked` does when the settings
+        // window's Notifications switch is turned off: the engine is the
+        // monitor's source of truth for config (see `fetch_config`).
+        let mut cfg = engine.config().expect("the engine answers");
+        cfg.notifications.enabled = false;
+        engine.send(sayd_core::engine::Command::ApplyConfig(cfg));
+
+        // The monitor re-reads its cached config on `DUE_INTERVAL`; give it
+        // a few of those rather than racing the one that happens to be next.
+        tokio::time::sleep(DUE_INTERVAL * 3).await;
+        call_notify(&app, "Signal", "after disabling").await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let spoke_after = engine_has(&spoken, "Signal: after disabling");
+        monitor.abort();
+        engine.shutdown();
+        assert!(
+            !spoke_after,
+            "a notification arriving after notifications.enabled went false \
+             was still narrated; the monitor fails open on the one field that \
+             says whether to speak at all"
         );
     }
 

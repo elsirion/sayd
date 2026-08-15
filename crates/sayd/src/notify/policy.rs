@@ -77,7 +77,18 @@ pub struct Limiter {
     /// delayed, never lost. This is what makes the ordering-independence
     /// promised above true: whether `due` or `decide` notices the closed
     /// window first, the follow-up still gets spoken.
-    pending: Vec<String>,
+    ///
+    /// `(display_name, announcement)`, not a bare announcement: `due` drops a
+    /// window whose application has since left `allow` (see its doc comment),
+    /// and a follow-up parked here has to be subject to exactly the same
+    /// check -- it is the same window's line, queued a moment earlier by a
+    /// different code path. MINOR 1: it was not, so removing an application
+    /// from the allowlist could still be followed by one last "N more
+    /// notifications" from it, and `due`'s own doc comment promised
+    /// otherwise. The name is kept alongside because the announcement string
+    /// has already been composed by then and is not something to re-parse a
+    /// name back out of.
+    pending: Vec<(String, String)>,
 }
 
 struct Window {
@@ -165,7 +176,9 @@ impl Limiter {
                 return Decision::Count;
             }
             if let Some(w) = self.windows.remove(&key) {
-                self.pending.extend(announcement(&w));
+                if let Some(text) = announcement(&w) {
+                    self.pending.push((w.display_name, text));
+                }
             }
         }
         self.windows.insert(
@@ -196,6 +209,13 @@ impl Limiter {
     /// lets an unallowed application open a window in the first place, so
     /// this only ever fires for a window that was allowed when it opened
     /// and had its permission revoked while it was still counting.
+    ///
+    /// MINOR 1: that rule applies to both halves, and used to apply only to
+    /// the second. A follow-up `decide` had already retired into `pending`
+    /// -- a window that closed in the up-to-one-second gap before this tick
+    /// -- went straight out unfiltered, so whether a de-allowlisted
+    /// application got the last word depended on which of the two noticed
+    /// its window closing first.
     pub fn due(&mut self, cfg: &NotificationConfig, now: Instant) -> Vec<String> {
         let cooldown = Duration::from_secs(cfg.cooldown_secs);
         let mut expired: Vec<String> = self
@@ -208,7 +228,11 @@ impl Limiter {
         // not depend on hash-map iteration order.
         expired.sort();
 
-        let mut out = std::mem::take(&mut self.pending);
+        let mut out: Vec<String> = std::mem::take(&mut self.pending)
+            .into_iter()
+            .filter(|(display_name, _)| is_allowed(display_name, cfg))
+            .map(|(_, text)| text)
+            .collect();
         out.extend(expired.into_iter().filter_map(|key| {
             let w = self.windows.remove(&key)?;
             if !is_allowed(&w.display_name, cfg) {
@@ -725,6 +749,56 @@ mod tests {
         // resurrect the old window's count on a later tick.
         c.allow = vec!["Signal".into()];
         assert!(l.due(&c, t0 + Duration::from_secs(32)).is_empty());
+    }
+
+    /// MINOR 1: the same rule as `due_does_not_announce_an_application_
+    /// removed_from_allow` above, for the follow-up that took the *other*
+    /// route into `due` -- queued by `decide` when it found the window
+    /// already expired and reopened it, rather than found expired by `due`
+    /// itself. Whether an application removed from `allow` gets one last
+    /// word must not depend on which of the two noticed the closed window
+    /// first; before this, `due` returned `pending` verbatim and it did.
+    ///
+    /// The `decide` that retires the window here happens *before* the
+    /// allowlist change, deliberately: that is what puts the follow-up in
+    /// `pending` in the first place (an application removed from `allow`
+    /// cannot `decide` at all -- it returns `NotAllowed` before it ever
+    /// reaches a window).
+    #[test]
+    fn due_does_not_announce_a_pending_followup_from_a_de_allowlisted_application() {
+        let mut c = cfg(); // allows "Signal", 30s window
+        let mut l = Limiter::new();
+        let t0 = Instant::now();
+        let _ = l.decide(&n("Signal", "first", ""), &c, t0);
+        for i in 0..3 {
+            let _ = l.decide(
+                &n("Signal", "more", ""),
+                &c,
+                t0 + Duration::from_secs(1 + i),
+            );
+        }
+        // The window has closed and nothing has called `due` yet: this
+        // `decide` retires the old window into `pending` and opens a fresh
+        // one.
+        let reopened = t0 + Duration::from_secs(31);
+        assert!(matches!(
+            l.decide(&n("Signal", "next", ""), &c, reopened),
+            Decision::Speak(_)
+        ));
+
+        // The user removes the application before the next tick.
+        c.allow.clear();
+        assert!(
+            l.due(&c, reopened).is_empty(),
+            "a follow-up queued by `decide` must be dropped when its \
+             application has left the allowlist, exactly like one `due` \
+             retires itself"
+        );
+
+        // And it is gone rather than merely withheld: re-allowing the
+        // application does not resurrect it on a later tick.
+        c.allow = vec!["Signal".into()];
+        assert!(l.due(&c, reopened + Duration::from_secs(1)).is_empty());
     }
 
     /// A cooldown large enough to overflow `Instant` arithmetic must not
