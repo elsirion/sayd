@@ -33,6 +33,17 @@
 //! there. Unbounded, a provider could write a 60 KB warning line, forge
 //! further `warning: reword:` lines inside it and run ANSI escapes at
 //! whoever reads `journalctl`.
+//!
+//! # The request goes to `base_url` and nowhere else
+//!
+//! §7 tells the user their text goes to `base_url`, and the `info: reword:
+//! sending text to …` line names `base_url`. `ureq` picks a proxy out of
+//! `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` by default, which would make both
+//! statements false in a shell that happens to have one set -- the request
+//! would be tunnelled through a host the user was never told about. The
+//! agent therefore sets `proxy(None)` explicitly.
+//! A user who must egress through a proxy puts it in `base_url`, where the
+//! line that announces it can name it.
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -417,6 +428,11 @@ fn build_agent(ceiling: Duration) -> ureq::Agent {
         // and the body is discarded -- and the body is where
         // `error.message` lives.
         .http_status_as_error(false)
+        // Load-bearing for §7, not for correctness: `ureq`'s default reads
+        // `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` and would tunnel the
+        // request through a host neither §7's privacy statement nor the
+        // `sending text to …` line names. See the module doc.
+        .proxy(None)
         .build();
     ureq::Agent::new_with_config(config)
 }
@@ -1239,6 +1255,63 @@ mod tests {
             elapsed < Duration::from_secs(5),
             "the ceiling that ended the call must be the one that was set, not a \
              timeout somewhere else: {elapsed:?}"
+        );
+    }
+
+    /// §7 says the text goes to `base_url`, and the `sending text to …`
+    /// line names `base_url`. `ureq`'s default reads `ALL_PROXY` and
+    /// friends, which would make both statements false in a shell that has
+    /// one set -- measured: a fake proxy received the `CONNECT`.
+    ///
+    /// Pinned in a **child process**, because the variables have to be set
+    /// for the assertion to mean anything and setting them here would race
+    /// every other test that builds an agent -- `ureq` reads the
+    /// environment when the config is built, so the flakiness would land
+    /// on the ceiling test, which would then try to reach a proxy that is
+    /// not there.
+    #[test]
+    fn the_agent_ignores_an_environment_proxy() {
+        let exe = std::env::current_exe().expect("the test binary");
+        let output = std::process::Command::new(exe)
+            .args([
+                "an_environment_proxy_is_not_picked_up",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("ALL_PROXY", "http://127.0.0.1:1")
+            .env("HTTP_PROXY", "http://127.0.0.1:1")
+            .env("HTTPS_PROXY", "http://127.0.0.1:1")
+            .env_remove("NO_PROXY")
+            .env_remove("no_proxy")
+            .output()
+            .expect("re-run this test binary");
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        assert!(
+            output.status.success(),
+            "the child said: {stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // A filter that matches nothing exits 0, which would make the
+        // assertion above vacuous.
+        assert!(
+            stdout.contains("1 passed"),
+            "the child must actually have run the test: {stdout}"
+        );
+    }
+
+    /// The body of [`the_agent_ignores_an_environment_proxy`], which is
+    /// the only thing that runs it -- with the proxy variables set.
+    #[test]
+    #[ignore = "run by the_agent_ignores_an_environment_proxy in a child process"]
+    fn an_environment_proxy_is_not_picked_up() {
+        assert!(
+            ureq::Agent::config_builder().build().proxy().is_some(),
+            "this test is meaningless unless the environment really did reach \
+             `ureq`; the parent sets ALL_PROXY, HTTP_PROXY and HTTPS_PROXY"
+        );
+        assert!(
+            build_agent(REWORD_HTTP_CEILING).config().proxy().is_none(),
+            "the text goes to base_url and nowhere else (§7)"
         );
     }
 
