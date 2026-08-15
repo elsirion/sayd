@@ -1137,39 +1137,35 @@ mod tests {
 
     /// The one this module exists for, in the shape it was measured in:
     /// arrivals that all miss their deadline against a provider that is
-    /// stuck. Counted in threads, because threads are the resource that ran
-    /// out -- 30 to 548 in three and a half minutes, then tokio's 512-thread
-    /// cap, then `Say` over D-Bus never returning.
+    /// stuck. The original incident was counted in threads -- 30 to 548 in
+    /// three and a half minutes, then tokio's 512-thread cap, then `Say`
+    /// over D-Bus never returning -- but a process-wide thread count is not
+    /// a quantity this test can own: this suite runs its tests in parallel
+    /// in one process, and engine threads, dbus integration tests, the
+    /// settings writer and tokio's own pools all move `/proc/self/task`
+    /// underneath it, which is what made this test fail two runs in three
+    /// in the full workspace suite despite the property it guards being
+    /// intact. `two_rewrites_run_at_once_and_never_three` already solved
+    /// this the right way for the concurrent-burst case: watch the
+    /// rewriter's own in-flight count instead of the process's thread
+    /// count. That is not a duplicate of this test -- that one bursts four
+    /// requests at a provider that eventually answers and checks that
+    /// permits are reused wave over wave; this one is the pathological case
+    /// Task 3 exists for, 60 arrivals in a row against a provider that
+    /// *never* answers inside its deadline, and it is pinning a different
+    /// half of the same guarantee: that arrivals past the permit count are
+    /// refused outright rather than each costing a fresh blocking job.
     ///
     /// With the permit released at the deadline instead of held, every one
-    /// of these 60 arrivals would get a permit and a fresh blocking thread
-    /// while the previous ones were still parked, and this test would count
-    /// dozens rather than two.
-    #[cfg(target_os = "linux")]
+    /// of these 60 arrivals would get a permit and a fresh blocking job
+    /// while the previous ones were still parked, so both the peak in-flight
+    /// count and the call count would climb far past
+    /// [`REWORD_MAX_INFLIGHT`] instead of stopping at it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_stuck_rewriter_does_not_leak_blocking_threads() {
-        /// This process's live threads, which is what ran out.
-        fn threads() -> usize {
-            std::fs::read_dir("/proc/self/task")
-                .map(|d| d.count())
-                .unwrap_or(0)
-        }
-
-        let stub = Stub::slow(Duration::from_millis(500), Vec::new());
+    async fn a_stuck_rewriter_never_exceeds_its_permit_count_in_flight() {
+        let stub = Counted::new(Duration::from_millis(500));
         let state = RewordState::new();
-        // One attempt first, so the blocking pool has grown its first thread
-        // and the baseline is not credited with it.
-        let _ = attempt(
-            stub.clone() as Arc<dyn Rewriter>,
-            state.clone(),
-            "Alice: where do you want to go for dinner".into(),
-            Duration::from_millis(10),
-        )
-        .await;
-        let baseline = threads();
-        assert!(baseline > 0, "/proc/self/task must be readable here");
 
-        let mut peak = baseline;
         for _ in 0..60 {
             let _ = attempt(
                 stub.clone() as Arc<dyn Rewriter>,
@@ -1178,14 +1174,13 @@ mod tests {
                 Duration::from_millis(10),
             )
             .await;
-            peak = peak.max(threads());
         }
 
         assert!(
-            peak <= baseline + REWORD_MAX_INFLIGHT,
-            "60 arrivals against a stuck provider grew the process from {baseline} \
-             threads to {peak}; the bound is {REWORD_MAX_INFLIGHT} blocking threads \
-             no matter how many arrive"
+            stub.peak.load(Ordering::SeqCst) <= REWORD_MAX_INFLIGHT,
+            "at most {REWORD_MAX_INFLIGHT} rewrites were ever in flight against a \
+             stuck provider, no matter how many arrivals came after them; saw {}",
+            stub.peak.load(Ordering::SeqCst)
         );
         assert!(
             stub.calls.load(Ordering::SeqCst) <= REWORD_MAX_INFLIGHT,
