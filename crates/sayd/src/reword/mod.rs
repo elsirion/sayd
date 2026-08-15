@@ -44,7 +44,8 @@
 //!
 //! Those two rules together used to make the transport breaker inert
 //! against the one provider failure it most exists for. `timeout_ms` is
-//! capped at 2500 ms and the client's ceiling is 10 s, so a provider that
+//! capped at `REWORD_TIMEOUT_MAX_MS` and the client's ceiling is 10 s, so a
+//! provider that
 //! accepts a connection and then never answers *always* produces
 //! [`Attempt::Deadline`]: the [`RewordError::Ceiling`] the client eventually
 //! returns died with the abandoned `JoinHandle` and never reached
@@ -1381,8 +1382,9 @@ mod tests {
     /// daemon actually meets it: a provider that accepts connections and
     /// never answers.
     ///
-    /// `timeout_ms` is capped at 2500 ms and the client's own ceiling is
-    /// 10 s, so every one of those attempts returns [`Attempt::Deadline`]
+    /// `timeout_ms` is capped at `REWORD_TIMEOUT_MAX_MS` and the client's
+    /// own ceiling is 10 s, so every one of those attempts returns
+    /// [`Attempt::Deadline`]
     /// to its caller and the [`RewordError::Ceiling`] arrives long after
     /// the caller is gone. With the outcome recorded only by the caller the
     /// breaker never moved -- measured, ten consecutive ceiling-class

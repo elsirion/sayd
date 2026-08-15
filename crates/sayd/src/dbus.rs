@@ -101,9 +101,11 @@ impl SaydIface {
     /// far larger change for a caller that is already blocked on a
     /// synchronous method call. So `say --reword "..."` can take up to
     /// `reword.timeout_ms` to return -- which is why `Config::load_str`
-    /// clamps that at 2500 ms: `sayd-cli` bounds every D-Bus interaction at
-    /// 3 s, and a rewrite that outlived the caller would turn an enhancement
-    /// into "sayd is not responding".
+    /// clamps that at `REWORD_TIMEOUT_MAX_MS`: `sayd-cli` bounds every D-Bus
+    /// interaction at 3 s, and a rewrite that outlived the caller would turn
+    /// an enhancement into "sayd is not responding". The ceiling is set
+    /// against that 3 s with the two 250 ms engine round trips on either side
+    /// of the rewrite subtracted -- see the constant.
     ///
     /// Every way this can fail ends in the original text being returned and
     /// therefore spoken -- no configured endpoint, no client in this build, a
@@ -650,8 +652,8 @@ mod tests {
     /// `sayd-cli`'s 3 s bound -- not a "sayd is not responding".
     ///
     /// The two halves of that are `reword.timeout_ms`, clamped to
-    /// `REWORD_TIMEOUT_MAX_MS` (2500 ms) by `Config::load_str` no matter
-    /// what the file says, and `sayd-cli`'s own `TIMEOUT` of 3 s. They live
+    /// `REWORD_TIMEOUT_MAX_MS` by `Config::load_str` no matter what the file
+    /// says, and `sayd-cli`'s own `TIMEOUT` of 3 s. They live
     /// in two crates and neither can import the other's constant, so the
     /// relationship is checked here the only way it can be: end to end,
     /// through the real loader, against a real socket, with the deadline the

@@ -28,8 +28,10 @@ const IFACE: &str = "sh.sayd.Sayd1";
 /// `--reword` is answered inline -- `Say` returns the utterance id and the
 /// daemon allocates that id from the text, so it cannot hand one back and
 /// rewrite afterwards -- so a `Say` carrying `reword` legitimately takes up
-/// to that ceiling to return. The daemon clamps it to 2500 ms
-/// (`sayd_core::config::REWORD_TIMEOUT_MAX_MS`) for this reason and no other.
+/// to that ceiling to return. The daemon clamps it to
+/// `sayd_core::config::REWORD_TIMEOUT_MAX_MS` for this reason and no other,
+/// at a value chosen to leave room inside this bound for the two 250 ms
+/// engine round trips that bracket the rewrite.
 /// The two constants are in different binaries and neither can import the
 /// other, so the relationship is pinned by a test instead:
 /// `sayd::dbus::tests::a_reword_against_a_silent_provider_still_answers_inside_the_cli_bound`.

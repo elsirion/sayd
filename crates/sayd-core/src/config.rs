@@ -103,8 +103,24 @@ impl Default for NotificationConfig {
 /// reaches `Duration::from_millis` must be inside this window whichever
 /// door the config came through.
 pub const REWORD_TIMEOUT_MIN_MS: u64 = 200;
-/// See [`REWORD_TIMEOUT_MIN_MS`].
-pub const REWORD_TIMEOUT_MAX_MS: u64 = 2500;
+/// See [`REWORD_TIMEOUT_MIN_MS`] for what this ceiling is for. Its *value*
+/// is arithmetic, not taste, and it used to leave no margin at all.
+///
+/// A `Say` carrying `reword` is answered inline, so what `sayd-cli` waits
+/// for is three things end to end: `EngineHandle::config()`, bounded by
+/// `CONFIG_REPLY_TIMEOUT` at 250 ms; the rewrite, bounded by this; and
+/// `EngineHandle::submit`, bounded by `SUBMIT_REPLY_TIMEOUT` at 250 ms. At
+/// 2500 that is 250 + 2500 + 250 = 3000 ms -- exactly `sayd-cli`'s own 3 s
+/// bound, which is to say zero theoretical margin for the bus round trip,
+/// for scheduling, or for the difference between a budget and the moment
+/// the runtime notices it has elapsed. The one failure this clamp exists to
+/// prevent was sitting on its own boundary.
+///
+/// 2000 leaves about a second of it. What that costs a user with a genuinely
+/// slower provider is visible to them: the settings window's Test row
+/// reports the latency it measured, which is how someone discovers they need
+/// a different provider rather than a larger number here.
+pub const REWORD_TIMEOUT_MAX_MS: u64 = 2000;
 
 /// The shortest non-zero `notifications.cooldown_secs` [`Config::load_str`]
 /// will honour, and the one range in this table that is not about taste.
@@ -574,8 +590,8 @@ mod tests {
     /// `86400000` reaches `Duration::from_millis` otherwise, and with a
     /// real client the practical bound becomes the 10 s HTTP ceiling --
     /// which is past `sayd-cli`'s 3 s D-Bus bound, so `say --reword`
-    /// returns a CLI error rather than a sentence. That is exactly what the
-    /// 2500 ceiling exists to prevent.
+    /// returns a CLI error rather than a sentence. That is exactly what
+    /// [`REWORD_TIMEOUT_MAX_MS`] exists to prevent.
     #[test]
     fn a_hand_edited_timeout_is_clamped_by_the_parse_itself() {
         let (c, err) = Config::load_str("[reword]\ntimeout_ms = 86400000\n");
@@ -591,8 +607,8 @@ mod tests {
 
         // A value inside the window is not touched, which is the case that
         // matters for every honest config.
-        let (c, _) = Config::load_str("[reword]\ntimeout_ms = 2000\n");
-        assert_eq!(c.reword.timeout_ms, 2000);
+        let (c, _) = Config::load_str("[reword]\ntimeout_ms = 1200\n");
+        assert_eq!(c.reword.timeout_ms, 1200);
     }
 
     /// A coalescing window that closes before the notification which opened

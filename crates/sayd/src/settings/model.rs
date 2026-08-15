@@ -88,8 +88,8 @@ pub const COOLDOWN_STEP: f64 = 5.0;
 /// What the Reword group's spin rows offer, per spec §6. `timeout_ms`'s
 /// ceiling is the load-bearing one: `sayd-cli` bounds every D-Bus
 /// interaction at 3 s and `say --reword` waits for the rewrite inline, so a
-/// budget above 2500 ms would turn a slow provider into a CLI error instead
-/// of a spoken sentence.
+/// budget past `REWORD_TIMEOUT_MAX_MS` would turn a slow provider into a CLI
+/// error instead of a spoken sentence.
 ///
 /// The numbers themselves live in `sayd_core::config`, because
 /// `Config::load_str` applies the same clamp to a hand-edited file that
@@ -1978,7 +1978,7 @@ mod tests {
         cfg.reword.timeout_ms = 9000;
         cfg.reword.max_chars = 1;
         let warnings = normalize(&mut cfg);
-        assert_eq!(cfg.reword.timeout_ms, 2500);
+        assert_eq!(cfg.reword.timeout_ms, REWORD_TIMEOUT_MAX as u64);
         assert_eq!(cfg.reword.max_chars, 32);
         assert_eq!(warnings.len(), 2, "both clamps must say so: {warnings:?}");
 
@@ -1990,7 +1990,7 @@ mod tests {
             "an unusable base_url is a degradation reported by the Test row, \
              not a reason to refuse an unrelated edit"
         );
-        assert_eq!(cfg.reword.timeout_ms, 2500);
+        assert_eq!(cfg.reword.timeout_ms, REWORD_TIMEOUT_MAX as u64);
     }
 
     /// The premise of normalising an unknown model to `FALLBACK_MODEL`: that
