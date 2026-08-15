@@ -90,8 +90,13 @@ pub const COOLDOWN_STEP: f64 = 5.0;
 /// interaction at 3 s and `say --reword` waits for the rewrite inline, so a
 /// budget above 2500 ms would turn a slow provider into a CLI error instead
 /// of a spoken sentence.
-pub const REWORD_TIMEOUT_MIN: f64 = 200.0;
-pub const REWORD_TIMEOUT_MAX: f64 = 2500.0;
+///
+/// The numbers themselves live in `sayd_core::config`, because
+/// `Config::load_str` applies the same clamp to a hand-edited file that
+/// never reaches a spin row: two spellings of one window is exactly the
+/// drift this pair exists to prevent.
+pub const REWORD_TIMEOUT_MIN: f64 = sayd_core::config::REWORD_TIMEOUT_MIN_MS as f64;
+pub const REWORD_TIMEOUT_MAX: f64 = sayd_core::config::REWORD_TIMEOUT_MAX_MS as f64;
 // `#[allow(dead_code)]`: unlike `COOLDOWN_STEP` and friends, no spin row
 // consumes this yet -- the Reword group's window.rs wiring is a later task
 // in this milestone. `clamp_ranges` already needs the MIN/MAX pair above, so

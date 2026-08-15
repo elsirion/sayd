@@ -90,6 +90,21 @@ impl Default for NotificationConfig {
     }
 }
 
+/// The window `reword.timeout_ms` is honoured in, applied by
+/// [`Config::load_str`] as well as by `settings::model::clamp_ranges`.
+///
+/// Declared here rather than only beside the settings window's spin rows
+/// because the ceiling is not a matter of taste: `sayd-cli` bounds every
+/// D-Bus interaction at 3 s and `say --reword` waits for the rewrite
+/// inline, so a hand-edited `timeout_ms = 86400000` -- which no spin row
+/// can produce and no `load_str` caller used to reject -- turns a slow
+/// provider into a CLI error instead of a spoken sentence. The value that
+/// reaches `Duration::from_millis` must be inside this window whichever
+/// door the config came through.
+pub const REWORD_TIMEOUT_MIN_MS: u64 = 200;
+/// See [`REWORD_TIMEOUT_MIN_MS`].
+pub const REWORD_TIMEOUT_MAX_MS: u64 = 2500;
+
 /// Rewriting text for the ear before it is spoken.
 ///
 /// Off by default, and pointed at a *local* endpoint by default. With
@@ -124,7 +139,8 @@ pub struct RewordConfig {
     /// used and `api_key` is ignored.
     pub api_key_env: String,
     /// How long a rewrite may take before the original is spoken instead.
-    /// Clamped to 200..=2500 (`settings::model::clamp_ranges`): `sayd-cli`
+    /// Clamped to [`REWORD_TIMEOUT_MIN_MS`]..=[`REWORD_TIMEOUT_MAX_MS`] on
+    /// load as well as by `settings::model::clamp_ranges`: `sayd-cli`
     /// bounds every D-Bus interaction at 3 s, and `say --reword` waits for
     /// the rewrite inline, so a budget that could exceed it would turn a
     /// slow provider into a CLI error instead of a spoken sentence.
@@ -281,8 +297,25 @@ impl Config {
     /// parse error -- can parse the bytes it already has instead of paying
     /// for, and racing, a second read.
     pub fn load_str(txt: &str) -> (Config, Option<String>) {
-        match toml::from_str(txt) {
-            Ok(c) => (c, None),
+        match toml::from_str::<Config>(txt) {
+            Ok(mut c) => {
+                // The one range this layer enforces itself. Everything else
+                // out of range is a degradation the daemon can report and
+                // carry on with (`settings::model::normalize`), and both
+                // daemon entry points do exactly that. `reword.timeout_ms`
+                // is different in kind: it is handed to
+                // `Duration::from_millis` and awaited inline by `say
+                // --reword`, so a value past `sayd-cli`'s 3 s D-Bus bound
+                // does not degrade the answer, it replaces it with an
+                // error. Enforced at the parse rather than at the use
+                // because there are four `load_from` callers and only two
+                // of them normalise.
+                c.reword.timeout_ms = c
+                    .reword
+                    .timeout_ms
+                    .clamp(REWORD_TIMEOUT_MIN_MS, REWORD_TIMEOUT_MAX_MS);
+                (c, None)
+            }
             Err(e) => (Config::default(), Some(e.to_string())),
         }
     }
@@ -496,6 +529,33 @@ mod tests {
         assert_eq!(c.voice, "am_fenrir");
         assert!(!c.reword.enabled);
         assert_eq!(c.reword.timeout_ms, 1500);
+    }
+
+    /// A hand-edited `timeout_ms` is clamped by the *parse*, not only by
+    /// the two callers that happen to normalise afterwards.
+    ///
+    /// `86400000` reaches `Duration::from_millis` otherwise, and with a
+    /// real client the practical bound becomes the 10 s HTTP ceiling --
+    /// which is past `sayd-cli`'s 3 s D-Bus bound, so `say --reword`
+    /// returns a CLI error rather than a sentence. That is exactly what the
+    /// 2500 ceiling exists to prevent.
+    #[test]
+    fn a_hand_edited_timeout_is_clamped_by_the_parse_itself() {
+        let (c, err) = Config::load_str("[reword]\ntimeout_ms = 86400000\n");
+        assert_eq!(err, None);
+        assert_eq!(c.reword.timeout_ms, REWORD_TIMEOUT_MAX_MS);
+
+        let (c, _) = Config::load_str("[reword]\ntimeout_ms = 0\n");
+        assert_eq!(
+            c.reword.timeout_ms, REWORD_TIMEOUT_MIN_MS,
+            "and a zero budget is not a way to switch the feature off -- \
+             `enabled` is"
+        );
+
+        // A value inside the window is not touched, which is the case that
+        // matters for every honest config.
+        let (c, _) = Config::load_str("[reword]\ntimeout_ms = 2000\n");
+        assert_eq!(c.reword.timeout_ms, 2000);
     }
 
     #[test]

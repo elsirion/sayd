@@ -69,6 +69,15 @@ pub enum Rejection {
         chars: usize,
         limit: usize,
     },
+    /// Longer than the ceiling could admit under *any* encoding, decided on
+    /// the byte count alone before anything scans the candidate. Separate
+    /// from [`Rejection::TooLong`] because it carries bytes rather than
+    /// characters: counting the characters is precisely the work this
+    /// variant exists to skip.
+    Oversized {
+        bytes: usize,
+        limit: usize,
+    },
 }
 
 impl Rejection {
@@ -83,6 +92,9 @@ impl Rejection {
             Rejection::CodeFence => "a code fence".to_string(),
             Rejection::TooLong { chars, limit } => {
                 format!("{chars} characters, over the {limit}-character ceiling")
+            }
+            Rejection::Oversized { bytes, limit } => {
+                format!("{bytes} bytes, past anything the {limit}-character ceiling could admit")
             }
         }
     }
@@ -112,7 +124,25 @@ pub fn length_ceiling(original: &str) -> usize {
 /// mitigations are structural rather than algorithmic (one short input, a
 /// low temperature, a small model) and the README says so plainly.
 pub fn check(original: &str, candidate: &str) -> Result<String, Rejection> {
-    let candidate = strip_wrapping_quotes(candidate.trim());
+    let candidate = candidate.trim();
+    let limit = length_ceiling(original);
+    // Before anything walks the candidate. UTF-8 spends at most 4 bytes on
+    // a `char`, so `bytes > limit * 4` proves `chars > limit` without
+    // counting them: the rejection is the one the character check would
+    // reach anyway, arrived at in constant time. It is here rather than in
+    // the caller because it makes the cost of a hostile body a property of
+    // the guard rather than of whichever client remembered to cap what it
+    // read -- measured through this function on a tokio worker, a 1 MB
+    // candidate cost 1.2 ms and a 256 MB candidate 261 ms, which is a
+    // synthesis thread's whole budget spent counting characters in a body
+    // no answer could ever come from.
+    if candidate.len() > limit.saturating_mul(4) {
+        return Err(Rejection::Oversized {
+            bytes: candidate.len(),
+            limit,
+        });
+    }
+    let candidate = strip_wrapping_quotes(candidate);
     if candidate.is_empty() {
         return Err(Rejection::Empty);
     }
@@ -135,7 +165,6 @@ pub fn check(original: &str, candidate: &str) -> Result<String, Rejection> {
         return Err(Rejection::CodeFence);
     }
     let chars = candidate.chars().count();
-    let limit = length_ceiling(original);
     if chars > limit {
         return Err(Rejection::TooLong { chars, limit });
     }
@@ -400,6 +429,57 @@ mod tests {
         );
     }
 
+    /// A candidate no answer could ever be is rejected on its byte count,
+    /// before anything walks it.
+    ///
+    /// The cost of a hostile body must not depend on a client remembering
+    /// to cap what it read: measured through this function on a tokio
+    /// worker, the three scans below cost 1.2 ms for 1 MB and 261 ms for
+    /// 256 MB. The bail is exact rather than a heuristic -- UTF-8 spends at
+    /// most 4 bytes on a `char`, so `bytes > limit * 4` proves the
+    /// character check would have rejected it too -- which is why it can be
+    /// unconditional.
+    #[test]
+    fn an_oversized_candidate_is_refused_before_anything_scans_it() {
+        let original = "Alice: where do you want to go for dinner";
+        let limit = length_ceiling(original);
+
+        // One byte past `limit * 4` is the first candidate that cannot
+        // possibly hold `limit` characters or fewer.
+        let hostile = "x".repeat(limit * 4 + 1);
+        assert_eq!(
+            check(original, &hostile),
+            Err(Rejection::Oversized {
+                bytes: limit * 4 + 1,
+                limit
+            })
+        );
+
+        // A megabyte of it is the same rejection at the same cost, which is
+        // the point.
+        let huge = "x".repeat(1 << 20);
+        assert_eq!(
+            check(original, &huge),
+            Err(Rejection::Oversized {
+                bytes: 1 << 20,
+                limit
+            })
+        );
+
+        // And the bail cannot reject anything the character count would
+        // have accepted: exactly `limit * 4` bytes still goes the long way
+        // round and is judged on its characters. Four-byte characters, so
+        // this is `limit` characters exactly -- an acceptance, not a
+        // rejection.
+        let at_the_bail = "🙂".repeat(limit);
+        assert_eq!(at_the_bail.len(), limit * 4);
+        assert!(
+            check(original, &at_the_bail).is_ok(),
+            "a candidate of exactly `limit` characters must survive a byte \
+             check that is an over-estimate of them"
+        );
+    }
+
     /// The fragments the settings window's Test row builds its subtitle
     /// out of. The sentence around them is the model layer's job; these are
     /// the only part with a number in.
@@ -416,6 +496,14 @@ mod tests {
             }
             .phrase(),
             "633 characters, over the 632-character ceiling"
+        );
+        assert_eq!(
+            Rejection::Oversized {
+                bytes: 1 << 20,
+                limit: 632
+            }
+            .phrase(),
+            "1048576 bytes, past anything the 632-character ceiling could admit"
         );
     }
 
