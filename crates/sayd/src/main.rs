@@ -157,6 +157,36 @@ const FORWARD_CALL_TIMEOUT: Duration = Duration::from_secs(3);
 /// so this path is now no *less* responsive than the one it beat.
 const CONFIG_STAMP_READ_TIMEOUT: Duration = Duration::from_millis(250);
 
+/// How long [`main`] lets the runtime finish what is on its blocking pool
+/// before it stops waiting and lets the process exit.
+///
+/// `Runtime::drop` waits for every blocking task that has *started*, with no
+/// bound of its own -- the failure `NotifyEnabledWatch`'s CRITICAL 1 already
+/// records ("SIGTERM left the process sitting for a minute"). This milestone
+/// is what makes it a routine cost rather than a pathological one: the
+/// rewrite's `ureq` call runs on that pool and is bounded only by
+/// `reword::REWORD_HTTP_CEILING`, ten seconds. Measured, one detached
+/// rewrite in flight against a provider that accepts and never answers:
+/// `Runtime::drop` took 9.73 s, so a `systemctl --user restart sayd` in the
+/// middle of one sat for ten seconds.
+///
+/// 500 ms because that is twice the longest *bounded* thing on this pool --
+/// `sayd_core::handle`'s 250 ms `SUBMIT_REPLY_TIMEOUT` and
+/// `CONFIG_REPLY_TIMEOUT`, and [`CONFIG_STAMP_READ_TIMEOUT`] above -- so
+/// every task that can finish promptly still does, and nothing is abandoned
+/// that was about to succeed. It is also well under the 2 s
+/// `settings::FLUSH_TIMEOUT` already spent by this point, so it does not
+/// become the shutdown budget; the whole of SIGTERM-to-exit stays inside
+/// systemd's `TimeoutStopSec` by two orders of magnitude rather than by a
+/// factor of nine.
+///
+/// What waiting longer would buy is nothing: the two tasks that can outlast
+/// this are a config-stamp read (whose value the publish loop has already
+/// given up on) and a rewrite whose answer §2 has already dropped --
+/// `RewordPlan::resolve` holds no `EngineHandle`, so there is no path on
+/// which the thing being waited for could still be spoken.
+const RUNTIME_SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
+
 /// `AudioSink` for `SAYD_NO_AUDIO`: accepts and immediately discards every
 /// sample, reporting nothing ever pending.
 ///
@@ -1394,6 +1424,11 @@ fn main() -> std::process::ExitCode {
 
     main_loop.run();
     let code = *exit.lock().expect("exit mutex");
+    // Bounded, rather than letting `rt` drop here: `Runtime::drop` waits
+    // without limit for blocking tasks that have started, and since this
+    // milestone one of those is a `ureq` request bounded only by
+    // `reword::REWORD_HTTP_CEILING`. See `RUNTIME_SHUTDOWN_GRACE`.
+    rt.shutdown_timeout(RUNTIME_SHUTDOWN_GRACE);
     code
 }
 
@@ -1829,5 +1864,41 @@ mod tests {
 
         sup.reconcile(false, &engine);
         engine.shutdown();
+    }
+
+    /// IMPORTANT 2: SIGTERM to exit must not gain the rewrite's ceiling.
+    ///
+    /// `main` used to let `rt` drop when the glib loop returned, and
+    /// `Runtime::drop` waits -- with no bound of its own -- for every
+    /// blocking task that has started. This milestone put a `ureq` request
+    /// on that pool whose only bound is `reword::REWORD_HTTP_CEILING`, ten
+    /// seconds. Measured with `drop(rt)` in place of the call below and one
+    /// rewrite in flight against a provider that accepts and never answers:
+    /// 9.73 s, which is what a `systemctl --user restart sayd` mid-rewrite
+    /// sat for.
+    ///
+    /// The stuck task here stands in for that request, and is bounded by the
+    /// same constant it is: nothing shorter would tell the difference between
+    /// a bounded shutdown and a lucky one.
+    #[test]
+    fn a_stuck_blocking_task_cannot_hold_shutdown_past_the_grace() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.spawn_blocking(|| std::thread::sleep(crate::reword::REWORD_HTTP_CEILING));
+        // `Runtime::drop` waits for blocking tasks that have *started*, so
+        // the task has to have started for this to be measuring anything.
+        std::thread::sleep(Duration::from_millis(100));
+
+        let started = Instant::now();
+        rt.shutdown_timeout(RUNTIME_SHUTDOWN_GRACE);
+        let waited = started.elapsed();
+
+        assert!(
+            waited < RUNTIME_SHUTDOWN_GRACE * 2,
+            "shutdown waited {waited:?} on a request whose answer §2 has already \
+             dropped; the bound is {RUNTIME_SHUTDOWN_GRACE:?}"
+        );
     }
 }
