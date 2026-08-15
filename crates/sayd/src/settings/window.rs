@@ -18,6 +18,10 @@
 //!   an already-open window is re-presented.
 //! - A row that cannot express what the config holds says so, rather than
 //!   quietly showing something else -- see [`Combo`] and [`Spin`].
+//!
+//! The notification allowlist is the one part whose *number* of rows comes
+//! from the config, so its redraw closure rebuilds them rather than setting
+//! a value; see [`allowlist_group`].
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -25,13 +29,14 @@ use std::sync::Arc;
 
 use adw::prelude::*;
 use gtk4 as gtk;
-use sayd_core::config::{CleanupConfig, Config, UrlPolicy};
+use sayd_core::config::{CleanupConfig, Config, NotificationConfig, UrlPolicy};
 use sayd_core::engine::SayOpts;
 use sayd_core::handle::EngineHandle;
 use sayd_core::queue::{Policy, Source as QueueSource};
 
 use super::model::{
-    SettingsModel, IDLE_UNLOAD_MAX, IDLE_UNLOAD_MIN, IDLE_UNLOAD_STEP, MAX_CHARS_MAX,
+    allow_add, allow_contains, allow_remove, SettingsModel, COOLDOWN_MAX, COOLDOWN_MIN,
+    COOLDOWN_STEP, IDLE_UNLOAD_MAX, IDLE_UNLOAD_MIN, IDLE_UNLOAD_STEP, MAX_CHARS_MAX,
     MAX_CHARS_MIN, MAX_CHARS_STEP, MODELS, SPEED_MAX, SPEED_MIN, SPEED_STEP, THREADS_MAX,
     THREADS_MIN, THREADS_STEP,
 };
@@ -65,10 +70,20 @@ type CleanupGet = fn(&CleanupConfig) -> bool;
 type CleanupSet = fn(&mut CleanupConfig, bool);
 
 /// One row's "draw yourself from this config" closure; see [`Ui::rows`].
-/// Boxed because the nine of them have nine different types, `Rc<RefCell<_>>`
-/// because [`Ui`] is cloned into every handler and each of those may call
-/// [`Ui::redraw`].
-type Redraws = Rc<RefCell<Vec<Box<dyn Fn(&Config)>>>>;
+/// Boxed because they have as many different types as there are rows,
+/// `Rc<RefCell<_>>` because [`Ui`] is cloned into every handler and each of
+/// those may call [`Ui::redraw`].
+///
+/// The [`Ui`] is handed *in* rather than captured, which matters for exactly
+/// one of these closures: the allowlist's, which builds fresh rows with
+/// fresh handlers every time it runs and so needs a `Ui` to give them. A
+/// closure that captured one would close a reference cycle through this very
+/// list -- list holds closure holds `Ui` holds list -- and unlike the cycle
+/// every row handler already makes through the window (broken when GTK
+/// disposes the widget tree on close), nothing would ever break that one, so
+/// each opening of the settings window would leak its whole `Ui`. Passing it
+/// as an argument makes that unrepresentable rather than merely discouraged.
+type Redraws = Rc<RefCell<Vec<Box<dyn Fn(&Ui, &Config)>>>>;
 
 /// The Text cleanup group, in the order spec §8 lists the transforms.
 const CLEANUP_SWITCHES: [(&str, &str, CleanupGet, CleanupSet); 5] = [
@@ -101,6 +116,40 @@ const CLEANUP_SWITCHES: [(&str, &str, CleanupGet, CleanupSet); 5] = [
         "Read TTS as T-T-S rather than as a word",
         |c| c.spell_acronyms,
         |c, v| c.spell_acronyms = v,
+    ),
+];
+
+/// The same arrangement as [`CleanupGet`]/[`CleanupSet`], for the same
+/// reason: `NotificationConfig`'s three flags are plain `bool`s with no
+/// common accessor, so one handler serves all three only if each row can say
+/// which field it is.
+type NotifyGet = fn(&NotificationConfig) -> bool;
+type NotifySet = fn(&mut NotificationConfig, bool);
+
+/// The Notifications group's switches, in the order spec §6 lists them.
+///
+/// `enabled` leads because the other two are refinements of it -- and
+/// because it is the one that starts and stops the bus monitor, rather than
+/// changing the wording of an announcement that was going to happen anyway.
+const NOTIFICATION_SWITCHES: [(&str, &str, NotifyGet, NotifySet); 3] = [
+    (
+        "Speak notifications",
+        "Announce desktop notifications from the applications listed below; \
+         they are still shown as usual",
+        |c| c.enabled,
+        |c, v| c.enabled = v,
+    ),
+    (
+        "Say the application name",
+        "Announce “Signal: Ada: dinner?” rather than the summary on its own",
+        |c| c.speak_app_name,
+        |c, v| c.speak_app_name = v,
+    ),
+    (
+        "Say the body",
+        "Read the body after the summary; many applications only restate the summary there",
+        |c| c.speak_body,
+        |c, v| c.speak_body = v,
     ),
 ];
 
@@ -178,10 +227,9 @@ struct Ui {
     /// One "draw yourself from this config" closure per row, in the order
     /// the rows were built.
     ///
-    /// These deliberately capture only their own widget, never a [`Ui`]:
-    /// the window already owns its handlers and the handlers own a `Ui`, so
-    /// a closure here that captured one too would add a second cycle to keep
-    /// track of for nothing.
+    /// These deliberately capture only their own widget, never a [`Ui`] --
+    /// one is passed to them instead, for the reason spelled out on
+    /// [`Redraws`].
     rows: Redraws,
 }
 
@@ -210,7 +258,7 @@ impl Ui {
     }
 
     /// Register a row's redraw closure. Called once per row, at build time.
-    fn row(&self, draw: impl Fn(&Config) + 'static) {
+    fn row(&self, draw: impl Fn(&Ui, &Config) + 'static) {
         self.rows.borrow_mut().push(Box::new(draw));
     }
 
@@ -222,8 +270,13 @@ impl Ui {
     /// after a hand edit can move any of them.
     fn redraw(&self, cfg: &Config) {
         self.quietly(|| {
+            // Borrowed, not `borrow_mut`: the allowlist's closure rebuilds
+            // widgets while this iteration is live, and a row registering
+            // itself mid-redraw (which nothing does -- `row` is only called
+            // at build time) would otherwise be a panic rather than a
+            // question.
             for draw in self.rows.borrow().iter() {
-                draw(cfg);
+                draw(self, cfg);
             }
         });
     }
@@ -272,6 +325,8 @@ fn build(model: Arc<SettingsModel>, engine: EngineHandle) -> Ui {
     page.add(&voice_group(&ui, &cfg, engine));
     page.add(&engine_group(&ui, &cfg));
     page.add(&cleanup_group(&ui, &cfg));
+    page.add(&notification_group(&ui, &cfg));
+    page.add(&allowlist_group(&ui, &cfg));
     window.add(&page);
 
     // A write that fails does so long after the click that caused it, on the
@@ -483,7 +538,7 @@ fn voice_group(ui: &Ui, cfg: &Config, engine: EngineHandle) -> adw::PreferencesG
     voice.show(&cfg.voice, voices.iter().position(|v| *v == cfg.voice));
     let c = voice.clone();
     let known = voices.clone();
-    ui.row(move |cfg| c.show(&cfg.voice, known.iter().position(|v| *v == cfg.voice)));
+    ui.row(move |_, cfg| c.show(&cfg.voice, known.iter().position(|v| *v == cfg.voice)));
     let u = ui.clone();
     let c = voice.clone();
     let known = voices.clone();
@@ -512,7 +567,7 @@ fn voice_group(ui: &Ui, cfg: &Config, engine: EngineHandle) -> adw::PreferencesG
     );
     speed.show(cfg.speed as f64);
     let s = speed.clone();
-    ui.row(move |cfg| s.show(cfg.speed as f64));
+    ui.row(move |_, cfg| s.show(cfg.speed as f64));
     let u = ui.clone();
     speed.row.connect_value_notify(move |row| {
         if u.echo() {
@@ -603,7 +658,7 @@ fn engine_group(ui: &Ui, cfg: &Config) -> adw::PreferencesGroup {
     let position = |name: &str| MODELS.iter().position(|(n, _)| *n == name);
     model_row.show(&cfg.model, position(&cfg.model));
     let c = model_row.clone();
-    ui.row(move |cfg| c.show(&cfg.model, position(&cfg.model)));
+    ui.row(move |_, cfg| c.show(&cfg.model, position(&cfg.model)));
     let u = ui.clone();
     let c = model_row.clone();
     model_row.row.connect_selected_notify(move |_| {
@@ -631,7 +686,7 @@ fn engine_group(ui: &Ui, cfg: &Config) -> adw::PreferencesGroup {
     );
     threads.show(cfg.threads as f64);
     let s = threads.clone();
-    ui.row(move |cfg| s.show(cfg.threads as f64));
+    ui.row(move |_, cfg| s.show(cfg.threads as f64));
     let u = ui.clone();
     threads.row.connect_value_notify(move |row| {
         if u.echo() {
@@ -653,7 +708,7 @@ fn engine_group(ui: &Ui, cfg: &Config) -> adw::PreferencesGroup {
     );
     idle.show(cfg.idle_unload_secs as f64);
     let s = idle.clone();
-    ui.row(move |cfg| s.show(cfg.idle_unload_secs as f64));
+    ui.row(move |_, cfg| s.show(cfg.idle_unload_secs as f64));
     let u = ui.clone();
     idle.row.connect_value_notify(move |row| {
         if u.echo() {
@@ -675,7 +730,7 @@ fn engine_group(ui: &Ui, cfg: &Config) -> adw::PreferencesGroup {
     );
     max_chars.show(cfg.max_chars as f64);
     let s = max_chars.clone();
-    ui.row(move |cfg| s.show(cfg.max_chars as f64));
+    ui.row(move |_, cfg| s.show(cfg.max_chars as f64));
     let u = ui.clone();
     max_chars.row.connect_value_notify(move |row| {
         if u.echo() {
@@ -702,7 +757,7 @@ fn cleanup_group(ui: &Ui, cfg: &Config) -> adw::PreferencesGroup {
             .active(get(&cfg.cleanup))
             .build();
         let r = row.clone();
-        ui.row(move |cfg| r.set_active(get(&cfg.cleanup)));
+        ui.row(move |_, cfg| r.set_active(get(&cfg.cleanup)));
         let u = ui.clone();
         row.connect_active_notify(move |row| {
             if u.echo() {
@@ -726,7 +781,7 @@ fn cleanup_group(ui: &Ui, cfg: &Config) -> adw::PreferencesGroup {
     let describe = |p: UrlPolicy| format!("{p:?}").to_lowercase();
     urls.show(&describe(cfg.cleanup.urls), position(cfg.cleanup.urls));
     let c = urls.clone();
-    ui.row(move |cfg| c.show(&describe(cfg.cleanup.urls), position(cfg.cleanup.urls)));
+    ui.row(move |_, cfg| c.show(&describe(cfg.cleanup.urls), position(cfg.cleanup.urls)));
     let u = ui.clone();
     let c = urls.clone();
     urls.row.connect_selected_notify(move |_| {
@@ -744,4 +799,186 @@ fn cleanup_group(ui: &Ui, cfg: &Config) -> adw::PreferencesGroup {
     group.add(&urls.row);
 
     group
+}
+
+fn notification_group(ui: &Ui, cfg: &Config) -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::builder()
+        .title("Notifications")
+        .description("Takes effect at once: turning this on starts watching the session bus")
+        .build();
+
+    for (title, subtitle, get, set) in NOTIFICATION_SWITCHES {
+        let row = adw::SwitchRow::builder()
+            .title(title)
+            .subtitle(subtitle)
+            .active(get(&cfg.notifications))
+            .build();
+        let r = row.clone();
+        ui.row(move |_, cfg| r.set_active(get(&cfg.notifications)));
+        let u = ui.clone();
+        row.connect_active_notify(move |row| {
+            if u.echo() {
+                return;
+            }
+            let on = row.is_active();
+            u.apply(|c| set(&mut c.notifications, on));
+        });
+        group.add(&row);
+    }
+
+    // The subtitle has to spend its words on `0`, which is the one value here
+    // that does not mean what a "seconds between X" row usually means: it is
+    // not "no wait", it turns rate limiting off entirely, so every single
+    // notification from an allowed application is spoken (`Limiter::decide`'s
+    // `cooldown_secs == 0` arm, and the test that pins it). Left unsaid, `0`
+    // reads like the *least* chatty setting rather than the most.
+    let cooldown = Spin::new(
+        "Cooldown",
+        "Seconds before the same application is announced again; 0 speaks every notification",
+        COOLDOWN_MIN,
+        COOLDOWN_MAX,
+        COOLDOWN_STEP,
+        0,
+    );
+    cooldown.show(cfg.notifications.cooldown_secs as f64);
+    let s = cooldown.clone();
+    ui.row(move |_, cfg| s.show(cfg.notifications.cooldown_secs as f64));
+    let u = ui.clone();
+    cooldown.row.connect_value_notify(move |row| {
+        if u.echo() {
+            return;
+        }
+        let value = row.value() as u64;
+        u.apply(|c| c.notifications.cooldown_secs = value);
+    });
+    group.add(&cooldown.row);
+
+    group
+}
+
+/// The allowlist: an entry to add a name, and one row per name already on it.
+///
+/// A group of its own rather than more rows under the switches, for three
+/// reasons. It is the only part of the window whose row *count* changes, and
+/// a group boundary is what keeps a rebuild from having to know which of a
+/// mixed group's children were its own. It is the only part that needs a
+/// paragraph of explanation -- an empty list speaks nothing, which is a trap
+/// worth a description rather than a subtitle on somebody else's row. And at
+/// the window's 520px it reads as a list: libadwaita draws each group as its
+/// own rounded card, so a dozen one-line rows sit under their own heading
+/// instead of turning the Notifications card into a wall.
+fn allowlist_group(ui: &Ui, cfg: &Config) -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::builder()
+        .title("Applications to announce")
+        .description(
+            "Matched against the name an application gives itself, ignoring case. \
+             Nothing is spoken while this list is empty: switch announcements on with \
+             it empty and sayd logs every name it declines, which is how to find them.",
+        )
+        .build();
+
+    let entry = adw::EntryRow::builder().title("Application name").build();
+    let add = gtk::Button::builder()
+        .icon_name("list-add-symbolic")
+        .valign(gtk::Align::Center)
+        .tooltip_text("Add this application to the list")
+        .build();
+    add.add_css_class("flat");
+    entry.add_suffix(&add);
+    // Not registered with `Ui::row`, for the reason the Test row is not: what
+    // the user has typed is not a view of the config, and clobbering it on
+    // every unrelated edit would be its own bug.
+    group.add(&entry);
+
+    let u = ui.clone();
+    let e = entry.clone();
+    add.connect_clicked(move |_| add_to_allowlist(&u, &e));
+    let u = ui.clone();
+    // Enter in the field is the same action as the button, as in the Test row.
+    entry.connect_entry_activated(move |row| add_to_allowlist(&u, row));
+
+    // The rows the closure below has put in the group, so a rebuild takes
+    // away exactly what it added and never the entry row above.
+    let shown: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
+    let g = group.clone();
+    let draw = move |ui: &Ui, cfg: &Config| {
+        // Rebuilt wholesale rather than diffed: the list is a handful of
+        // names, and a diff would have to decide what "the same row" means
+        // across a rename -- another rule, in the layer that is not allowed
+        // to hold any.
+        //
+        // Every caller of a row's redraw closure is inside `Ui::quietly`
+        // (see `Ui::redraw`), and building an `ActionRow` emits nothing that
+        // would write anyway, so this cannot re-enter its own handlers. The
+        // one path that looks like it might -- a Remove button whose click
+        // ends up destroying the very row it is attached to -- is safe
+        // because the emission holds its own reference to the button for the
+        // length of the call; see `remove` below.
+        for row in shown.borrow_mut().drain(..) {
+            g.remove(&row);
+        }
+        for name in &cfg.notifications.allow {
+            let row = adw::ActionRow::builder()
+                .title(name)
+                // `AdwPreferencesRow:use-markup` defaults to true and these
+                // titles are application-controlled, which is a bad pair:
+                // measured, an entry of `Ada & Co` makes GTK refuse the
+                // title outright ("Failed to set text ... escape ampersand
+                // as &amp;") and the row renders *blank*, so the one row
+                // whose name the user most needs to read to remove it is
+                // the one they cannot see.
+                .use_markup(false)
+                .build();
+            let remove = gtk::Button::builder()
+                .icon_name("list-remove-symbolic")
+                .valign(gtk::Align::Center)
+                .tooltip_text("Stop announcing this application")
+                .build();
+            remove.add_css_class("flat");
+            row.add_suffix(&remove);
+            let u = ui.clone();
+            let name = name.clone();
+            remove.connect_clicked(move |_| {
+                // Cloned out of the closure's environment before the edit,
+                // because the edit redraws and the redraw destroys this row
+                // and this button with it. GTK holds a reference to the
+                // instance for the length of a signal emission, so the
+                // closure outlives the call either way -- taking the copy
+                // first means nothing here depends on knowing that.
+                let name = name.clone();
+                u.apply(move |c| allow_remove(c, &name));
+            });
+            g.add(&row);
+            shown.borrow_mut().push(row);
+        }
+    };
+    // Populated before the handler above could ever fire, and before this
+    // closure is handed over, in the same order every other row uses.
+    draw(ui, cfg);
+    ui.row(draw);
+
+    group
+}
+
+/// Put whatever the entry holds on the allowlist.
+///
+/// Every rule about *what* that means -- an empty name, a name already
+/// there in some other casing, the surrounding whitespace -- is
+/// `allow_add`'s, in `model.rs`. This asks only the one question a widget
+/// has to answer for itself: whether to clear the field.
+fn add_to_allowlist(ui: &Ui, entry: &adw::EntryRow) {
+    let name = entry.text().to_string();
+    ui.apply(|c| allow_add(c, &name));
+    // Cleared only once the list really holds the name -- which covers the
+    // duplicate case too, where nothing was added but the name is listed and
+    // the field has served its purpose. When it does not (an empty field, or
+    // an edit the model refused and toasted), what was typed stays put to be
+    // fixed rather than vanishing.
+    if allow_contains(&ui.model.current(), &name) {
+        // The entry has no handler `set_text` could re-enter today --
+        // `entry_activated` fires on Enter, not on a programmatic set -- but
+        // this is a widget write made by this code, and the window has one
+        // way of saying so.
+        ui.quietly(|| entry.set_text(""));
+    }
 }

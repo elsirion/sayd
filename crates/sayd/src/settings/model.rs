@@ -55,6 +55,18 @@ pub const IDLE_UNLOAD_STEP: f64 = 30.0;
 pub const MAX_CHARS_MIN: f64 = 100.0;
 pub const MAX_CHARS_MAX: f64 = 200_000.0;
 pub const MAX_CHARS_STEP: f64 = 500.0;
+/// `0` is the minimum because it means something, and something the row has
+/// to be able to offer: `Limiter::decide`'s `cooldown_secs == 0` arm turns
+/// rate limiting off entirely, so every notification from an allowed
+/// application is spoken. See the Notifications group's subtitle, which says
+/// that rather than letting `0` read as "no wait between announcements".
+pub const COOLDOWN_MIN: f64 = 0.0;
+/// An hour, the same ceiling `IDLE_UNLOAD_MAX` uses: past it the spinner is
+/// no longer a control anyone drives to the end, and a longer window is a
+/// hand edit (which, as with every other row here, is left alone rather than
+/// clamped -- see the doc comment above).
+pub const COOLDOWN_MAX: f64 = 3600.0;
+pub const COOLDOWN_STEP: f64 = 5.0;
 
 /// How long a burst of edits is allowed to keep collapsing into one write.
 ///
@@ -754,6 +766,71 @@ pub fn normalize(cfg: &mut Config) -> Vec<String> {
         cfg.model = FALLBACK_MODEL.to_string();
     }
     warnings
+}
+
+/// Is `name` already on the notification allowlist?
+///
+/// Case-folded and trimmed, because that is how the list is *read*:
+/// `notify::policy`'s `is_allowed` lowercases both sides before comparing,
+/// and `compose` trims an `app_name` before speaking it. "Signal" and
+/// " signal " are one entry to the layer that consumes this list, so they
+/// must be one entry to the layer that edits it -- otherwise the window
+/// would happily add a second row that changes nothing and cannot be told
+/// apart from the first.
+///
+/// A name that is empty once trimmed is on no list: it is what an empty
+/// entry field produces, and `compose` treats an `app_name` that trims to
+/// nothing as no name at all.
+///
+/// Public because the window needs to ask the question -- whether to clear
+/// the entry field after an add -- without knowing the rule.
+pub fn allow_contains(cfg: &Config, name: &str) -> bool {
+    let name = name.trim().to_lowercase();
+    !name.is_empty()
+        && cfg
+            .notifications
+            .allow
+            .iter()
+            .any(|a| a.trim().to_lowercase() == name)
+}
+
+/// Put `name` on the notification allowlist, or leave the config exactly as
+/// it is.
+///
+/// An empty name and one already on the list are both no-ops, decided here
+/// rather than in the window: the window is the one layer with no test
+/// coverage, and "what happens when the user presses Add on an empty field"
+/// is a rule like any other.
+///
+/// Takes `&mut Config` and mutates it in place so it can be handed straight
+/// to `SettingsModel::edit`, whose copy is seeded from the file rather than
+/// from anything the window has been holding. An add expressed as "write
+/// back the list I drew" would silently revert an entry added by a hand edit
+/// (or removed by one) since the window last redrew.
+pub fn allow_add(cfg: &mut Config, name: &str) {
+    let name = name.trim();
+    if name.is_empty() || allow_contains(cfg, name) {
+        return;
+    }
+    // Stored trimmed: the surrounding space would survive into the file, and
+    // `is_allowed` would then match it only because it trims too. A file that
+    // needs a reader's help to be read is a file that will eventually be
+    // hand-edited wrong.
+    cfg.notifications.allow.push(name.to_string());
+}
+
+/// Take `name` off the notification allowlist.
+///
+/// Every case-folded match goes, not just the first. A hand-edited file can
+/// hold both `"Signal"` and `"signal"`; `is_allowed` matches either, so a
+/// Remove button that took away only the row it was attached to would leave
+/// the application still speaking with its row gone -- the worst of the
+/// available outcomes.
+pub fn allow_remove(cfg: &mut Config, name: &str) {
+    let name = name.trim().to_lowercase();
+    cfg.notifications
+        .allow
+        .retain(|a| a.trim().to_lowercase() != name);
 }
 
 /// Voice-pack names from `<models_dir>/voices/*.bin`, sorted.
@@ -1532,6 +1609,141 @@ mod tests {
             start.elapsed()
         );
         engine.shutdown();
+    }
+
+    /// What the window's Add button does, for every name worth pressing it
+    /// with. All of it is decided here because the window cannot be tested.
+    #[test]
+    fn adding_to_the_allowlist_trims_and_ignores_empty_and_duplicate_names() {
+        // (what the list holds, what the user typed, what the list must hold)
+        let cases: [(&[&str], &str, &[&str]); 8] = [
+            (&[], "Signal", &["Signal"]),
+            (&["Signal"], "Fractal", &["Signal", "Fractal"]),
+            // Nothing typed: the button is a no-op rather than an entry the
+            // policy layer would then read as "no name at all".
+            (&[], "", &[]),
+            (&[], "   ", &[]),
+            // Already there, in every casing `is_allowed` would match.
+            (&["Signal"], "Signal", &["Signal"]),
+            (&["Signal"], "signal", &["Signal"]),
+            (&["Signal"], "  SIGNAL  ", &["Signal"]),
+            // Trimmed on the way in, so the file holds what a human would
+            // have written.
+            (&["Signal"], "  Fractal  ", &["Signal", "Fractal"]),
+        ];
+        for (before, typed, after) in cases {
+            let mut cfg = Config::default();
+            cfg.notifications.allow = before.iter().map(|s| (*s).to_string()).collect();
+            allow_add(&mut cfg, typed);
+            assert_eq!(
+                cfg.notifications.allow, after,
+                "adding {typed:?} to {before:?}"
+            );
+        }
+    }
+
+    /// What each row's Remove button does.
+    #[test]
+    fn removing_from_the_allowlist_takes_every_entry_that_matched() {
+        let cases: [(&[&str], &str, &[&str]); 5] = [
+            (&["Signal", "Fractal"], "Signal", &["Fractal"]),
+            (&["Signal", "Fractal"], "signal", &["Fractal"]),
+            // Both, or the application keeps speaking with no row left to
+            // stop it: `is_allowed` matches either spelling.
+            (&["Signal", "signal"], "Signal", &[]),
+            // A name that is not on the list changes nothing.
+            (&["Signal"], "Fractal", &["Signal"]),
+            (&["Signal"], "", &["Signal"]),
+        ];
+        for (before, removed, after) in cases {
+            let mut cfg = Config::default();
+            cfg.notifications.allow = before.iter().map(|s| (*s).to_string()).collect();
+            allow_remove(&mut cfg, removed);
+            assert_eq!(
+                cfg.notifications.allow, after,
+                "removing {removed:?} from {before:?}"
+            );
+        }
+    }
+
+    /// The window's duplicate rule and the policy layer's match rule have to
+    /// be the same rule. If they drift, the window either refuses a name the
+    /// daemon would never have matched or accepts a second entry that does
+    /// nothing -- so this pins `allow_add` against the code that actually
+    /// reads the list rather than against a second copy of its wording.
+    #[test]
+    fn an_entry_the_model_adds_is_one_the_policy_layer_matches() {
+        use crate::notify::policy::{Decision, Limiter};
+        use crate::notify::Notification;
+
+        let mut cfg = Config::default();
+        cfg.notifications.enabled = true;
+        allow_add(&mut cfg, "  Signal  ");
+
+        let notification = Notification {
+            app_name: "signal".into(),
+            summary: "Ada: dinner?".into(),
+            body: String::new(),
+        };
+        let mut limiter = Limiter::new();
+        assert_ne!(
+            limiter.decide(&notification, &cfg.notifications, std::time::Instant::now()),
+            Decision::NotAllowed,
+            "a name the window added must be one the daemon speaks for"
+        );
+
+        // And so the other casing is a duplicate rather than a second entry
+        // that would change nothing.
+        allow_add(&mut cfg, "signal");
+        assert_eq!(cfg.notifications.allow, ["Signal"]);
+    }
+
+    /// The allowlist is the one field the window edits as a *list*, so it is
+    /// the one with an obvious wrong implementation: hold the list the rows
+    /// were drawn from and write it back with one entry more. `edit` seeds
+    /// from the file, and `allow_add` mutates that seed, so an entry added by
+    /// hand while the window sat open survives the next Add.
+    #[test]
+    fn an_allowlist_add_does_not_drop_an_entry_added_outside_the_window() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let models = models_dir_with(&["af_heart"], dir.path());
+        let path = dir.path().join("config.toml");
+        let (store, engine) = store_in(dir.path());
+        let m = SettingsModel::new(store.clone(), models, Config::default());
+
+        let mut hand_edited = Config::default();
+        hand_edited.notifications.enabled = true;
+        hand_edited.notifications.allow = vec!["Fractal".into()];
+        hand_edited.save_to(&path).expect("hand edit");
+        assert_eq!(store.reload(), ReloadOutcome::Applied);
+
+        m.edit(|c| allow_add(c, "Signal")).expect("edit succeeds");
+        settled(&m);
+
+        let (on_disk, err) = Config::load_from(&path);
+        assert_eq!(err, None);
+        assert_eq!(
+            on_disk.notifications.allow,
+            ["Fractal", "Signal"],
+            "the hand-added entry must survive the window's add"
+        );
+        engine.shutdown();
+    }
+
+    /// The cooldown row must be able to show the value a fresh config has,
+    /// or the very first window opened on a default config would report its
+    /// own default as out of the range it offers (see `Spin::show`).
+    #[test]
+    fn the_cooldown_row_can_express_the_default_cooldown() {
+        let cooldown = Config::default().notifications.cooldown_secs as f64;
+        assert!(
+            (COOLDOWN_MIN..=COOLDOWN_MAX).contains(&cooldown),
+            "the default cooldown {cooldown} is outside {COOLDOWN_MIN}-{COOLDOWN_MAX}"
+        );
+        assert_eq!(
+            COOLDOWN_MIN, 0.0,
+            "0 is a setting -- no rate limiting at all -- not a floor to be raised"
+        );
     }
 
     /// The Model row's inline text is spec'd verbatim; the window renders
