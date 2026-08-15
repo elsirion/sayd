@@ -24,7 +24,7 @@
 //! by one; see [`DEBOUNCE`].
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -96,6 +96,9 @@ pub struct ConfigStore {
     last_written: Mutex<Config>,
     status: Arc<ConfigStatus>,
     applied_reloads: AtomicUsize,
+    /// Bumped once per config change that actually reached the engine. See
+    /// [`ConfigStore::generation`].
+    generation: AtomicU64,
     /// Test-only: how many times `current` took the stamp.
     ///
     /// Finding 6 is about a caller on the glib main thread taking this lock
@@ -119,6 +122,7 @@ impl ConfigStore {
             last_written: Mutex::new(running),
             status: Arc::new(ConfigStatus::default()),
             applied_reloads: AtomicUsize::new(0),
+            generation: AtomicU64::new(0),
             #[cfg(test)]
             stamp_reads: AtomicUsize::new(0),
         }
@@ -179,6 +183,40 @@ impl ConfigStore {
         #[cfg(test)]
         self.stamp_reads.fetch_add(1, Ordering::Relaxed);
         self.stamp().clone()
+    }
+
+    /// A counter that changes exactly when the config this store describes
+    /// changes -- readable without taking the stamp's lock.
+    ///
+    /// IMPORTANT 2 (M5 final review): `current()` is cheap only when nothing
+    /// is contending for the stamp, and the stamp is held across
+    /// `write_locked`'s unbounded disk write. A caller that only wants to
+    /// know *whether* to look -- the publish loop, five times a second for
+    /// the life of a daemon that runs for weeks (see `main.rs`'s
+    /// `NotifyEnabledWatch`) -- must not pay a mutex acquisition, let alone
+    /// a `spawn_blocking` hop, to be told "nothing has changed" for the
+    /// millionth time. This is the cheap half of that: an atomic load, with
+    /// the expensive `current()` behind it only when the number moved.
+    ///
+    /// Bumped in exactly the two places a config becomes behaviour --
+    /// `write_locked` (every settings-window save, tray mute, MPRIS rate
+    /// change, and `save`) and `reload`'s applied path -- and in both of them
+    /// *after* the stamp has been replaced and `Command::ApplyConfig` sent,
+    /// while the stamp's lock is still held. That ordering is what makes the
+    /// gate sound rather than merely cheap: an observer that sees a new
+    /// generation and then takes the stamp is guaranteed to find the config
+    /// that generation belongs to (or a newer one), never the previous one.
+    /// Bumping before the write would invert that and let a reader record a
+    /// generation for a value it never saw.
+    ///
+    /// A write that *fails* does not bump: `write_locked` restores what it
+    /// displaced and sends no `ApplyConfig`, so nothing changed for a reader
+    /// to notice. Neither does a stuck write, until it finishes -- which is
+    /// correct for the same reason: while `save_to` is parked, the engine has
+    /// not been told either, and a config nobody is running yet is not a
+    /// change for the publish loop to reconcile against.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
     }
 
     /// How many times `current` has taken the stamp. Test-only; see the
@@ -300,6 +338,9 @@ impl ConfigStore {
         // model is one this build knows and the ranges are the engine's own.
         self.status.set(None);
         self.engine.send(Command::ApplyConfig(cfg));
+        // Last, under the stamp's lock: see `generation`'s doc comment for
+        // why the order matters.
+        self.generation.fetch_add(1, Ordering::Release);
         Ok(())
     }
 
@@ -510,6 +551,11 @@ impl ConfigStore {
         *stamp = cfg.clone();
         self.applied_reloads.fetch_add(1, Ordering::Relaxed);
         self.engine.send(Command::ApplyConfig(cfg));
+        // The other place a config becomes behaviour, so the other place the
+        // generation moves -- last, under the stamp's lock, exactly as in
+        // `write_locked`. A hand edit that flips `notifications.enabled` is
+        // otherwise invisible to the publish loop's gate.
+        self.generation.fetch_add(1, Ordering::Release);
         ReloadOutcome::Applied
     }
 
@@ -1133,6 +1179,81 @@ mod tests {
         wait_for(&engine, "the engine to mute despite the stuck write", |s| {
             s.muted
         });
+        engine.shutdown();
+    }
+
+    /// IMPORTANT 2: the publish loop reads `notifications.enabled` only when
+    /// this counter moves (see `main.rs`'s `NotifyEnabledWatch`), so the
+    /// counter has to move on exactly the events that change what the daemon
+    /// is running -- no more, or the gate buys nothing, and no fewer, or a
+    /// change is missed until the next unrelated one.
+    #[test]
+    fn the_generation_moves_exactly_when_the_config_does() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let engine = engine();
+        let store = ConfigStore::new(path.clone(), engine.clone(), Config::default());
+
+        let start = store.generation();
+        assert_eq!(
+            store.reload(),
+            ReloadOutcome::Missing,
+            "nothing on disk yet"
+        );
+        assert_eq!(store.generation(), start, "a missing file changes nothing");
+
+        let cfg = Config {
+            voice: "am_fenrir".into(),
+            ..Config::default()
+        };
+        store.save(&cfg).expect("save succeeds");
+        let after_save = store.generation();
+        assert_eq!(after_save, start + 1, "a write that lands is a change");
+
+        assert_eq!(
+            store.reload(),
+            ReloadOutcome::OwnWrite,
+            "our own write comes back"
+        );
+        assert_eq!(
+            store.generation(),
+            after_save,
+            "an own-write echo is not a change; a gate that moved here would \
+             put the publish loop back to reading the store on every event"
+        );
+
+        std::fs::write(&path, "voice = \"bm_george\"\n").expect("hand edit");
+        assert_eq!(store.reload(), ReloadOutcome::Applied);
+        assert_eq!(
+            store.generation(),
+            after_save + 1,
+            "a hand edit is a change -- this is the path a user flipping \
+             notifications.enabled in the file takes"
+        );
+        engine.shutdown();
+    }
+
+    /// The other half: a write that fails restores the stamp and tells the
+    /// engine nothing, so there is nothing for a reader to re-read.
+    #[test]
+    fn a_failed_write_does_not_move_the_generation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"not a directory").expect("blocker");
+        let engine = engine();
+        let store = ConfigStore::new(
+            blocker.join("config.toml"),
+            engine.clone(),
+            Config::default(),
+        );
+
+        let start = store.generation();
+        let cfg = Config {
+            voice: "am_fenrir".into(),
+            ..Config::default()
+        };
+        assert!(store.save(&cfg).is_err(), "the write must fail");
+        assert_eq!(store.generation(), start);
         engine.shutdown();
     }
 

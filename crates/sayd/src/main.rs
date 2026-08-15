@@ -123,7 +123,7 @@ const FANOUT_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 /// a local session-bus round trip.
 const FORWARD_CALL_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// How long the publish loop waits for [`read_notifications_enabled`]'s
+/// How long the publish loop waits for [`NotifyEnabledWatch`]'s
 /// `spawn_blocking` hop -- reading `ConfigStore::current()` -- before giving
 /// up on it for this tick.
 ///
@@ -342,32 +342,142 @@ impl NotifyMonitorSupervisor {
     }
 }
 
-/// `store.current().notifications.enabled`, bounded by
-/// [`CONFIG_STAMP_READ_TIMEOUT`] so a stuck concurrent write cannot stall
-/// whoever awaits this. See `CONFIG_STAMP_READ_TIMEOUT`'s doc comment for
-/// the failure this exists to avoid (CRITICAL 1) and the measurement behind
-/// it.
+/// `notifications.enabled`, as the publish loop sees it: cached between
+/// changes, re-read off the blocking pool when the config store says it has
+/// actually changed, and never more than one read in flight at a time.
 ///
-/// Returns `None` on timeout or on a `spawn_blocking` join failure (the
-/// latter should not happen -- `ConfigStore::current` is poison-tolerant,
-/// see its doc comment -- but is handled the same way rather than
-/// unwrapped). Either way the caller is expected to skip whatever it meant
-/// to do with the value for this tick and try again on the next one, not to
-/// block waiting: giving up on the `.await` does not cancel the
-/// `spawn_blocking` task itself, which stays parked on the mutex for as
-/// long as the write does and simply finishes unobserved.
-async fn read_notifications_enabled(
-    store: &std::sync::Arc<config_watch::ConfigStore>,
-) -> Option<bool> {
-    let store = store.clone();
-    match tokio::time::timeout(
-        CONFIG_STAMP_READ_TIMEOUT,
-        tokio::task::spawn_blocking(move || store.current().notifications.enabled),
-    )
-    .await
-    {
-        Ok(Ok(enabled)) => Some(enabled),
-        Ok(Err(_)) | Err(_) => None,
+/// Three separate properties, all of them measured against the real daemon:
+///
+/// **CRITICAL 1 (single-flight).** The previous shape of this -- a bare
+/// `async fn` that spawned a fresh `spawn_blocking` on every 200 ms tick and
+/// bounded the `.await` on it with [`CONFIG_STAMP_READ_TIMEOUT`] -- fixed
+/// the stall it was written for and replaced it with something worse. The
+/// timeout abandons the `.await`, never the task: the task stays parked on
+/// `ConfigStore`'s stamp for as long as the write holding it takes, and
+/// nothing stopped the next tick spawning another. Measured, real daemon,
+/// `config.toml.tmp` a FIFO nobody reads and one `SetMuted` to start a
+/// stuck write: 30 threads to 150 in 30 s, on to tokio's 512-blocking-thread
+/// cap in a few minutes -- and at that cap a `Say` over D-Bus never returned
+/// (`dbus::SaydIface::submit` is a `spawn_blocking` too, and so is
+/// `notify::monitor::speak`, so narration stopped with it), while SIGTERM
+/// left the process sitting for a minute because `Runtime::drop` waits for
+/// blocking tasks that have started. Holding the outstanding `JoinHandle`
+/// here and polling *that* instead of spawning a second one is the whole
+/// fix: at most one parked task exists, ever, no matter how long the write
+/// stays stuck or how many ticks go by.
+///
+/// **IMPORTANT 2 (the gate).** Spec §8 says `enabled = false` must cost
+/// nothing. The connection half holds -- no `enabled`, no task -- but the
+/// read itself ran unconditionally, five times a second, forever, on a
+/// daemon meant to run for weeks. `ConfigStore::generation` makes the common
+/// case an atomic load: the stamp is touched only when a config change has
+/// actually landed (a settings save, a tray mute, a hand edit), which on a
+/// desktop is a handful of times a day rather than 432,000.
+///
+/// **The original stall.** Still fixed, and by the same means as before: the
+/// read runs on the blocking pool and the `.await` on it is bounded, so a
+/// write stuck on a hung NFS or FUSE home cannot block the publish loop's
+/// `tokio::select!` -- `sigterm.recv()` included. See
+/// `CONFIG_STAMP_READ_TIMEOUT`.
+struct NotifyEnabledWatch {
+    /// The last value read, returned as-is on every tick that finds the
+    /// generation unmoved. Seeded in `new` from the store itself, so the
+    /// first tick has a real value to reconcile against rather than a guess.
+    enabled: bool,
+    /// The generation `enabled` was read at. A read is started only when the
+    /// store's generation differs from this.
+    seen_generation: u64,
+    /// The one outstanding blocking read, with the generation it was started
+    /// at, or `None` when no read is in flight.
+    ///
+    /// The generation is remembered *from the moment the task was spawned*,
+    /// not from when it finishes: the value the task hands back describes the
+    /// store at some point at or after that, so crediting it to a later
+    /// generation could mark a change as seen that this read never observed.
+    /// Recording the earlier one can only ever cost one redundant re-read.
+    inflight: Option<(u64, tokio::task::JoinHandle<bool>)>,
+    /// Log-once for a standing stall, the same shape as
+    /// `recovery_failure_logged` in the publish loop: the first tick that
+    /// cannot read the store within `CONFIG_STAMP_READ_TIMEOUT` is worth a
+    /// line, the fifth one 200 ms later (while the same write is presumably
+    /// still stuck) is not.
+    stall_logged: bool,
+}
+
+impl NotifyEnabledWatch {
+    /// Seeded from the store, in that order -- generation first, value second
+    /// -- so that a change landing between the two reads is seen as *not yet
+    /// observed* and re-read on the first tick, rather than silently
+    /// credited to the generation before it.
+    fn new(store: &std::sync::Arc<config_watch::ConfigStore>) -> Self {
+        let seen_generation = store.generation();
+        Self {
+            enabled: store.current().notifications.enabled,
+            seen_generation,
+            inflight: None,
+            stall_logged: false,
+        }
+    }
+
+    /// The value the supervisor should be reconciled against this tick.
+    ///
+    /// Never `Option`: a tick that cannot read the store keeps returning the
+    /// last value it did read, so `reconcile` still runs and still notices a
+    /// monitor task that has ended (IMPORTANT 3's real point). The previous
+    /// version skipped `reconcile` entirely on a stalled read, which left a
+    /// dead monitor unnoticed for as long as the stall lasted.
+    async fn enabled(&mut self, store: &std::sync::Arc<config_watch::ConfigStore>) -> bool {
+        let generation = store.generation();
+        if self.inflight.is_none() {
+            if generation == self.seen_generation {
+                // The common case, and the whole of IMPORTANT 2: one atomic
+                // load, no lock, no task.
+                return self.enabled;
+            }
+            let s = store.clone();
+            self.inflight = Some((
+                generation,
+                tokio::task::spawn_blocking(move || s.current().notifications.enabled),
+            ));
+        }
+        let (at, handle) = self.inflight.as_mut().expect("just set above");
+        let at = *at;
+        // Bound the wait, not the task: whether this resolves or times out,
+        // the task is either finished (and taken, below) or still parked and
+        // still the only one -- the next tick polls this same handle rather
+        // than starting a second.
+        let result = tokio::time::timeout(CONFIG_STAMP_READ_TIMEOUT, handle).await;
+        match result {
+            Ok(Ok(enabled)) => {
+                self.inflight = None;
+                self.seen_generation = at;
+                self.enabled = enabled;
+                self.stall_logged = false;
+            }
+            // The task itself failed -- a panic under `ConfigStore::current`,
+            // which is poison-tolerant and so should not happen (see its doc
+            // comment). Drop the handle so the next tick starts a fresh read
+            // rather than polling a task that will never answer.
+            Ok(Err(e)) => {
+                self.inflight = None;
+                if !self.stall_logged {
+                    eprintln!("warning: the config-store read task failed: {e}");
+                    self.stall_logged = true;
+                }
+            }
+            Err(_elapsed) => {
+                if !self.stall_logged {
+                    eprintln!(
+                        "warning: reading the config store took longer than {:.0}ms \
+                         (a write may be stuck); the notification monitor will keep \
+                         running as last configured until it responds again",
+                        CONFIG_STAMP_READ_TIMEOUT.as_millis()
+                    );
+                    self.stall_logged = true;
+                }
+            }
+        }
+        self.enabled
     }
 }
 
@@ -774,12 +884,10 @@ async fn run_daemon() -> std::process::ExitCode {
     // stopped from `notifications.enabled` on every tick below. See
     // `NotifyMonitorSupervisor::reconcile`'s doc comment.
     let mut notify_supervisor = NotifyMonitorSupervisor::new();
-    // CRITICAL 1: log-once for a standing stall in `read_notifications_
-    // enabled`, the same shape as `recovery_failure_logged` below -- the
-    // first tick that cannot read the config store within
-    // `CONFIG_STAMP_READ_TIMEOUT` is worth a line, the fifth one 200ms later
-    // (while the same write is presumably still stuck) is not.
-    let mut notify_config_read_stalled = false;
+    // CRITICAL 1 / IMPORTANT 2: what the supervisor is reconciled against,
+    // and everything that keeps reading it cheap and bounded. See
+    // `NotifyEnabledWatch`.
+    let mut notify_enabled = NotifyEnabledWatch::new(&store);
     let mut ticker = tokio::time::interval(PUBLISH_INTERVAL);
     let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
     {
@@ -812,35 +920,21 @@ async fn run_daemon() -> std::process::ExitCode {
                 //
                 // CRITICAL 1: that same mutex is held by `write_locked`
                 // across a synchronous, unbounded disk write, so the read
-                // goes through `read_notifications_enabled` -- `spawn_
-                // blocking` plus a bound on the `.await` -- rather than
-                // being taken directly here, or a write stuck on a hung
-                // filesystem would stall this whole `select!` loop,
-                // `sigterm.recv()` included. See `CONFIG_STAMP_READ_
-                // TIMEOUT`'s doc comment for the measurement.
-                match read_notifications_enabled(&store).await {
-                    Some(enabled) => {
-                        notify_config_read_stalled = false;
-                        notify_supervisor.reconcile(enabled, &engine);
-                    }
-                    None => {
-                        // Skip this tick's reconcile entirely rather than
-                        // fall back to a stale or default value:
-                        // `notify_supervisor` simply keeps doing whatever it
-                        // was last told, exactly as it would if this whole
-                        // tick had not fired.
-                        if !notify_config_read_stalled {
-                            eprintln!(
-                                "warning: reading the config store took longer \
-                                 than {:.0}ms (a write may be stuck); the \
-                                 notification monitor will not be reconciled \
-                                 until it responds again",
-                                CONFIG_STAMP_READ_TIMEOUT.as_millis()
-                            );
-                            notify_config_read_stalled = true;
-                        }
-                    }
-                }
+                // goes through `NotifyEnabledWatch` -- gated on
+                // `ConfigStore::generation`, off the blocking pool, one read
+                // in flight at a time, and bounded -- rather than being taken
+                // directly here. Taken directly, a write stuck on a hung
+                // filesystem stalled this whole `select!` loop,
+                // `sigterm.recv()` included; taken on an unbounded number of
+                // `spawn_blocking` hops, it exhausted tokio's blocking pool
+                // and wedged the daemon harder. See `NotifyEnabledWatch` and
+                // `CONFIG_STAMP_READ_TIMEOUT` for both measurements.
+                //
+                // `reconcile` runs on every tick regardless of whether a
+                // fresh value could be read: it is also what notices a
+                // monitor task that has ended on its own (IMPORTANT 2/3).
+                let notifications_enabled = notify_enabled.enabled(&store).await;
+                notify_supervisor.reconcile(notifications_enabled, &engine);
 
                 // Finding 3: bounded `RemainingSeconds` publishing. "Active"
                 // means it is actually counting down -- `Speaking` with
@@ -1310,8 +1404,169 @@ mod tests {
         engine.shutdown();
     }
 
+    /// A store on a real path, with `config.toml.tmp` a FIFO nobody reads,
+    /// and a thread parked inside `set_muted`'s write to it.
+    ///
+    /// This is `config_watch.rs`'s `a_mute_takes_effect_even_while_the_write_
+    /// is_stuck` technique: `Config::save_to` writes `<path>.tmp` with a
+    /// plain `std::fs::write`, and opening a FIFO for writing blocks until
+    /// something opens the read end -- so the write never returns, with the
+    /// stamp's lock held across it, which is precisely the state CRITICAL 1
+    /// is about.
+    ///
+    /// The returned closure *must* be called before the test ends. Dropping
+    /// a tokio runtime waits for in-flight `spawn_blocking` tasks, and a read
+    /// parked on that same lock is exactly such a task: leaving the write
+    /// stuck hangs the whole test binary at teardown instead of failing it.
+    fn stuck_write(
+        dir: &tempfile::TempDir,
+        engine: &EngineHandle,
+    ) -> (
+        std::sync::Arc<config_watch::ConfigStore>,
+        impl FnOnce() + use<>,
+    ) {
+        let path = dir.path().join("config.toml");
+        let tmp = path.with_extension("toml.tmp");
+        let tmp_c = std::ffi::CString::new(tmp.to_str().expect("utf8 path")).expect("no NUL");
+        assert_eq!(
+            unsafe { libc::mkfifo(tmp_c.as_ptr(), 0o600) },
+            0,
+            "mkfifo failed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        let store = std::sync::Arc::new(config_watch::ConfigStore::new(
+            path,
+            engine.clone(),
+            Config::default(),
+        ));
+        let writer = store.clone();
+        let writer_thread = std::thread::spawn(move || {
+            let _ = writer.set_muted(true);
+        });
+        // Give the writer thread a moment to actually reach the stuck write
+        // and take the stamp's lock, so what follows contends with it
+        // instead of racing to go first.
+        std::thread::sleep(Duration::from_millis(50));
+
+        let unstick = move || {
+            // Opening the read end lets `save_to`'s `write` complete, which
+            // releases the stamp's lock, which lets every task parked on it
+            // finish.
+            let _ = std::fs::read(&tmp);
+            writer_thread.join().expect("writer thread does not panic");
+        };
+        (store, unstick)
+    }
+
+    /// CRITICAL 1, the property that actually matters and that the previous
+    /// fix in these lines got wrong: a stuck write must not let the publish
+    /// loop accumulate blocking tasks. The 250ms timeout abandons the
+    /// `.await`, never the task -- so without single-flight every tick left
+    /// one more thread parked on the stamp, and the daemon walked into
+    /// tokio's 512-blocking-thread cap in a couple of minutes (measured, real
+    /// daemon: 30 threads to 541, after which a `Say` over D-Bus never
+    /// returned).
+    ///
+    /// `ConfigStore::stamp_reads` counts `current()` calls, and `current()`
+    /// increments it *before* it takes the stamp -- so it counts blocking
+    /// tasks that have started and parked, which is exactly the quantity that
+    /// used to grow without bound. Ticking the watch several times while the
+    /// write is stuck must produce one, not one per tick.
+    #[tokio::test]
+    async fn a_stuck_write_cannot_pile_up_blocking_config_reads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = test_engine();
+        let (store, unstick) = stuck_write(&dir, &engine);
+
+        // Constructed before the gate can be consulted, so it holds no
+        // generation the store has moved past -- then `set_muted`'s write
+        // (stuck, but its `ApplyConfig`/generation bump comes only when it
+        // finishes) leaves the watch with a read to make and no way to
+        // complete it.
+        let mut watch = NotifyEnabledWatch {
+            enabled: false,
+            // A generation the store cannot be at, so `enabled()` is forced
+            // to actually read rather than short-circuiting on the gate --
+            // this test is about the read path, not about the gate (that is
+            // `an_unchanged_config_is_not_re_read_on_every_tick`).
+            seen_generation: u64::MAX,
+            inflight: None,
+            stall_logged: false,
+        };
+
+        let before = store.stamp_reads();
+        for _ in 0..4 {
+            // Each of these times out; the value it hands back is the cached
+            // one, unchanged.
+            assert!(!watch.enabled(&store).await);
+        }
+        let started = store.stamp_reads() - before;
+
+        unstick();
+        engine.shutdown();
+
+        assert_eq!(
+            started, 1,
+            "four ticks against a stuck write started {started} blocking reads; \
+             the loop must hold the one outstanding task and never spawn a \
+             second while it is in flight"
+        );
+    }
+
+    /// IMPORTANT 2: §8's "`enabled = false` costs nothing" applies to the
+    /// read too, not just to the connection. Nothing changed the config, so
+    /// no tick may take the stamp at all -- and when something does change
+    /// it, the very next tick must see it.
+    #[tokio::test]
+    async fn an_unchanged_config_is_not_re_read_on_every_tick() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let engine = test_engine();
+        let store = std::sync::Arc::new(config_watch::ConfigStore::new(
+            path,
+            engine.clone(),
+            Config::default(),
+        ));
+
+        let mut watch = NotifyEnabledWatch::new(&store);
+        let after_seeding = store.stamp_reads();
+        for _ in 0..20 {
+            assert!(
+                !watch.enabled(&store).await,
+                "the default config has notifications disabled"
+            );
+        }
+        assert_eq!(
+            store.stamp_reads(),
+            after_seeding,
+            "an unchanged config must be answered from the generation counter \
+             alone -- no lock, no blocking task, 5 times a second for weeks"
+        );
+
+        // A real change, through the same path every config mutation in the
+        // daemon takes.
+        let seed = store.current();
+        let mut next = seed.clone();
+        next.notifications.enabled = true;
+        store
+            .save_merging(&seed, &next)
+            .expect("the write succeeds");
+        let before_change = store.stamp_reads();
+
+        assert!(
+            watch.enabled(&store).await,
+            "a config change must be picked up on the next tick"
+        );
+        assert!(
+            store.stamp_reads() > before_change,
+            "picking it up means actually reading the store"
+        );
+        engine.shutdown();
+    }
+
     /// CRITICAL 1: the reviewer's probe, reproduced directly against
-    /// `read_notifications_enabled` rather than the whole publish loop --
+    /// `NotifyEnabledWatch::enabled` rather than the whole publish loop --
     /// there is no way to drive the loop's `tokio::select!` from a unit
     /// test without a real bus connection, a real engine and a real tray,
     /// but the thing that actually blocked it (`ConfigStore::current()`
@@ -1324,69 +1579,44 @@ mod tests {
     #[tokio::test]
     async fn a_stuck_write_does_not_delay_reading_notifications_enabled() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("config.toml");
-        let tmp = path.with_extension("toml.tmp");
-        let tmp_c = std::ffi::CString::new(tmp.to_str().expect("utf8 path")).expect("no NUL");
-        assert_eq!(
-            unsafe { libc::mkfifo(tmp_c.as_ptr(), 0o600) },
-            0,
-            "mkfifo failed: {}",
-            std::io::Error::last_os_error()
-        );
-
         let engine = test_engine();
-        let store = std::sync::Arc::new(config_watch::ConfigStore::new(
-            path.clone(),
-            engine.clone(),
-            Config::default(),
-        ));
+        let (store, unstick) = stuck_write(&dir, &engine);
 
-        // `set_muted` blocks inside `save_to`'s `std::fs::write` to the
-        // FIFO, holding the stamp's lock the whole time. It stays stuck
-        // until this test drains the pipe at the end -- which it must:
-        // dropping a tokio runtime waits for in-flight `spawn_blocking`
-        // tasks, and the one `read_notifications_enabled` leaves parked on
-        // that same lock is exactly such a task. Leaving the write stuck
-        // hangs the whole test binary at teardown rather than failing it.
-        let writer = store.clone();
-        let writer_thread = std::thread::spawn(move || {
-            let _ = writer.set_muted(true);
-        });
-        // Give the writer thread a moment to actually reach the stuck write
-        // and take the stamp's lock, so the read below contends with it
-        // instead of racing to go first.
-        std::thread::sleep(Duration::from_millis(50));
+        let mut watch = NotifyEnabledWatch {
+            enabled: true,
+            // Forces a read: the stuck write has not bumped the generation
+            // (it bumps only once it finishes), so the gate would otherwise
+            // -- correctly, and this is IMPORTANT 2's point -- decline to
+            // read at all, and there would be no wait left to bound.
+            seen_generation: u64::MAX,
+            inflight: None,
+            stall_logged: false,
+        };
 
         let started = tokio::time::Instant::now();
-        let result = read_notifications_enabled(&store).await;
+        let result = watch.enabled(&store).await;
         let elapsed = started.elapsed();
 
-        // The bound this actually proves: whatever awaits `read_
-        // notifications_enabled` (the publish loop's `ticker.tick()` arm)
-        // is capped at `CONFIG_STAMP_READ_TIMEOUT`, not at however long the
-        // write takes -- which here is "forever." The margin over the
-        // timeout absorbs scheduling jitter without weakening what is being
-        // checked: this used to not return within 500ms at all.
+        // The bound this actually proves: whatever awaits this (the publish
+        // loop's `ticker.tick()` arm) is capped at
+        // `CONFIG_STAMP_READ_TIMEOUT`, not at however long the write takes --
+        // which here is "forever." The margin over the timeout absorbs
+        // scheduling jitter without weakening what is being checked: this
+        // used to not return within 500ms at all.
         assert!(
             elapsed < CONFIG_STAMP_READ_TIMEOUT + Duration::from_millis(750),
             "reading the config store while a write was stuck took {elapsed:?}; \
              the publish loop's tokio::select! (and SIGTERM handling with it) \
              would have been blocked for at least that long"
         );
-        assert_eq!(
-            result, None,
-            "a read that could not complete within the bound must report \
-             that rather than silently returning stale or default data"
+        assert!(
+            result,
+            "a read that could not complete within the bound must hand back \
+             the last value it did read, not a default -- the supervisor is \
+             reconciled against this on every tick"
         );
 
-        // Unstick the write now that the measurement is taken: opening the
-        // read end lets `save_to`'s `write` complete, which releases the
-        // stamp's lock, which lets the blocking-pool task the timed-out
-        // `.await` abandoned finish. Without this the runtime's own drop
-        // waits on that task forever.
-        let _ = std::fs::read(&tmp);
-        writer_thread.join().expect("writer thread does not panic");
-
+        unstick();
         engine.shutdown();
     }
 
