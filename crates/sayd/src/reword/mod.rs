@@ -39,6 +39,37 @@
 //! (or to the ceiling) with its result discarded: a wasted request and an
 //! occupied thread. What does not differ is correctness. Buying
 //! cancellation would have cost 40 additional crates.
+//!
+//! # The answer is dropped; the outcome is not
+//!
+//! Those two rules together used to make the transport breaker inert
+//! against the one provider failure it most exists for. `timeout_ms` is
+//! capped at 2500 ms and the client's ceiling is 10 s, so a provider that
+//! accepts a connection and then never answers *always* produces
+//! [`Attempt::Deadline`]: the [`RewordError::Ceiling`] the client eventually
+//! returns died with the abandoned `JoinHandle` and never reached
+//! [`RewordState::record`]. Measured: ten consecutive ceiling-class
+//! failures, and `allow` still said `Ok(())`. Every eligible notification
+//! went on paying the full `timeout_ms`, both permits stayed occupied so
+//! most arrivals degraded to [`Attempt::Busy`], and §8's "after 3
+//! consecutive transport failures, stop attempting for 60 s" could never
+//! fire.
+//!
+//! The fix is the distinction the spec is actually drawing: **the blocking
+//! job folds its own outcome into `record` before it drops the permit**.
+//! §2's rule is about the *answer* -- the `JoinHandle`'s value is still
+//! discarded, `record` takes no `EngineHandle` and returns nothing, so
+//! there is still no path on which a late rewrite is spoken. §8's rule is
+//! about the *outcome*, and an outcome is not a thing that can be spoken.
+//! [`attempt`] is therefore the only place that records: the job records
+//! what it got, the caller records the deadline it saw, and neither records
+//! the other's.
+//!
+//! The alternative -- a second breaker counting consecutive
+//! [`Attempt::Deadline`]s -- was rejected: it opens on a provider that is
+//! slow but working perfectly, which is a different failure with a
+//! different right answer (`timeout_ms` is too low), and it would double
+//! count the stuck provider that this one already catches.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -85,6 +116,20 @@ pub const REWORD_MAX_INFLIGHT: usize = 2;
 const TRANSPORT_FAILURES_TO_OPEN: u32 = 3;
 /// How long it stays open before one request is let through.
 const TRANSPORT_BREAKER_COOLDOWN: Duration = Duration::from_secs(60);
+/// How long a half-open probe may be outstanding before the next arrival
+/// may take one instead.
+///
+/// §8's "then let one through" is a *token*, and a token that is taken and
+/// never resolved is a breaker stuck half-open for the life of the process:
+/// nothing would ever be attempted again. Every way of taking one without
+/// resolving it is a caller that passed [`RewordState::allow`] and then did
+/// not attempt -- no permit was free, or `context` could not build a
+/// client. [`REWORD_HTTP_CEILING`] is the bound because it is the longest a
+/// real attempt can take, so a probe older than this cannot still be in
+/// flight; the cost of the safety net is at worst one extra request per
+/// ceiling's worth of an open breaker, against a bug whose cost is the
+/// feature never running again.
+const TRANSPORT_PROBE_TTL: Duration = REWORD_HTTP_CEILING;
 /// Backoff after a 429 with no `Retry-After`.
 const RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(60);
 /// The longest a `Retry-After` may hold the breaker shut.
@@ -102,6 +147,57 @@ const RATE_LIMIT_MAX_BACKOFF: Duration = Duration::from_secs(3600);
 const DEADLINE_LOG_EVERY: u64 = 50;
 /// How much of a rejected candidate reaches the debug log.
 const DEBUG_SNIPPET_CHARS: usize = 80;
+
+/// A breaker window: the instant it lifts, or "not on any timeline this
+/// clock will produce".
+///
+/// `Instant::checked_add` returns `None` on overflow, and a `None` deadline
+/// stored in an `Option<Instant>` reads as *no window at all* -- the
+/// opposite of what the arithmetic that produced it was trying to say. This
+/// type makes the failure direction impossible to get wrong: overflow
+/// becomes [`Window::Forever`], which is shut for every `now`, so the
+/// degradation is "speak the text as written", which is what every other
+/// row of §8 degrades to as well. `notify::policy::is_expired` makes
+/// exactly this call for exactly this arithmetic (`None` => not expired)
+/// and says why in the same words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Window {
+    Until(Instant),
+    Forever,
+}
+
+impl Window {
+    /// A window of `d` opening at `now`, failing closed if that instant
+    /// cannot be represented.
+    fn opening(now: Instant, d: Duration) -> Window {
+        match now.checked_add(d) {
+            Some(t) => Window::Until(t),
+            None => Window::Forever,
+        }
+    }
+
+    /// Is the window still shut at `now`?
+    fn shut_at(self, now: Instant) -> bool {
+        match self {
+            Window::Until(t) => now < t,
+            Window::Forever => true,
+        }
+    }
+
+    /// The later of two windows.
+    ///
+    /// Two rewrites may be in flight, so two 429s in a row is ordinary
+    /// rather than exotic -- and assigning rather than extending means a
+    /// second, shorter `Retry-After` silently cancels a longer one that is
+    /// still in force. Measured: `record(3600 s)` then `record(1 s)` and
+    /// the next attempt went out two seconds later.
+    fn later(self, other: Window) -> Window {
+        match (self, other) {
+            (Window::Forever, _) | (_, Window::Forever) => Window::Forever,
+            (Window::Until(a), Window::Until(b)) => Window::Until(a.max(b)),
+        }
+    }
+}
 
 /// Poison-tolerant, for the reason `settings::model::lock` gives: this state
 /// is reached from GTK signal handlers (the Test row), glib calls those
@@ -207,40 +303,73 @@ pub enum Attempt {
 /// Returns the outcome and how long the caller waited. The `Duration` is
 /// wall-clock from the moment the permit was requested, which is what the
 /// settings window reports and compares against the configured deadline.
+///
+/// **This is the only function that calls [`RewordState::record`] for an
+/// attempt**, and it calls it exactly once per outcome: the job records the
+/// answer it got (from the blocking thread, before it drops its permit, so
+/// a provider that outlives the caller's deadline still teaches the
+/// breaker), and the caller records the deadline or the panic it saw. A
+/// caller that recorded as well would count one failure twice.
 pub async fn attempt(
     rewriter: Arc<dyn Rewriter>,
     state: Arc<RewordState>,
+    cfg: &RewordConfig,
     text: String,
     budget: Duration,
 ) -> (Attempt, Duration) {
     let started = Instant::now();
     let Some(permit) = state.try_permit() else {
+        state.record(cfg, &Attempt::Busy, Instant::now());
         return (Attempt::Busy, started.elapsed());
     };
+    // §7's privacy line, behind the permit rather than in front of it: it
+    // is what a user greps to learn where their text goes, so it must not
+    // announce a send for an utterance that then finds no permit and makes
+    // no request. Past this point a request is certain -- the closure below
+    // always calls `reword`.
+    state.note_endpoint(cfg);
+    let job_state = state.clone();
+    let job_cfg = cfg.clone();
     let job = tokio::task::spawn_blocking(move || {
         // `let _permit`, never `let _`: binding to `_` drops the permit at
         // once and is precisely the bug §2 exists to prevent. Named, it
         // lives to the end of this closure, so the permit is released when
         // the *job* finishes -- not when the deadline below fires.
         let _permit = permit;
-        rewriter.reword(&text)
+        let outcome = Attempt::Answered(rewriter.reword(&text));
+        // Folded in here rather than by the caller, and this is the whole
+        // of the Ceiling fix: past the deadline the caller is gone and this
+        // outcome would otherwise die with the abandoned `JoinHandle`. The
+        // answer still goes nowhere -- `record` takes no engine handle and
+        // returns nothing -- but the breaker learns what happened. Before
+        // the permit is released, so a breaker that opens here is open for
+        // the next arrival rather than one request later.
+        job_state.record(&job_cfg, &outcome, Instant::now());
+        outcome
     });
     match tokio::time::timeout(budget, job).await {
-        Ok(Ok(result)) => (Attempt::Answered(result), started.elapsed()),
+        Ok(Ok(outcome)) => (outcome, started.elapsed()),
         // The blocking task itself failed, which means it panicked. Not
         // reachable through the shipped client, but a panic here must not
-        // take the announcement with it.
-        Ok(Err(join)) => (
-            Attempt::Answered(Err(RewordError::Malformed(format!(
+        // take the announcement with it -- and the unwind skipped the
+        // job's own `record`, so this one is the caller's to make.
+        Ok(Err(join)) => {
+            let outcome = Attempt::Answered(Err(RewordError::Malformed(format!(
                 "the rewrite task failed: {join}"
-            )))),
-            started.elapsed(),
-        ),
+            ))));
+            state.record(cfg, &outcome, Instant::now());
+            (outcome, started.elapsed())
+        }
         // The `.await` on the handle is abandoned here. The job keeps
         // running (bounded by REWORD_HTTP_CEILING) and keeps its permit
         // (bounded by REWORD_MAX_INFLIGHT), and its eventual answer has
-        // nowhere to go.
-        Err(_elapsed) => (Attempt::Deadline, started.elapsed()),
+        // nowhere to go -- but its *outcome* still reaches `record` from
+        // the job itself, which is what stops a permanently stuck provider
+        // from being invisible to §8's breaker.
+        Err(_elapsed) => {
+            state.record(cfg, &Attempt::Deadline, Instant::now());
+            (Attempt::Deadline, started.elapsed())
+        }
     }
 }
 
@@ -282,8 +411,21 @@ struct Inner {
     /// the config value either.
     auth_latched_for: Option<RewordConfig>,
     transport_failures: u32,
-    transport_open_until: Option<Instant>,
-    rate_limited_until: Option<Instant>,
+    transport_open_until: Option<Window>,
+    /// The half-open probe: when the token minted by an expired cooldown
+    /// stops being honoured, or `None` when no probe is out.
+    ///
+    /// §8 says "stop attempting for 60 s, **then let one through**", and
+    /// *one* is the whole of it. Clearing the window on the first `allow`
+    /// past it -- which is what this used to do -- opens the gate for
+    /// everyone until three fresh failures accumulate: measured, 100 of 100
+    /// arrivals at the same instant past the cooldown were admitted. The
+    /// token is minted by `allow`, spent by the one caller it admits, and
+    /// resolved by that attempt's `record`: an answer closes the breaker, a
+    /// transport failure re-arms another full cooldown. See
+    /// [`TRANSPORT_PROBE_TTL`] for what happens to a token nobody resolves.
+    transport_probe: Option<Window>,
+    rate_limited_until: Option<Window>,
     deadlines: u64,
     /// Log-once latches, one per §8 row that says "once per run".
     not_configured_logged: bool,
@@ -318,25 +460,40 @@ impl RewordState {
     }
 
     /// May a request be made at all?
+    ///
+    /// Not a pure predicate: past an expired transport cooldown this is the
+    /// transition that mints and spends §8's one probe, so a caller that
+    /// asks and then does not attempt costs the run a probe (bounded by
+    /// [`TRANSPORT_PROBE_TTL`]) rather than, as it used to, the whole
+    /// breaker.
     pub fn allow(&self, cfg: &RewordConfig, now: Instant) -> Result<(), Blocked> {
         let mut i = lock(&self.inner);
         if i.auth_latched_for.as_ref() == Some(cfg) {
             return Err(Blocked::AuthLatched);
         }
-        if let Some(until) = i.transport_open_until {
-            if now < until {
-                return Err(Blocked::TransportOpen);
-            }
-            // "then let one through": the breaker closes, and the failure
-            // count starts again from zero rather than from three.
-            i.transport_open_until = None;
-            i.transport_failures = 0;
-        }
-        if let Some(until) = i.rate_limited_until {
-            if now < until {
+        // "then let one through", and *one* is the load-bearing word: the
+        // window is not cleared here. It stays until a probe comes back
+        // with an answer, so an expired cooldown admits one caller and
+        // refuses everyone behind it.
+        let probing = match i.transport_open_until {
+            Some(w) if w.shut_at(now) => return Err(Blocked::TransportOpen),
+            Some(_) => match i.transport_probe {
+                // Somebody else's probe is still out; theirs is the one
+                // that decides.
+                Some(p) if p.shut_at(now) => return Err(Blocked::TransportOpen),
+                _ => true,
+            },
+            None => false,
+        };
+        if let Some(w) = i.rate_limited_until {
+            if w.shut_at(now) {
                 return Err(Blocked::RateLimited);
             }
             i.rate_limited_until = None;
+        }
+        // Last, so a caller turned away by a later row does not spend it.
+        if probing {
+            i.transport_probe = Some(Window::opening(now, TRANSPORT_PROBE_TTL));
         }
         Ok(())
     }
@@ -344,10 +501,18 @@ impl RewordState {
     /// Fold one outcome into the breakers, and log whatever §8 says this
     /// row owes -- once per run, or the first of a standing outage, never
     /// once per utterance.
+    ///
+    /// Takes no engine handle and returns nothing, which is why it is safe
+    /// to call from inside the rewrite job: §2's rule is that a late
+    /// *answer* is dropped unread, and an outcome is not a thing that can
+    /// be spoken. See [`attempt`], the only caller for an attempt.
     pub fn record(&self, cfg: &RewordConfig, outcome: &Attempt, now: Instant) {
         let mut i = lock(&self.inner);
         match outcome {
-            Attempt::Busy => {}
+            // Nothing was sent, so nothing was learned -- and if this
+            // caller was holding §8's probe, it hands it back unspent
+            // rather than sitting on it for the TTL.
+            Attempt::Busy => i.transport_probe = None,
             Attempt::Deadline => {
                 i.deadlines += 1;
                 if i.deadlines == 1 || i.deadlines.is_multiple_of(DEADLINE_LOG_EVERY) {
@@ -359,7 +524,7 @@ impl RewordState {
                 }
             }
             Attempt::Answered(Ok(_)) => {
-                i.transport_failures = 0;
+                i.transport_answered();
                 i.outage_logged = false;
             }
             Attempt::Answered(Err(e)) => match e {
@@ -380,6 +545,7 @@ impl RewordState {
                         i.auth_logged = true;
                     }
                     i.auth_latched_for = Some(cfg.clone());
+                    i.transport_answered();
                 }
                 RewordError::NoSuchModel {
                     status,
@@ -397,12 +563,19 @@ impl RewordState {
                         );
                         i.model_logged = true;
                     }
+                    i.transport_answered();
                 }
                 RewordError::RateLimited { retry_after, .. } => {
                     let wait = retry_after
                         .unwrap_or(RATE_LIMIT_BACKOFF)
                         .min(RATE_LIMIT_MAX_BACKOFF);
-                    i.rate_limited_until = now.checked_add(wait);
+                    let opening = Window::opening(now, wait);
+                    // Extended, never replaced: see `Window::later`.
+                    i.rate_limited_until = Some(match i.rate_limited_until {
+                        Some(standing) => standing.later(opening),
+                        None => opening,
+                    });
+                    i.transport_answered();
                 }
                 RewordError::Unreachable(detail) => {
                     if !i.outage_logged {
@@ -430,6 +603,11 @@ impl RewordState {
                 RewordError::Unavailable => {}
                 RewordError::Malformed(detail) => {
                     debug(format_args!("reword: unusable response: {detail}"));
+                    // The transport did its job -- something came back and
+                    // the client could not use it -- so this resolves a
+                    // probe as an answer, and the next notification still
+                    // gets its chance.
+                    i.transport_answered();
                 }
             },
         }
@@ -450,6 +628,10 @@ impl RewordState {
     /// and warn once about cleartext to a non-loopback host. Returns
     /// whether this was the first time -- which the settings window uses to
     /// say that a first request includes connection setup.
+    ///
+    /// Called from [`attempt`] *after* a permit is in hand, never before:
+    /// this line is what a user greps to find out where their text goes, so
+    /// a run in which nothing left the machine must not contain it.
     pub fn note_endpoint(&self, cfg: &RewordConfig) -> bool {
         let key = format!("{}|{}", cfg.base_url, cfg.model);
         let mut i = lock(&self.inner);
@@ -509,11 +691,30 @@ impl Inner {
     /// count toward the same breaker, so they share the one body rather
     /// than two that can drift apart.
     fn fail_transport(&mut self, now: Instant) {
+        if self.transport_probe.take().is_some() {
+            // The one §8 let through failed as well. Another full cooldown,
+            // not a fresh count of three: the evidence that the provider is
+            // still down is the probe, and it is complete on its own.
+            self.transport_open_until = Some(Window::opening(now, TRANSPORT_BREAKER_COOLDOWN));
+            self.transport_failures = 0;
+            return;
+        }
         self.transport_failures += 1;
         if self.transport_failures >= TRANSPORT_FAILURES_TO_OPEN {
-            self.transport_open_until = now.checked_add(TRANSPORT_BREAKER_COOLDOWN);
+            self.transport_open_until = Some(Window::opening(now, TRANSPORT_BREAKER_COOLDOWN));
             self.transport_failures = 0;
         }
+    }
+
+    /// The provider answered -- with a rewrite, or with a 401, a 429 or a
+    /// body the client could not parse. Any of those is proof the transport
+    /// works, which is the only question this breaker asks, so the window
+    /// closes, a probe resolves as a success, and the consecutive-failure
+    /// count starts again from zero.
+    fn transport_answered(&mut self) {
+        self.transport_probe = None;
+        self.transport_open_until = None;
+        self.transport_failures = 0;
     }
 }
 
@@ -550,10 +751,11 @@ pub async fn reword_or_original(
     rewriter: Arc<dyn Rewriter>,
     state: Arc<RewordState>,
 ) -> String {
-    state.note_endpoint(cfg);
     let budget = Duration::from_millis(cfg.timeout_ms);
-    let (outcome, _elapsed) = attempt(rewriter, state.clone(), text.clone(), budget).await;
-    state.record(cfg, &outcome, Instant::now());
+    // No `record` here: `attempt` owns it end to end, because the outcome
+    // of an attempt that outlived its deadline is only reachable from
+    // inside the job. Recording here as well would count it twice.
+    let (outcome, _elapsed) = attempt(rewriter, state, cfg, text.clone(), budget).await;
     let Attempt::Answered(Ok(candidate)) = outcome else {
         return text;
     };
@@ -683,6 +885,30 @@ mod tests {
         }
     }
 
+    /// [`attempt`] on a task of its own. The future borrows its config, so
+    /// a test that wants it detached hands it one to own.
+    fn spawn_attempt(
+        rewriter: Arc<dyn Rewriter>,
+        state: Arc<RewordState>,
+        text: String,
+        budget: Duration,
+    ) -> tokio::task::JoinHandle<(Attempt, Duration)> {
+        tokio::spawn(async move { attempt(rewriter, state, &cfg(), text, budget).await })
+    }
+
+    /// Wait for every permit to come back, which is also the point at which
+    /// every abandoned job has folded its own outcome into `record`: the
+    /// permit is released after that call, not before.
+    async fn settle(state: &RewordState) {
+        for _ in 0..200 {
+            if state.available_permits() == REWORD_MAX_INFLIGHT {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the rewrite jobs never finished");
+    }
+
     /// The deadline race. A rewrite that has not answered in `timeout_ms`
     /// does not get spoken; the original does, and it gets spoken exactly
     /// once.
@@ -732,6 +958,7 @@ mod tests {
         let (outcome, _) = attempt(
             stub as Arc<dyn Rewriter>,
             state.clone(),
+            &cfg(),
             "Alice: where do you want to go for dinner".into(),
             Duration::from_millis(50),
         )
@@ -764,18 +991,18 @@ mod tests {
         let state = RewordState::new();
         let text = "Alice: where do you want to go for dinner".to_string();
 
-        let a = tokio::spawn(attempt(
+        let a = spawn_attempt(
             stub.clone() as Arc<dyn Rewriter>,
             state.clone(),
             text.clone(),
             Duration::from_millis(900),
-        ));
-        let b = tokio::spawn(attempt(
+        );
+        let b = spawn_attempt(
             stub.clone() as Arc<dyn Rewriter>,
             state.clone(),
             text.clone(),
             Duration::from_millis(900),
-        ));
+        );
         // Long enough for both permits to be taken, far short of the 400 ms
         // the stub sleeps for.
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -784,6 +1011,7 @@ mod tests {
         let (third, _) = attempt(
             stub.clone() as Arc<dyn Rewriter>,
             state.clone(),
+            &cfg(),
             text.clone(),
             Duration::from_millis(900),
         )
@@ -800,6 +1028,61 @@ mod tests {
         let _ = a.await;
         let _ = b.await;
         assert_eq!(stub.calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// The failure the transport breaker most exists for, in the shape the
+    /// daemon actually meets it: a provider that accepts connections and
+    /// never answers.
+    ///
+    /// `timeout_ms` is capped at 2500 ms and the client's own ceiling is
+    /// 10 s, so every one of those attempts returns [`Attempt::Deadline`]
+    /// to its caller and the [`RewordError::Ceiling`] arrives long after
+    /// the caller is gone. With the outcome recorded only by the caller the
+    /// breaker never moved -- measured, ten consecutive ceiling-class
+    /// failures and `allow` still said `Ok(())`, so every eligible
+    /// notification went on paying the full budget forever. The job folding
+    /// its own outcome in is what makes §8's row reachable at all here.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ceiling_failures_open_the_breaker_even_though_every_caller_saw_a_deadline() {
+        let stub = Stub::slow(
+            // Longer than the budget below, so the caller always gives up
+            // first, exactly as it does against the real 10 s ceiling.
+            Duration::from_millis(150),
+            (0..TRANSPORT_FAILURES_TO_OPEN)
+                .map(|_| Err(RewordError::Ceiling))
+                .collect(),
+        );
+        let state = RewordState::new();
+        let cfg = cfg();
+
+        for i in 0..TRANSPORT_FAILURES_TO_OPEN {
+            let (outcome, _) = attempt(
+                stub.clone() as Arc<dyn Rewriter>,
+                state.clone(),
+                &cfg,
+                "Alice: where do you want to go for dinner".into(),
+                Duration::from_millis(20),
+            )
+            .await;
+            assert!(
+                matches!(outcome, Attempt::Deadline),
+                "attempt {i} must have given up before the provider did: {outcome:?}"
+            );
+            settle(&state).await;
+        }
+
+        assert_eq!(
+            stub.calls.load(Ordering::SeqCst),
+            TRANSPORT_FAILURES_TO_OPEN as usize,
+            "each arrival made exactly one request"
+        );
+        assert_eq!(
+            state.allow(&cfg, Instant::now()),
+            Err(Blocked::TransportOpen),
+            "three ceiling-class failures opened the breaker even though \
+             every caller was handed a Deadline and the answers themselves \
+             were dropped unread"
+        );
     }
 
     /// §8's auth latch. A bad key does not fix itself, and every retry
@@ -879,7 +1162,9 @@ mod tests {
             "after 60 s one is let through"
         );
 
-        // The client's own 10 s ceiling counts toward the same breaker.
+        // The client's own 10 s ceiling counts toward the same breaker. The
+        // first of these is the probe just taken failing, which re-arms the
+        // window on its own; the other two are the count starting again.
         for _ in 0..3 {
             state.record(&cfg, &Attempt::Answered(Err(RewordError::Ceiling)), t0);
         }
@@ -904,6 +1189,181 @@ mod tests {
             t0,
         );
         assert_eq!(state.allow(&cfg, t0), Ok(()));
+    }
+
+    /// §8 says "stop attempting for 60 s, **then let one through**", and
+    /// *one* is the whole of the sentence. Clearing the window on the first
+    /// `allow` past it opens the gate for everyone until three fresh
+    /// failures accumulate -- measured on the previous implementation, 100
+    /// of 100 arrivals at the same instant past the cooldown were admitted,
+    /// which against a provider that is still down is 100 requests, 100
+    /// full `timeout_ms` delays, and both permits occupied.
+    #[test]
+    fn an_expired_cooldown_admits_one_probe_and_not_the_hundred_behind_it() {
+        let state = RewordState::new();
+        let cfg = cfg();
+        let t0 = Instant::now();
+
+        for _ in 0..TRANSPORT_FAILURES_TO_OPEN {
+            state.record(
+                &cfg,
+                &Attempt::Answered(Err(RewordError::Unreachable("connection refused".into()))),
+                t0,
+            );
+        }
+        assert_eq!(state.allow(&cfg, t0), Err(Blocked::TransportOpen));
+
+        let past = t0 + TRANSPORT_BREAKER_COOLDOWN + Duration::from_secs(1);
+        assert_eq!(state.allow(&cfg, past), Ok(()), "one is let through");
+        let admitted = (0..100).filter(|_| state.allow(&cfg, past).is_ok()).count();
+        assert_eq!(
+            admitted, 0,
+            "and the hundred arrivals behind it are still refused: the \
+             cooldown expiring mints one probe, it does not reopen the gate"
+        );
+    }
+
+    /// The probe's two resolutions, which are what makes it a probe rather
+    /// than a free pass: a failure buys another full cooldown, an answer
+    /// closes the breaker for everyone.
+    #[test]
+    fn a_failed_probe_re_arms_the_cooldown_and_a_successful_one_closes_it() {
+        let cfg = cfg();
+        let t0 = Instant::now();
+        let past = t0 + TRANSPORT_BREAKER_COOLDOWN + Duration::from_secs(1);
+
+        let open = || {
+            let state = RewordState::new();
+            for _ in 0..TRANSPORT_FAILURES_TO_OPEN {
+                state.record(
+                    &cfg,
+                    &Attempt::Answered(Err(RewordError::Unreachable("refused".into()))),
+                    t0,
+                );
+            }
+            assert_eq!(state.allow(&cfg, t0), Err(Blocked::TransportOpen));
+            state
+        };
+
+        // The probe fails: another 60 s, not three more chances.
+        let state = open();
+        assert_eq!(state.allow(&cfg, past), Ok(()));
+        state.record(
+            &cfg,
+            &Attempt::Answered(Err(RewordError::Unreachable("refused".into()))),
+            past,
+        );
+        assert_eq!(
+            state.allow(&cfg, past + Duration::from_secs(59)),
+            Err(Blocked::TransportOpen),
+            "one failed probe re-arms the whole cooldown by itself"
+        );
+        assert_eq!(
+            state.allow(
+                &cfg,
+                past + TRANSPORT_BREAKER_COOLDOWN + Duration::from_secs(1)
+            ),
+            Ok(()),
+            "and then another probe, indefinitely, for as long as it keeps failing"
+        );
+
+        // The probe succeeds: the breaker is closed for everyone, not just
+        // for the caller that happened to hold the token.
+        let state = open();
+        assert_eq!(state.allow(&cfg, past), Ok(()));
+        state.record(&cfg, &Attempt::Answered(Ok("a rewrite".into())), past);
+        for _ in 0..10 {
+            assert_eq!(
+                state.allow(&cfg, past),
+                Ok(()),
+                "a provider that came back is not rationed"
+            );
+        }
+    }
+
+    /// A probe nobody resolves must not shut the feature off for the life
+    /// of the process. Every way of taking one without resolving it is a
+    /// caller that passed `allow` and then did not attempt -- no permit was
+    /// free, or `context` could not build a client -- and the second of
+    /// those does not even reach a `record`. So the token expires.
+    #[test]
+    fn an_abandoned_probe_expires_rather_than_latching_the_breaker_shut() {
+        let state = RewordState::new();
+        let cfg = cfg();
+        let t0 = Instant::now();
+        for _ in 0..TRANSPORT_FAILURES_TO_OPEN {
+            state.record(
+                &cfg,
+                &Attempt::Answered(Err(RewordError::Unreachable("refused".into()))),
+                t0,
+            );
+        }
+        let past = t0 + TRANSPORT_BREAKER_COOLDOWN + Duration::from_secs(1);
+        assert_eq!(state.allow(&cfg, past), Ok(()));
+        // ...and this caller never attempts. Nothing resolves the token.
+        assert_eq!(state.allow(&cfg, past), Err(Blocked::TransportOpen));
+        assert_eq!(
+            state.allow(&cfg, past + TRANSPORT_PROBE_TTL + Duration::from_secs(1)),
+            Ok(()),
+            "past the ceiling a real attempt could have taken, the probe \
+             cannot still be in flight, so the next arrival may take one"
+        );
+
+        // A caller that found no permit hands the token straight back
+        // rather than sitting on it for the ceiling.
+        let state = RewordState::new();
+        for _ in 0..TRANSPORT_FAILURES_TO_OPEN {
+            state.record(
+                &cfg,
+                &Attempt::Answered(Err(RewordError::Unreachable("refused".into()))),
+                t0,
+            );
+        }
+        assert_eq!(state.allow(&cfg, past), Ok(()));
+        state.record(&cfg, &Attempt::Busy, past);
+        assert_eq!(
+            state.allow(&cfg, past),
+            Ok(()),
+            "nothing was sent, so nothing was learned and the probe is \
+             still there to be taken"
+        );
+    }
+
+    /// The concurrent shape of the same rule, on real threads rather than
+    /// on an argument about the lock: eight callers arrive at the same
+    /// instant past an expired cooldown and exactly one is admitted. The
+    /// previous implementation admitted all eight.
+    #[test]
+    fn concurrent_callers_past_an_expired_window_admit_exactly_one() {
+        let state = RewordState::new();
+        let cfg = cfg();
+        let t0 = Instant::now();
+        for _ in 0..TRANSPORT_FAILURES_TO_OPEN {
+            state.record(
+                &cfg,
+                &Attempt::Answered(Err(RewordError::Unreachable("refused".into()))),
+                t0,
+            );
+        }
+        let past = t0 + TRANSPORT_BREAKER_COOLDOWN + Duration::from_secs(1);
+
+        let admitted = AtomicUsize::new(0);
+        let ready = std::sync::Barrier::new(8);
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| {
+                    ready.wait();
+                    if state.allow(&cfg, past).is_ok() {
+                        admitted.fetch_add(1, Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            admitted.load(Ordering::SeqCst),
+            1,
+            "the probe is a token, and a token is taken by exactly one caller"
+        );
     }
 
     /// §8's rate-limit row: honour `Retry-After` when present, otherwise
@@ -939,6 +1399,71 @@ mod tests {
             Err(Blocked::RateLimited)
         );
         assert_eq!(state.allow(&cfg, t0 + Duration::from_secs(61)), Ok(()));
+    }
+
+    /// A later, shorter `Retry-After` must not cancel a longer one that is
+    /// still in force. Two rewrites may be in flight, so two 429s in a row
+    /// is ordinary rather than exotic -- and a provider that answers the
+    /// second with `Retry-After: 1` has not withdrawn the hour it asked for
+    /// on the first. Measured on the previous implementation:
+    /// `record(3600 s)` then `record(1 s)`, and the next attempt went out
+    /// two seconds later.
+    #[test]
+    fn a_second_retry_after_extends_the_backoff_and_never_shortens_it() {
+        let state = RewordState::new();
+        let cfg = cfg();
+        let t0 = Instant::now();
+        let limited = |after: u64| {
+            Attempt::Answered(Err(RewordError::RateLimited {
+                retry_after: Some(Duration::from_secs(after)),
+                message: None,
+            }))
+        };
+
+        state.record(&cfg, &limited(3600), t0);
+        state.record(&cfg, &limited(1), t0);
+        assert_eq!(
+            state.allow(&cfg, t0 + Duration::from_secs(2)),
+            Err(Blocked::RateLimited),
+            "the shorter of the two did not replace the hour"
+        );
+        assert_eq!(
+            state.allow(&cfg, t0 + Duration::from_secs(3599)),
+            Err(Blocked::RateLimited)
+        );
+        assert_eq!(state.allow(&cfg, t0 + Duration::from_secs(3601)), Ok(()));
+
+        // And the other order still extends: a longer second window moves
+        // the deadline out.
+        let state = RewordState::new();
+        state.record(&cfg, &limited(5), t0);
+        state.record(&cfg, &limited(600), t0);
+        assert_eq!(
+            state.allow(&cfg, t0 + Duration::from_secs(30)),
+            Err(Blocked::RateLimited)
+        );
+        assert_eq!(state.allow(&cfg, t0 + Duration::from_secs(601)), Ok(()));
+    }
+
+    /// Both breaker windows are dated by `Instant::checked_add`, and its
+    /// `None` used to be stored as "no window at all" -- so the arithmetic
+    /// that overflowed *because* the wait was absurd produced no wait.
+    /// `notify::policy::is_expired` makes the opposite call for the same
+    /// arithmetic and says why; this is that call, made in the type.
+    #[test]
+    fn a_window_that_cannot_be_dated_is_shut_rather_than_open() {
+        let now = Instant::now();
+        assert_eq!(Window::opening(now, Duration::MAX), Window::Forever);
+        assert!(Window::Forever.shut_at(now));
+        assert!(Window::Forever.shut_at(now + Duration::from_secs(86_400)));
+        assert_eq!(
+            Window::Forever.later(Window::Until(now)),
+            Window::Forever,
+            "and it cannot be shortened by a window that can be dated"
+        );
+        assert!(
+            !Window::opening(now, Duration::from_secs(60)).shut_at(now + Duration::from_secs(61))
+        );
     }
 
     /// The gate the callers use before they spawn anything. Short text,
@@ -1039,6 +1564,60 @@ mod tests {
         );
     }
 
+    /// §7's privacy line is what a user greps to find out where their text
+    /// goes, so it must not name a destination for a run in which nothing
+    /// left the machine. An arrival that finds no permit makes no request
+    /// at all -- and used to announce one anyway, because the line was
+    /// printed before the permit was asked for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn nothing_is_announced_for_an_utterance_that_never_sent_anything() {
+        let stub = Stub::slow(
+            Duration::from_millis(400),
+            vec![Ok("a".into()), Ok("b".into())],
+        );
+        let state = RewordState::new();
+        let cfg = cfg();
+        let text = "Alice: where do you want to go for dinner".to_string();
+
+        // Both permits taken by rewrites that are still in flight.
+        let a = spawn_attempt(
+            stub.clone() as Arc<dyn Rewriter>,
+            state.clone(),
+            text.clone(),
+            Duration::from_millis(900),
+        );
+        let b = spawn_attempt(
+            stub.clone() as Arc<dyn Rewriter>,
+            state.clone(),
+            text.clone(),
+            Duration::from_millis(900),
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // A third arrival, against an endpoint nothing has announced yet.
+        let mut unannounced = cfg.clone();
+        unannounced.base_url = "https://api.ppq.ai/v1".into();
+        let (third, _) = attempt(
+            stub.clone() as Arc<dyn Rewriter>,
+            state.clone(),
+            &unannounced,
+            text,
+            Duration::from_millis(900),
+        )
+        .await;
+        assert!(matches!(third, Attempt::Busy));
+        assert!(
+            !state.endpoint_seen(&unannounced),
+            "no permit, no request, no line claiming the text was sent"
+        );
+
+        let _ = a.await;
+        let _ = b.await;
+        // ...and the endpoint the two that *did* run were pointed at is
+        // announced, so the line has not simply gone away.
+        assert!(state.endpoint_seen(&cfg));
+    }
+
     /// A stub needs no runtime, no futures and no associated types. If this
     /// stops compiling, the seam has grown something.
     #[test]
@@ -1091,12 +1670,12 @@ mod tests {
         for wave in 0..3 {
             let mut spawned = Vec::new();
             for _ in 0..4 {
-                spawned.push(tokio::spawn(attempt(
+                spawned.push(spawn_attempt(
                     stub.clone() as Arc<dyn Rewriter>,
                     state.clone(),
                     text.clone(),
                     Duration::from_secs(5),
-                )));
+                ));
             }
             let mut answered = 0;
             let mut busy = 0;
@@ -1166,6 +1745,7 @@ mod tests {
             let _ = attempt(
                 stub.clone() as Arc<dyn Rewriter>,
                 state.clone(),
+                &cfg(),
                 "Alice: where do you want to go for dinner".into(),
                 Duration::from_millis(10),
             )
@@ -1288,16 +1868,16 @@ mod tests {
         assert!(!will_reword(text, &cfg, &state));
         // The injected clock is a minute later, so the same state lets one
         // through -- no wall-clock second has elapsed to make that true.
-        assert_eq!(
-            state.allow(
-                &cfg,
-                t0 + TRANSPORT_BREAKER_COOLDOWN + Duration::from_secs(1)
-            ),
-            Ok(())
-        );
+        let past = t0 + TRANSPORT_BREAKER_COOLDOWN + Duration::from_secs(1);
+        assert_eq!(state.allow(&cfg, past), Ok(()));
+        // That was the probe, and the probe is one: a real-clock caller
+        // behind it is still refused until the probe comes back.
+        assert!(!will_reword(text, &cfg, &state));
+        state.record(&cfg, &Attempt::Answered(Ok("a rewrite".into())), past);
         assert!(
             will_reword(text, &cfg, &state),
-            "and the breaker it closed stays closed for the real clock too"
+            "and the breaker the injected clock closed is closed for the \
+             real clock too"
         );
 
         // The other direction: a window dated into the future by the

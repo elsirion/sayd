@@ -71,7 +71,7 @@ tempfile = "3"
 
 [features]
 models = []
-# Off by default, and the justification is not weight -- at 15 crates that
+# Off by default, and the justification is not weight -- at 16 crates that
 # would not carry it. The README promises "no network access at runtime,
 # nothing leaves your machine", and a default build with no HTTP client and
 # no TLS in it makes that a property of the *binary* rather than a property
