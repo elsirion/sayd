@@ -326,14 +326,17 @@ async fn run_on(engine: EngineHandle, address: Option<String>) -> Outcome {
                                         Decision::Speak(text) => {
                                             // An application wrote this one,
                                             // which is what §1's rewrite is
-                                            // for.
+                                            // for -- and this arm does not
+                                            // say so, it just forwards the
+                                            // `Written` it was handed. See
+                                            // `crate::reword::Written`.
                                             // The handle is dropped, which
                                             // is what detaching means: this
                                             // arm must not wait for a
                                             // rewrite. It is returned at all
                                             // so the tests can tell the two
                                             // paths apart -- see `speak`.
-                                            drop(speak(&engine, text, &cfg, Origin::Written, &submit_failure_logged).await);
+                                            drop(speak(&engine, text, &cfg, &submit_failure_logged).await);
                                         }
                                         // Counted against an open window; the
                                         // follow-up comes out of `due` below
@@ -388,13 +391,13 @@ async fn run_on(engine: EngineHandle, address: Option<String>) -> Outcome {
                     let due = limiter.due(&cfg.notifications, Instant::now());
                     if cfg.notifications.enabled {
                         for text in due {
-                            // This daemon composed these, so `Origin` has
-                            // one honest value here and the never-reword
-                            // rule follows from it rather than from a
-                            // judgement taken again at this call site. See
-                            // `Origin::Composed` for why that rule holds --
-                            // and for the ordering argument it is not.
-                            drop(speak(&engine, text, &cfg, Origin::Composed, &submit_failure_logged).await);
+                            // `Limiter::due` hands back `Composed`s, so this
+                            // arm states nothing at all: the never-reword
+                            // rule travels with the value rather than being
+                            // re-decided here. See `crate::reword::Composed`
+                            // for why that rule holds -- and for the
+                            // ordering argument it is not.
+                            drop(speak(&engine, text, &cfg, &submit_failure_logged).await);
                         }
                     }
                 }
@@ -621,13 +624,14 @@ fn notification_opts() -> SayOpts {
 /// be reworded therefore takes today's awaited path byte for byte. §2's
 /// requirement holds in full: the rewrite never blocks the `select!` arm.
 ///
-/// `origin` is [`Origin::Composed`] for a coalesced `"N more notifications"`
-/// follow-up and [`Origin::Written`] for an application's own notification;
-/// [`RewordPlan`] is what turns that into a rewrite or not. It is an enum
-/// rather than the `bool` it was because flipping that `bool` at the ticker's
-/// call site compiled and passed every test while sending a line this daemon
-/// composed itself to a provider -- see [`Origin::Composed`], which carries
-/// the rule and the reasoning, including which ordering hazard it is *not*.
+/// Provenance arrives *in* `text`: `Limiter::decide` hands back a
+/// [`Written`] and `Limiter::due` hands back [`Composed`]s, and
+/// [`RewordPlan::automatic`] is what turns that into a rewrite or not.
+/// Neither of `run_on`'s two call sites names an origin, which is the point:
+/// as a `bool`, and then as an `Origin` passed alongside the text, both arms
+/// were flippable and both flips passed the whole suite -- see [`Written`],
+/// which carries the two measurements, and [`Composed`], which carries the
+/// never-reword rule and which ordering hazard it is *not*.
 ///
 /// The detached task is not a child of the monitor task, so
 /// `NotifyMonitorSupervisor`'s `handle.abort()` does not cancel it. Same
@@ -666,12 +670,12 @@ fn notification_opts() -> SayOpts {
 /// here so it is not lost.
 async fn speak(
     engine: &EngineHandle,
-    text: String,
+    text: impl Into<Origin>,
     cfg: &Config,
-    origin: Origin,
     failure_logged: &Arc<AtomicBool>,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    let len = text.chars().count();
+    let text = text.into();
+    let len = text.text().chars().count();
     if len > cfg.max_chars {
         eprintln!(
             "warning: a notification's announcement is {len} characters, over the \
@@ -683,7 +687,7 @@ async fn speak(
 
     // `automatic`, never `requested`: this path is the standing ask that
     // `[reword] enabled` governs. `--reword` is the other one, in `dbus.rs`.
-    let plan = match RewordPlan::automatic(text, &cfg.reword, origin) {
+    let plan = match RewordPlan::automatic(text, &cfg.reword) {
         Ok(plan) => plan,
         // Not being reworded, and here is the text back. Today's path
         // exactly, awaited: nothing was spawned, so two announcements
@@ -809,6 +813,7 @@ fn log_discovery(app_name: &str, announced: &mut Announced) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reword::{Composed, Written};
     use std::collections::HashMap;
     use std::io::{BufRead, BufReader};
     use std::process::{Child, Command, Stdio};
@@ -929,7 +934,7 @@ mod tests {
             ..Config::default()
         };
         let logged = Arc::new(AtomicBool::new(false));
-        let detached = speak(&engine, "a".repeat(30), &cfg, Origin::Written, &logged).await;
+        let detached = speak(&engine, Written("a".repeat(30)), &cfg, &logged).await;
         assert!(
             detached.is_none(),
             "an announcement that was never submitted has nothing to detach"
@@ -979,14 +984,14 @@ mod tests {
         let off = Config::default();
         assert!(!off.reword.enabled, "the shipped default is off");
         assert!(
-            RewordPlan::automatic(text.into(), &off.reword, Origin::Written).is_err(),
+            RewordPlan::automatic(Written(text.into()), &off.reword).is_err(),
             "`enabled = false` must not even look for a client"
         );
         // And in a build with no client in it, not even `enabled = true`
         // can produce a plan.
         #[cfg(not(feature = "reword"))]
         assert!(
-            RewordPlan::automatic(text.into(), &rewording_on().reword, Origin::Written).is_err(),
+            RewordPlan::automatic(Written(text.into()), &rewording_on().reword).is_err(),
             "a build without the `reword` feature has nothing to rewrite with"
         );
     }
@@ -1011,7 +1016,7 @@ mod tests {
 
         let text = "Alice: where do you want to go for dinner".to_string();
         let logged = Arc::new(AtomicBool::new(false));
-        let detached = speak(&engine, text.clone(), &cfg, Origin::Written, &logged).await;
+        let detached = speak(&engine, Written(text.clone()), &cfg, &logged).await;
 
         assert!(
             detached.is_none(),
@@ -1035,7 +1040,7 @@ mod tests {
     /// already a sentence written for the ear; rewriting it would cost a
     /// provider round trip for text this daemon wrote and delay by up to
     /// `timeout_ms` a line whose whole job is to arrive when the window
-    /// closes. See `Origin::Composed`, which also records why the ordering
+    /// closes. See `crate::reword::Composed`, which also records why the ordering
     /// argument this comment used to give is backwards.
     ///
     /// Asserted on `RewordPlan::automatic` rather than by counting calls into
@@ -1062,21 +1067,21 @@ mod tests {
             "the follow-up is eligible on length; the exclusion must be the rule"
         );
         assert!(
-            RewordPlan::automatic(followup.clone(), &cfg.reword, Origin::Composed).is_err(),
+            RewordPlan::automatic(Composed(followup.clone()), &cfg.reword).is_err(),
             "a follow-up must never be admitted to a rewrite"
         );
         // The positive control: the same text under the same config *is*
-        // admitted as `Origin::Written`, in a build that has a client to
+        // admitted as a `Written`, in a build that has a client to
         // admit it to. Without this the assertion above would also pass
         // against a config that could never rewrite anything.
         assert_eq!(
-            RewordPlan::automatic(followup.clone(), &cfg.reword, Origin::Written).is_ok(),
+            RewordPlan::automatic(Written(followup.clone()), &cfg.reword).is_ok(),
             cfg!(feature = "reword"),
             "only the origin should decide this, and only a build with a client \
              can say yes at all"
         );
         let logged = Arc::new(AtomicBool::new(false));
-        let detached = speak(&engine, followup.clone(), &cfg, Origin::Composed, &logged).await;
+        let detached = speak(&engine, Composed(followup.clone()), &cfg, &logged).await;
         // The end-to-end half, and the one the assertion above cannot make:
         // `speak` must *forward* the origin it was handed. Measured -- making
         // `speak` ignore its `origin` argument entirely passed 254 of 254
@@ -1116,7 +1121,7 @@ mod tests {
 
         let text = "Alice: where do you want to go for dinner".to_string();
         assert_eq!(
-            RewordPlan::automatic(text.clone(), &cfg.reword, Origin::Written).is_ok(),
+            RewordPlan::automatic(Written(text.clone()), &cfg.reword).is_ok(),
             cfg!(feature = "reword"),
             "the case under test is the detaching one; in a build with a client \
              this announcement must be admitted, or the timing below proves nothing"
@@ -1124,7 +1129,7 @@ mod tests {
 
         let logged = Arc::new(AtomicBool::new(false));
         let started = Instant::now();
-        let detached = speak(&engine, text, &cfg, Origin::Written, &logged).await;
+        let detached = speak(&engine, Written(text), &cfg, &logged).await;
         let elapsed = started.elapsed();
 
         assert_eq!(
@@ -1389,6 +1394,16 @@ mod tests {
         allow: Vec<String>,
         cooldown_secs: u64,
     ) -> (EngineHandle, Arc<Mutex<Vec<String>>>) {
+        engine_with_reword(allow, cooldown_secs, RewordConfig::default())
+    }
+
+    /// [`engine_with`], plus the `[reword]` table the monitor will read back
+    /// off it on every tick.
+    fn engine_with_reword(
+        allow: Vec<String>,
+        cooldown_secs: u64,
+        reword: RewordConfig,
+    ) -> (EngineHandle, Arc<Mutex<Vec<String>>>) {
         let cfg = Config {
             notifications: NotificationConfig {
                 enabled: true,
@@ -1396,6 +1411,7 @@ mod tests {
                 cooldown_secs,
                 ..NotificationConfig::default()
             },
+            reword: Box::new(reword),
             ..Config::default()
         };
         let spoken = Arc::new(Mutex::new(Vec::new()));
@@ -1683,6 +1699,22 @@ mod tests {
     /// window are counted, and "Signal: 3 more notifications" must arrive on
     /// its own once the window closes -- there is no fourth notification to
     /// carry it out any other way.
+    ///
+    /// Run with **rewording switched on**, pointed at a provider that accepts
+    /// a connection and says nothing, and that is the second thing it pins:
+    /// the follow-up must reach the engine without a provider round trip.
+    /// Flipping the ticker's arm to the written origin used to compile and
+    /// pass 263 of 263 while sending a line this daemon composed itself to a
+    /// provider and delaying it by up to `timeout_ms`; provenance travels
+    /// with the value now (`Limiter::due` hands back `Composed`s), so that
+    /// mutation no longer type-checks -- and this is the behavioural half,
+    /// which would still catch it if the types were ever loosened again.
+    ///
+    /// The three-word eligibility floor is what makes the check exact: the
+    /// notifications this test sends are all two words, so the follow-up is
+    /// the *only* text in the whole run that could reach a provider at all,
+    /// and `endpoint_seen` is therefore about it and nothing else. Both halves
+    /// of that are asserted below rather than assumed.
     #[tokio::test]
     async fn the_tick_speaks_a_coalesced_followup_on_its_own() {
         let Some((bus, _daemon, app)) = stub_daemon_and_app().await else {
@@ -1690,7 +1722,27 @@ mod tests {
             return;
         };
 
-        let (engine, spoken) = engine_with(vec!["Signal".to_string(), "Control".to_string()], 2);
+        let (base_url, provider) = crate::reword::silent_provider(Duration::from_millis(500));
+        let reword = RewordConfig {
+            enabled: true,
+            base_url,
+            timeout_ms: 400,
+            ..RewordConfig::default()
+        };
+        assert!(
+            sayd_core::reword::eligible("Signal: first", reword.max_chars).is_err(),
+            "the notifications this test sends must be ineligible on their own              account, or `endpoint_seen` below would not be about the follow-up"
+        );
+        assert!(
+            sayd_core::reword::eligible("Signal: 3 more notifications", reword.max_chars).is_ok(),
+            "...and the follow-up must be eligible, or its exclusion would be an              accident of length rather than the rule under test"
+        );
+
+        let (engine, spoken) = engine_with_reword(
+            vec!["Signal".to_string(), "Control".to_string()],
+            2,
+            reword.clone(),
+        );
         let monitor = tokio::spawn(run_on(engine.clone(), Some(bus.address.clone())));
 
         // Establish the monitor is active with a throwaway app, so the burst
@@ -1744,9 +1796,20 @@ mod tests {
 
         monitor.abort();
         engine.shutdown();
+        provider.join().expect("the silent provider thread ends");
         assert!(
             spoke_followup,
             "the coalesced follow-up never arrived; the ticker's `Limiter::due` wiring is not working"
+        );
+        // And it got there without asking a provider first. In a build with
+        // no client `context` returns `None` and nothing could have reached
+        // one anyway, so the assertion is only meaningful -- and is only made
+        // -- where it can fail.
+        #[cfg(feature = "reword")]
+        assert!(
+            !crate::reword::state().endpoint_seen(&reword),
+            "a line this daemon composed itself was sent to a provider; the \
+             follow-up must never be reworded"
         );
     }
 

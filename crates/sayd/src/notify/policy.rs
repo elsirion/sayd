@@ -20,12 +20,20 @@ use std::time::{Duration, Instant};
 
 use sayd_core::config::NotificationConfig;
 
+use crate::reword::{Composed, Written};
+
 use super::Notification;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Decision {
     /// Speak this now.
-    Speak(String),
+    ///
+    /// A [`Written`] rather than a `String`, and [`Limiter::due`] hands back
+    /// [`Composed`]s for the same reason: provenance travels with the text,
+    /// so `notify::monitor`'s two call sites never name one and cannot name
+    /// the wrong one. See [`Written`] for the two measured mutations that
+    /// shape exists to kill -- one of them was flipping *this* arm.
+    Speak(Written),
     /// Inside an open window: counted, and announced as "N more" when it
     /// closes.
     Count,
@@ -88,7 +96,7 @@ pub struct Limiter {
     /// otherwise. The name is kept alongside because the announcement string
     /// has already been composed by then and is not something to re-parse a
     /// name back out of.
-    pending: Vec<(String, String)>,
+    pending: Vec<(String, Composed)>,
 }
 
 struct Window {
@@ -109,14 +117,17 @@ struct Window {
 /// The follow-up line for a window being retired, or `None` when it saw no
 /// suppressed traffic -- a bare "0 more notifications" would be worse than
 /// silence, so a quiet window is retired without a word.
-fn announcement(w: &Window) -> Option<String> {
+fn announcement(w: &Window) -> Option<Composed> {
     (w.suppressed > 0).then(|| {
         let noun = if w.suppressed == 1 {
             "notification"
         } else {
             "notifications"
         };
-        format!("{}: {} more {noun}", w.display_name, w.suppressed)
+        // [`Composed`] at the point of composition, not at the call site
+        // that speaks it: this `format!` *is* the daemon writing the line,
+        // and it is the last place that fact is self-evident.
+        Composed(format!("{}: {} more {noun}", w.display_name, w.suppressed))
     })
 }
 
@@ -165,7 +176,7 @@ impl Limiter {
             return Decision::NothingToSay;
         };
         if cfg.cooldown_secs == 0 {
-            return Decision::Speak(text);
+            return Decision::Speak(Written(text));
         }
 
         let cooldown = Duration::from_secs(cfg.cooldown_secs);
@@ -197,7 +208,7 @@ impl Limiter {
                 display_name: n.app_name.trim().to_string(),
             },
         );
-        Decision::Speak(text)
+        Decision::Speak(Written(text))
     }
 
     /// The coalesced "N more notifications" announcements due to be spoken
@@ -224,7 +235,7 @@ impl Limiter {
     /// -- went straight out unfiltered, so whether a de-allowlisted
     /// application got the last word depended on which of the two noticed
     /// its window closing first.
-    pub fn due(&mut self, cfg: &NotificationConfig, now: Instant) -> Vec<String> {
+    pub fn due(&mut self, cfg: &NotificationConfig, now: Instant) -> Vec<Composed> {
         let cooldown = Duration::from_secs(cfg.cooldown_secs);
         let mut expired: Vec<String> = self
             .windows
@@ -236,7 +247,7 @@ impl Limiter {
         // not depend on hash-map iteration order.
         expired.sort();
 
-        let mut out: Vec<String> = std::mem::take(&mut self.pending)
+        let mut out: Vec<Composed> = std::mem::take(&mut self.pending)
             .into_iter()
             .filter(|(display_name, _)| is_allowed(display_name, cfg))
             .map(|(_, text)| text)
@@ -426,6 +437,49 @@ mod tests {
             allow: vec!["Signal".into()],
             ..NotificationConfig::default()
         }
+    }
+
+    /// The type on `Decision::Speak` is the whole of the never-reword rule
+    /// for this path, so it is checked as behaviour rather than left to a
+    /// reader to notice.
+    ///
+    /// Changing that payload from [`Written`] to [`Composed`] -- and it is
+    /// exactly one word -- compiles cleanly through `decide` and through
+    /// `notify::monitor`'s arm, and silently switches the whole milestone off
+    /// while `[reword] enabled = true`. That edit was found sitting
+    /// uncommitted in this tree once, and it passed 263 of 263 tests. Here it
+    /// fails: what `decide` speaks must be *admissible* to a rewrite.
+    ///
+    /// Nothing here touches a network. `RewordPlan::automatic` builds a
+    /// client and consults the breakers; the request only happens in
+    /// `resolve`, which this never calls -- and the plan is dropped, which
+    /// costs at worst §8's half-open probe token, and only in the (never
+    /// reached here) state where a transport cooldown has just expired.
+    #[test]
+    fn what_decide_speaks_is_admissible_to_a_rewrite() {
+        let mut limiter = Limiter::new();
+        let Decision::Speak(text) = limiter.decide(
+            &n("Signal", "where do you want to go for dinner", ""),
+            &cfg(),
+            Instant::now(),
+        ) else {
+            panic!("an allowlisted application's first notification is spoken");
+        };
+        let reword = sayd_core::config::RewordConfig {
+            enabled: true,
+            ..sayd_core::config::RewordConfig::default()
+        };
+        assert!(
+            sayd_core::reword::eligible(text.0.as_str(), reword.max_chars).is_ok(),
+            "the announcement must clear the eligibility floor, or `is_ok` below \
+             would be false for a reason that has nothing to do with provenance"
+        );
+        assert_eq!(
+            crate::reword::RewordPlan::automatic(text, &reword).is_ok(),
+            cfg!(feature = "reword"),
+            "an application's own notification is what §1's rewrite exists for; \
+             only a build with no client in it may refuse it"
+        );
     }
 
     /// IMPORTANT 4: `is_allowed` is the authority on what "allowed" means,
@@ -621,7 +675,7 @@ mod tests {
         ));
         assert_eq!(
             l.due(&c, t0 + Duration::from_secs(31)),
-            vec!["signal: 1 more notification".to_string()]
+            vec![Composed("signal: 1 more notification".to_string())]
         );
     }
 
@@ -648,7 +702,7 @@ mod tests {
         assert!(l.due(&c, t0 + Duration::from_secs(29)).is_empty());
         assert_eq!(
             l.due(&c, t0 + Duration::from_secs(31)),
-            vec!["Signal: 3 more notifications".to_string()]
+            vec![Composed("Signal: 3 more notifications".to_string())]
         );
         // ...and only once.
         assert!(l.due(&c, t0 + Duration::from_secs(32)).is_empty());
@@ -678,7 +732,7 @@ mod tests {
         let _ = l.decide(&n("Signal", "second", ""), &c, t0 + Duration::from_secs(1));
         assert_eq!(
             l.due(&c, t0 + Duration::from_secs(31)),
-            vec!["Signal: 1 more notification".to_string()]
+            vec![Composed("Signal: 1 more notification".to_string())]
         );
     }
 
@@ -796,7 +850,7 @@ mod tests {
         // itself.
         assert_eq!(
             l.due(&c, reopened),
-            vec!["Signal: 3 more notifications".to_string()]
+            vec![Composed("Signal: 3 more notifications".to_string())]
         );
     }
 

@@ -310,7 +310,17 @@ pub enum Attempt {
 /// a provider that outlives the caller's deadline still teaches the
 /// breaker), and the caller records the deadline or the panic it saw. A
 /// caller that recorded as well would count one failure twice.
-pub async fn attempt(
+///
+/// **Private.** It was `pub`, and a probe measured what that bought: a
+/// caller in `dbus.rs` calling `context(cfg)` and then this compiled clean
+/// and skipped the eligibility rule, the auth latch, the transport breaker
+/// and the rate limiter -- the bypass [`RewordPlan`]'s own doc calls
+/// structurally impossible. [`reword_or_original`] is the only caller and
+/// [`RewordPlan::resolve`] is the only caller of *that*, so the claim now
+/// holds. The settings window's Test row is the one deliberate exception and
+/// does not come through here at all -- see `settings::model::run_reword_test`,
+/// whose doc says so and why.
+async fn attempt(
     rewriter: Arc<dyn Rewriter>,
     state: Arc<RewordState>,
     cfg: &RewordConfig,
@@ -465,6 +475,12 @@ struct Inner {
     outage_logged: bool,
     auth_logged: bool,
     model_logged: bool,
+    /// MINOR 5's row: an explicit `--reword` against a build that has no
+    /// client in it. Its own latch rather than one of the others because it
+    /// is the one line whose cause is the *binary*, not the configuration --
+    /// nothing a user edits will clear it, so saying it twice would be
+    /// saying it twice for the life of the process.
+    unavailable_logged: bool,
 }
 
 impl RewordState {
@@ -769,6 +785,43 @@ impl RewordState {
             .contains(&format!("{}|{}", cfg.base_url, cfg.model))
     }
 
+    /// Has [`RewordState::note_unavailable`]'s line already been said this
+    /// run? Test-only: reading the latch is how that rule is checked without
+    /// capturing stderr.
+    #[cfg(test)]
+    fn unavailable_logged(&self) -> bool {
+        lock(&self.inner).unavailable_logged
+    }
+
+    /// MINOR 5: say once, per run, that this build cannot rewrite anything.
+    ///
+    /// [`RewordState::record`] swallows [`RewordError::Unavailable`], and
+    /// that is right for the path it was written for: `[reword] enabled` in
+    /// a feature-off build would otherwise owe a line per notification for a
+    /// rewrite nobody asked for. The explicit path *did* ask, and `dbus.rs`
+    /// promises it "the diagnosis is in the log, once per run" -- so
+    /// [`RewordPlan::requested`] says it here instead, where the once-per-run
+    /// latch already lives and where the line is built under the lock and
+    /// printed outside it like every other one ([`Journal`]).
+    ///
+    /// Returns whether it printed, which is what makes the latch testable
+    /// without capturing stderr.
+    pub fn note_unavailable(&self) -> bool {
+        let mut i = lock(&self.inner);
+        if i.unavailable_logged {
+            return false;
+        }
+        i.unavailable_logged = true;
+        drop(i);
+        self.emit([Journal::Line(
+            "warning: reword: this build of sayd has no rewriting client, so an \
+             explicit --reword speaks the text as written; rebuild with \
+             `--features reword` (said once per run)"
+                .to_string(),
+        )]);
+        true
+    }
+
     /// §4's logging rule: over-long text is worth one line per run, short
     /// text is worth none at all.
     pub fn note_ineligible(&self, why: Ineligible) {
@@ -887,46 +940,96 @@ async fn reword_or_original(
     }
 }
 
-/// Where a piece of text came from -- the one fact that decides whether it
-/// may be reworded at all.
+/// Text a person or an application wrote: a `Say`, `SaySelection` or
+/// `SayClipboard` body, or an application's own notification. §1's rewrite
+/// exists for exactly this.
 ///
-/// This was a bare `bool` parameter on `notify::monitor::speak`, and the
-/// hazard was measured rather than imagined: flipping the coalescing
-/// ticker's `false` to `true` compiled and passed every test in the suite,
-/// while sending a line this daemon composed itself to a provider and
-/// delaying it by up to `timeout_ms` on the way. A `bool` asks each call
-/// site to re-take a decision; this asks it only to say what it has, which
-/// is not a thing a call site can be wrong about.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Origin {
-    /// A person or an application wrote it: a `Say`, `SaySelection` or
-    /// `SayClipboard` body, or an application's own notification. §1's
-    /// rewrite exists for exactly this.
-    Written,
-    /// This daemon composed it: the coalesced `"N more notifications"`
-    /// follow-up `notify::policy` builds when a window closes (§2). Never
-    /// reworded, for three reasons that are all about the line itself:
-    /// `notify::policy::announcement` builds it from a template, so it is
-    /// already a sentence written for the ear and a rewrite can only make it
-    /// worse; it costs a provider round trip for text this daemon wrote; and
-    /// its whole job is to arrive the moment the window closes, which a
-    /// rewrite would delay by up to `timeout_ms`.
+/// A newtype **around the string** rather than a label passed beside it, and
+/// that is the whole of the guarantee. This started as a `bool` parameter on
+/// `notify::monitor::speak` and then became an `Origin` enum passed
+/// alongside the text; both shapes asked each call site to *state* where its
+/// text came from, and a call site that states something can state it
+/// wrongly. Measured on the enum, not imagined: flipping the coalescing
+/// ticker's arm to the written value passed 263 of 263 tests while sending a
+/// line this daemon composed itself to a provider, and flipping
+/// `Decision::Speak`'s arm to the composed one passed 263 of 263 while
+/// switching the whole feature off with `enabled = true` -- that second one
+/// was found sitting uncommitted in the tree.
+///
+/// Carried by the value, provenance is not a thing a call site can state at
+/// all: `Limiter::decide` hands back a `Written`, `Limiter::due` hands back
+/// `Composed`s, and [`RewordPlan::automatic`] takes `impl Into<Origin>`.
+/// Neither call site names an origin, so neither can name the wrong one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Written(pub String);
+
+/// Text this daemon composed: the coalesced `"N more notifications"`
+/// follow-up `notify::policy` builds when a window closes (§2). Never
+/// reworded, for three reasons that are all about the line itself:
+/// `notify::policy::announcement` builds it from a template, so it is
+/// already a sentence written for the ear and a rewrite can only make it
+/// worse; it costs a provider round trip for text this daemon wrote; and
+/// its whole job is to arrive the moment the window closes, which a
+/// rewrite would delay by up to `timeout_ms`.
+///
+/// **Not** because rewriting it would let it overtake its opener, which
+/// is what this comment, spec §2 and the brief all used to say. That
+/// reasoning is backwards and must not be copied into a later task:
+/// *excluding* the follow-up is what makes it instant, and rewriting it
+/// would push it later, never earlier.
+///
+/// The inversion those texts describe is real, but it arrives from the
+/// other side -- the *opener* is what a rewrite delays. A window that
+/// closes before its opener has been submitted lets the follow-up reach
+/// an idle engine first and start playing, and `Policy::Front` does not
+/// save the opener: `Front` jumps ahead of what is pending, not ahead of
+/// what is already playing. That is bounded where it lives, by
+/// `sayd_core::config::NOTIFY_COOLDOWN_MIN_SECS`, which keeps every
+/// non-zero cooldown clear of the reword ceiling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Composed(pub String);
+
+/// A [`Written`] or a [`Composed`], for the one function that has to tell
+/// them apart.
+///
+/// A tuple struct around a **private** enum, not a public enum, and the
+/// difference is the point: a public `Origin::Composed(text)` would be
+/// spellable at every call site again, which is precisely the shape both
+/// measured mutations exploited. The only ways to build one of these are the
+/// two `From` impls below, and each of them needs a value whose *type* has
+/// already fixed the answer.
+pub struct Origin(Provenance);
+
+enum Provenance {
+    Written(String),
+    Composed(String),
+}
+
+impl From<Written> for Origin {
+    fn from(w: Written) -> Origin {
+        Origin(Provenance::Written(w.0))
+    }
+}
+
+impl From<Composed> for Origin {
+    fn from(c: Composed) -> Origin {
+        Origin(Provenance::Composed(c.0))
+    }
+}
+
+impl Origin {
+    /// The text itself, whichever it is.
     ///
-    /// **Not** because rewriting it would let it overtake its opener, which
-    /// is what this comment, spec §2 and the brief all used to say. That
-    /// reasoning is backwards and must not be copied into a later task:
-    /// *excluding* the follow-up is what makes it instant, and rewriting it
-    /// would push it later, never earlier.
-    ///
-    /// The inversion those texts describe is real, but it arrives from the
-    /// other side -- the *opener* is what a rewrite delays. A window that
-    /// closes before its opener has been submitted lets the follow-up reach
-    /// an idle engine first and start playing, and `Policy::Front` does not
-    /// save the opener: `Front` jumps ahead of what is pending, not ahead of
-    /// what is already playing. That is bounded where it lives, by
-    /// `sayd_core::config::NOTIFY_COOLDOWN_MIN_SECS`, which keeps every
-    /// non-zero cooldown clear of the reword ceiling.
-    Composed,
+    /// Reading the string says nothing about where it came from and cannot
+    /// be used to build one, which is why this is safe to expose where a
+    /// constructor is not. `notify::monitor::speak` needs it for its
+    /// `max_chars` check, which happens before the rewrite so that an
+    /// announcement the engine is going to refuse costs no round trip.
+    pub fn text(&self) -> &str {
+        match &self.0 {
+            Provenance::Written(t) | Provenance::Composed(t) => t,
+        }
+    }
 }
 
 /// A rewrite the breakers have already cleared, and the only way anything in
@@ -941,9 +1044,23 @@ pub enum Origin {
 /// `reword_or_original` prevents that, so the protection is structural
 /// instead: this type's fields are private, [`RewordPlan::admit`] is its only
 /// constructor and calls `will_reword` on the way, [`RewordPlan::resolve`]
-/// consumes `self`, and both `will_reword` and `reword_or_original` are
-/// private to this module. A future edit cannot reorder or drop the check
+/// consumes `self`, and `will_reword`, `attempt` and `reword_or_original` are
+/// all private to this module. A future edit cannot reorder or drop the check
 /// without deleting the type that carries it.
+///
+/// `attempt` was `pub` until a probe measured what that cost: a caller in
+/// `dbus.rs` calling `context(cfg)` and then `attempt(..)` compiled clean and
+/// skipped the eligibility rule, the auth latch, the transport breaker and
+/// the rate limiter -- exactly the bypass this doc claims is impossible. It
+/// is private now, so the claim is true.
+///
+/// There is **one** deliberate exception, and it is a named function rather
+/// than a loophole: `settings::model::run_reword_test`, the settings
+/// window's Test button. It takes a permit and announces the endpoint like
+/// any other send, but consults and updates no breaker, because a user who
+/// has just fixed a rejected key must get a real request rather than a
+/// cached verdict. Its own doc comment states that as a rule; nothing else
+/// in the daemon may do it.
 ///
 /// It lives here rather than in `notify::monitor`, where it was written,
 /// because `dbus.rs` is a second call site and a guarantee that protects one
@@ -993,23 +1110,30 @@ impl RewordPlan {
     /// one mutex -- so text that is not going to be rewritten costs no
     /// allocation, no clone of the config, and above all no `tokio::spawn`.
     /// That is what keeps the feature-off path exactly what it was: with
-    /// `enabled = false` this returns on the first line, and in a build
+    /// `enabled = false` this returns on the second line, and in a build
     /// without the `reword` feature [`build_rewriter`] cannot make a client
-    /// at all, so `context` returns `None` and it returns on the second.
+    /// at all, so `context` returns `None` and `admit` returns on its first.
     ///
     /// Takes the text by value and hands it back in the `Err`, which is what
     /// makes "the plan owns what it admitted" free for the caller: every
     /// caller has a fallback that speaks the original, and giving the string
     /// back is cheaper than the clone the alternative would need.
-    pub fn automatic(
-        text: String,
-        cfg: &RewordConfig,
-        origin: Origin,
-    ) -> Result<RewordPlan, String> {
+    ///
+    /// Takes an `impl Into<Origin>` rather than a text and a separate origin,
+    /// so the caller never names one: it passes the [`Written`] or
+    /// [`Composed`] it is holding and the type decides. See [`Written`] for
+    /// the two mutations that shape exists to make unspellable.
+    pub fn automatic(text: impl Into<Origin>, cfg: &RewordConfig) -> Result<RewordPlan, String> {
+        let text = match text.into().0 {
+            Provenance::Written(text) => text,
+            // Matched rather than compared, so a third kind of text cannot
+            // be added without this rule being re-decided for it.
+            Provenance::Composed(text) => return Err(text),
+        };
         if !cfg.enabled {
             return Err(text);
         }
-        RewordPlan::admit(text, cfg, origin)
+        RewordPlan::admit(text, cfg)
     }
 
     /// This caller's explicit ask: `say --reword`, or `reword` in the D-Bus
@@ -1022,24 +1146,44 @@ impl RewordPlan {
     /// else -- a usable endpoint, the eligibility rule, all three breakers --
     /// applies identically, because `admit` below is shared.
     ///
-    /// Takes no [`Origin`]: an explicit request is by construction about
-    /// text its caller wrote, and offering `Origin::Composed` here would
-    /// re-introduce the unspellable-wrong-value the enum exists to remove.
+    /// Takes a plain `String` rather than an [`Origin`]: an explicit request
+    /// is by construction about text its caller wrote, and offering a
+    /// composed one here would put back the wrong value that [`Written`]
+    /// exists to make unspellable.
+    ///
+    /// MINOR 5: this is also the one path that owes a line when the build
+    /// itself cannot rewrite. [`RewordState::record`] deliberately swallows
+    /// [`RewordError::Unavailable`] -- right for the automatic path, which
+    /// never asked for anything -- but `dbus.rs` promises an explicit
+    /// `--reword` that "the diagnosis is in the log, once per run", and a
+    /// feature-off daemon used to log nothing at all. The condition is
+    /// exact rather than a guess at the reason: in a build without the
+    /// feature `context` can never return a client, so it is the *first*
+    /// thing `admit` fails on and `Unavailable` is the only reason there is.
     pub fn requested(text: String, cfg: &RewordConfig) -> Result<RewordPlan, String> {
-        RewordPlan::admit(text, cfg, Origin::Written)
+        RewordPlan::requested_in(text, cfg, &state())
+    }
+
+    /// [`RewordPlan::requested`] with its process-wide state handed in, so
+    /// the once-per-run line above can be tested against a state no other
+    /// test has already latched.
+    fn requested_in(
+        text: String,
+        cfg: &RewordConfig,
+        state: &RewordState,
+    ) -> Result<RewordPlan, String> {
+        let plan = RewordPlan::admit(text, cfg);
+        if plan.is_err() && !cfg!(feature = "reword") {
+            state.note_unavailable();
+        }
+        plan
     }
 
     /// The shared body, and the only place [`will_reword`] is called.
     ///
     /// `Err` is not a failure: it is "this text is not being reworded, here
     /// it is back", and every caller speaks it as written.
-    fn admit(text: String, cfg: &RewordConfig, origin: Origin) -> Result<RewordPlan, String> {
-        match origin {
-            Origin::Written => {}
-            // Matched rather than compared, so a third kind of text cannot
-            // be added without this rule being re-decided for it.
-            Origin::Composed => return Err(text),
-        }
+    fn admit(text: String, cfg: &RewordConfig) -> Result<RewordPlan, String> {
         let Some((rewriter, state)) = context(cfg) else {
             return Err(text);
         };
@@ -1890,7 +2034,7 @@ mod tests {
         off.enabled = false;
 
         assert_eq!(
-            RewordPlan::automatic(text.into(), &off, Origin::Written).err(),
+            RewordPlan::automatic(Written(text.into()), &off).err(),
             Some(text.to_string()),
             "`enabled = false` must not even look for a client, and the text \
              comes straight back"
@@ -1901,7 +2045,7 @@ mod tests {
             "an explicit --reword does not need `enabled`"
         );
         assert_eq!(
-            RewordPlan::automatic(text.into(), &cfg(), Origin::Written).is_ok(),
+            RewordPlan::automatic(Written(text.into()), &cfg()).is_ok(),
             cfg!(feature = "reword")
         );
     }
@@ -1911,23 +2055,56 @@ mod tests {
     /// says. As a `bool` parameter this was flippable at its call site --
     /// measured: `true` compiled and passed the whole suite, while sending a
     /// templated line to a provider and delaying it by up to `timeout_ms`.
-    /// See [`Origin::Composed`] for why that is wrong and for the ordering
+    /// See [`Composed`] for why that is wrong and for the ordering
     /// hazard it is *not*.
     #[test]
     fn composed_text_is_never_admitted() {
         let followup = "Signal: 3 more notifications";
         assert_eq!(
-            RewordPlan::automatic(followup.into(), &cfg(), Origin::Composed).err(),
+            RewordPlan::automatic(Composed(followup.into()), &cfg()).err(),
             Some(followup.to_string()),
             "a follow-up is refused, and gets its own text back to speak"
         );
         // ...and not because it was ineligible on its own account: the same
         // string with the other origin is admitted wherever there is a client.
         assert_eq!(
-            RewordPlan::automatic(followup.into(), &cfg(), Origin::Written).is_ok(),
+            RewordPlan::automatic(Written(followup.into()), &cfg()).is_ok(),
             cfg!(feature = "reword"),
             "the exclusion must be the origin, not the length"
         );
+    }
+
+    /// MINOR 5: an explicit `--reword` that this *build* cannot honour says
+    /// so, once per run.
+    ///
+    /// `dbus.rs` promises every `--reword` failure that "the diagnosis is in
+    /// the log, once per run", and a feature-off daemon used to print nothing
+    /// at all: `RewordState::record` swallows `RewordError::Unavailable`,
+    /// which is right for the automatic path (it would owe a line per
+    /// notification for a rewrite nobody asked for) and wrong for the path
+    /// that asked.
+    ///
+    /// Both directions are asserted, and the `cfg!` is what makes this one
+    /// test rather than two: a build *with* a client must not print the line,
+    /// because in that build `Unavailable` is not the reason for anything.
+    #[test]
+    fn an_explicit_reword_says_so_when_the_build_cannot_rewrite() {
+        let state = RewordState::new();
+        let text = "Alice: where do you want to go for dinner";
+        let plan = RewordPlan::requested_in(text.into(), &cfg(), &state);
+        assert_eq!(plan.is_ok(), cfg!(feature = "reword"));
+        assert_eq!(
+            state.unavailable_logged(),
+            !cfg!(feature = "reword"),
+            "a build with no rewriting client in it owes an explicit --reword a \
+             line; one that has a client owes it nothing"
+        );
+
+        // ...and only ever one line, whichever build this is: the latch is
+        // per run, not per `--reword`.
+        let fresh = RewordState::new();
+        assert!(fresh.note_unavailable(), "the first ask is worth a line");
+        assert!(!fresh.note_unavailable(), "and the thousandth is not");
     }
 
     /// The guard is applied to whatever comes back, and a rejection means
