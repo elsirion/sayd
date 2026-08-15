@@ -6,6 +6,7 @@
 //! (`window.rs`, filled in by Task 5) can be nothing but widgets that read
 //! `current()`/`voices()`/`MODELS` and call `edit`.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -14,6 +15,7 @@ use std::time::Duration;
 use sayd_core::config::Config;
 
 use crate::config_watch::ConfigStore;
+use crate::notify::seen;
 
 /// The model values, with the measured trade-off shown inline in the
 /// window. Numbers are from the benchmark recorded in the design doc; do
@@ -282,6 +284,70 @@ impl SettingsModel {
     /// The dropdown's contents: sorted voice-pack names.
     pub fn voices(&self) -> &[String] {
         &self.voices
+    }
+
+    /// Suggestions for the notification allowlist editor's "add an
+    /// application" picker: applications `sayd` has actually watched notify
+    /// this run (most recent first, `seen: true`), then [`CURATED`]
+    /// (`seen: false`) -- filtered to drop anything already on the
+    /// allowlist, and deduplicated so an application that is both recently
+    /// seen and in the curated table is offered once, as the seen one.
+    ///
+    /// Seen entries sort first: the application a user opens this picker to
+    /// add is almost always the one that just interrupted them, and a
+    /// curated entry is a guess by construction (see `CURATED`'s doc
+    /// comment) -- an educated one, but still second-best to what the
+    /// application actually just sent.
+    ///
+    /// Both the allow-filter and the dedupe fold case, matching
+    /// `allow_contains` (in turn matching `notify::policy::is_allowed`):
+    /// "signal" already on the allowlist must hide a suggestion spelled
+    /// "Signal", or the picker offers to add something that changes
+    /// nothing.
+    ///
+    /// A seen entry keeps the icon the application actually sent rather
+    /// than `CURATED`'s guess -- the whole reason `notify::seen` records an
+    /// icon at all is to show the real one once one has been observed.
+    pub fn suggestions(&self) -> Vec<Suggestion> {
+        let cfg = self.current();
+        // Case-folded app names already placed in `out`: what makes "seen
+        // wins over curated" true, and also guards a source duplicating
+        // itself (`notify::seen` already dedupes internally, but nothing
+        // stops two `CURATED` rows from clashing after case-folding, and
+        // `the_curated_table_is_well_formed` only checks that -- this is
+        // the belt to that test's suspenders).
+        let mut included: HashSet<String> = HashSet::new();
+        let mut out = Vec::new();
+
+        for app in seen::snapshot() {
+            if allow_contains(&cfg, &app.app_name) {
+                continue;
+            }
+            if !included.insert(app.app_name.trim().to_lowercase()) {
+                continue;
+            }
+            out.push(Suggestion {
+                icon: icon_source(&app.app_icon),
+                app_name: app.app_name,
+                seen: true,
+            });
+        }
+
+        for (name, icon) in CURATED {
+            if allow_contains(&cfg, name) {
+                continue;
+            }
+            if !included.insert(name.trim().to_lowercase()) {
+                continue;
+            }
+            out.push(Suggestion {
+                app_name: (*name).to_string(),
+                icon: icon_source(icon),
+                seen: false,
+            });
+        }
+
+        out
     }
 
     /// What the window should be showing right now. See `Pending::current`.
@@ -832,6 +898,125 @@ pub fn allow_remove(cfg: &mut Config, name: &str) {
         .allow
         .retain(|a| a.trim().to_lowercase() != name);
 }
+
+/// What an `app_icon` string actually refers to.
+///
+/// The notification spec allows three shapes for this one field: a
+/// freedesktop icon *name*, looked up in the user's icon theme; a path to an
+/// image file; or a `file://` URI wrapping that same path. Which one a given
+/// application sends is not negotiable or discoverable ahead of time --
+/// `notify::seen` records whatever string arrived verbatim -- so the window
+/// cannot draw an icon without first classifying which of the three it has.
+/// That classification is a rule, so, like everything else in this file, it
+/// lives here rather than in `window.rs`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IconSource {
+    /// A freedesktop icon theme name, e.g. `"signal-desktop"` or
+    /// `"org.gnome.Fractal"` -- looked up through the icon theme, not
+    /// loaded from disk directly.
+    Named(String),
+    /// A path to an image file -- loaded from disk directly rather than
+    /// through a theme. Absolute in every case this codebase has actually
+    /// seen, but a relative one is accepted the same way; see
+    /// `icon_source`'s doc comment for why that costs nothing extra.
+    File(PathBuf),
+    /// Nothing to show: an empty or whitespace-only `app_icon`. Not every
+    /// application sends one.
+    None,
+}
+
+/// Classify one `app_icon` string, per [`IconSource`].
+///
+/// The freedesktop icon naming spec forbids a `/` in an icon *name* --
+/// names are resolved through the theme, never as filesystem paths -- so any
+/// string containing one is necessarily a path of some kind, whether or not
+/// it happens to be absolute. That single check is what lets a relative path
+/// (`"icons/x.png"`, say) fall out of the same rule as an absolute one,
+/// without a second case for it.
+///
+/// A `file://` URI is unwrapped to the path it names first, since it would
+/// otherwise be caught by that same `/`-means-a-path rule and turned into a
+/// nonsense `File` whose path starts with `"file:"`. Only the two authority
+/// forms real senders actually produce are handled -- an empty one
+/// (`file:///abs/path`) and `file://localhost/abs/path`, both meaning "this
+/// host" per RFC 8089 -- because that is what covers everything this
+/// codebase has seen a `file://` icon carry. A URI naming some *other* host
+/// has no local path to hand back and is not something a notification icon
+/// would plausibly carry, so it is deliberately left unhandled (it falls
+/// through to the `/`-means-a-path rule above and becomes a `File` with a
+/// nonsense leading `host/` segment -- wrong, but no worse than the icon a
+/// theme lookup on a bare URI would have produced anyway). Percent-encoded
+/// characters are likewise left undecoded. Both are a "not seen in practice,
+/// so not worth the code" judgement call, not an oversight -- either would
+/// need to actually appear in some application's `app_icon` before it earns
+/// a decoder.
+pub fn icon_source(app_icon: &str) -> IconSource {
+    let trimmed = app_icon.trim();
+    if trimmed.is_empty() {
+        return IconSource::None;
+    }
+    if let Some(rest) = trimmed.strip_prefix("file://") {
+        let path = rest.strip_prefix("localhost").unwrap_or(rest);
+        return IconSource::File(PathBuf::from(path));
+    }
+    if trimmed.contains('/') {
+        return IconSource::File(PathBuf::from(trimmed));
+    }
+    IconSource::Named(trimmed.to_string())
+}
+
+/// One row the notification allowlist editor's "add an application" picker
+/// could offer.
+///
+/// `seen` is which of `suggestions()`'s two sources this came from: `true`
+/// for an application `sayd` has actually watched notify this run (see
+/// `notify::seen`), `false` for one drawn from [`CURATED`]. The window uses
+/// it to label the two differently rather than the model picking a
+/// rendering, which would put a rule back in the one layer meant to hold
+/// none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Suggestion {
+    pub app_name: String,
+    pub icon: IconSource,
+    pub seen: bool,
+}
+
+/// A short, hand-checked list of applications worth suggesting even when
+/// they have never notified this run -- offered underneath whatever
+/// `notify::seen` has actually observed (see `SettingsModel::suggestions`),
+/// never in place of it.
+///
+/// Each pair is `(app_name, icon name)` exactly as the *application* itself
+/// passes them to `Notify`, not a marketing name: matching against the
+/// allowlist is literal and case-insensitive (`allow_contains`'s rule), so a
+/// plausible-looking guess that is not what the application actually sends
+/// would silently never match anything -- worse than not suggesting the
+/// application at all, because it looks like it worked. Checked against
+/// upstream `.desktop` files, the packaging that ships them, and -- where
+/// the application is open source -- the code that actually calls
+/// `Notify`/`notify_init`, rather than trusted as given; Task 2's report
+/// says what was verified against what and where a name is a reasoned guess
+/// instead.
+///
+/// `notify-send` is here deliberately: it is what a user reaches for to
+/// test the feature, and it is the one entry guaranteed correct, because
+/// `notify-send` really does pass its own program name (`g_get_prgname()`,
+/// i.e. `"notify-send"`) as `app_name` whenever `-a` is not given.
+pub const CURATED: &[(&str, &str)] = &[
+    ("Signal", "signal-desktop"),
+    ("Element", "element"),
+    ("Fractal", "org.gnome.Fractal"),
+    ("Telegram Desktop", "org.telegram.desktop"),
+    ("Discord", "discord"),
+    ("Slack", "slack"),
+    ("Thunderbird", "org.mozilla.Thunderbird"),
+    ("evolution-mail-notification", "evolution"),
+    ("Firefox", "firefox"),
+    ("Nextcloud", "Nextcloud"),
+    ("KeePassXC", "keepassxc"),
+    ("Spotify", "spotify-client"),
+    ("notify-send", "utilities-terminal"),
+];
 
 /// Voice-pack names from `<models_dir>/voices/*.bin`, sorted.
 ///
@@ -1755,5 +1940,175 @@ mod tests {
         assert!(joined.contains("fp32") && joined.contains("4.78"));
         assert!(joined.contains("fp16") && joined.contains("4.66"));
         assert!(joined.contains("q8") && joined.contains("1.40"));
+    }
+
+    /// The three shapes `app_icon` can actually arrive in, per the
+    /// notification spec: a freedesktop icon name, an absolute path, or a
+    /// `file://` URI wrapping one -- plus nothing at all, which is not a
+    /// hypothetical case (not every application sends an icon).
+    #[test]
+    fn an_icon_is_classified_as_a_name_a_path_or_nothing() {
+        assert_eq!(
+            icon_source("signal-desktop"),
+            IconSource::Named("signal-desktop".into())
+        );
+        assert_eq!(
+            icon_source("org.gnome.Fractal"),
+            IconSource::Named("org.gnome.Fractal".into())
+        );
+        assert_eq!(
+            icon_source("/usr/share/icons/x.png"),
+            IconSource::File("/usr/share/icons/x.png".into())
+        );
+        assert_eq!(
+            icon_source("file:///usr/share/icons/x.png"),
+            IconSource::File("/usr/share/icons/x.png".into())
+        );
+        assert_eq!(icon_source(""), IconSource::None);
+        assert_eq!(icon_source("   "), IconSource::None);
+    }
+
+    /// Seen apps come first: the app a user is trying to allow is almost
+    /// always the one that just notified them, and a curated entry is a
+    /// guess by construction.
+    ///
+    /// `seen::record` writes into a process-global registry every test in
+    /// this binary shares -- including `notify::monitor`'s real-bus tests,
+    /// several of which call a real `Notify` with `app_name` `"Signal"` or
+    /// `"Fractal"` and so, through `run`'s own `seen::record` call, race
+    /// this test for those two names. This asserts the *relative* order of
+    /// its own tagged entry against `"KeePassXC"`, a curated name nothing
+    /// else in this binary ever records, rather than an absolute position
+    /// or a name shared with those tests -- exactly the race `seen.rs`'s
+    /// own `recording_again_refreshes_the_icon_and_moves_the_entry_ahead`
+    /// had to be rewritten to avoid.
+    #[test]
+    fn seen_apps_are_listed_before_curated_ones() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let models = models_dir_with(&["af_heart"], dir.path());
+        let (store, engine) = store_in(dir.path());
+        let m = SettingsModel::new(store, models, Config::default());
+
+        seen::record("sug1-JustNotified", "sug1-icon");
+
+        let suggestions = m.suggestions();
+        let seen_pos = suggestions
+            .iter()
+            .position(|s| s.app_name == "sug1-JustNotified")
+            .expect("the just-recorded app must be suggested");
+        let curated_pos = suggestions
+            .iter()
+            .position(|s| s.app_name == "KeePassXC")
+            .expect("a curated entry must be suggested");
+
+        assert!(
+            seen_pos < curated_pos,
+            "a seen app must be listed before curated entries: seen at {seen_pos}, curated at {curated_pos}"
+        );
+        assert!(suggestions[seen_pos].seen);
+        assert!(!suggestions[curated_pos].seen);
+        engine.shutdown();
+    }
+
+    /// A suggestion for something already allowed is noise, and the
+    /// allowlist matches case-insensitively -- so the filter must too, or
+    /// "signal" in the config still offers "Signal".
+    ///
+    /// Exercises both sources: a seen app already allowed under a different
+    /// case, and a curated entry (`CURATED[0]` is `"Signal"`) already
+    /// allowed under a different case.
+    #[test]
+    fn already_allowed_apps_are_not_suggested_whatever_their_case() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let models = models_dir_with(&["af_heart"], dir.path());
+        let (store, engine) = store_in(dir.path());
+        let m = SettingsModel::new(store, models, Config::default());
+
+        seen::record("sug2-Already", "sug2-icon");
+        m.edit(|c| {
+            c.notifications.allow = vec!["SUG2-ALREADY".into(), "signal".into()];
+        })
+        .expect("edit succeeds");
+
+        let suggestions = m.suggestions();
+        assert!(
+            !suggestions
+                .iter()
+                .any(|s| s.app_name.eq_ignore_ascii_case("sug2-Already")),
+            "an already-allowed seen app must not be suggested, whatever its case"
+        );
+        assert!(
+            !suggestions
+                .iter()
+                .any(|s| s.app_name.eq_ignore_ascii_case("signal")),
+            "an already-allowed curated app must not be suggested, whatever its case"
+        );
+        engine.shutdown();
+    }
+
+    /// A seen app that is also curated appears once, as the seen one -- the
+    /// seen entry carries the icon the application really sent.
+    ///
+    /// `"nextcloud"` here matches the curated `("Nextcloud", "Nextcloud")`
+    /// case-insensitively but is recorded with a different icon, which is
+    /// what distinguishes "the seen entry survived" from "the curated entry
+    /// happened to look the same". Neither `"Signal"`/`"Fractal"`
+    /// (`notify::monitor`'s real-bus tests also record those into this same
+    /// process-global registry, same reason as `seen_apps_are_listed_
+    /// before_curated_ones` above) nor `"KeePassXC"` (that test's own
+    /// anchor -- picking the same name here would make the two race each
+    /// other within this file).
+    #[test]
+    fn a_seen_app_that_is_also_curated_appears_once_and_keeps_its_own_icon() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let models = models_dir_with(&["af_heart"], dir.path());
+        let (store, engine) = store_in(dir.path());
+        let m = SettingsModel::new(store, models, Config::default());
+
+        seen::record("nextcloud", "sug3-custom-icon");
+
+        let suggestions = m.suggestions();
+        let matches: Vec<&Suggestion> = suggestions
+            .iter()
+            .filter(|s| s.app_name.eq_ignore_ascii_case("nextcloud"))
+            .collect();
+
+        assert_eq!(
+            matches.len(),
+            1,
+            "must appear once, not once per source: {matches:?}"
+        );
+        assert!(
+            matches[0].seen,
+            "the seen entry must win, not the curated one"
+        );
+        assert_eq!(
+            matches[0].app_name, "nextcloud",
+            "and keep its own spelling"
+        );
+        assert_eq!(
+            matches[0].icon,
+            IconSource::Named("sug3-custom-icon".into()),
+            "must keep the icon the application actually sent, not CURATED's guess"
+        );
+        engine.shutdown();
+    }
+
+    /// Every curated entry must be a plausible `app_name`, not a marketing
+    /// name: the list is matched literally and a wrong guess silently never
+    /// matches anything.
+    #[test]
+    fn the_curated_table_is_well_formed() {
+        for (name, icon) in CURATED {
+            assert!(!name.trim().is_empty());
+            assert!(!icon.trim().is_empty());
+            assert_eq!(*name, name.trim());
+        }
+        // No duplicates, case-insensitively.
+        let mut seen: Vec<String> = CURATED.iter().map(|(n, _)| n.to_lowercase()).collect();
+        seen.sort();
+        let before = seen.len();
+        seen.dedup();
+        assert_eq!(seen.len(), before, "the curated table has duplicates");
     }
 }
