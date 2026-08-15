@@ -11,11 +11,13 @@ runtime.
 
 M1 (engine and audio), M2 (the `sh.sayd.Sayd1` D-Bus interface, the `say`
 control CLI, PRIMARY selection and clipboard reading, single-instance
-handling), M3 (the StatusNotifierItem tray icon and MPRIS2) and M4 (the
+handling), M3 (the StatusNotifierItem tray icon and MPRIS2), M4 (the
 GTK4/libadwaita settings window, config write-through, and an inotify
-reload for hand edits) are done. Text in, chunk-streamed speech out,
-starting about a second after the keypress regardless of how much was
-selected. Notification narration is still to come.
+reload for hand edits) and M5 (speaking desktop notifications, off by
+default -- see the workspace README's Notifications section) are done. Text
+in, chunk-streamed speech out, starting about a second after the keypress
+regardless of how much was selected. That is the whole of the original
+build order; nothing further is queued.
 
 The workspace README (in the source repository, not shipped in this crate's
 package) has the sway keybinds, a sample systemd unit, and the full D-Bus

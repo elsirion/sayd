@@ -196,7 +196,16 @@ spell_acronyms = true
 [chunking]
 target_chars = 400
 lookahead_chunks = 2
+
+[notifications]
+enabled = false          # the monitor is not even started when false
+allow = []               # app_name values, matched case-insensitively
+cooldown_secs = 30       # per-application rate-limit window; 0 disables it
+speak_app_name = true    # prefix the announcement with the application's name
+speak_body = false       # append the notification's body after its summary
 ```
+
+See [Notifications](#notifications) below for what each of those does.
 
 A malformed file never wedges the daemon, and is not overwritten until you
 change something in the window -- or until you press Mute, which writes
@@ -224,6 +233,100 @@ is playing *and* writes `muted = true` to the config, so it survives a
 restart (spec §6); the same is true of the speed set through MPRIS `Rate`.
 Before this they lived only inside the running daemon, and the next config
 change of any kind silently undid them.
+
+## Notifications
+
+`sayd` can speak desktop notifications -- "Signal: Alice sent a message." It
+sees them by watching the session bus for the `org.freedesktop.Notifications`
+`Notify` call, not by owning that name itself, so this is entirely
+independent of whichever notification daemon you already run (mako, dunst,
+...): it keeps receiving every `Notify` call, keeps displaying its own popups,
+and keeps returning its own ids to the calling application, exactly as if
+`sayd` were not there. **The other half of that is a real limit, not just a
+reassurance**: a notification that never crosses the bus -- an application
+drawing its own popup, or a daemon with a private protocol -- is invisible to
+`sayd`. There is nothing to fix here; a passive monitor can only see bus
+traffic.
+
+**Off by default.** `notifications.enabled = false` out of the box --
+narration is a behaviour change to your desktop, and it should be asked for,
+not assumed.
+
+### Finding names: the on-ramp
+
+Turning `enabled` on is not enough by itself. With an empty `allow` list,
+`sayd` speaks nothing at all -- instead, it logs the `app_name` of every
+notification it declines to speak, once per distinct name per run:
+
+    info: notification from "Signal" (not in notifications.allow; add it to
+    speak these)
+
+That log line *is* the discovery workflow: enable notifications, watch
+`sayd`'s log (or run it in a terminal) while you go about your day, and copy
+each name you want spoken into `notifications.allow`. Each name is logged
+once, not once per notification, so a chat application does not turn the log
+into the flood the allowlist exists to prevent in the first place.
+
+The allowlist matches `app_name` exactly, case-insensitively -- no globs, no
+regex. `app_name` is whatever the application passed to `Notify`, which is
+also what ends up in the discovery log and in the spoken announcement's
+prefix, so all three always agree on the name.
+
+### Config
+
+```toml
+[notifications]
+enabled = false          # the monitor is not even started when false
+allow = []               # app_name values, matched case-insensitively
+cooldown_secs = 30       # per-application rate-limit window; 0 disables it
+speak_app_name = true    # prefix the announcement with the application's name
+speak_body = false       # append the notification's body after its summary
+```
+
+### What gets said
+
+The announcement is built from the notification's summary and (optionally)
+its body, composed by two independent switches:
+
+| `speak_app_name` | `speak_body` | Announcement |
+|---|---|---|
+| true | false | `Signal: Alice sent a message` |
+| false | false | `Alice sent a message` |
+| true | true | `Signal: Alice sent a message. See you at five` |
+| false | true | `Alice sent a message. See you at five` |
+
+`speak_body` defaults to `false`: summaries are written to be read at a
+glance, but bodies are frequently several sentences and often just restate
+the summary -- an email notification's body can be a whole paragraph, so
+reading it out is offered, not assumed.
+
+Bodies may carry a small set of HTML-like tags the freedesktop notification
+spec allows (`<b>`, `<i>`, `<u>`, `<a>`, `<img>`, ...); `sayd` strips those
+tags and decodes the accompanying entities before speaking, so a body does
+not come out as "b Alice b replied".
+
+### Rate limiting
+
+At most one utterance per application per `cooldown_secs`. The first
+notification from an application speaks immediately; anything else that
+arrives inside that window is counted instead of spoken, and read out as a
+single follow-up once the window closes:
+
+    Signal: Alice sent a message        <- spoken immediately
+                                         <- 3 more arrive inside the window
+    Signal: 3 more notifications        <- spoken once the window closes
+
+**`cooldown_secs = 0` disables rate limiting entirely** -- every notification
+speaks, with no coalescing. The setting window's Cooldown row says the same
+thing, because `0` is the one value here that does not mean "no wait": it
+turns the limiter off.
+
+Notifications are submitted with the `front` queue policy (the same one
+`opts.policy = "front"` selects on the D-Bus interface): a notification is
+placed ahead of whatever is already queued, but does not interrupt the
+utterance currently playing. Mute applies to notifications exactly as it does
+to every other source -- a muted daemon accepts and silently discards them,
+so nothing piles up to be spoken once you unmute.
 
 ## `say`, the control CLI
 
@@ -457,6 +560,42 @@ for looking at it. Walk this yourself once, after installing:
 12. Restart `sayd` -- every setting from the steps above survives. This is
     M4's stated done-when.
 
+## Verify notifications
+
+Same reason as the two sections above: the monitor talks to a real session
+bus and a real notification daemon (mako, dunst, ...), neither of which
+exists in a CI or agent environment. The composition, filtering and
+rate-limiting logic is unit-tested (`crates/sayd/src/notify/`); what none of
+that covers is a real `Notify` call arriving over the bus you actually use.
+Walk this yourself once, after installing, with `notify-send` available
+(it ships with most notification daemons, or `apt install libnotify-bin`):
+
+1. `cargo build --release`, put `sayd` and `say` on `$PATH`, start it (or
+   reload sway if `exec sayd` is already in your config).
+2. Open **Settings…**, turn on **Speak notifications** under the
+   Notifications group, leave **Applications to announce** empty.
+3. Run `notify-send -a "Test App" "hello"`. `-a` sets `app_name` explicitly
+   -- notify-send's first positional argument is the *summary*, not the app
+   name, and without `-a` most builds send an empty or unhelpful one. Your
+   notification daemon still shows the popup as usual, and `sayd` says
+   nothing -- watch `sayd`'s log (run it in a terminal, or `journalctl
+   --user -u sh.sayd.Sayd -f` under systemd) for a line naming `"Test App"`
+   as declined.
+4. Add `Test App` to the allowlist (the settings window's "Applications to
+   announce" add-row entry, or hand-edit `notifications.allow` in
+   `config.toml`).
+5. Run `notify-send -a "Test App" "hello again"` -- `sayd` should speak
+   "Test App: hello again" this time.
+6. Send five in quick succession:
+   `for i in $(seq 5); do notify-send -a "Test App" "msg $i"; done`.
+   Expect one immediate utterance for the first, then, once the cooldown
+   window closes (30s by default -- lower **Cooldown** in the settings
+   window first if you would rather not wait), a single coalesced
+   "Test App: 4 more notifications".
+7. Turn **Speak notifications** off again and run
+   `notify-send -a "Test App" "hello"` once more -- the popup still
+   appears, but `sayd` stays silent.
+
 ## Troubleshooting
 
 **`could not read the primary selection: ... -- WAYLAND_DISPLAY is not set`**
@@ -486,9 +625,12 @@ primary selection; check with `sway --version`.
 
 M1 (engine and audio), M2 (D-Bus interface, `say` CLI, selection and
 clipboard reading, single-instance handling), M3 (StatusNotifierItem tray,
-MPRIS2) and M4 (the GTK4/libadwaita settings window, config write-through,
-and an inotify reload for hand edits) are done. Notification narration
-(spec §12) is what remains, as a fifth milestone.
+MPRIS2), M4 (the GTK4/libadwaita settings window, config write-through, and
+an inotify reload for hand edits) and M5 (notification narration -- see
+[Notifications](#notifications) above) are done. That is the whole of the
+original build order from the main design doc's plan: nothing is queued up
+after M5, so what comes next is whatever is chosen from here, not a milestone
+already on the books.
 
 ## Publishing
 
