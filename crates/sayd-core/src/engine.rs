@@ -124,6 +124,16 @@ pub struct SayOpts {
     pub source: Source,
 }
 
+// `ApplyConfig(Config)` is the outlier clippy is flagging: `Config` grows by
+// one nested table every settings-window milestone (`CleanupConfig`,
+// `ChunkConfig`, `NotificationConfig`, now `RewordConfig`), and this enum
+// carries it by value into `Engine::handle`, which needs to own it (it
+// becomes `self.cfg`). Boxing would ripple into every `Command::ApplyConfig`
+// constructor and match arm across this crate and `sayd` (`config_watch.rs`,
+// `dbus.rs`, `notify/monitor.rs`, and this file's own tests) for a command
+// that is sent on a settings change, not per-utterance -- not the hot path
+// this lint exists to protect.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 pub enum Command {
     Say {

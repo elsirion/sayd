@@ -90,6 +90,97 @@ impl Default for NotificationConfig {
     }
 }
 
+/// Rewriting text for the ear before it is spoken.
+///
+/// Off by default, and pointed at a *local* endpoint by default. With
+/// `enabled = false` nothing happens either way, but the configuration a
+/// user first sees should be the one that keeps the README's promise;
+/// choosing a remote endpoint should be an act.
+///
+/// This table is **not** gated on the `reword` cargo feature. The settings
+/// window serialises the whole `Config` on every save, so a gated field
+/// would be silently deleted the first time a feature-off daemon wrote the
+/// file.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RewordConfig {
+    /// Rewrite notification announcements without being asked. `--reword`
+    /// on a submission does not require this: `enabled` means "rewrite my
+    /// notifications automatically", `--reword` is being asked.
+    pub enabled: bool,
+    /// Any OpenAI-compatible endpoint. PPQ, Ollama, llama.cpp's `server`,
+    /// LM Studio and vLLM all speak the same request, so there is no
+    /// `provider` field -- it would have one meaningful value and four ways
+    /// to get it wrong. A trailing `/` is stripped before
+    /// `/chat/completions` is appended, so both spellings work.
+    pub base_url: String,
+    pub model: String,
+    /// Local servers ignore this. Prefer `api_key_env`: a key in a shell
+    /// profile or a systemd `EnvironmentFile` can be rotated without
+    /// touching a file the settings window rewrites wholesale, and it keeps
+    /// the key out of that file entirely.
+    pub api_key: String,
+    /// If this names a variable that is set and non-empty, that value is
+    /// used and `api_key` is ignored.
+    pub api_key_env: String,
+    /// How long a rewrite may take before the original is spoken instead.
+    /// Clamped to 200..=2500 (`settings::model::clamp_ranges`): `sayd-cli`
+    /// bounds every D-Bus interaction at 3 s, and `say --reword` waits for
+    /// the rewrite inline, so a budget that could exceed it would turn a
+    /// slow provider into a CLI error instead of a spoken sentence.
+    pub timeout_ms: u64,
+    /// Longer text is spoken as written. Clamped to 32..=2000. The default
+    /// is the chunker's `target_chars`: one synthesis chunk, which is the
+    /// natural unit here, and above it the submission is a document rather
+    /// than a notification.
+    pub max_chars: usize,
+}
+
+impl Default for RewordConfig {
+    fn default() -> Self {
+        RewordConfig {
+            enabled: false,
+            base_url: "http://localhost:11434/v1".into(),
+            model: "llama3.2:3b".into(),
+            api_key: String::new(),
+            api_key_env: "SAYD_REWORD_API_KEY".into(),
+            // A budget, not an observation: chosen to sit under sayd-cli's
+            // 3 s D-Bus timeout with room for the bus round trip, and above
+            // the first-token latency a small model is generally capable
+            // of. End-to-end provider latency has not been measured -- the
+            // settings window's Test row is how a user gets their own
+            // number on their own setup and sets this against it.
+            timeout_ms: 1500,
+            max_chars: 400,
+        }
+    }
+}
+
+/// The key to send, or `None` for no `Authorization` header at all -- which
+/// is exactly right for a local server and exactly wrong for a remote one.
+///
+/// Split from [`resolve_api_key`] so it can be tested without touching
+/// process-global environment state, which every other test in this binary
+/// shares.
+pub fn resolve_api_key_with(
+    cfg: &RewordConfig,
+    env: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    if !cfg.api_key_env.is_empty() {
+        if let Some(v) = env(&cfg.api_key_env) {
+            if !v.is_empty() {
+                return Some(v);
+            }
+        }
+    }
+    (!cfg.api_key.is_empty()).then(|| cfg.api_key.clone())
+}
+
+/// [`resolve_api_key_with`], against the real environment.
+pub fn resolve_api_key(cfg: &RewordConfig) -> Option<String> {
+    resolve_api_key_with(cfg, |name| std::env::var(name).ok())
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -125,6 +216,7 @@ pub struct Config {
     pub cleanup: CleanupConfig,
     pub chunking: ChunkConfig,
     pub notifications: NotificationConfig,
+    pub reword: RewordConfig,
 }
 
 impl Default for Config {
@@ -141,6 +233,7 @@ impl Default for Config {
             cleanup: CleanupConfig::default(),
             chunking: ChunkConfig::default(),
             notifications: NotificationConfig::default(),
+            reword: RewordConfig::default(),
         }
     }
 }
@@ -187,6 +280,17 @@ impl Config {
 
     /// Write atomically: a temp file in the same directory, then rename. The
     /// caller is responsible for ignoring the resulting inotify event.
+    ///
+    /// A config carrying an inline `[reword] api_key` is written `0600`.
+    /// Without this it lands with the process umask, which on most desktops
+    /// is world-readable -- and the settings window's password row is a
+    /// direct route to putting a key there.
+    ///
+    /// The mode is set on the *temp* file, before the rename, rather than on
+    /// the destination afterwards. DEPARTURE from §6, which says "after the
+    /// rename": setting it afterwards leaves a window in which the key is
+    /// on disk at the umask's mode, and the observable requirement -- the
+    /// file the user ends up with is `0600` -- is satisfied either way.
     pub fn save_to(&self, path: &Path) -> std::io::Result<()> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
@@ -195,6 +299,13 @@ impl Config {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let tmp = path.with_extension("toml.tmp");
         std::fs::write(&tmp, txt)?;
+        if !self.reword.api_key.is_empty() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+            }
+        }
         std::fs::rename(&tmp, path)
     }
 
@@ -347,5 +458,129 @@ mod tests {
             .filter(|n| n != "config.toml")
             .collect();
         assert!(leftovers.is_empty(), "unexpected files: {leftovers:?}");
+    }
+
+    /// The defaults are a promise: rewording is off, and the endpoint a user
+    /// first sees is a local one. Pointing sayd at a remote endpoint should
+    /// be an act, not something they inherit.
+    #[test]
+    fn reword_defaults_are_off_and_local() {
+        let c = Config::default();
+        assert!(!c.reword.enabled);
+        assert_eq!(c.reword.base_url, "http://localhost:11434/v1");
+        assert_eq!(c.reword.model, "llama3.2:3b");
+        assert_eq!(c.reword.api_key, "");
+        assert_eq!(c.reword.api_key_env, "SAYD_REWORD_API_KEY");
+        assert_eq!(
+            c.reword.timeout_ms, 1500,
+            "a budget, not a measurement -- see the spec's §10"
+        );
+        assert_eq!(c.reword.max_chars, 400);
+    }
+
+    /// A config written before this milestone has no `[reword]` table at
+    /// all, and must keep loading.
+    #[test]
+    fn a_config_without_the_reword_table_still_loads() {
+        let (c, err) = Config::load_str("voice = \"am_fenrir\"\n");
+        assert_eq!(err, None);
+        assert_eq!(c.voice, "am_fenrir");
+        assert!(!c.reword.enabled);
+        assert_eq!(c.reword.timeout_ms, 1500);
+    }
+
+    #[test]
+    fn the_reword_table_round_trips() {
+        let mut c = Config::default();
+        c.reword.enabled = true;
+        c.reword.base_url = "https://api.ppq.ai/v1".into();
+        c.reword.model = "gpt-4o-mini".into();
+        c.reword.timeout_ms = 2000;
+        c.reword.max_chars = 300;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("config.toml");
+        c.save_to(&p).expect("save");
+        let (back, err) = Config::load_from(&p);
+        assert_eq!(err, None);
+        assert_eq!(back, c);
+    }
+
+    /// A key pasted into the settings window must not land in a
+    /// world-readable file. `save_to` writes with the process umask
+    /// otherwise.
+    #[test]
+    fn a_config_carrying_an_api_key_is_written_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("config.toml");
+
+        let mut c = Config::default();
+        c.reword.api_key = "sk-secret".into();
+        c.save_to(&p).expect("save");
+        let mode = std::fs::metadata(&p)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "a config holding an API key must not be readable by anyone else"
+        );
+
+        // And a config with no key is left to the umask, unchanged from
+        // every release before this one.
+        let q = dir.path().join("nokey.toml");
+        Config::default().save_to(&q).expect("save");
+        assert!(std::fs::metadata(&q).is_ok());
+    }
+
+    /// The environment wins over the file, and an unset or empty variable
+    /// falls back to it. No key at all is `None`, which is what stops an
+    /// `Authorization` header being sent to a local server that does not
+    /// want one.
+    #[test]
+    fn the_environment_key_wins_over_the_file() {
+        let mut cfg = RewordConfig {
+            api_key: "from-file".into(),
+            api_key_env: "SAYD_TEST_KEY".into(),
+            ..Default::default()
+        };
+
+        let env_set = |name: &str| (name == "SAYD_TEST_KEY").then(|| "from-env".to_string());
+        assert_eq!(
+            resolve_api_key_with(&cfg, env_set).as_deref(),
+            Some("from-env")
+        );
+
+        let env_empty = |name: &str| (name == "SAYD_TEST_KEY").then(String::new);
+        assert_eq!(
+            resolve_api_key_with(&cfg, env_empty).as_deref(),
+            Some("from-file"),
+            "an empty variable is not a key; the file still counts"
+        );
+
+        let env_unset = |_: &str| None;
+        assert_eq!(
+            resolve_api_key_with(&cfg, env_unset).as_deref(),
+            Some("from-file")
+        );
+
+        cfg.api_key = String::new();
+        assert_eq!(
+            resolve_api_key_with(&cfg, env_unset),
+            None,
+            "no key anywhere means no Authorization header at all"
+        );
+
+        // An empty `api_key_env` must not be looked up as a variable name.
+        cfg.api_key = "from-file".into();
+        cfg.api_key_env = String::new();
+        assert_eq!(
+            resolve_api_key_with(&cfg, |name| {
+                panic!("an empty api_key_env must never be looked up (got {name:?})")
+            })
+            .as_deref(),
+            Some("from-file")
+        );
     }
 }

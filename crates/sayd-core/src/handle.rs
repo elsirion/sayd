@@ -73,7 +73,7 @@ const CONFIG_REPLY_TIMEOUT: Duration = SUBMIT_REPLY_TIMEOUT;
 type SubmitJob = (String, SayOpts, Sender<Result<Submitted, String>>);
 
 enum Msg {
-    Cmd(Command),
+    Cmd(Box<Command>),
     Submit(Box<SubmitJob>),
     ReplaceSink(Box<dyn AudioSink>),
     GetConfig(Sender<Config>),
@@ -123,7 +123,7 @@ impl EngineHandle {
     /// Fire and forget. A dead engine thread silently drops the command —
     /// the daemon notices through the snapshot, not here.
     pub fn send(&self, cmd: Command) {
-        let _ = self.tx.send(Msg::Cmd(cmd));
+        let _ = self.tx.send(Msg::Cmd(Box::new(cmd)));
     }
 
     /// Submit text and wait for the engine's answer, up to
@@ -251,7 +251,7 @@ fn run(
     loop {
         match rx.recv_timeout(TICK_INTERVAL) {
             Ok(Msg::Cmd(c)) => {
-                engine.handle(c);
+                engine.handle(*c);
                 publish(&published, &engine);
             }
             Ok(Msg::Submit(job)) => {

@@ -85,6 +85,26 @@ pub const COOLDOWN_MIN: f64 = 0.0;
 /// clamped -- see the doc comment above).
 pub const COOLDOWN_MAX: f64 = 3600.0;
 pub const COOLDOWN_STEP: f64 = 5.0;
+/// What the Reword group's spin rows offer, per spec §6. `timeout_ms`'s
+/// ceiling is the load-bearing one: `sayd-cli` bounds every D-Bus
+/// interaction at 3 s and `say --reword` waits for the rewrite inline, so a
+/// budget above 2500 ms would turn a slow provider into a CLI error instead
+/// of a spoken sentence.
+pub const REWORD_TIMEOUT_MIN: f64 = 200.0;
+pub const REWORD_TIMEOUT_MAX: f64 = 2500.0;
+// `#[allow(dead_code)]`: unlike `COOLDOWN_STEP` and friends, no spin row
+// consumes this yet -- the Reword group's window.rs wiring is a later task
+// in this milestone. `clamp_ranges` already needs the MIN/MAX pair above, so
+// this is produced now to match, per the interface the later task expects.
+#[allow(dead_code)]
+pub const REWORD_TIMEOUT_STEP: f64 = 100.0;
+/// The floor is not `0`: there is no magic zero here. `enabled` is the off
+/// switch, and `--reword` on an over-long submission is a no-op rather than
+/// an error.
+pub const REWORD_MAX_CHARS_MIN: f64 = 32.0;
+pub const REWORD_MAX_CHARS_MAX: f64 = 2000.0;
+#[allow(dead_code)]
+pub const REWORD_MAX_CHARS_STEP: f64 = 32.0;
 
 /// How long a burst of edits is allowed to keep collapsing into one write.
 ///
@@ -801,6 +821,28 @@ fn clamp_ranges(cfg: &mut Config) -> Vec<String> {
     if cfg.threads == 0 {
         warnings.push("threads = 0 is not a thread count; running with 1".to_string());
         cfg.threads = 1;
+    }
+    let timeout = cfg
+        .reword
+        .timeout_ms
+        .clamp(REWORD_TIMEOUT_MIN as u64, REWORD_TIMEOUT_MAX as u64);
+    if timeout != cfg.reword.timeout_ms {
+        warnings.push(format!(
+            "reword.timeout_ms {} is outside {}-{}; using {timeout}",
+            cfg.reword.timeout_ms, REWORD_TIMEOUT_MIN as u64, REWORD_TIMEOUT_MAX as u64
+        ));
+        cfg.reword.timeout_ms = timeout;
+    }
+    let max_chars = cfg
+        .reword
+        .max_chars
+        .clamp(REWORD_MAX_CHARS_MIN as usize, REWORD_MAX_CHARS_MAX as usize);
+    if max_chars != cfg.reword.max_chars {
+        warnings.push(format!(
+            "reword.max_chars {} is outside {}-{}; using {max_chars}",
+            cfg.reword.max_chars, REWORD_MAX_CHARS_MIN as usize, REWORD_MAX_CHARS_MAX as usize
+        ));
+        cfg.reword.max_chars = max_chars;
     }
     warnings
 }
@@ -1919,6 +1961,31 @@ mod tests {
         let before = cfg.clone();
         assert!(normalize(&mut cfg).is_empty());
         assert_eq!(cfg, before);
+    }
+
+    /// A hand-edited `timeout_ms` past `sayd-cli`'s 3 s D-Bus bound must be
+    /// clamped and *warned about*, not refused -- refusing would lock the
+    /// user out of every unrelated settings row, which is exactly what
+    /// `model = "int4"` used to do.
+    #[test]
+    fn out_of_range_reword_bounds_are_clamped_and_warned_about_not_rejected() {
+        let mut cfg = Config::default();
+        cfg.reword.timeout_ms = 9000;
+        cfg.reword.max_chars = 1;
+        let warnings = normalize(&mut cfg);
+        assert_eq!(cfg.reword.timeout_ms, 2500);
+        assert_eq!(cfg.reword.max_chars, 32);
+        assert_eq!(warnings.len(), 2, "both clamps must say so: {warnings:?}");
+
+        let mut cfg = Config::default();
+        cfg.reword.timeout_ms = 9000;
+        cfg.reword.base_url = "not a url at all".into();
+        assert!(
+            validate(&mut cfg).is_ok(),
+            "an unusable base_url is a degradation reported by the Test row, \
+             not a reason to refuse an unrelated edit"
+        );
+        assert_eq!(cfg.reword.timeout_ms, 2500);
     }
 
     /// The premise of normalising an unknown model to `FALLBACK_MODEL`: that
