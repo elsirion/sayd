@@ -327,7 +327,13 @@ async fn run_on(engine: EngineHandle, address: Option<String>) -> Outcome {
                                             // An application wrote this one,
                                             // which is what §1's rewrite is
                                             // for.
-                                            speak(&engine, text, &cfg, Origin::Written, &submit_failure_logged).await;
+                                            // The handle is dropped, which
+                                            // is what detaching means: this
+                                            // arm must not wait for a
+                                            // rewrite. It is returned at all
+                                            // so the tests can tell the two
+                                            // paths apart -- see `speak`.
+                                            drop(speak(&engine, text, &cfg, Origin::Written, &submit_failure_logged).await);
                                         }
                                         // Counted against an open window; the
                                         // follow-up comes out of `due` below
@@ -388,7 +394,7 @@ async fn run_on(engine: EngineHandle, address: Option<String>) -> Outcome {
                             // judgement taken again at this call site. See
                             // `Origin::Composed` for the ordering bug that
                             // makes the rule load-bearing.
-                            speak(&engine, text, &cfg, Origin::Composed, &submit_failure_logged).await;
+                            drop(speak(&engine, text, &cfg, Origin::Composed, &submit_failure_logged).await);
                         }
                     }
                 }
@@ -586,6 +592,18 @@ fn notification_opts() -> SayOpts {
 /// Submit one announcement, rewriting it first when §1 asks for that, and
 /// logging only the first failure of a standing run of them.
 ///
+/// Returns the detached task's handle, or `None` when the announcement took
+/// the immediate path -- which is to say: whether a rewrite is happening at
+/// all. `run_on` drops it; the value exists because the two rules below are
+/// otherwise untestable end to end, and were measured to be untested.
+/// Making `speak` ignore its `origin` argument entirely passed 254 of 254
+/// tests, *including* the one named for the coalescing rule, because that
+/// test called `RewordPlan::automatic` itself and never checked that `speak`
+/// forwarded what it was given; making `speak` detach unconditionally passed
+/// 254 of 254 as well, so the departure documented below -- the reason it was
+/// granted -- had no test at all. Both are now one-line assertions on this
+/// return value.
+///
 /// Returns as soon as it has either submitted or handed the whole sequence
 /// to a detached task. It must never wait for a rewrite: this is called from
 /// `run_on`'s `tokio::select!` arm, and holding that arm for a 1.5-second
@@ -651,7 +669,7 @@ async fn speak(
     cfg: &Config,
     origin: Origin,
     failure_logged: &Arc<AtomicBool>,
-) {
+) -> Option<tokio::task::JoinHandle<()>> {
     let len = text.chars().count();
     if len > cfg.max_chars {
         eprintln!(
@@ -659,7 +677,7 @@ async fn speak(
              {max_chars}-character limit; skipping it rather than submitting it",
             max_chars = cfg.max_chars
         );
-        return;
+        return None;
     }
 
     // `automatic`, never `requested`: this path is the standing ask that
@@ -672,13 +690,13 @@ async fn speak(
         // arrived.
         Err(text) => {
             submit_announcement(engine, text, failure_logged).await;
-            return;
+            return None;
         }
     };
 
     let engine = engine.clone();
     let failure_logged = failure_logged.clone();
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         // `resolve` holds no `EngineHandle`: it returns the text to speak
         // and this scope submits it. That is what makes a late answer
         // unreachable rather than merely unwanted -- a rewrite that lands
@@ -687,7 +705,7 @@ async fn speak(
         // `will_reword` judged.
         let text = plan.resolve().await;
         submit_announcement(&engine, text, &failure_logged).await;
-    });
+    }))
 }
 
 /// Hand one announcement to the engine, logging only the first failure of a
@@ -910,7 +928,11 @@ mod tests {
             ..Config::default()
         };
         let logged = Arc::new(AtomicBool::new(false));
-        speak(&engine, "a".repeat(30), &cfg, Origin::Written, &logged).await;
+        let detached = speak(&engine, "a".repeat(30), &cfg, Origin::Written, &logged).await;
+        assert!(
+            detached.is_none(),
+            "an announcement that was never submitted has nothing to detach"
+        );
 
         assert!(
             spoken.lock().expect("spoken mutex").is_empty(),
@@ -968,6 +990,45 @@ mod tests {
         );
     }
 
+    /// The §2 departure, end to end: the detach is **conditional**, and an
+    /// announcement that is not going to be reworded takes the awaited path
+    /// byte for byte.
+    ///
+    /// This is the rule the departure was granted for -- detaching
+    /// unconditionally would let two announcements from different
+    /// applications be submitted out of order with rewording switched *off*,
+    /// a behaviour change in a path this milestone was not asked to touch --
+    /// and it had no test at all: measured, making `speak` detach
+    /// unconditionally passed 254 of 254. `None` here is exactly "nothing was
+    /// spawned", so the submission below happened in the caller's own scope
+    /// and in its own order.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_announcement_with_rewording_off_is_submitted_without_detaching() {
+        let (engine, spoken) = engine_allowing("Signal");
+        let cfg = Config::default();
+        assert!(!cfg.reword.enabled, "the shipped default is off");
+
+        let text = "Alice: where do you want to go for dinner".to_string();
+        let logged = Arc::new(AtomicBool::new(false));
+        let detached = speak(&engine, text.clone(), &cfg, Origin::Written, &logged).await;
+
+        assert!(
+            detached.is_none(),
+            "with no rewrite to wait for there is nothing to detach, and the \
+             order two back-to-back announcements are submitted in must be the \
+             order they arrived"
+        );
+        // ...and it really was submitted, awaited, before `speak` returned:
+        // no polling loop here, unlike the detaching tests.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !engine_has(&spoken, &text) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let arrived = engine_has(&spoken, &text);
+        engine.shutdown();
+        assert!(arrived, "the announcement must still be spoken");
+    }
+
     /// §2: a coalesced "N more notifications" follow-up is never reworded.
     /// It is already a sentence written for the ear, and -- the real reason
     /// -- a follow-up that skipped the rewrite would be submitted instantly
@@ -1012,7 +1073,17 @@ mod tests {
              can say yes at all"
         );
         let logged = Arc::new(AtomicBool::new(false));
-        speak(&engine, followup.clone(), &cfg, Origin::Composed, &logged).await;
+        let detached = speak(&engine, followup.clone(), &cfg, Origin::Composed, &logged).await;
+        // The end-to-end half, and the one the assertion above cannot make:
+        // `speak` must *forward* the origin it was handed. Measured -- making
+        // `speak` ignore its `origin` argument entirely passed 254 of 254
+        // tests, this one included, because everything it asserted was about
+        // `RewordPlan::automatic` and nothing was about `speak`.
+        assert!(
+            detached.is_none(),
+            "a follow-up must take the immediate path: nothing to rewrite, so \
+             nothing to detach"
+        );
 
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline && !engine_has(&spoken, &followup) {
@@ -1050,8 +1121,16 @@ mod tests {
 
         let logged = Arc::new(AtomicBool::new(false));
         let started = Instant::now();
-        speak(&engine, text, &cfg, Origin::Written, &logged).await;
+        let detached = speak(&engine, text, &cfg, Origin::Written, &logged).await;
         let elapsed = started.elapsed();
+
+        assert_eq!(
+            detached.is_some(),
+            cfg!(feature = "reword"),
+            "an announcement that is being reworded is the one case that \
+             detaches, and in a build with no client there is nothing to wait \
+             for and nothing to detach"
+        );
 
         provider.join().expect("the silent provider thread ends");
         engine.shutdown();
