@@ -395,6 +395,32 @@ pub fn parse_response(
     })
 }
 
+/// One agent, with `ceiling` as its global timeout.
+///
+/// `ceiling` is an argument rather than a read of [`REWORD_HTTP_CEILING`]
+/// for one reason: it is the only way the ceiling can be *tested*. The real
+/// one is 10 s, longer than any test should take, and a test that reached
+/// for the cached agent could only pin it by waiting. Passed in, the same
+/// builder that production uses can be handed 400 ms and pointed at a
+/// server that never answers -- so
+/// `a_provider_that_never_answers_hits_the_ceiling` fails if this line
+/// stops setting a global timeout, which is exactly what a comment could
+/// not do. Note the type: `Duration`, not `Option<Duration>`. "No ceiling
+/// at all" is not expressible here.
+fn build_agent(ceiling: Duration) -> ureq::Agent {
+    let config = ureq::Agent::config_builder()
+        // The only thing that bounds the blocking thread.
+        // `tokio::time::timeout` cannot -- see the module doc one level
+        // up.
+        .timeout_global(Some(ceiling))
+        // Load-bearing. Left on (the default), a 4xx becomes an `Err`
+        // and the body is discarded -- and the body is where
+        // `error.message` lives.
+        .http_status_as_error(false)
+        .build();
+    ureq::Agent::new_with_config(config)
+}
+
 /// The agent, built once and cached.
 ///
 /// An `Agent` owns a connection pool, and against a 1.5 s budget a fresh DNS
@@ -411,19 +437,7 @@ pub fn parse_response(
 /// on screen.
 fn agent() -> &'static ureq::Agent {
     static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
-    AGENT.get_or_init(|| {
-        let config = ureq::Agent::config_builder()
-            // The only thing that bounds the blocking thread.
-            // `tokio::time::timeout` cannot -- see the module doc one level
-            // up.
-            .timeout_global(Some(REWORD_HTTP_CEILING))
-            // Load-bearing. Left on (the default), a 4xx becomes an `Err`
-            // and the body is discarded -- and the body is where
-            // `error.message` lives.
-            .http_status_as_error(false)
-            .build();
-        ureq::Agent::new_with_config(config)
-    })
+    AGENT.get_or_init(|| build_agent(REWORD_HTTP_CEILING))
 }
 
 pub struct HttpRewriter {
@@ -446,64 +460,73 @@ impl HttpRewriter {
     }
 }
 
+/// Send one request on `agent` and classify what comes back.
+///
+/// The agent is a parameter rather than a call to [`agent`] so a test can
+/// drive this whole path -- socket, status, headers, body limit,
+/// classification -- against an agent built by [`build_agent`] with a
+/// ceiling short enough to assert on.
+fn send(
+    agent: &ureq::Agent,
+    request: &Request,
+    model: &str,
+    host: &str,
+) -> Result<String, RewordError> {
+    let mut call = agent
+        .post(&request.url)
+        .header("content-type", "application/json");
+    if let Some(auth) = &request.authorization {
+        call = call.header("authorization", auth);
+    }
+    let mut response = match call.send_json(&request.body) {
+        Ok(r) => r,
+        Err(ureq::Error::Timeout(_)) => return Err(RewordError::Ceiling),
+        // Nothing was sent: the URL or a header value could not go into
+        // a request at all. `parse_base_url` checks the scheme and
+        // picks out the host, which is not the same as being a URI, and
+        // a key pasted with a stray control character is an invalid
+        // header value. Both are configuration failures no amount of
+        // time fixes, so neither may count toward the transport
+        // breaker -- they belong on the row that says so once per run.
+        Err(e @ (ureq::Error::BadUri(_) | ureq::Error::Http(_))) => {
+            return Err(RewordError::NotConfigured(format!(
+                "reword.base_url or the API key cannot be put into a request ({e})"
+            )))
+        }
+        Err(e) => return Err(RewordError::Unreachable(e.to_string())),
+    };
+    let status = response.status().as_u16();
+    let retry_after = response
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let body = match response
+        .body_mut()
+        .with_config()
+        .limit(BODY_LIMIT)
+        .read_to_vec()
+    {
+        Ok(b) => b,
+        Err(ureq::Error::Timeout(_)) => return Err(RewordError::Ceiling),
+        // A body over the limit is a *response* this client will not
+        // read, not a provider that is down: classifying it as
+        // `Unreachable` would count it toward the transport breaker and
+        // switch the feature off for a minute over one fat answer.
+        Err(ureq::Error::BodyExceedsLimit(limit)) => {
+            return Err(RewordError::Malformed(format!(
+                "the response body exceeded {limit} bytes"
+            )))
+        }
+        Err(e) => return Err(RewordError::Unreachable(e.to_string())),
+    };
+    parse_response(status, retry_after.as_deref(), &body, model, host)
+}
+
 impl Rewriter for HttpRewriter {
     fn reword(&self, text: &str) -> Result<String, RewordError> {
         let request = build_request(&self.cfg, self.key.as_deref(), text);
-        let mut call = agent()
-            .post(&request.url)
-            .header("content-type", "application/json");
-        if let Some(auth) = &request.authorization {
-            call = call.header("authorization", auth);
-        }
-        let mut response = match call.send_json(&request.body) {
-            Ok(r) => r,
-            Err(ureq::Error::Timeout(_)) => return Err(RewordError::Ceiling),
-            // Nothing was sent: the URL or a header value could not go into
-            // a request at all. `parse_base_url` checks the scheme and
-            // picks out the host, which is not the same as being a URI, and
-            // a key pasted with a stray control character is an invalid
-            // header value. Both are configuration failures no amount of
-            // time fixes, so neither may count toward the transport
-            // breaker -- they belong on the row that says so once per run.
-            Err(e @ (ureq::Error::BadUri(_) | ureq::Error::Http(_))) => {
-                return Err(RewordError::NotConfigured(format!(
-                    "reword.base_url or the API key cannot be put into a request ({e})"
-                )))
-            }
-            Err(e) => return Err(RewordError::Unreachable(e.to_string())),
-        };
-        let status = response.status().as_u16();
-        let retry_after = response
-            .headers()
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-        let body = match response
-            .body_mut()
-            .with_config()
-            .limit(BODY_LIMIT)
-            .read_to_vec()
-        {
-            Ok(b) => b,
-            Err(ureq::Error::Timeout(_)) => return Err(RewordError::Ceiling),
-            // A body over the limit is a *response* this client will not
-            // read, not a provider that is down: classifying it as
-            // `Unreachable` would count it toward the transport breaker and
-            // switch the feature off for a minute over one fat answer.
-            Err(ureq::Error::BodyExceedsLimit(limit)) => {
-                return Err(RewordError::Malformed(format!(
-                    "the response body exceeded {limit} bytes"
-                )))
-            }
-            Err(e) => return Err(RewordError::Unreachable(e.to_string())),
-        };
-        parse_response(
-            status,
-            retry_after.as_deref(),
-            &body,
-            &self.cfg.model,
-            &self.host,
-        )
+        send(agent(), &request, &self.cfg.model, &self.host)
     }
 }
 
@@ -1163,6 +1186,50 @@ mod tests {
             ),
             other => panic!("a closed port is unreachable, got {other:?}"),
         }
+    }
+
+    /// **§9's ceiling, pinned rather than commented.**
+    ///
+    /// The knob is [`build_agent`]'s `timeout_global`, and it is the single
+    /// most expensive one in this file: it is the *only* thing that bounds
+    /// the blocking thread, because `tokio::time::timeout` abandons an
+    /// `.await` and never the task behind it. Driven here at 400 ms
+    /// through the same builder production hands 10 s, so deleting that
+    /// line -- which used to leave all thirty `reword::` tests passing --
+    /// fails this test instead.
+    ///
+    /// The server accepts the connection, reads the whole request, and
+    /// then says nothing at all: there is no other thing in this client
+    /// that can end that call.
+    #[test]
+    fn a_provider_that_never_answers_hits_the_ceiling() {
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let (cfg, server) = serve(move |_| {
+            // Bounded at 20 s rather than forever, so that a build with no
+            // global timeout fails this test in 20 s -- the connection
+            // closes and the outcome is `Unreachable` -- rather than
+            // hanging the suite with no verdict at all.
+            let _ = held.recv_timeout(Duration::from_secs(20));
+            None
+        });
+
+        let agent = build_agent(Duration::from_millis(400));
+        let request = build_request(&cfg, None, "Alice: dinner?");
+        let started = std::time::Instant::now();
+        let outcome = send(&agent, &request, &cfg.model, "127.0.0.1");
+        let elapsed = started.elapsed();
+        let _ = release.send(());
+        server.join().expect("the server thread");
+
+        assert!(
+            matches!(outcome, Err(RewordError::Ceiling)),
+            "a provider that accepts and then never answers is the ceiling, got {outcome:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the ceiling that ended the call must be the one that was set, not a \
+             timeout somewhere else: {elapsed:?}"
+        );
     }
 
     /// The long tail §12 names, driven through the real agent rather than
