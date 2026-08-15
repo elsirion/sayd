@@ -873,10 +873,11 @@ async fn reword_or_original(
 ///
 /// This was a bare `bool` parameter on `notify::monitor::speak`, and the
 /// hazard was measured rather than imagined: flipping the coalescing
-/// ticker's `false` to `true` compiled and passed every test in the suite
-/// while reintroducing the ordering bug the `false` exists to prevent. A
-/// `bool` asks each call site to re-take a decision; this asks it only to
-/// say what it has, which is not a thing a call site can be wrong about.
+/// ticker's `false` to `true` compiled and passed every test in the suite,
+/// while sending a line this daemon composed itself to a provider and
+/// delaying it by up to `timeout_ms` on the way. A `bool` asks each call
+/// site to re-take a decision; this asks it only to say what it has, which
+/// is not a thing a call site can be wrong about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Origin {
     /// A person or an application wrote it: a `Say`, `SaySelection` or
@@ -885,11 +886,27 @@ pub enum Origin {
     Written,
     /// This daemon composed it: the coalesced `"N more notifications"`
     /// follow-up `notify::policy` builds when a window closes (§2). Never
-    /// reworded. It is already a sentence written for the ear, so a rewrite
-    /// could only make it worse and cost money -- and, the real reason, a
-    /// follow-up that skipped the rewrite would be submitted instantly while
-    /// the notification that opened its window was still in flight, and with
-    /// `Policy::Front` it would then be spoken *first*.
+    /// reworded, for three reasons that are all about the line itself:
+    /// `notify::policy::announcement` builds it from a template, so it is
+    /// already a sentence written for the ear and a rewrite can only make it
+    /// worse; it costs a provider round trip for text this daemon wrote; and
+    /// its whole job is to arrive the moment the window closes, which a
+    /// rewrite would delay by up to `timeout_ms`.
+    ///
+    /// **Not** because rewriting it would let it overtake its opener, which
+    /// is what this comment, spec §2 and the brief all used to say. That
+    /// reasoning is backwards and must not be copied into a later task:
+    /// *excluding* the follow-up is what makes it instant, and rewriting it
+    /// would push it later, never earlier.
+    ///
+    /// The inversion those texts describe is real, but it arrives from the
+    /// other side -- the *opener* is what a rewrite delays. A window that
+    /// closes before its opener has been submitted lets the follow-up reach
+    /// an idle engine first and start playing, and `Policy::Front` does not
+    /// save the opener: `Front` jumps ahead of what is pending, not ahead of
+    /// what is already playing. That is bounded where it lives, by
+    /// `sayd_core::config::NOTIFY_COOLDOWN_MIN_SECS`, which keeps every
+    /// non-zero cooldown clear of the reword ceiling.
     Composed,
 }
 
@@ -1868,8 +1885,10 @@ mod tests {
     /// The rule the enum exists to carry: text this daemon composed itself
     /// is never reworded, whichever ask is being made and whatever `enabled`
     /// says. As a `bool` parameter this was flippable at its call site --
-    /// measured: `true` compiled and passed the whole suite while
-    /// reintroducing §2's `Policy::Front` ordering bug.
+    /// measured: `true` compiled and passed the whole suite, while sending a
+    /// templated line to a provider and delaying it by up to `timeout_ms`.
+    /// See [`Origin::Composed`] for why that is wrong and for the ordering
+    /// hazard it is *not*.
     #[test]
     fn composed_text_is_never_admitted() {
         let followup = "Signal: 3 more notifications";

@@ -70,7 +70,8 @@ pub struct NotificationConfig {
     /// with `enabled = true` that is the intended way to discover names, since
     /// the daemon logs each one it declines to speak.
     pub allow: Vec<String>,
-    /// Per-application rate-limit window.
+    /// Per-application rate-limit window. `0` switches rate limiting off;
+    /// any other value is raised to [`NOTIFY_COOLDOWN_MIN_SECS`] on load.
     pub cooldown_secs: u64,
     pub speak_app_name: bool,
     /// Bodies are frequently several sentences and often restate the summary,
@@ -104,6 +105,32 @@ impl Default for NotificationConfig {
 pub const REWORD_TIMEOUT_MIN_MS: u64 = 200;
 /// See [`REWORD_TIMEOUT_MIN_MS`].
 pub const REWORD_TIMEOUT_MAX_MS: u64 = 2500;
+
+/// The shortest non-zero `notifications.cooldown_secs` [`Config::load_str`]
+/// will honour, and the one range in this table that is not about taste.
+///
+/// A coalescing window opens when a notification arrives and closes
+/// `cooldown_secs` later, at which point the `"N more notifications"`
+/// follow-up is composed and submitted *immediately* -- it is never
+/// reworded. The notification that opened the window is submitted up to
+/// `reword.timeout_ms` after it arrived, because its rewrite has to finish or
+/// time out first. With a cooldown shorter than that budget the follow-up
+/// therefore reaches the engine while its own opener is still in flight, and
+/// `Source::Notification`'s `Policy::Front` does not save it: `Front` jumps
+/// ahead of what is *pending*, not ahead of what is already playing (its own
+/// doc comment: "Play next, but let the current utterance finish first"). On
+/// an idle engine the follow-up starts playing at once, and the user hears
+/// "Signal: 3 more notifications" before the notification it is counting
+/// from. Measured with the shipped 1500 ms budget and `cooldown_secs = 1`.
+///
+/// One second past the reword ceiling, derived from it rather than written
+/// out, so the two cannot drift: the opener is submitted at the latest
+/// `REWORD_TIMEOUT_MAX_MS` after it arrived and this leaves the rest of that
+/// second for the submission round trip. `0` is exempt because it means
+/// something else entirely -- `Limiter::decide`'s `cooldown_secs == 0` arm
+/// switches rate limiting off, so no window ever opens and no follow-up is
+/// ever composed, and the ordering this floor protects does not exist.
+pub const NOTIFY_COOLDOWN_MIN_SECS: u64 = REWORD_TIMEOUT_MAX_MS.div_ceil(1000) + 1;
 
 /// Rewriting text for the ear before it is spoken.
 ///
@@ -314,6 +341,16 @@ impl Config {
                     .reword
                     .timeout_ms
                     .clamp(REWORD_TIMEOUT_MIN_MS, REWORD_TIMEOUT_MAX_MS);
+                // The same kind of range for the same kind of reason, and
+                // the other half of the same interaction: a window that
+                // closes before the notification that opened it has been
+                // submitted inverts the two. `0` is left alone -- it is the
+                // off switch, not a short window. See
+                // `NOTIFY_COOLDOWN_MIN_SECS`.
+                if c.notifications.cooldown_secs != 0 {
+                    c.notifications.cooldown_secs =
+                        c.notifications.cooldown_secs.max(NOTIFY_COOLDOWN_MIN_SECS);
+                }
                 (c, None)
             }
             Err(e) => (Config::default(), Some(e.to_string())),
@@ -556,6 +593,39 @@ mod tests {
         // matters for every honest config.
         let (c, _) = Config::load_str("[reword]\ntimeout_ms = 2000\n");
         assert_eq!(c.reword.timeout_ms, 2000);
+    }
+
+    /// A coalescing window that closes before the notification which opened
+    /// it has been submitted inverts the two: the follow-up is never
+    /// reworded, so it goes out the instant the window closes, while its
+    /// opener is still waiting on a rewrite for up to `timeout_ms`. On an
+    /// idle engine the follow-up starts playing at once and
+    /// `Policy::Front` does not save the opener -- `Front` jumps ahead of
+    /// what is pending, not ahead of what is already playing. Measured with
+    /// the shipped 1500 ms budget and `cooldown_secs = 1`.
+    #[test]
+    fn a_cooldown_shorter_than_the_rewrite_budget_is_raised_to_clear_it() {
+        let (c, err) = Config::load_str("[notifications]\ncooldown_secs = 1\n");
+        assert_eq!(err, None);
+        assert_eq!(c.notifications.cooldown_secs, NOTIFY_COOLDOWN_MIN_SECS);
+
+        assert!(
+            std::time::Duration::from_secs(NOTIFY_COOLDOWN_MIN_SECS)
+                > std::time::Duration::from_millis(REWORD_TIMEOUT_MAX_MS),
+            "the floor has to actually clear the budget it is derived from, \
+             or it is decoration"
+        );
+
+        let (c, _) = Config::load_str("[notifications]\ncooldown_secs = 0\n");
+        assert_eq!(
+            c.notifications.cooldown_secs, 0,
+            "`0` is the off switch, not a short window: with rate limiting off \
+             no window opens and no follow-up is ever composed"
+        );
+
+        // Everything an honest config says is left exactly as it said it.
+        let (c, _) = Config::load_str("[notifications]\ncooldown_secs = 30\n");
+        assert_eq!(c.notifications.cooldown_secs, 30);
     }
 
     #[test]

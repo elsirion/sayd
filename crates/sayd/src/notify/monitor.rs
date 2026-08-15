@@ -392,8 +392,8 @@ async fn run_on(engine: EngineHandle, address: Option<String>) -> Outcome {
                             // one honest value here and the never-reword
                             // rule follows from it rather than from a
                             // judgement taken again at this call site. See
-                            // `Origin::Composed` for the ordering bug that
-                            // makes the rule load-bearing.
+                            // `Origin::Composed` for why that rule holds --
+                            // and for the ordering argument it is not.
                             drop(speak(&engine, text, &cfg, Origin::Composed, &submit_failure_logged).await);
                         }
                     }
@@ -625,8 +625,9 @@ fn notification_opts() -> SayOpts {
 /// follow-up and [`Origin::Written`] for an application's own notification;
 /// [`RewordPlan`] is what turns that into a rewrite or not. It is an enum
 /// rather than the `bool` it was because flipping that `bool` at the ticker's
-/// call site compiled and passed every test while reintroducing §2's
-/// `Policy::Front` ordering bug -- see [`Origin`], which carries the rule.
+/// call site compiled and passed every test while sending a line this daemon
+/// composed itself to a provider -- see [`Origin::Composed`], which carries
+/// the rule and the reasoning, including which ordering hazard it is *not*.
 ///
 /// The detached task is not a child of the monitor task, so
 /// `NotifyMonitorSupervisor`'s `handle.abort()` does not cancel it. Same
@@ -1030,10 +1031,12 @@ mod tests {
     }
 
     /// §2: a coalesced "N more notifications" follow-up is never reworded.
-    /// It is already a sentence written for the ear, and -- the real reason
-    /// -- a follow-up that skipped the rewrite would be submitted instantly
-    /// while the notification that opened the window was still in flight,
-    /// and with `Policy::Front` it would be spoken first.
+    /// `notify::policy::announcement` builds it from a template, so it is
+    /// already a sentence written for the ear; rewriting it would cost a
+    /// provider round trip for text this daemon wrote and delay by up to
+    /// `timeout_ms` a line whose whole job is to arrive when the window
+    /// closes. See `Origin::Composed`, which also records why the ordering
+    /// argument this comment used to give is backwards.
     ///
     /// Asserted on `RewordPlan::automatic` rather than by counting calls into
     /// a stub `Rewriter`: `speak` reaches its rewriter through
