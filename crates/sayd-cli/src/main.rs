@@ -23,6 +23,16 @@ const IFACE: &str = "sh.sayd.Sayd1";
 /// for a local session-bus round trip, and this binary is forked every
 /// 15-30 seconds by agent narration, so failing fast matters more than
 /// tolerating a slow daemon.
+///
+/// **It cannot be lowered below the daemon's `reword.timeout_ms` ceiling.**
+/// `--reword` is answered inline -- `Say` returns the utterance id and the
+/// daemon allocates that id from the text, so it cannot hand one back and
+/// rewrite afterwards -- so a `Say` carrying `reword` legitimately takes up
+/// to that ceiling to return. The daemon clamps it to 2500 ms
+/// (`sayd_core::config::REWORD_TIMEOUT_MAX_MS`) for this reason and no other.
+/// The two constants are in different binaries and neither can import the
+/// other, so the relationship is pinned by a test instead:
+/// `sayd::dbus::tests::a_reword_against_a_silent_provider_still_answers_inside_the_cli_bound`.
 const TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Parser, Debug)]
@@ -57,6 +67,20 @@ struct Cli {
     /// elsewhere. Must come before the text/subcommand it applies to.
     #[arg(long, global = true)]
     speed: Option<f64>,
+
+    /// Rewrite this submission into something written for the ear before
+    /// speaking it -- "Alice: dinner?" becomes "Alice is asking about
+    /// dinner". Needs a configured `[reword]` endpoint and a daemon built
+    /// with `--features reword`; without either, the text is spoken as
+    /// written. Does *not* require `[reword] enabled = true`, which only
+    /// governs whether notifications are rewritten automatically.
+    /// Meaningless outside a submission; ignored elsewhere. Must come
+    /// before the text/subcommand it applies to.
+    ///
+    /// There is no `--no-reword`: nothing makes CLI submissions rewrite by
+    /// default, so there is nothing to negate.
+    #[arg(long, global = true)]
+    reword: bool,
 
     /// Text to speak. Use `--` first if it begins with a subcommand name.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -156,9 +180,9 @@ async fn main() -> std::process::ExitCode {
         }
     };
 
-    // Built once: `--policy`/`--voice`/`--speed` matter only to the three
-    // submission paths (bare text, `selection`, `clipboard`), all of which
-    // share this dict. Every other command ignores it.
+    // Built once: `--policy`/`--voice`/`--speed`/`--reword` matter only to
+    // the three submission paths (bare text, `selection`, `clipboard`), all
+    // of which share this dict. Every other command ignores it.
     let opts = say_opts(&cli);
     let result = match cli.command {
         Some(Command::Selection) => call(proxy.call_method("SaySelection", &(opts,)))
@@ -209,7 +233,7 @@ async fn main() -> std::process::ExitCode {
 }
 
 /// Build the D-Bus `opts` dict for a submission from the parsed CLI's
-/// `--policy`/`--voice`/`--speed`. Only keys the caller actually set are
+/// `--policy`/`--voice`/`--speed`/`--reword`. Only keys the caller set are
 /// present -- the daemon's own `say_opts_from` already treats an absent key
 /// as "use the default," so there is no reason to send one explicitly.
 fn say_opts(cli: &Cli) -> HashMap<String, OwnedValue> {
@@ -228,6 +252,12 @@ fn say_opts(cli: &Cli) -> HashMap<String, OwnedValue> {
     }
     if let Some(speed) = cli.speed {
         opts.insert("speed".to_string(), OwnedValue::from(speed));
+    }
+    // Only when asked. A daemon that predates the key ignores it, and a
+    // `say hello` without the flag is byte-identical on the wire to what it
+    // was before the flag existed.
+    if cli.reword {
+        opts.insert("reword".to_string(), OwnedValue::from(true));
     }
     opts
 }
@@ -508,6 +538,53 @@ mod tests {
         let err = Cli::try_parse_from(["say", "--policy", "nonsense", "hello"])
             .expect_err("an unknown policy value must not silently parse");
         assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
+    }
+
+    /// `--reword` is global, like `--policy`/`--voice`/`--speed`, so it
+    /// works on bare text and on the two reading subcommands alike --
+    /// `say --reword selection` needs no code of its own, because
+    /// selection and clipboard reads go through the same submission path.
+    #[test]
+    fn reword_is_global_and_reaches_every_submission() {
+        let c = Cli::try_parse_from(["say", "--reword", "hello", "world"]).expect("parses");
+        assert!(c.reword);
+        assert_eq!(c.text.join(" "), "hello world");
+        assert!(say_opts(&c).contains_key("reword"));
+
+        let c = Cli::try_parse_from(["say", "--reword", "selection"]).expect("parses");
+        assert!(c.reword);
+        assert!(matches!(c.command, Some(Command::Selection)));
+
+        let c = Cli::try_parse_from(["say", "clipboard", "--reword"]).expect("parses");
+        assert!(c.reword);
+    }
+
+    /// Only keys the caller actually set are sent, so a plain `say hello`
+    /// against an old daemon is byte-identical on the wire to what it was
+    /// before this flag existed.
+    #[test]
+    fn no_reword_key_is_sent_unless_it_was_asked_for() {
+        let c = Cli::try_parse_from(["say", "hello"]).expect("parses");
+        assert!(!c.reword);
+        assert!(!say_opts(&c).contains_key("reword"));
+    }
+
+    /// The key the daemon's `wants_reword` reads is a *boolean* `reword`.
+    /// The two are in different binaries with no shared type between them,
+    /// so the wire contract is worth stating on both sides: a `Str` here
+    /// would be silently ignored by the daemon and the flag would do
+    /// nothing at all.
+    #[test]
+    fn the_reword_key_goes_on_the_wire_as_a_boolean_true() {
+        let c = Cli::try_parse_from(["say", "--reword", "hello"]).expect("parses");
+        let opts = say_opts(&c);
+        let v = opts.get("reword").expect("the key is present");
+        assert!(
+            v.downcast_ref::<bool>()
+                .expect("a boolean variant, which is what the daemon downcasts to"),
+            "the flag sends `true`, and the daemon reads it with \
+             `downcast_ref::<bool>`"
+        );
     }
 
     #[test]

@@ -722,14 +722,14 @@ impl Inner {
 /// *before* anything is spawned, so an ineligible submission costs one pass
 /// over a short string and a mutex.
 ///
-/// Both callers -- `notify::monitor::speak` and `dbus.rs` -- gate on this
-/// and only detach or await when it says yes.
-///
 /// **Call it once per arrival, then attempt.** It is not a pure predicate:
 /// past an expired transport cooldown [`RewordState::allow`] mints and
 /// spends §8's one half-open probe, so a caller that asks twice and attempts
-/// once costs the run a probe until [`TRANSPORT_PROBE_TTL`] expires.
-pub fn will_reword(text: &str, cfg: &RewordConfig, state: &RewordState) -> bool {
+/// once costs the run a probe until [`TRANSPORT_PROBE_TTL`] expires. That is
+/// why this is private and [`RewordPlan::admit`] is its only caller: one
+/// constructor, one ask, one attempt, and no way for a call site to hold the
+/// answer and then decide something else with it.
+fn will_reword(text: &str, cfg: &RewordConfig, state: &RewordState) -> bool {
     if let Err(why) = eligible(text, cfg.max_chars) {
         state.note_ineligible(why);
         return false;
@@ -745,11 +745,15 @@ pub fn will_reword(text: &str, cfg: &RewordConfig, state: &RewordState) -> bool 
 /// Do not add a submit callback to this signature.
 ///
 /// Assumes [`will_reword`] has already said yes -- and does not check, which
-/// is why `notify::monitor` reaches this only through a `RewordPlan` whose
+/// is why every call site reaches this only through a [`RewordPlan`], whose
 /// sole constructor calls `will_reword`. Nothing here consults
 /// [`RewordState::allow`], so a caller that skips it bypasses the auth
 /// latch, the transport breaker and the rate limiter entirely.
-pub async fn reword_or_original(
+///
+/// Private, therefore: [`RewordPlan::resolve`] is the only caller in the
+/// daemon, which is what makes "reached only through a plan" a fact about
+/// the module boundary rather than a convention two files agree to keep.
+async fn reword_or_original(
     text: String,
     cfg: &RewordConfig,
     rewriter: Arc<dyn Rewriter>,
@@ -773,6 +777,134 @@ pub async fn reword_or_original(
             ));
             text
         }
+    }
+}
+
+/// Where a piece of text came from -- the one fact that decides whether it
+/// may be reworded at all.
+///
+/// This was a bare `bool` parameter on `notify::monitor::speak`, and the
+/// hazard was measured rather than imagined: flipping the coalescing
+/// ticker's `false` to `true` compiled and passed every test in the suite
+/// while reintroducing the ordering bug the `false` exists to prevent. A
+/// `bool` asks each call site to re-take a decision; this asks it only to
+/// say what it has, which is not a thing a call site can be wrong about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// A person or an application wrote it: a `Say`, `SaySelection` or
+    /// `SayClipboard` body, or an application's own notification. §1's
+    /// rewrite exists for exactly this.
+    Written,
+    /// This daemon composed it: the coalesced `"N more notifications"`
+    /// follow-up `notify::policy` builds when a window closes (§2). Never
+    /// reworded. It is already a sentence written for the ear, so a rewrite
+    /// could only make it worse and cost money -- and, the real reason, a
+    /// follow-up that skipped the rewrite would be submitted instantly while
+    /// the notification that opened its window was still in flight, and with
+    /// `Policy::Front` it would then be spoken *first*.
+    Composed,
+}
+
+/// A rewrite the breakers have already cleared, and the only way anything in
+/// this daemon reaches [`reword_or_original`].
+///
+/// The breakers are *advisory*: neither [`attempt`] nor
+/// [`reword_or_original`] consults [`RewordState::allow`], so a call site
+/// that reached the rewrite without going through [`will_reword`] first
+/// would silently bypass the auth latch, the transport breaker and the rate
+/// limiter -- and would keep hammering a provider that has already answered
+/// 401, once per submission. Nothing in the *signature* of
+/// `reword_or_original` prevents that, so the protection is structural
+/// instead: this type's fields are private, [`RewordPlan::admit`] is its only
+/// constructor and calls `will_reword` on the way, [`RewordPlan::resolve`]
+/// consumes `self`, and both `will_reword` and `reword_or_original` are
+/// private to this module. A future edit cannot reorder or drop the check
+/// without deleting the type that carries it.
+///
+/// It lives here rather than in `notify::monitor`, where it was written,
+/// because `dbus.rs` is a second call site and a guarantee that protects one
+/// caller is not a guarantee. The two paths differ in exactly one respect --
+/// whether `[reword] enabled` has a say -- and that difference is the two
+/// constructors below rather than an `if` at either call site.
+///
+/// `will_reword` is called exactly *once* per submission, and then the
+/// attempt is made. Past an expired transport cooldown `allow` mints and
+/// spends §8's one half-open probe, so asking twice and attempting once
+/// would burn a probe the run does not get back until the TTL expires.
+pub struct RewordPlan {
+    rewriter: Arc<dyn Rewriter>,
+    state: Arc<RewordState>,
+    /// The exact config the decision was taken under, cloned once here
+    /// rather than read again later: `notify::monitor` refreshes its cached
+    /// `Config` on every tick, and text judged eligible under one
+    /// `max_chars` must not then be sent under another. Owning it is also
+    /// what lets a caller detach the resolve -- [`attempt`] borrows its
+    /// config, and a detached task has nothing to borrow from.
+    cfg: RewordConfig,
+}
+
+impl RewordPlan {
+    /// The configuration's standing ask: `[reword] enabled = true`, which
+    /// means "rewrite my notifications without being asked".
+    ///
+    /// Every step is synchronous and cheap -- a pass over a short string and
+    /// one mutex -- so text that is not going to be rewritten costs no
+    /// allocation, no clone of the config, and above all no `tokio::spawn`.
+    /// That is what keeps the feature-off path exactly what it was: with
+    /// `enabled = false` this returns on the first line, and in a build
+    /// without the `reword` feature [`build_rewriter`] cannot make a client
+    /// at all, so `context` returns `None` and it returns on the second.
+    pub fn automatic(text: &str, cfg: &RewordConfig, origin: Origin) -> Option<RewordPlan> {
+        if !cfg.enabled {
+            return None;
+        }
+        RewordPlan::admit(text, cfg, origin)
+    }
+
+    /// This caller's explicit ask: `say --reword`, or `reword` in the D-Bus
+    /// `opts` map.
+    ///
+    /// Deliberately does **not** consult `enabled`. That switch means
+    /// "rewrite my notifications without being asked", and `--reword` *is*
+    /// being asked; refusing an explicit request because a different,
+    /// automatic behaviour is switched off would be surprising. Everything
+    /// else -- a usable endpoint, the eligibility rule, all three breakers --
+    /// applies identically, because `admit` below is shared.
+    ///
+    /// Takes no [`Origin`]: an explicit request is by construction about
+    /// text its caller wrote, and offering `Origin::Composed` here would
+    /// re-introduce the unspellable-wrong-value the enum exists to remove.
+    pub fn requested(text: &str, cfg: &RewordConfig) -> Option<RewordPlan> {
+        RewordPlan::admit(text, cfg, Origin::Written)
+    }
+
+    /// The shared body, and the only place [`will_reword`] is called.
+    fn admit(text: &str, cfg: &RewordConfig, origin: Origin) -> Option<RewordPlan> {
+        match origin {
+            Origin::Written => {}
+            // Matched rather than compared, so a third kind of text cannot
+            // be added without this rule being re-decided for it.
+            Origin::Composed => return None,
+        }
+        let (rewriter, state) = context(cfg)?;
+        if !will_reword(text, cfg, &state) {
+            return None;
+        }
+        Some(RewordPlan {
+            rewriter,
+            state,
+            cfg: cfg.clone(),
+        })
+    }
+
+    /// The text to speak. Consumes the plan, so the single `will_reword`
+    /// that admitted it buys exactly one attempt.
+    ///
+    /// Holds no `EngineHandle` and returns a `String`: the caller submits, so
+    /// a rewrite that lands past the deadline is dropped rather than spoken
+    /// second. Do not add a submit callback to this signature.
+    pub async fn resolve(self, text: String) -> String {
+        reword_or_original(text, &self.cfg, self.rewriter, self.state).await
     }
 }
 
@@ -820,6 +952,50 @@ pub fn context(cfg: &RewordConfig) -> Option<(Arc<dyn Rewriter>, Arc<RewordState
             None
         }
     }
+}
+
+/// A loopback server that accepts a connection and then says nothing for
+/// `hold`, then closes it. Returns a `base_url` pointing at it and the thread
+/// serving it.
+///
+/// A *refused* connection would not do: it fails in well under a millisecond,
+/// so both the detached notification path and the awaited D-Bus one would
+/// return as fast against it whether or not they were doing the thing under
+/// test. Measured: with the `tokio::spawn` in `notify::monitor::speak`
+/// removed and `base_url` pointed at a closed port,
+/// `speak_returns_at_once_when_a_rewrite_is_in_flight` still passed. Against
+/// this, the same mutation takes the whole `timeout_ms`.
+///
+/// Non-blocking accept with a deadline so the thread always ends and can be
+/// joined: joining it is what closes the socket, which is what lets the
+/// runtime's own shutdown -- which waits on the blocking pool, where the
+/// rewrite's `ureq` call lives -- finish promptly.
+///
+/// Here rather than in either caller's `mod tests` because both
+/// `notify::monitor` and `dbus` need exactly this server, for the two halves
+/// of the same rule: the notification path must not wait for a stuck
+/// provider, and the D-Bus path must wait for it and still answer inside
+/// `sayd-cli`'s 3 s bound.
+#[cfg(test)]
+pub fn silent_provider(hold: Duration) -> (String, std::thread::JoinHandle<()>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let port = listener.local_addr().expect("local addr").port();
+    listener
+        .set_nonblocking(true)
+        .expect("non-blocking listener");
+    let handle = std::thread::spawn(move || {
+        let until = Instant::now() + hold;
+        // Held, not dropped: a socket dropped straight away would let the
+        // client's read fail at once, which is the refused-fast case again.
+        let mut accepted = Vec::new();
+        while Instant::now() < until {
+            match listener.accept() {
+                Ok((sock, _)) => accepted.push(sock),
+                Err(_) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+    });
+    (format!("http://127.0.0.1:{port}/v1"), handle)
 }
 
 /// Build a client for `cfg`. The one function whose body differs between
@@ -1497,6 +1673,56 @@ mod tests {
             &cfg,
             &state
         ));
+    }
+
+    /// The two asks, and the one difference between them: `enabled` governs
+    /// the automatic rewrite and nothing else. "Rewrite my notifications
+    /// without being asked" is what that switch says, and `--reword` is
+    /// being asked -- refusing an explicit request because a different,
+    /// automatic behaviour is off would be surprising. Everything else is
+    /// the same code, because both constructors share `admit`.
+    ///
+    /// `is_some()` is compared against `cfg!(feature = "reword")` rather than
+    /// asserted outright: without the feature there is no client to build, so
+    /// `context` returns `None` and *nothing* is ever admitted -- which is
+    /// the compiler's half of the promise and is worth pinning here too.
+    #[test]
+    fn only_the_automatic_ask_consults_enabled() {
+        let text = "Alice: where do you want to go for dinner";
+        let mut off = cfg();
+        off.enabled = false;
+
+        assert!(
+            RewordPlan::automatic(text, &off, Origin::Written).is_none(),
+            "`enabled = false` must not even look for a client"
+        );
+        assert_eq!(
+            RewordPlan::requested(text, &off).is_some(),
+            cfg!(feature = "reword"),
+            "an explicit --reword does not need `enabled`"
+        );
+        assert_eq!(
+            RewordPlan::automatic(text, &cfg(), Origin::Written).is_some(),
+            cfg!(feature = "reword")
+        );
+    }
+
+    /// The rule the enum exists to carry: text this daemon composed itself
+    /// is never reworded, whichever ask is being made and whatever `enabled`
+    /// says. As a `bool` parameter this was flippable at its call site --
+    /// measured: `true` compiled and passed the whole suite while
+    /// reintroducing §2's `Policy::Front` ordering bug.
+    #[test]
+    fn composed_text_is_never_admitted() {
+        let followup = "Signal: 3 more notifications";
+        assert!(RewordPlan::automatic(followup, &cfg(), Origin::Composed).is_none());
+        // ...and not because it was ineligible on its own account: the same
+        // string with the other origin is admitted wherever there is a client.
+        assert_eq!(
+            RewordPlan::automatic(followup, &cfg(), Origin::Written).is_some(),
+            cfg!(feature = "reword"),
+            "the exclusion must be the origin, not the length"
+        );
     }
 
     /// The guard is applied to whatever comes back, and a rejection means

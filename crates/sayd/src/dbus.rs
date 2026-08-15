@@ -67,9 +67,72 @@ fn say_opts_from(opts: &HashMap<String, OwnedValue>, source: QueueSource) -> Say
     }
 }
 
+/// Did the caller ask for this submission to be rewritten?
+///
+/// The same ignore-don't-reject rule as [`say_opts_from`]: an absent key, a
+/// wrongly-typed value and an explicit `false` all mean no. That rule is what
+/// lets a new `say` talk to an old daemon (which ignores the key) and an old
+/// `say` talk to a new one (which never sees it) without either erroring.
+///
+/// Deliberately *not* part of `SayOpts`. The rewrite is a pre-submission
+/// transform -- it happens before `Engine::submit` is called at all -- and
+/// `sayd-core` has no business knowing about it; a field on the struct the
+/// engine consumes that the engine never reads would suggest otherwise.
+fn wants_reword(opts: &HashMap<String, OwnedValue>) -> bool {
+    opts.get("reword")
+        .and_then(|v| v.downcast_ref::<bool>().ok())
+        .unwrap_or(false)
+}
+
 impl SaydIface {
     pub fn new(engine: EngineHandle, store: Arc<ConfigStore>) -> Self {
         SaydIface { engine, store }
+    }
+
+    /// Rewrite `text` if the caller asked for it, or hand it straight back.
+    ///
+    /// **Awaited inline**, unlike `notify::monitor::speak`, which detaches.
+    /// The asymmetry is forced: `Say` returns an utterance id,
+    /// `Engine::submit` is what allocates that id, and there is no way to
+    /// allocate one ahead of the text -- `Queue` exposes no `iter_mut`,
+    /// `Utterance::text` is never reassigned anywhere in `sayd-core`, and
+    /// `Current`'s fields are private. Returning an id and rewriting
+    /// afterwards would need a text-replacement hook inside the engine, a
+    /// far larger change for a caller that is already blocked on a
+    /// synchronous method call. So `say --reword "..."` can take up to
+    /// `reword.timeout_ms` to return -- which is why `Config::load_str`
+    /// clamps that at 2500 ms: `sayd-cli` bounds every D-Bus interaction at
+    /// 3 s, and a rewrite that outlived the caller would turn an enhancement
+    /// into "sayd is not responding".
+    ///
+    /// Every way this can fail ends in the original text being returned and
+    /// therefore spoken -- no configured endpoint, no client in this build, a
+    /// latched breaker, a provider that never answers. A `--reword` on a
+    /// keybind must not stop speaking because an optional enhancement is
+    /// misconfigured; the diagnosis is in the log, once per run.
+    ///
+    /// The config is fetched only *after* the opt has been seen, so an
+    /// ordinary `Say` pays nothing at all for this -- not even the 250 ms
+    /// round trip `EngineHandle::config` can cost.
+    async fn maybe_reword(&self, text: String, opts: &HashMap<String, OwnedValue>) -> String {
+        if !wants_reword(opts) {
+            return text;
+        }
+        let engine = self.engine.clone();
+        // On the blocking pool for the reason every other `EngineHandle`
+        // round trip in this file is: it waits up to 250 ms on an engine
+        // thread that may be mid-chunk. C2 again.
+        let Ok(Some(cfg)) = tokio::task::spawn_blocking(move || engine.config()).await else {
+            return text;
+        };
+        // `requested`, never `automatic`: `[reword] enabled` means "rewrite
+        // my notifications without being asked", and this caller is asking.
+        // Everything else -- endpoint, eligibility, all three breakers -- is
+        // the same code, because both constructors share `admit`.
+        let Some(plan) = crate::reword::RewordPlan::requested(&text, &cfg.reword) else {
+            return text;
+        };
+        plan.resolve(text).await
     }
 
     /// Shared body of `Say`, `SaySelection` and `SayClipboard`.
@@ -151,6 +214,7 @@ impl SaydIface {
     /// `submit`'s doc comment) -- also safe, since the queue does not reach
     /// that id in practice either.
     async fn say(&self, text: String, opts: HashMap<String, OwnedValue>) -> fdo::Result<u32> {
+        let text = self.maybe_reword(text, &opts).await;
         self.submit(text, say_opts_from(&opts, QueueSource::DBus))
             .await
     }
@@ -164,6 +228,7 @@ impl SaydIface {
             .await
             .map_err(|e| fdo::Error::Failed(format!("selection read panicked: {e}")))?
             .map_err(fdo::Error::Failed)?;
+        let text = self.maybe_reword(text, &opts).await;
         self.submit(text, say_opts_from(&opts, QueueSource::Hotkey))
             .await
     }
@@ -176,6 +241,7 @@ impl SaydIface {
             .await
             .map_err(|e| fdo::Error::Failed(format!("clipboard read panicked: {e}")))?
             .map_err(fdo::Error::Failed)?;
+        let text = self.maybe_reword(text, &opts).await;
         self.submit(text, say_opts_from(&opts, QueueSource::Hotkey))
             .await
     }
@@ -535,6 +601,147 @@ mod tests {
             "the mute must survive a config change that never mentioned it"
         );
         i.engine.shutdown();
+    }
+
+    fn opts_with(key: &str, value: OwnedValue) -> HashMap<String, OwnedValue> {
+        let mut m = HashMap::new();
+        m.insert(key.to_string(), value);
+        m
+    }
+
+    /// The one new key, read the way every other one is: absent, wrongly
+    /// typed and explicitly false all mean "do not rewrite", because
+    /// `say_opts_from`'s ignore-don't-reject rule is what lets a new CLI
+    /// talk to an old daemon and the other way round.
+    #[test]
+    fn the_reword_opt_is_read_and_never_rejected() {
+        assert!(wants_reword(&opts_with("reword", OwnedValue::from(true))));
+        assert!(!wants_reword(&opts_with("reword", OwnedValue::from(false))));
+        assert!(!wants_reword(&HashMap::new()));
+        assert!(
+            !wants_reword(&opts_with("reword", OwnedValue::from(Str::from("yes")))),
+            "a wrongly-typed value is ignored, not an error"
+        );
+    }
+
+    /// The `reword` key is read *only* by `maybe_reword`; it must not leak
+    /// into what the engine is told about the submission. `SayOpts` gains no
+    /// field for it, so this pins that an opts map carrying it still produces
+    /// exactly the `SayOpts` it would have produced without it.
+    #[test]
+    fn the_reword_opt_changes_nothing_the_engine_is_told() {
+        let with = say_opts_from(
+            &opts_with("reword", OwnedValue::from(true)),
+            QueueSource::DBus,
+        );
+        let without = say_opts_from(&HashMap::new(), QueueSource::DBus);
+        assert_eq!(with.policy, without.policy);
+        assert_eq!(with.voice, without.voice);
+        assert_eq!(with.speed, without.speed);
+        assert_eq!(with.source, without.source);
+    }
+
+    /// The relationship the whole inline-await design rests on: a `--reword`
+    /// submission against a provider that accepts the connection and then
+    /// never answers must come back with a *spoken utterance*, inside
+    /// `sayd-cli`'s 3 s bound -- not a "sayd is not responding".
+    ///
+    /// The two halves of that are `reword.timeout_ms`, clamped to
+    /// `REWORD_TIMEOUT_MAX_MS` (2500 ms) by `Config::load_str` no matter
+    /// what the file says, and `sayd-cli`'s own `TIMEOUT` of 3 s. They live
+    /// in two crates and neither can import the other's constant, so the
+    /// relationship is checked here the only way it can be: end to end,
+    /// through the real loader, against a real socket, with the deadline the
+    /// clamp actually produced. `86400000` is what a hand-edited config can
+    /// say and no spin row can.
+    ///
+    /// In a build without the `reword` feature there is no client to make a
+    /// request with, so this returns at once and still passes -- which is the
+    /// other half of the promise: a `--reword` that cannot be honoured is
+    /// spoken as written rather than refused. `--features reword` is the
+    /// configuration where the timing can actually fail.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reword_against_a_silent_provider_still_answers_inside_the_cli_bound() {
+        // `sayd-cli`'s own bound on any one D-Bus interaction, restated
+        // because this crate cannot import it: `sayd-cli` is a binary.
+        const CLI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (base_url, provider) = crate::reword::silent_provider(CLI_TIMEOUT);
+        let (cfg, err) = Config::load_str(&format!(
+            "[reword]\nbase_url = \"{base_url}\"\ntimeout_ms = 86400000\n"
+        ));
+        assert_eq!(err, None);
+        assert_eq!(
+            cfg.reword.timeout_ms,
+            sayd_core::config::REWORD_TIMEOUT_MAX_MS,
+            "a hand-edited timeout must be clamped on load, or the wait below \
+             outlives the caller"
+        );
+        assert!(
+            !cfg.reword.enabled,
+            "and `enabled` stays off: an explicit --reword must not need it"
+        );
+
+        let engine = sayd_core::handle::EngineHandle::spawn(
+            cfg.clone(),
+            Box::new(StubSynthesizer::new()),
+            Box::new(VecSink::new(24_000 * 10)),
+        );
+        let store = Arc::new(ConfigStore::new(
+            dir.path().join("config.toml"),
+            engine.clone(),
+            cfg.clone(),
+        ));
+        let i = SaydIface::new(engine, store);
+
+        let started = std::time::Instant::now();
+        let id = i
+            .say(
+                "Alice: where do you want to go for dinner".into(),
+                opts_with("reword", OwnedValue::from(true)),
+            )
+            .await
+            .expect("a rewrite that cannot happen is not an error");
+        let elapsed = started.elapsed();
+
+        assert_ne!(id, 0, "the original was queued and will be spoken");
+        assert!(
+            elapsed < CLI_TIMEOUT,
+            "Say took {elapsed:?} against sayd-cli's {CLI_TIMEOUT:?} bound; the \
+             caller would have printed \"sayd is not responding\" for a rewrite \
+             that was never going to arrive"
+        );
+        // ...and in a build that can actually make the request, it really did
+        // wait inline rather than passing for the trivial reason. Both bounds
+        // together are the whole design: long enough to be worth having, short
+        // enough that the caller is still listening.
+        //
+        // `endpoint_seen` is the check that the request was made at all --
+        // `attempt` sets it once a permit is in hand -- and it is keyed on
+        // `base_url`, which is this test's own ephemeral port. It is asserted
+        // rather than branched on because the process-wide `RewordState` is
+        // shared with every other test in this binary: a breaker opened, or
+        // both permits taken, elsewhere in the run would make the timing
+        // below prove nothing, and that is worth a loud failure rather than a
+        // quiet pass.
+        #[cfg(feature = "reword")]
+        {
+            assert!(
+                crate::reword::state().endpoint_seen(&cfg.reword),
+                "the rewrite never reached the provider, so the timing below \
+                 would prove nothing"
+            );
+            assert!(
+                elapsed >= std::time::Duration::from_millis(cfg.reword.timeout_ms) / 2,
+                "Say returned in {elapsed:?}, far inside the {} ms budget: the \
+                 rewrite was not awaited inline",
+                cfg.reword.timeout_ms
+            );
+        }
+
+        i.engine.shutdown();
+        provider.join().expect("the silent provider thread ends");
     }
 
     #[tokio::test]
