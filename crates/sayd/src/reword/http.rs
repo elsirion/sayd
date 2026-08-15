@@ -24,12 +24,13 @@
 //!
 //! Not because the operator is: because a half-configured local server, a
 //! reverse proxy and a load balancer all produce bodies no provider's
-//! documentation describes. Every response field here is an `Option`,
-//! nothing is indexed, and there is no `unwrap`, `expect` or `panic!` on any
-//! value that arrived over the wire. The read is length-limited for the same
-//! reason, and the one string that reaches a log line -- `error.message` --
-//! is cut to [`MESSAGE_CHARS`] and stripped of control characters before it
-//! gets there. Unbounded, a provider could write a 60 KB warning line, forge
+//! documentation describes. Every response field here is an `Option` that
+//! tolerates the wrong type as well as `null`, nothing is indexed, and there
+//! is no `unwrap`, `expect` or `panic!` on any value that arrived over the
+//! wire. The read is length-limited for the same reason, and the one string
+//! that reaches a log line -- `error.message` -- is cut to
+//! [`MESSAGE_CHARS`] and stripped of control characters before it gets
+//! there. Unbounded, a provider could write a 60 KB warning line, forge
 //! further `warning: reword:` lines inside it and run ANSI escapes at
 //! whoever reads `journalctl`.
 
@@ -107,6 +108,28 @@ struct Message<'a> {
     content: &'a str,
 }
 
+/// A field that is missing, `null`, **or the wrong type entirely** reads as
+/// `None`, and the rest of the body survives it.
+///
+/// `Option` alone is not enough, and the gap is not hypothetical:
+/// `{"choices":[{"message":{"content":"a good rewrite"}}],"error":"oops"}` --
+/// an `error` that is a string where this client expects an object -- fails
+/// the whole parse with plain `Option<ApiError>`, and a perfectly good
+/// rewrite is thrown away with it. `Option` covers `null`;
+/// `#[serde(default)]` covers absent; only buffering the field and letting
+/// its own parse fail in isolation covers the wrong type.
+///
+/// The cost is one `serde_json::Value` per field, on a body already capped
+/// at [`BODY_LIMIT`], on a path that runs at most twice a minute.
+fn lenient<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(T::deserialize(value).ok())
+}
+
 /// Every field an `Option`: this is untrusted input off a socket, whoever is
 /// running the server.
 ///
@@ -115,30 +138,31 @@ struct Message<'a> {
 /// but not an explicit `null`, and `"content": null` is exactly what a local
 /// server returns when generation produced nothing. With the bare type one
 /// `null` anywhere fails the whole parse, and the `error.message` that would
-/// have said *why* goes with it.
+/// have said *why* goes with it. [`lenient`] extends the same argument to a
+/// field of the wrong type.
 #[derive(Deserialize, Default)]
 struct ChatResponse {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     choices: Option<Vec<Choice>>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     error: Option<ApiError>,
 }
 
 #[derive(Deserialize)]
 struct Choice {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     message: Option<ChoiceMessage>,
 }
 
 #[derive(Deserialize)]
 struct ChoiceMessage {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     content: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct ApiError {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     message: Option<String>,
 }
 
@@ -340,6 +364,15 @@ pub fn parse_response(
             message,
         });
     }
+    // A 200 carrying *both* a usable `content` and a non-empty
+    // `error.message` is read as the error, so a provider that attaches a
+    // deprecation notice to a good answer switches the feature off silently.
+    // Deliberate, and this is the cheaper direction: an `error` object is a
+    // server saying something went wrong, and speaking an answer it
+    // disowned -- a truncated generation, a content-filter stub -- puts
+    // words in the user's ear that no line in the journal can take back.
+    // The other direction merely costs a rewrite and leaves the reason in
+    // the debug log.
     if let Some(message) = message {
         return Err(RewordError::Malformed(message));
     }
@@ -761,6 +794,58 @@ mod tests {
             parse_response(500, None, br#"{"error":{"message":"  boom  "}}"#, "m", "h"),
             Err(RewordError::Malformed("boom".into()))
         );
+    }
+
+    /// One field of the wrong type may cost that field and nothing else.
+    /// With a plain `Option` the body below fails the whole parse and a
+    /// good rewrite is thrown away with an `error` this client does not
+    /// even understand.
+    #[test]
+    fn a_field_of_the_wrong_type_costs_only_that_field() {
+        assert_eq!(
+            parse_response(
+                200,
+                None,
+                br#"{"choices":[{"message":{"content":"a good rewrite"}}],"error":"oops"}"#,
+                "m",
+                "h"
+            )
+            .as_deref(),
+            Ok("a good rewrite"),
+            "an `error` this client cannot read is not a reason to discard the answer"
+        );
+        // The mirror: a `choices` of the wrong type must not cost the
+        // diagnosis that says why there is no answer in it.
+        assert_eq!(
+            parse_response(
+                200,
+                None,
+                br#"{"choices":"soon","error":{"message":"model 'm' not found"}}"#,
+                "m",
+                "h"
+            ),
+            Err(RewordError::NoSuchModel {
+                status: 200,
+                model: "m".into(),
+                message: Some("model 'm' not found".into()),
+            })
+        );
+        // ...and none of these is an answer either.
+        for body in [
+            &br#"{"choices":[{"message":{"content":42}}]}"#[..],
+            br#"{"choices":[{"message":"hello"}]}"#,
+            br#"{"choices":{"0":{"message":{"content":"hi"}}}}"#,
+            br#"{"error":{"message":{"detail":"nested"}}}"#,
+        ] {
+            assert!(
+                matches!(
+                    parse_response(200, None, body, "m", "h"),
+                    Err(RewordError::Malformed(_))
+                ),
+                "{} must not be read as a rewrite",
+                String::from_utf8_lossy(body)
+            );
+        }
     }
 
     /// The shapes a half-configured local server and a reverse proxy
