@@ -27,7 +27,11 @@
 //! documentation describes. Every response field here is an `Option`,
 //! nothing is indexed, and there is no `unwrap`, `expect` or `panic!` on any
 //! value that arrived over the wire. The read is length-limited for the same
-//! reason.
+//! reason, and the one string that reaches a log line -- `error.message` --
+//! is cut to [`MESSAGE_CHARS`] and stripped of control characters before it
+//! gets there. Unbounded, a provider could write a 60 KB warning line, forge
+//! further `warning: reword:` lines inside it and run ANSI escapes at
+//! whoever reads `journalctl`.
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -77,6 +81,16 @@ const MAX_TOKENS: u32 = 256;
 /// far more than [`MAX_TOKENS`] of UTF-8 plus the envelope, and far more
 /// than any `error.message` worth reading.
 const BODY_LIMIT: u64 = 64 * 1024;
+
+/// How much of a provider's `error.message` may reach a log line.
+///
+/// §8 asks for "the reason and the first 80 characters", and this is the
+/// second half of that sentence. [`BODY_LIMIT`] bounds the *process*; this
+/// bounds the *journal*, which is a different budget with a different
+/// attacker: a message is quoted verbatim into a `warning: reword:` line, so
+/// unbounded it is a 64 KB log entry, and one containing a newline is a
+/// forged second warning line.
+const MESSAGE_CHARS: usize = 80;
 
 #[derive(Serialize)]
 struct ChatRequest<'a> {
@@ -166,6 +180,46 @@ pub fn build_request(cfg: &RewordConfig, key: Option<&str>, text: &str) -> Reque
     }
 }
 
+/// A provider's own words, cut to length and stripped of anything that can
+/// act on a terminal. `None` for a message that is absent or all whitespace.
+///
+/// **The byte came off a socket, so this is the boundary.** Sanitising here
+/// rather than at the `eprintln!` means there is one place to get it right
+/// and no way for a later caller to forget: past this function no
+/// `RewordError` carries a string a provider chose the length or the bytes
+/// of.
+///
+/// Two separate hazards, one function:
+///
+/// * **Length.** Measured on a hostile loopback server: a 60 000-character
+///   `error.message` survived whole into a single `warning:` line.
+/// * **Control characters.** JSON `\n` and `\u001b` survive `serde_json`
+///   into the `String`, because they are perfectly legal JSON. A newline
+///   forges an additional `warning: reword:` line in the journal -- a
+///   provider writing what looks like this daemon's own diagnostics -- and
+///   an ESC runs ANSI sequences at whoever is reading it. Both become
+///   U+FFFD, which is visible rather than silent: a mangled message tells
+///   the reader something was in there.
+///
+/// The ellipsis is not decoration. Without it a truncated message reads as
+/// the provider's complete sentence, and the user goes looking for a reason
+/// that was cut off.
+fn sanitise_message(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let head = sayd_core::reword::truncate_for_debug(raw, MESSAGE_CHARS);
+    let mut out: String = head
+        .chars()
+        .map(|c| if c.is_control() { '\u{fffd}' } else { c })
+        .collect();
+    if head.len() < raw.len() {
+        out.push('…');
+    }
+    Some(out)
+}
+
 /// Does `message` name `model`?
 ///
 /// A plain `contains` is the obvious spelling and is wrong: with a short
@@ -235,7 +289,8 @@ fn mentions_model(message: &str, model: &str) -> bool {
 ///   mitigation -- 500-for-a-missing-model and 200-with-an-error-body --
 ///   working.
 ///
-/// A message is used for its wording wherever one is present.
+/// A message is used for its wording wherever one is present, after
+/// [`sanitise_message`] has bounded it.
 pub fn parse_response(
     status: u16,
     retry_after: Option<&str>,
@@ -251,7 +306,7 @@ pub fn parse_response(
     let message = parsed
         .error
         .and_then(|e| e.message)
-        .filter(|m| !m.trim().is_empty());
+        .and_then(|m| sanitise_message(&m));
 
     // Unambiguous statuses first: the body may say what happened, never
     // which row it was.
@@ -657,6 +712,55 @@ mod tests {
             ),
             Err(RewordError::NoSuchModel { status: 400, .. })
         ));
+    }
+
+    /// **What a provider may write into the journal.** §8 asks for the
+    /// reason and the first 80 characters; unbounded, `error.message` is a
+    /// 60 KB warning line that can forge further `warning: reword:` lines
+    /// inside itself and run ANSI escapes at whoever reads it.
+    #[test]
+    fn a_providers_message_cannot_write_the_journal() {
+        let huge = serde_json::json!({ "error": { "message": "A".repeat(60_000) } }).to_string();
+        let Err(RewordError::Malformed(message)) =
+            parse_response(400, None, huge.as_bytes(), "m", "h")
+        else {
+            panic!("an error object is not an answer");
+        };
+        assert_eq!(
+            message.chars().count(),
+            MESSAGE_CHARS + 1,
+            "80 characters, and the ellipsis that says there was more: {message}"
+        );
+
+        // Both of these are perfectly legal JSON strings, and both survive
+        // `serde_json` into the `String` as the bytes they name.
+        let hostile = serde_json::json!({
+            "error": {
+                "message": "down\nwarning: reword: your API key was revoked\u{1b}[2J\rgone"
+            }
+        })
+        .to_string();
+        let Err(RewordError::Malformed(message)) =
+            parse_response(500, None, hostile.as_bytes(), "m", "h")
+        else {
+            panic!("an error object is not an answer");
+        };
+        assert!(
+            !message.chars().any(char::is_control),
+            "no newline may forge a second log line and no escape may reach a \
+             terminal: {message:?}"
+        );
+        assert!(
+            message.contains("your API key was revoked"),
+            "the words still reach the user, which is the whole point: {message:?}"
+        );
+
+        // A message that fits is passed through exactly, ellipsis and all
+        // -- the cap must not become a tax on every ordinary reason.
+        assert_eq!(
+            parse_response(500, None, br#"{"error":{"message":"  boom  "}}"#, "m", "h"),
+            Err(RewordError::Malformed("boom".into()))
+        );
     }
 
     /// The shapes a half-configured local server and a reverse proxy
