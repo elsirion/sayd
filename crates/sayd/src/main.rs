@@ -123,6 +123,39 @@ const FANOUT_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 /// a local session-bus round trip.
 const FORWARD_CALL_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// How long the publish loop waits for [`read_notifications_enabled`]'s
+/// `spawn_blocking` hop -- reading `ConfigStore::current()` -- before giving
+/// up on it for this tick.
+///
+/// CRITICAL 1: `current()` takes `config_watch::ConfigStore`'s
+/// `last_written` lock, the same `std::sync::Mutex` `write_locked` holds
+/// across `Config::save_to`'s synchronous, unbounded disk write (its own
+/// doc comment: "unbounded on a hung NFS or FUSE home") -- and every
+/// settings-window save, tray mute and MPRIS rate change reaches
+/// `write_locked`. Calling `current()` directly in this arm -- no
+/// `.await`, no `spawn_blocking` -- used to mean a write stuck on such a
+/// filesystem blocked this entire `select!` loop, `sigterm.recv()`
+/// included: measured, with a `set_muted` parked on a FIFO nobody reads (the
+/// same technique `config_watch.rs`'s `a_mute_takes_effect_even_while_the_
+/// write_is_stuck` uses), a concurrent `current()` did not return within
+/// 500ms. That is the exact failure class `FANOUT_TIMEOUT`'s doc comment
+/// above records at 60.6s of ignored SIGTERM -- an unbounded wait inside
+/// this one `tokio::select!`, which cannot preempt a branch once chosen, so
+/// the shutdown arms get no turn until the arm currently running gives
+/// control back.
+///
+/// The fix moves the read onto `spawn_blocking` (as
+/// `config_watch::persist_in_background` already does for this same
+/// struct) and bounds the `.await` on its `JoinHandle` with this timeout --
+/// the `.await` is what this loop can give up on and still hand control
+/// back to `select!`; the blocking-pool thread itself stays parked on the
+/// mutex for as long as the write takes, same as before, it just no longer
+/// holds this loop hostage while it waits. 250ms matches `sayd-core`'s
+/// `CONFIG_REPLY_TIMEOUT`, the bound on `EngineHandle::config()` -- the
+/// alternative this call was chosen over specifically for being cheaper --
+/// so this path is now no *less* responsive than the one it beat.
+const CONFIG_STAMP_READ_TIMEOUT: Duration = Duration::from_millis(250);
+
 /// `AudioSink` for `SAYD_NO_AUDIO`: accepts and immediately discards every
 /// sample, reporting nothing ever pending.
 ///
@@ -172,12 +205,32 @@ impl AudioSink for DiscardSink {
     }
 }
 
+/// How long `NotifyMonitorSupervisor::reconcile` waits after noticing the
+/// monitor task ended on its own before it will spawn a fresh one.
+///
+/// IMPORTANT 2: `notify::monitor::run` returns on its own only when the bus
+/// permanently refuses `become_monitor` -- a policy decision that will not
+/// change between one 200ms publish tick and the next (see `run`'s doc
+/// comment). Restarting on every tick with no backoff at all would repeat
+/// that same refused call five times a second, forever, for a verdict `run`
+/// already logged once. This is not as short as `RECOVERY_RETRY_INTERVAL`
+/// (2s -- audio devices routinely recover within seconds, so retrying
+/// promptly is worth it) because a bus policy refusal has no comparable
+/// "it'll probably clear itself" case; it is not permanent-and-silent
+/// either, so that *if* `run` ever ends for some other, genuinely transient
+/// reason, the daemon notices and retries within a bounded time rather than
+/// needing `enabled` toggled off and on by hand. Same duration and same
+/// reasoning as `FANOUT_RETRY_INTERVAL`, which backs off a different stuck
+/// consumer for the same "bounded noise, not a hot loop" reason.
+const NOTIFY_RESTART_BACKOFF: Duration = Duration::from_secs(5);
+
 /// Starts and stops the notification monitor (`notify::monitor::run`) to
 /// track `notifications.enabled` -- the one thing under `[notifications]`
 /// that actually needs a restart. `run` itself re-reads `allow`,
 /// `cooldown_secs`, `speak_app_name` and `speak_body` off its own
 /// one-second tick (see its doc comment), so this supervisor's whole job is
-/// the on/off switch.
+/// the on/off switch -- plus, since IMPORTANT 2, noticing when the task it
+/// started has ended without being asked to.
 ///
 /// A small struct beside the publish loop, not two more locals folded into
 /// it (a `JoinHandle` and a "was it enabled last tick" bool): `run_daemon`
@@ -190,15 +243,26 @@ impl AudioSink for DiscardSink {
 /// or did not get spawned.
 struct NotifyMonitorSupervisor {
     /// `Some` exactly while the monitor task is (or was, until the next
-    /// reconcile notices a drop) running. Doubles as "what was enabled last
-    /// tick" -- `reconcile` needs no separate bool for that, since the two
-    /// facts are the same fact.
+    /// `reconcile` notices it has ended -- deliberately stopped or not)
+    /// running. Doubles as "what was enabled last tick" -- `reconcile`
+    /// needs no separate bool for that, since the two facts are the same
+    /// fact.
     handle: Option<tokio::task::JoinHandle<()>>,
+    /// Earliest time `reconcile` may spawn a fresh task after noticing the
+    /// previous one ended on its own. See [`NOTIFY_RESTART_BACKOFF`].
+    /// `Instant::now()` at construction and after every deliberate stop, so
+    /// neither the first start nor a normal re-enable after `enabled` went
+    /// false is ever delayed by this -- it only ever pushes forward when
+    /// `reconcile` finds a *finished* handle, never when it finds `None`.
+    next_restart_attempt: Instant,
 }
 
 impl NotifyMonitorSupervisor {
     fn new() -> Self {
-        Self { handle: None }
+        Self {
+            handle: None,
+            next_restart_attempt: Instant::now(),
+        }
     }
 
     /// Start or stop the monitor task to match `enabled`. Called every
@@ -218,10 +282,41 @@ impl NotifyMonitorSupervisor {
     /// rather than engineered around; there is no cheap way to make a
     /// blocking-pool call cancellable, and the window is one utterance, not
     /// a standing leak.
+    ///
+    /// IMPORTANT 2: checked first, before the `(enabled, handle)` match
+    /// below, so both of that match's arms see an accurate `self.handle`.
+    /// Without this, `(true, Some(_))` read "already running" unconditionally
+    /// -- true the instant a task is spawned, but never re-checked after --
+    /// so a task that ended on its own (the documented trigger is a
+    /// permanently refused `become_monitor`; see `run`'s doc comment) left
+    /// `self.handle` pointing at a dead task forever, and narration stayed
+    /// dead until something toggled `enabled` off and on by hand to force a
+    /// fresh spawn. `is_finished()` catches that for *any* reason `run`
+    /// might end, not just the one currently documented.
     fn reconcile(&mut self, enabled: bool, engine: &EngineHandle) {
+        if self.handle.as_ref().is_some_and(|h| h.is_finished()) {
+            eprintln!(
+                "warning: the notification monitor task ended; it will be \
+                 restarted in up to {:.0}s if notifications are still \
+                 enabled",
+                NOTIFY_RESTART_BACKOFF.as_secs_f64()
+            );
+            self.handle = None;
+            self.next_restart_attempt = Instant::now() + NOTIFY_RESTART_BACKOFF;
+        }
+
         match (enabled, &self.handle) {
             (true, None) => {
-                self.handle = Some(tokio::spawn(notify::monitor::run(engine.clone())));
+                // Not just "no handle" but "no handle, and not backing off
+                // after the last one ended on its own" -- see
+                // `NOTIFY_RESTART_BACKOFF`. On every ordinary path into this
+                // arm (first start; re-enabling after a deliberate stop)
+                // `next_restart_attempt` is already in the past (set in
+                // `new()` and reset by the `(false, Some(_))` arm below), so
+                // this check costs nothing there.
+                if Instant::now() >= self.next_restart_attempt {
+                    self.handle = Some(tokio::spawn(notify::monitor::run(engine.clone())));
+                }
             }
             (false, Some(_)) => {
                 // `.take()` before `.abort()`: `handle` must read `None` the
@@ -233,11 +328,46 @@ impl NotifyMonitorSupervisor {
                 if let Some(handle) = self.handle.take() {
                     handle.abort();
                 }
+                // A deliberate stop, not the task ending on its own -- the
+                // next `(true, None)` this sees (immediately, if `enabled`
+                // flips straight back) must start it right away, not
+                // inherit a backoff left over from some earlier, unrelated
+                // self-ended task.
+                self.next_restart_attempt = Instant::now();
             }
-            // Already matches: (true, Some(_)) is already running,
-            // (false, None) is already stopped.
+            // Already matches: (true, Some(_)) is already running (and just
+            // confirmed alive, above), (false, None) is already stopped.
             _ => {}
         }
+    }
+}
+
+/// `store.current().notifications.enabled`, bounded by
+/// [`CONFIG_STAMP_READ_TIMEOUT`] so a stuck concurrent write cannot stall
+/// whoever awaits this. See `CONFIG_STAMP_READ_TIMEOUT`'s doc comment for
+/// the failure this exists to avoid (CRITICAL 1) and the measurement behind
+/// it.
+///
+/// Returns `None` on timeout or on a `spawn_blocking` join failure (the
+/// latter should not happen -- `ConfigStore::current` is poison-tolerant,
+/// see its doc comment -- but is handled the same way rather than
+/// unwrapped). Either way the caller is expected to skip whatever it meant
+/// to do with the value for this tick and try again on the next one, not to
+/// block waiting: giving up on the `.await` does not cancel the
+/// `spawn_blocking` task itself, which stays parked on the mutex for as
+/// long as the write does and simply finishes unobserved.
+async fn read_notifications_enabled(
+    store: &std::sync::Arc<config_watch::ConfigStore>,
+) -> Option<bool> {
+    let store = store.clone();
+    match tokio::time::timeout(
+        CONFIG_STAMP_READ_TIMEOUT,
+        tokio::task::spawn_blocking(move || store.current().notifications.enabled),
+    )
+    .await
+    {
+        Ok(Ok(enabled)) => Some(enabled),
+        Ok(Err(_)) | Err(_) => None,
     }
 }
 
@@ -644,6 +774,12 @@ async fn run_daemon() -> std::process::ExitCode {
     // stopped from `notifications.enabled` on every tick below. See
     // `NotifyMonitorSupervisor::reconcile`'s doc comment.
     let mut notify_supervisor = NotifyMonitorSupervisor::new();
+    // CRITICAL 1: log-once for a standing stall in `read_notifications_
+    // enabled`, the same shape as `recovery_failure_logged` below -- the
+    // first tick that cannot read the config store within
+    // `CONFIG_STAMP_READ_TIMEOUT` is worth a line, the fifth one 200ms later
+    // (while the same write is presumably still stuck) is not.
+    let mut notify_config_read_stalled = false;
     let mut ticker = tokio::time::interval(PUBLISH_INTERVAL);
     let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
     {
@@ -661,18 +797,50 @@ async fn run_daemon() -> std::process::ExitCode {
                 let now_instant = Instant::now();
 
                 // M5 Task 5: start/stop the notification monitor with
-                // `notifications.enabled`. `store.current()` is a plain
-                // mutex read, not a round trip through the engine thread
-                // (contrast `EngineHandle::config`, a bounded channel call) --
-                // it is safe to take on every 200ms tick because every
-                // config mutation in this daemon (a settings-window save, a
-                // hand edit picked up by `reload`, a tray mute, an MPRIS
-                // rate change) goes through `ConfigStore::write_locked`,
-                // which stamps it here *and* sends the engine's own
-                // `ApplyConfig` in the same critical section -- so this can
-                // never observe a config the engine itself has not also
-                // been told about. See `ConfigStore::current`'s doc comment.
-                notify_supervisor.reconcile(store.current().notifications.enabled, &engine);
+                // `notifications.enabled`. `ConfigStore::current()` is a
+                // plain mutex read, not a round trip through the engine
+                // thread (contrast `EngineHandle::config`, a bounded channel
+                // call), and its value is provably always in sync with what
+                // the engine is running: every config mutation in this
+                // daemon (a settings-window save, a hand edit picked up by
+                // `reload`, a tray mute, an MPRIS rate change) goes through
+                // `ConfigStore::write_locked`, which stamps it here *and*
+                // sends the engine's own `ApplyConfig` in the same critical
+                // section -- so this can never observe a config the engine
+                // itself has not also been told about. See
+                // `ConfigStore::current`'s doc comment.
+                //
+                // CRITICAL 1: that same mutex is held by `write_locked`
+                // across a synchronous, unbounded disk write, so the read
+                // goes through `read_notifications_enabled` -- `spawn_
+                // blocking` plus a bound on the `.await` -- rather than
+                // being taken directly here, or a write stuck on a hung
+                // filesystem would stall this whole `select!` loop,
+                // `sigterm.recv()` included. See `CONFIG_STAMP_READ_
+                // TIMEOUT`'s doc comment for the measurement.
+                match read_notifications_enabled(&store).await {
+                    Some(enabled) => {
+                        notify_config_read_stalled = false;
+                        notify_supervisor.reconcile(enabled, &engine);
+                    }
+                    None => {
+                        // Skip this tick's reconcile entirely rather than
+                        // fall back to a stale or default value:
+                        // `notify_supervisor` simply keeps doing whatever it
+                        // was last told, exactly as it would if this whole
+                        // tick had not fired.
+                        if !notify_config_read_stalled {
+                            eprintln!(
+                                "warning: reading the config store took longer \
+                                 than {:.0}ms (a write may be stuck); the \
+                                 notification monitor will not be reconciled \
+                                 until it responds again",
+                                CONFIG_STAMP_READ_TIMEOUT.as_millis()
+                            );
+                            notify_config_read_stalled = true;
+                        }
+                    }
+                }
 
                 // Finding 3: bounded `RemainingSeconds` publishing. "Active"
                 // means it is actually counting down -- `Speaking` with
@@ -904,6 +1072,19 @@ async fn run_daemon() -> std::process::ExitCode {
     }
 
     eprintln!("sayd: shutting down");
+    // MINOR 3: explicit, like every other step in this teardown sequence,
+    // rather than relying on the monitor task simply ending when the tokio
+    // runtime drops at process exit. That implicit path is not currently a
+    // leak or a hang -- traced through tokio's runtime shutdown -- but
+    // leaving it implicit is inconsistent with `settings::flush_pending()`
+    // and `engine.shutdown()` right below, both spelled out on purpose, and
+    // would silently stop being safe if this function's shutdown strategy
+    // ever changed. `reconcile(false, ...)` is `NotifyMonitorSupervisor`'s
+    // own, already-tested way of stopping the task (see its doc comment for
+    // why a plain `abort` loses nothing here) -- reused rather than reaching
+    // into `handle` by hand, so shutdown takes exactly the path
+    // `toggling_enabled_starts_and_stops_the_monitor` already exercises.
+    notify_supervisor.reconcile(false, &engine);
     // Before the engine goes away: a settings edit made in the last 250ms
     // (`settings::model::WRITE_DEBOUNCE`) can still be sitting on the
     // writer thread's queue, shown to the user as saved, and this model is
@@ -1124,6 +1305,144 @@ mod tests {
         assert!(
             abort_handle.is_finished(),
             "the monitor task must actually stop once disabled, not just lose its handle"
+        );
+
+        engine.shutdown();
+    }
+
+    /// CRITICAL 1: the reviewer's probe, reproduced directly against
+    /// `read_notifications_enabled` rather than the whole publish loop --
+    /// there is no way to drive the loop's `tokio::select!` from a unit
+    /// test without a real bus connection, a real engine and a real tray,
+    /// but the thing that actually blocked it (`ConfigStore::current()`
+    /// behind a stuck write) is exercised exactly the way `config_watch.rs`'s
+    /// `a_mute_takes_effect_even_while_the_write_is_stuck` reproduces
+    /// "stuck": a named pipe at the write's temp-file path blocks
+    /// `Config::save_to`'s `std::fs::write` forever, with the stamp's lock
+    /// held across it the whole time (see `ConfigStore::update`'s doc
+    /// comment).
+    #[tokio::test]
+    async fn a_stuck_write_does_not_delay_reading_notifications_enabled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let tmp = path.with_extension("toml.tmp");
+        let tmp_c = std::ffi::CString::new(tmp.to_str().expect("utf8 path")).expect("no NUL");
+        assert_eq!(
+            unsafe { libc::mkfifo(tmp_c.as_ptr(), 0o600) },
+            0,
+            "mkfifo failed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        let engine = test_engine();
+        let store = std::sync::Arc::new(config_watch::ConfigStore::new(
+            path.clone(),
+            engine.clone(),
+            Config::default(),
+        ));
+
+        // `set_muted` blocks inside `save_to`'s `std::fs::write` to the
+        // FIFO, holding the stamp's lock the whole time. It stays stuck
+        // until this test drains the pipe at the end -- which it must:
+        // dropping a tokio runtime waits for in-flight `spawn_blocking`
+        // tasks, and the one `read_notifications_enabled` leaves parked on
+        // that same lock is exactly such a task. Leaving the write stuck
+        // hangs the whole test binary at teardown rather than failing it.
+        let writer = store.clone();
+        let writer_thread = std::thread::spawn(move || {
+            let _ = writer.set_muted(true);
+        });
+        // Give the writer thread a moment to actually reach the stuck write
+        // and take the stamp's lock, so the read below contends with it
+        // instead of racing to go first.
+        std::thread::sleep(Duration::from_millis(50));
+
+        let started = tokio::time::Instant::now();
+        let result = read_notifications_enabled(&store).await;
+        let elapsed = started.elapsed();
+
+        // The bound this actually proves: whatever awaits `read_
+        // notifications_enabled` (the publish loop's `ticker.tick()` arm)
+        // is capped at `CONFIG_STAMP_READ_TIMEOUT`, not at however long the
+        // write takes -- which here is "forever." The margin over the
+        // timeout absorbs scheduling jitter without weakening what is being
+        // checked: this used to not return within 500ms at all.
+        assert!(
+            elapsed < CONFIG_STAMP_READ_TIMEOUT + Duration::from_millis(750),
+            "reading the config store while a write was stuck took {elapsed:?}; \
+             the publish loop's tokio::select! (and SIGTERM handling with it) \
+             would have been blocked for at least that long"
+        );
+        assert_eq!(
+            result, None,
+            "a read that could not complete within the bound must report \
+             that rather than silently returning stale or default data"
+        );
+
+        // Unstick the write now that the measurement is taken: opening the
+        // read end lets `save_to`'s `write` complete, which releases the
+        // stamp's lock, which lets the blocking-pool task the timed-out
+        // `.await` abandoned finish. Without this the runtime's own drop
+        // waits on that task forever.
+        let _ = std::fs::read(&tmp);
+        writer_thread.join().expect("writer thread does not panic");
+
+        engine.shutdown();
+    }
+
+    /// IMPORTANT 2: a monitor task that ends on its own (the documented
+    /// trigger is a permanently refused `become_monitor`; see
+    /// `notify::monitor::run`'s doc comment) must be noticed rather than
+    /// mistaken for "still running" forever, and noticing it must not turn
+    /// into a hot restart loop against a refusal that will not change from
+    /// one tick to the next.
+    #[tokio::test]
+    async fn a_task_that_ends_on_its_own_is_noticed_and_not_hot_restarted() {
+        let engine = test_engine();
+        let mut sup = NotifyMonitorSupervisor::new();
+
+        // Stand in for `run` ending on its own with a task that finishes
+        // immediately: what `reconcile` has to notice is "the handle it
+        // holds has finished", true of any ended task, not something only
+        // the real monitor can produce -- and the real one needs a session
+        // bus to refuse `become_monitor` against, which this test has no
+        // business standing up just to prove this.
+        sup.handle = Some(tokio::spawn(async {}));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !sup.handle.as_ref().expect("just set").is_finished()
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            sup.handle.as_ref().expect("just set").is_finished(),
+            "setup: the stand-in task must actually have finished"
+        );
+
+        sup.reconcile(true, &engine);
+        assert!(
+            sup.handle.is_none(),
+            "a finished task must be noticed and cleared, not held onto \
+             forever as if it were still running"
+        );
+
+        // Immediately afterward, `enabled = true` must not restart it --
+        // doing so on every tick would make a standing policy refusal a hot
+        // loop, re-spawning (and, for the real monitor, re-attempting
+        // `become_monitor`) five times a second forever.
+        sup.reconcile(true, &engine);
+        assert!(
+            sup.handle.is_none(),
+            "a restart must wait out NOTIFY_RESTART_BACKOFF, not fire on \
+             the very next tick"
+        );
+
+        // Once the backoff has elapsed, the next tick does restart it.
+        tokio::time::sleep(NOTIFY_RESTART_BACKOFF + Duration::from_millis(200)).await;
+        sup.reconcile(true, &engine);
+        assert!(
+            sup.handle.is_some(),
+            "once the backoff has elapsed, enabled = true must restart the monitor"
         );
 
         engine.shutdown();
