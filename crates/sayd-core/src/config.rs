@@ -216,7 +216,16 @@ pub struct Config {
     pub cleanup: CleanupConfig,
     pub chunking: ChunkConfig,
     pub notifications: NotificationConfig,
-    pub reword: RewordConfig,
+    /// Boxed because `RewordConfig` pushed `Command::ApplyConfig(Config)`
+    /// over clippy's `large_enum_variant` threshold, and `Config` grows by
+    /// one nested table every settings-window milestone -- boxing here,
+    /// inside `Config`, contains that growth to the field that keeps
+    /// causing it, rather than an `#[allow]` on the whole `Command` enum
+    /// that would also let `Command::Say`, the actually hot variant, grow
+    /// unnoticed. `Box<T>` derefs transparently for field reads and writes,
+    /// so this has no effect on any call site outside this file, and serde
+    /// serialises/deserialises it exactly as it would the bare struct.
+    pub reword: Box<RewordConfig>,
 }
 
 impl Default for Config {
@@ -233,7 +242,7 @@ impl Default for Config {
             cleanup: CleanupConfig::default(),
             chunking: ChunkConfig::default(),
             notifications: NotificationConfig::default(),
-            reword: RewordConfig::default(),
+            reword: Box::new(RewordConfig::default()),
         }
     }
 }
@@ -495,6 +504,12 @@ mod tests {
         c.reword.enabled = true;
         c.reword.base_url = "https://api.ppq.ai/v1".into();
         c.reword.model = "gpt-4o-mini".into();
+        // The key fields are the ones this table is most sensitive about --
+        // a silently dropped or mangled key would be the "miserable to
+        // debug" failure the design worries about, so both must round-trip
+        // too, not just be present when checking the file's mode.
+        c.reword.api_key = "sk-secret".into();
+        c.reword.api_key_env = "MY_CUSTOM_ENV".into();
         c.reword.timeout_ms = 2000;
         c.reword.max_chars = 300;
         let dir = tempfile::tempdir().expect("tempdir");
@@ -528,10 +543,26 @@ mod tests {
         );
 
         // And a config with no key is left to the umask, unchanged from
-        // every release before this one.
+        // every release before this one -- proven by parity with a plain
+        // `std::fs::write` in the same directory, rather than hard-coding
+        // an assumption about what the umask actually is.
         let q = dir.path().join("nokey.toml");
         Config::default().save_to(&q).expect("save");
-        assert!(std::fs::metadata(&q).is_ok());
+        let sibling = dir.path().join("sibling.txt");
+        std::fs::write(&sibling, "unrelated").expect("write");
+        let q_mode = std::fs::metadata(&q)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        let sibling_mode = std::fs::metadata(&sibling)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(
+            q_mode & 0o777,
+            sibling_mode & 0o777,
+            "a config with no api key must be left to the umask, like any other file"
+        );
     }
 
     /// The environment wins over the file, and an unset or empty variable
