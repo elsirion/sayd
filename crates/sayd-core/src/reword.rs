@@ -228,6 +228,17 @@ pub fn is_loopback(host: &str) -> bool {
             .is_some_and(|rest| rest.split('.').count() == 3)
 }
 
+/// The first `max_chars` characters, on a `char` boundary, for a log line.
+///
+/// Plain byte slicing can land inside a multi-byte UTF-8 sequence and
+/// panic, and this is applied to model output.
+pub fn truncate_for_debug(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((byte_idx, _)) => &s[..byte_idx],
+        None => s,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -423,6 +434,24 @@ mod tests {
                 "{bad:?} must not parse as an endpoint"
             );
         }
+    }
+
+    /// The debug snippet is cut on a `char` boundary, because what it is cut
+    /// out of is a model's output: a byte slice through the middle of a
+    /// multi-byte sequence would panic on the one path whose whole job is to
+    /// survive whatever came back.
+    #[test]
+    fn a_debug_snippet_is_cut_on_a_char_boundary() {
+        assert_eq!(truncate_for_debug("hello", 80), "hello");
+        assert_eq!(truncate_for_debug("hello", 2), "he");
+        assert_eq!(truncate_for_debug("", 4), "");
+        assert_eq!(truncate_for_debug("hello", 0), "");
+        // Four bytes per emoji: cutting at 2 *characters* must not cut at
+        // byte 2.
+        assert_eq!(truncate_for_debug("🙂🙂🙂", 2), "🙂🙂");
+        // Combining marks are separate `char`s; this is a length limit for a
+        // log line, not a grapheme count, and it must not panic either way.
+        assert_eq!(truncate_for_debug("é\u{0301}xyz", 2), "é\u{0301}");
     }
 
     /// Plain HTTP to a *non-loopback* host is allowed but warned about; to
