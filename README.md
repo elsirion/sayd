@@ -255,22 +255,55 @@ not assumed.
 ### Finding names: the on-ramp
 
 Turning `enabled` on is not enough by itself. With an empty `allow` list,
-`sayd` speaks nothing at all -- instead, it logs the `app_name` of every
-notification it declines to speak, once per distinct name per run:
+`sayd` speaks nothing at all -- it needs to be told each application's
+`app_name`, and there are two ways to find those.
+
+**The easy way** is the settings window (Settings… from the tray, see
+[Settings](#settings) above). Below the **Applications to announce** list
+itself, two suggestion groups offer names to add with one click:
+
+- **Seen notifying** -- every application `sayd` has actually watched call
+  `Notify` this run, most recent first, each shown with the icon that
+  application itself sent. A row here is exactly right: it is the name the
+  application really passed on this machine, not a guess, so adding it is
+  certain to match. It appears only after that application has notified at
+  least once -- there is nothing to show before that.
+- **Common applications** -- a short built-in list, offered so there is
+  something to click before anything has notified. Unlike a seen entry,
+  each one is `sayd`'s guess at what the application calls itself as
+  `app_name`. Matching is exact and case-insensitive (no globs, no regex --
+  see below), so a wrong guess does not partially work -- it silently
+  matches nothing, and the row you just added announces nothing. If that
+  happens, the log-based fallback below still has the real name.
+
+Either group disappears when it has nothing to offer -- all curated names
+already allowed, say, or nothing seen yet.
+
+The icons in both groups come from the notification itself (`app_icon`),
+never from a lookup `sayd` does on its own: what you see is what the
+application supplied. On a sparse icon theme, many rows -- especially in
+Common applications, where nothing has actually run yet to confirm the icon
+name is even installed -- fall back to a generic placeholder instead; that
+just means the theme has nothing by that name, not that anything is wrong.
+
+**Without the window**, or for anything Common applications missed, `sayd`
+also logs the `app_name` of every notification it declines to speak, once
+per distinct name per run:
 
     info: notification from "Signal" (not in notifications.allow; add it to
     speak these)
 
-That log line *is* the discovery workflow: enable notifications, watch
-`sayd`'s log (or run it in a terminal) while you go about your day, and copy
-each name you want spoken into `notifications.allow`. Each name is logged
-once, not once per notification, so a chat application does not turn the log
-into the flood the allowlist exists to prevent in the first place.
+That log line is the fallback discovery workflow: enable notifications,
+watch `sayd`'s log (or run it in a terminal) while you go about your day,
+and copy each name you want spoken into `notifications.allow`. Each name is
+logged once, not once per notification, so a chat application does not turn
+the log into the flood the allowlist exists to prevent in the first place.
 
 The allowlist matches `app_name` exactly, case-insensitively -- no globs, no
 regex. `app_name` is whatever the application passed to `Notify`, which is
-also what ends up in the discovery log and in the spoken announcement's
-prefix, so all three always agree on the name.
+also what ends up in the discovery log, in the settings window's Seen
+notifying group, and in the spoken announcement's prefix, so all four
+always agree on the name.
 
 ### Config
 
@@ -595,6 +628,14 @@ Walk this yourself once, after installing, with `notify-send` available
 7. Turn **Speak notifications** off again and run
    `notify-send -a "Test App" "hello"` once more -- the popup still
    appears, but `sayd` stays silent.
+8. Send one notification from an application that is *not* on the
+   allowlist yet -- `notify-send -a "Another App" "hi"` works, or use
+   whatever step 3 declined. Open **Settings…** -- **Another App** should
+   now appear as a row under **Seen notifying**, with the icon that
+   `notify-send` call carried (or the fallback glyph, if your icon theme
+   has nothing by that name -- see [Notifications](#notifications) above).
+   Click its **Add** button -- the row should move out of Seen notifying
+   and appear as a new row under **Applications to announce** instead.
 
 ## Troubleshooting
 
