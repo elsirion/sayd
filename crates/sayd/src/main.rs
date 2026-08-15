@@ -255,6 +255,21 @@ struct NotifyMonitorSupervisor {
     /// false is ever delayed by this -- it only ever pushes forward when
     /// `reconcile` finds a *finished* handle, never when it finds `None`.
     next_restart_attempt: Instant,
+    /// Set by the spawned task itself when `notify::monitor::run` handed back
+    /// [`notify::monitor::Outcome::Refused`], and read by `reconcile` when it
+    /// notices that task has ended.
+    ///
+    /// A shared flag rather than the task's own return value because
+    /// `reconcile` is deliberately synchronous -- `a_disabled_monitor_is_
+    /// never_started` is a plain `#[test]` precisely so that a `tokio::spawn`
+    /// on the `enabled = false` path would panic rather than pass quietly --
+    /// and reading a `JoinHandle`'s output needs an `.await`. Reset
+    /// immediately before every spawn, so it always describes the task
+    /// currently held.
+    refused: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Latched once a refusal has been observed: no further spawns at all
+    /// until `enabled` goes false and back. See `reconcile`.
+    refusal_latched: bool,
 }
 
 impl NotifyMonitorSupervisor {
@@ -262,7 +277,27 @@ impl NotifyMonitorSupervisor {
         Self {
             handle: None,
             next_restart_attempt: Instant::now(),
+            refused: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            refusal_latched: false,
         }
+    }
+
+    /// Spawn the monitor, wiring `run`'s outcome back to [`Self::refused`].
+    ///
+    /// The wrapper task is what turns a value `run` returns into something
+    /// the synchronous `reconcile` can read; it does nothing else, and
+    /// aborting it aborts `run` with it (the inner future is being polled
+    /// inside this task, so cancelling the task drops it).
+    fn spawn(&mut self, engine: &EngineHandle) {
+        self.refused
+            .store(false, std::sync::atomic::Ordering::Release);
+        let flag = self.refused.clone();
+        let engine = engine.clone();
+        self.handle = Some(tokio::spawn(async move {
+            if notify::monitor::run(engine).await == notify::monitor::Outcome::Refused {
+                flag.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }));
     }
 
     /// Start or stop the monitor task to match `enabled`. Called every
@@ -283,30 +318,66 @@ impl NotifyMonitorSupervisor {
     /// blocking-pool call cancellable, and the window is one utterance, not
     /// a standing leak.
     ///
-    /// IMPORTANT 2: checked first, before the `(enabled, handle)` match
-    /// below, so both of that match's arms see an accurate `self.handle`.
-    /// Without this, `(true, Some(_))` read "already running" unconditionally
-    /// -- true the instant a task is spawned, but never re-checked after --
-    /// so a task that ended on its own (the documented trigger is a
-    /// permanently refused `become_monitor`; see `run`'s doc comment) left
+    /// IMPORTANT 2: an ended task is checked first, before the
+    /// `(enabled, handle)` match below, so both of that match's arms see an
+    /// accurate `self.handle`. Without this, `(true, Some(_))` read "already
+    /// running" unconditionally -- true the instant a task is spawned, but
+    /// never re-checked after -- so a task that ended on its own left
     /// `self.handle` pointing at a dead task forever, and narration stayed
-    /// dead until something toggled `enabled` off and on by hand to force a
-    /// fresh spawn. `is_finished()` catches that for *any* reason `run`
-    /// might end, not just the one currently documented.
+    /// dead until something toggled `enabled` off and on by hand.
+    ///
+    /// IMPORTANT 3: *why* it ended decides what happens next, and the two
+    /// answers are opposites. `notify::monitor::run` returns `Refused` only
+    /// for a bus policy that forbids `BecomeMonitor` -- §2's failure table:
+    /// "log once with the reason, run without narration" -- a verdict that
+    /// cannot change while the daemon runs. Restarting into it on a timer
+    /// asks the same question forever: measured against a bus denying
+    /// `org.freedesktop.DBus.Monitoring`, a 5s backoff produced 37 log lines
+    /// in 90 seconds, alternating the restart warning and the full
+    /// `AccessDenied` reason, each from a fresh connection and auth
+    /// handshake with a new unique bus name -- about 35,000 journal lines and
+    /// 17,000 refused calls a day, for a `log once` row in the spec. So a
+    /// refusal latches: no further spawn until `enabled` goes false and back,
+    /// which is the one event that can plausibly accompany a changed bus
+    /// policy (and is what a user who has fixed the policy will do anyway).
+    /// Anything *else* ending the task keeps IMPORTANT 2's behaviour --
+    /// noticed, logged, restarted after `NOTIFY_RESTART_BACKOFF`.
     fn reconcile(&mut self, enabled: bool, engine: &EngineHandle) {
+        // Checked before anything else: this is the one event that clears a
+        // latched refusal, and it has to clear it whatever state the handle
+        // is in -- a latched supervisor holds no handle at all, so the
+        // `(false, Some(_))` arm below never runs for it.
+        if !enabled {
+            self.refusal_latched = false;
+        }
+
         if self.handle.as_ref().is_some_and(|h| h.is_finished()) {
-            eprintln!(
-                "warning: the notification monitor task ended; it will be \
-                 restarted in up to {:.0}s if notifications are still \
-                 enabled",
-                NOTIFY_RESTART_BACKOFF.as_secs_f64()
-            );
             self.handle = None;
-            self.next_restart_attempt = Instant::now() + NOTIFY_RESTART_BACKOFF;
+            let outcome = if self.refused.load(std::sync::atomic::Ordering::Acquire) {
+                notify::monitor::Outcome::Refused
+            } else {
+                notify::monitor::Outcome::Ended
+            };
+            match outcome {
+                // Deliberately silent: `run` has already printed the bus's
+                // own reason, once, including what to do about it. A second
+                // line here would be this supervisor's own contribution to
+                // the flood the latch exists to stop.
+                notify::monitor::Outcome::Refused => self.refusal_latched = true,
+                notify::monitor::Outcome::Ended => {
+                    eprintln!(
+                        "warning: the notification monitor task ended; it will be \
+                         restarted in up to {:.0}s if notifications are still \
+                         enabled",
+                        NOTIFY_RESTART_BACKOFF.as_secs_f64()
+                    );
+                    self.next_restart_attempt = Instant::now() + NOTIFY_RESTART_BACKOFF;
+                }
+            }
         }
 
         match (enabled, &self.handle) {
-            (true, None) => {
+            (true, None) if !self.refusal_latched => {
                 // Not just "no handle" but "no handle, and not backing off
                 // after the last one ended on its own" -- see
                 // `NOTIFY_RESTART_BACKOFF`. On every ordinary path into this
@@ -315,7 +386,7 @@ impl NotifyMonitorSupervisor {
                 // `new()` and reset by the `(false, Some(_))` arm below), so
                 // this check costs nothing there.
                 if Instant::now() >= self.next_restart_attempt {
-                    self.handle = Some(tokio::spawn(notify::monitor::run(engine.clone())));
+                    self.spawn(engine);
                 }
             }
             (false, Some(_)) => {
@@ -1675,6 +1746,76 @@ mod tests {
             "once the backoff has elapsed, enabled = true must restart the monitor"
         );
 
+        engine.shutdown();
+    }
+
+    /// IMPORTANT 3: a task that ended because the bus *refused* monitoring is
+    /// the one case that must never be restarted on a timer. §2's failure
+    /// table says "log once with the reason, run without narration"; the
+    /// backoff-restart above turned that into a fresh connection, auth
+    /// handshake and refused `BecomeMonitor` every 5s for the life of the
+    /// process -- measured, 37 log lines in 90 seconds, each with a new
+    /// unique bus name, for a verdict that cannot change.
+    ///
+    /// The refusal is staged the way the real task reports it (the flag
+    /// `NotifyMonitorSupervisor::spawn`'s wrapper sets from
+    /// `Outcome::Refused`) rather than by standing up a deny-policy
+    /// `dbus-daemon` here: that the real `run` actually returns
+    /// `Outcome::Refused` against such a bus is pinned in
+    /// `notify::monitor`'s own `a_refused_bus_makes_run_on_return`, and this
+    /// test is about what the supervisor does with that answer.
+    #[tokio::test]
+    async fn a_refused_monitor_is_not_restarted_until_enabled_is_toggled() {
+        let engine = test_engine();
+        let mut sup = NotifyMonitorSupervisor::new();
+
+        sup.handle = Some(tokio::spawn(async {}));
+        sup.refused
+            .store(true, std::sync::atomic::Ordering::Release);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !sup.handle.as_ref().expect("just set").is_finished()
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        sup.reconcile(true, &engine);
+        assert!(sup.handle.is_none(), "the ended task must be cleared");
+        assert!(
+            sup.refusal_latched,
+            "a refusal must be latched, not treated as an unexplained death"
+        );
+
+        // Well past `NOTIFY_RESTART_BACKOFF`: a backoff is what an
+        // *unexplained* death gets. A refusal gets nothing, ever, while
+        // `enabled` stays true.
+        tokio::time::sleep(NOTIFY_RESTART_BACKOFF + Duration::from_millis(200)).await;
+        for _ in 0..5 {
+            sup.reconcile(true, &engine);
+        }
+        assert!(
+            sup.handle.is_none(),
+            "a refused monitor must not be respawned, however many ticks pass: \
+             every respawn is another connection, auth handshake and refused \
+             BecomeMonitor against a bus that has already said no"
+        );
+
+        // Toggling `enabled` off and on is the one thing that asks again --
+        // it is what a user who has just fixed their bus policy does, and
+        // what the settings window's switch produces.
+        sup.reconcile(false, &engine);
+        assert!(!sup.refusal_latched, "disabling must clear the latch");
+        sup.reconcile(true, &engine);
+        assert!(
+            sup.handle.is_some(),
+            "toggling notifications.enabled off and on must retry"
+        );
+        assert!(
+            !sup.refused.load(std::sync::atomic::Ordering::Acquire),
+            "the fresh task's flag must not inherit the previous task's refusal"
+        );
+
+        sup.reconcile(false, &engine);
         engine.shutdown();
     }
 }

@@ -132,10 +132,37 @@ const MAX_ANNOUNCED: usize = 256;
 /// otherwise, and the freedesktop spec places no length limit on it.
 const MAX_APP_NAME_LEN: usize = 256;
 
+/// Why [`run`] stopped.
+///
+/// IMPORTANT 3: the supervisor (`main.rs`'s `NotifyMonitorSupervisor`) has to
+/// tell a monitor that was *told no* apart from one that died, because the
+/// right response to the two is opposite -- never restart, versus restart
+/// after a backoff -- and `run` returning `()` made them indistinguishable.
+/// The cost of guessing wrong was measured: a bus denying
+/// `org.freedesktop.DBus.Monitoring` produced 37 log lines and 18 full
+/// connect/auth/`BecomeMonitor` cycles in 90 seconds, forever, for a spec row
+/// (§2) that says "log once with the reason, run without narration".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// The bus answered `become_monitor` with a refusal that will not change
+    /// while this daemon runs -- policy, or a bus with no `Monitoring`
+    /// interface at all (see `classify_monitor_failure`). The reason has
+    /// already been logged, once, by the time this is returned.
+    Refused,
+    /// The task stopped for any other reason. `run`'s own loops never
+    /// produce this -- every other way out of them is a retry -- so it is
+    /// the supervisor's name for "the task is gone and it did not say it was
+    /// refused": it panicked, or some future edit of `run` grew a second way
+    /// to stop. Restart-with-backoff is the right answer to that, and having
+    /// a value to name it by is what keeps that branch honest instead of a
+    /// bare `else` that quietly also swallows refusals.
+    Ended,
+}
+
 /// Watch the session bus and speak the notifications the config allows.
 ///
 /// Runs until the connection is permanently refused or the task is aborted.
-pub async fn run(engine: EngineHandle) {
+pub async fn run(engine: EngineHandle) -> Outcome {
     run_on(engine, None).await
 }
 
@@ -144,7 +171,7 @@ pub async fn run(engine: EngineHandle) {
 /// Split out purely so the integration test below can point the monitor at a
 /// private `dbus-daemon` without touching `DBUS_SESSION_BUS_ADDRESS`, which
 /// is process-wide and would race every other test in this binary.
-async fn run_on(engine: EngineHandle, address: Option<String>) {
+async fn run_on(engine: EngineHandle, address: Option<String>) -> Outcome {
     // Cached rather than read per message: `EngineHandle::config` is a
     // blocking round trip with a 250 ms bound, and doing one of those inside
     // the message path would put a blocking-pool hop between a notification
@@ -184,8 +211,17 @@ async fn run_on(engine: EngineHandle, address: Option<String>) {
                 // logging nothing new -- so the task ends here and the rest
                 // of the daemon carries on unaffected, the same as a missing
                 // StatusNotifierWatcher.
-                eprintln!("info: {reason}; continuing without speaking notifications");
-                return;
+                //
+                // IMPORTANT 3: this is the *only* line either this task or
+                // its supervisor prints about a refusal, for the life of the
+                // process, so it also has to say what would make sayd ask
+                // again -- the supervisor latches on `Outcome::Refused` and
+                // will not respawn until `notifications.enabled` is toggled.
+                eprintln!(
+                    "info: {reason}; continuing without speaking notifications \
+                     (toggle notifications.enabled off and on to retry)"
+                );
+                return Outcome::Refused;
             }
             Err(Refusal::Transient(reason)) => {
                 if !outage_logged {
@@ -1287,6 +1323,14 @@ mod tests {
     /// `Err(Refusal::Permanent(_)) => { ...; return; }` arm in the outer loop
     /// is actually reached and actually returns, rather than looping,
     /// panicking, or hanging.
+    ///
+    /// IMPORTANT 3 (M5 final review): it must also return `Outcome::Refused`
+    /// specifically, not merely return. That value is the only thing telling
+    /// the supervisor apart "the bus said no, permanently" from "the task
+    /// died" -- and it is what makes the supervisor latch instead of
+    /// re-asking every 5s forever (measured before the latch: 37 log lines
+    /// and 18 connect/auth/`BecomeMonitor` cycles in 90s against this exact
+    /// bus configuration).
     #[tokio::test]
     async fn a_refused_bus_makes_run_on_return() {
         let Some(bus) = TestBus::start_denying_monitor() else {
@@ -1301,9 +1345,12 @@ mod tests {
         )
         .await;
         engine.shutdown();
-        assert!(
-            result.is_ok(),
-            "run_on did not return within 10s against a bus that denies BecomeMonitor"
+        assert_eq!(
+            result,
+            Ok(Outcome::Refused),
+            "run_on must return Outcome::Refused within 10s against a bus that \
+             denies BecomeMonitor -- returning at all is not enough, the \
+             supervisor cannot latch on a value it is not given"
         );
     }
 
