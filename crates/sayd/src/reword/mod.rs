@@ -137,7 +137,8 @@ pub fn debug(args: std::fmt::Arguments<'_>) {
 // constructs most of these, which is the whole point of the split -- the
 // classification, the breakers that fold it in and the tests that pin their
 // behaviour all live in the default build, and only the client that produces
-// the variants is gated. The next task constructs them from HTTP responses.
+// the variants is gated. `http::parse_response` is what constructs them, and
+// it exists only under `--features reword`.
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RewordError {
@@ -619,16 +620,11 @@ pub fn context(cfg: &RewordConfig) -> Option<(Arc<dyn Rewriter>, Arc<RewordState
 
 /// Build a client for `cfg`. The one function whose body differs between
 /// the two builds.
-// `#[allow(dead_code)]`: `HttpRewriter` lands in the next task, which is
-// where this attribute is deleted.
-#[allow(dead_code)]
 #[cfg(feature = "reword")]
 pub fn build_rewriter(cfg: &RewordConfig) -> Result<Arc<dyn Rewriter>, RewordError> {
     http::HttpRewriter::new(cfg).map(|r| Arc::new(r) as Arc<dyn Rewriter>)
 }
 
-// `#[allow(dead_code)]`: as above.
-#[allow(dead_code)]
 #[cfg(not(feature = "reword"))]
 pub fn build_rewriter(_cfg: &RewordConfig) -> Result<Arc<dyn Rewriter>, RewordError> {
     Err(RewordError::Unavailable)
