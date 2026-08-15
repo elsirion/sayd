@@ -129,7 +129,10 @@ mod tests {
     fn a_recorded_app_appears_in_the_snapshot_with_its_icon() {
         record("t1-Signal", "signal-desktop");
         let s = snapshot();
-        let e = s.iter().find(|a| a.app_name == "t1-Signal").expect("recorded");
+        let e = s
+            .iter()
+            .find(|a| a.app_name == "t1-Signal")
+            .expect("recorded");
         assert_eq!(e.app_icon, "signal-desktop");
     }
 
@@ -140,20 +143,40 @@ mod tests {
     fn the_same_app_in_a_different_case_is_one_entry() {
         record("t2-Fractal", "org.gnome.Fractal");
         record("t2-FRACTAL", "org.gnome.Fractal");
-        let n = snapshot().iter().filter(|a| a.app_name.eq_ignore_ascii_case("t2-Fractal")).count();
+        let n = snapshot()
+            .iter()
+            .filter(|a| a.app_name.eq_ignore_ascii_case("t2-Fractal"))
+            .count();
         assert_eq!(n, 1);
     }
 
     /// An app that changes its icon (a theme change, an update) must show
-    /// the current one.
+    /// the current one, and re-notifying must move it ahead of apps that
+    /// notified before it -- the app someone is trying to allow is almost
+    /// always the one that just interrupted them.
+    ///
+    /// Asserted as a *relative* order, not an absolute position. The
+    /// registry is process-global and `monitor`'s integration tests record
+    /// into it from a real bus while this runs, so anything of the form
+    /// `snapshot()[0] == ...` is a race: it passed on a warm run and failed
+    /// three times out of three when the suite had to compile first, which
+    /// left the dbus tests running for seconds alongside this one.
     #[test]
-    fn recording_again_refreshes_the_icon_and_moves_the_entry_to_the_front() {
+    fn recording_again_refreshes_the_icon_and_moves_the_entry_ahead() {
         record("t3-a", "old-icon");
         record("t3-b", "other");
         record("t3-a", "new-icon");
+
         let s = snapshot();
-        assert_eq!(s[0].app_name, "t3-a");
-        assert_eq!(s[0].app_icon, "new-icon");
+        let pos = |name: &str| s.iter().position(|a| a.app_name == name);
+        let a = pos("t3-a").expect("t3-a is recorded");
+        let b = pos("t3-b").expect("t3-b is recorded");
+
+        assert!(a < b, "re-recording must move an app ahead of older ones");
+        assert_eq!(
+            s[a].app_icon, "new-icon",
+            "the icon must be refreshed, not left at what it first sent"
+        );
     }
 
     /// The cap is what stops a hostile or buggy sender growing this without
@@ -167,7 +190,8 @@ mod tests {
         let s = snapshot();
         assert!(s.len() <= MAX_SEEN, "capped at {MAX_SEEN}, got {}", s.len());
         assert!(
-            s.iter().any(|a| a.app_name == format!("t4-{}", MAX_SEEN + 9)),
+            s.iter()
+                .any(|a| a.app_name == format!("t4-{}", MAX_SEEN + 9)),
             "the newest entry must survive"
         );
         assert!(
