@@ -478,6 +478,12 @@ fn send(
     if let Some(auth) = &request.authorization {
         call = call.header("authorization", auth);
     }
+    // `ureq`'s transport errors name what went wrong (`io: Connection
+    // refused`) and never *where*: the address lives in the separate
+    // once-per-run `sending text to …` line, which is not the line a user
+    // pastes into an issue. Appended here, the one warning they do paste
+    // says which endpoint could not be reached.
+    let unreachable = |e: ureq::Error| RewordError::Unreachable(format!("{e} ({})", request.url));
     let mut response = match call.send_json(&request.body) {
         Ok(r) => r,
         Err(ureq::Error::Timeout(_)) => return Err(RewordError::Ceiling),
@@ -493,7 +499,7 @@ fn send(
                 "reword.base_url or the API key cannot be put into a request ({e})"
             )))
         }
-        Err(e) => return Err(RewordError::Unreachable(e.to_string())),
+        Err(e) => return Err(unreachable(e)),
     };
     let status = response.status().as_u16();
     let retry_after = response
@@ -518,7 +524,7 @@ fn send(
                 "the response body exceeded {limit} bytes"
             )))
         }
-        Err(e) => return Err(RewordError::Unreachable(e.to_string())),
+        Err(e) => return Err(unreachable(e)),
     };
     parse_response(status, retry_after.as_deref(), &body, model, host)
 }
@@ -1158,13 +1164,15 @@ mod tests {
 
     /// A closed port -- nothing listening at all. The most common first-run
     /// failure there is: a `base_url` pointing at a server that is not
-    /// running. The detail it carries is what a user pastes into an issue,
-    /// so it is worth asserting that there is one. Recorded here rather
-    /// than asserted verbatim, because it is `ureq`'s wording and not
-    /// ours: `ureq` 3.4 produces `io: Connection refused`, which reaches
-    /// the journal as `warning: reword: could not reach the provider: io:
-    /// Connection refused` -- one line after the `info: reword: sending
-    /// text to …` line that names the endpoint it could not reach.
+    /// running. The detail it carries is the one line a user pastes into an
+    /// issue, so what is asserted is the part of it that is ours: `ureq`
+    /// 3.4 says `io: Connection refused` and names no address at all, and
+    /// the line that does name one -- `info: reword: sending text to …` --
+    /// is a different line, printed once per run, that a user quoting the
+    /// warning will leave behind. Together they reach the journal as
+    /// `warning: reword: could not reach the provider: io: Connection
+    /// refused (http://127.0.0.1:PORT/v1/chat/completions)`. The wording
+    /// before the parenthesis is `ureq`'s and is not asserted.
     #[test]
     fn a_closed_port_is_a_transport_error() {
         // Bind, read the port, drop the listener: the port is now free and
@@ -1181,8 +1189,10 @@ mod tests {
         let rewriter = HttpRewriter::new(&cfg).expect("a usable client");
         match rewriter.reword("Alice: dinner?") {
             Err(RewordError::Unreachable(detail)) => assert!(
-                !detail.trim().is_empty(),
-                "the one line a user will paste into an issue must say something"
+                detail.contains(&format!("127.0.0.1:{port}")),
+                "`io: Connection refused` names no address, and the line that does \
+                 name one is a separate `info:` line a user pasting this warning \
+                 will leave out: {detail}"
             ),
             other => panic!("a closed port is unreachable, got {other:?}"),
         }
