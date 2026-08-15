@@ -919,9 +919,27 @@ pub enum Origin {
 /// attempt is made. Past an expired transport cooldown `allow` mints and
 /// spends §8's one half-open probe, so asking twice and attempting once
 /// would burn a probe the run does not get back until the TTL expires.
+///
+/// `#[must_use]` for the other half of that: `resolve` consuming `self`
+/// enforces *at most* one attempt per admission, and nothing enforced at
+/// least one. A plan built and then dropped has already spent a half-open
+/// probe token -- the run does not get that back until
+/// [`TRANSPORT_PROBE_TTL`] expires -- and, on the paths this daemon has, is
+/// an announcement that was going to be reworded and now silently is not.
+#[must_use = "admitting a plan has already spent §8's half-open probe token; \
+              resolve it or the run pays for a rewrite that never happened"]
 pub struct RewordPlan {
     rewriter: Arc<dyn Rewriter>,
     state: Arc<RewordState>,
+    /// The exact text `will_reword` said yes to.
+    ///
+    /// Owned by the plan rather than handed to `resolve` later, and this is
+    /// the whole of the difference: `admit` judged *this* string against
+    /// `max_chars` and the guard, so `resolve` must send *this* string.
+    /// Measured on the previous shape -- `resolve(self, text: String)` taking
+    /// any string at all -- a plan minted for a 40-character announcement
+    /// could be handed 60 KB, and it compiled.
+    text: String,
     /// The exact config the decision was taken under, cloned once here
     /// rather than read again later: `notify::monitor` refreshes its cached
     /// `Config` on every tick, and text judged eligible under one
@@ -942,9 +960,18 @@ impl RewordPlan {
     /// `enabled = false` this returns on the first line, and in a build
     /// without the `reword` feature [`build_rewriter`] cannot make a client
     /// at all, so `context` returns `None` and it returns on the second.
-    pub fn automatic(text: &str, cfg: &RewordConfig, origin: Origin) -> Option<RewordPlan> {
+    ///
+    /// Takes the text by value and hands it back in the `Err`, which is what
+    /// makes "the plan owns what it admitted" free for the caller: every
+    /// caller has a fallback that speaks the original, and giving the string
+    /// back is cheaper than the clone the alternative would need.
+    pub fn automatic(
+        text: String,
+        cfg: &RewordConfig,
+        origin: Origin,
+    ) -> Result<RewordPlan, String> {
         if !cfg.enabled {
-            return None;
+            return Err(text);
         }
         RewordPlan::admit(text, cfg, origin)
     }
@@ -962,37 +989,45 @@ impl RewordPlan {
     /// Takes no [`Origin`]: an explicit request is by construction about
     /// text its caller wrote, and offering `Origin::Composed` here would
     /// re-introduce the unspellable-wrong-value the enum exists to remove.
-    pub fn requested(text: &str, cfg: &RewordConfig) -> Option<RewordPlan> {
+    pub fn requested(text: String, cfg: &RewordConfig) -> Result<RewordPlan, String> {
         RewordPlan::admit(text, cfg, Origin::Written)
     }
 
     /// The shared body, and the only place [`will_reword`] is called.
-    fn admit(text: &str, cfg: &RewordConfig, origin: Origin) -> Option<RewordPlan> {
+    ///
+    /// `Err` is not a failure: it is "this text is not being reworded, here
+    /// it is back", and every caller speaks it as written.
+    fn admit(text: String, cfg: &RewordConfig, origin: Origin) -> Result<RewordPlan, String> {
         match origin {
             Origin::Written => {}
             // Matched rather than compared, so a third kind of text cannot
             // be added without this rule being re-decided for it.
-            Origin::Composed => return None,
+            Origin::Composed => return Err(text),
         }
-        let (rewriter, state) = context(cfg)?;
-        if !will_reword(text, cfg, &state) {
-            return None;
+        let Some((rewriter, state)) = context(cfg) else {
+            return Err(text);
+        };
+        if !will_reword(&text, cfg, &state) {
+            return Err(text);
         }
-        Some(RewordPlan {
+        Ok(RewordPlan {
             rewriter,
             state,
+            text,
             cfg: cfg.clone(),
         })
     }
 
     /// The text to speak. Consumes the plan, so the single `will_reword`
-    /// that admitted it buys exactly one attempt.
+    /// that admitted it buys exactly one attempt -- of the exact string it
+    /// admitted, which is why the plan carries it rather than taking one
+    /// here.
     ///
     /// Holds no `EngineHandle` and returns a `String`: the caller submits, so
     /// a rewrite that lands past the deadline is dropped rather than spoken
     /// second. Do not add a submit callback to this signature.
-    pub async fn resolve(self, text: String) -> String {
-        reword_or_original(text, &self.cfg, self.rewriter, self.state).await
+    pub async fn resolve(self) -> String {
+        reword_or_original(self.text, &self.cfg, self.rewriter, self.state).await
     }
 }
 
@@ -1799,27 +1834,33 @@ mod tests {
     /// automatic behaviour is off would be surprising. Everything else is
     /// the same code, because both constructors share `admit`.
     ///
-    /// `is_some()` is compared against `cfg!(feature = "reword")` rather than
+    /// `is_ok()` is compared against `cfg!(feature = "reword")` rather than
     /// asserted outright: without the feature there is no client to build, so
     /// `context` returns `None` and *nothing* is ever admitted -- which is
     /// the compiler's half of the promise and is worth pinning here too.
+    ///
+    /// The `Err` is the text itself, handed back for the caller to speak as
+    /// written, so each rejection is checked to be that text and not some
+    /// other string.
     #[test]
     fn only_the_automatic_ask_consults_enabled() {
         let text = "Alice: where do you want to go for dinner";
         let mut off = cfg();
         off.enabled = false;
 
-        assert!(
-            RewordPlan::automatic(text, &off, Origin::Written).is_none(),
-            "`enabled = false` must not even look for a client"
+        assert_eq!(
+            RewordPlan::automatic(text.into(), &off, Origin::Written).err(),
+            Some(text.to_string()),
+            "`enabled = false` must not even look for a client, and the text \
+             comes straight back"
         );
         assert_eq!(
-            RewordPlan::requested(text, &off).is_some(),
+            RewordPlan::requested(text.into(), &off).is_ok(),
             cfg!(feature = "reword"),
             "an explicit --reword does not need `enabled`"
         );
         assert_eq!(
-            RewordPlan::automatic(text, &cfg(), Origin::Written).is_some(),
+            RewordPlan::automatic(text.into(), &cfg(), Origin::Written).is_ok(),
             cfg!(feature = "reword")
         );
     }
@@ -1832,11 +1873,15 @@ mod tests {
     #[test]
     fn composed_text_is_never_admitted() {
         let followup = "Signal: 3 more notifications";
-        assert!(RewordPlan::automatic(followup, &cfg(), Origin::Composed).is_none());
+        assert_eq!(
+            RewordPlan::automatic(followup.into(), &cfg(), Origin::Composed).err(),
+            Some(followup.to_string()),
+            "a follow-up is refused, and gets its own text back to speak"
+        );
         // ...and not because it was ineligible on its own account: the same
         // string with the other origin is admitted wherever there is a client.
         assert_eq!(
-            RewordPlan::automatic(followup, &cfg(), Origin::Written).is_some(),
+            RewordPlan::automatic(followup.into(), &cfg(), Origin::Written).is_ok(),
             cfg!(feature = "reword"),
             "the exclusion must be the origin, not the length"
         );

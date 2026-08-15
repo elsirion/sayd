@@ -129,10 +129,13 @@ impl SaydIface {
         // my notifications without being asked", and this caller is asking.
         // Everything else -- endpoint, eligibility, all three breakers -- is
         // the same code, because both constructors share `admit`.
-        let Some(plan) = crate::reword::RewordPlan::requested(&text, &cfg.reword) else {
-            return text;
-        };
-        plan.resolve(text).await
+        match crate::reword::RewordPlan::requested(text, &cfg.reword) {
+            // The plan owns the text it was admitted for, so what is sent is
+            // what `will_reword` judged; `Err` hands the original straight
+            // back.
+            Ok(plan) => plan.resolve().await,
+            Err(text) => text,
+        }
     }
 
     /// Shared body of `Say`, `SaySelection` and `SayClipboard`.

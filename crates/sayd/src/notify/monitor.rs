@@ -664,12 +664,16 @@ async fn speak(
 
     // `automatic`, never `requested`: this path is the standing ask that
     // `[reword] enabled` governs. `--reword` is the other one, in `dbus.rs`.
-    let Some(plan) = RewordPlan::automatic(&text, &cfg.reword, origin) else {
-        // Today's path exactly, awaited: nothing was spawned, so two
-        // announcements arriving back to back are still submitted in the
-        // order they arrived.
-        submit_announcement(engine, text, failure_logged).await;
-        return;
+    let plan = match RewordPlan::automatic(text, &cfg.reword, origin) {
+        Ok(plan) => plan,
+        // Not being reworded, and here is the text back. Today's path
+        // exactly, awaited: nothing was spawned, so two announcements
+        // arriving back to back are still submitted in the order they
+        // arrived.
+        Err(text) => {
+            submit_announcement(engine, text, failure_logged).await;
+            return;
+        }
     };
 
     let engine = engine.clone();
@@ -678,8 +682,10 @@ async fn speak(
         // `resolve` holds no `EngineHandle`: it returns the text to speak
         // and this scope submits it. That is what makes a late answer
         // unreachable rather than merely unwanted -- a rewrite that lands
-        // past the deadline is dropped, never spoken second.
-        let text = plan.resolve(text).await;
+        // past the deadline is dropped, never spoken second. It also owns
+        // the text it was admitted for, so what is sent is what
+        // `will_reword` judged.
+        let text = plan.resolve().await;
         submit_announcement(&engine, text, &failure_logged).await;
     });
 }
@@ -950,14 +956,14 @@ mod tests {
         let off = Config::default();
         assert!(!off.reword.enabled, "the shipped default is off");
         assert!(
-            RewordPlan::automatic(text, &off.reword, Origin::Written).is_none(),
+            RewordPlan::automatic(text.into(), &off.reword, Origin::Written).is_err(),
             "`enabled = false` must not even look for a client"
         );
         // And in a build with no client in it, not even `enabled = true`
         // can produce a plan.
         #[cfg(not(feature = "reword"))]
         assert!(
-            RewordPlan::automatic(text, &rewording_on().reword, Origin::Written).is_none(),
+            RewordPlan::automatic(text.into(), &rewording_on().reword, Origin::Written).is_err(),
             "a build without the `reword` feature has nothing to rewrite with"
         );
     }
@@ -992,7 +998,7 @@ mod tests {
             "the follow-up is eligible on length; the exclusion must be the rule"
         );
         assert!(
-            RewordPlan::automatic(&followup, &cfg.reword, Origin::Composed).is_none(),
+            RewordPlan::automatic(followup.clone(), &cfg.reword, Origin::Composed).is_err(),
             "a follow-up must never be admitted to a rewrite"
         );
         // The positive control: the same text under the same config *is*
@@ -1000,7 +1006,7 @@ mod tests {
         // admit it to. Without this the assertion above would also pass
         // against a config that could never rewrite anything.
         assert_eq!(
-            RewordPlan::automatic(&followup, &cfg.reword, Origin::Written).is_some(),
+            RewordPlan::automatic(followup.clone(), &cfg.reword, Origin::Written).is_ok(),
             cfg!(feature = "reword"),
             "only the origin should decide this, and only a build with a client \
              can say yes at all"
@@ -1036,7 +1042,7 @@ mod tests {
 
         let text = "Alice: where do you want to go for dinner".to_string();
         assert_eq!(
-            RewordPlan::automatic(&text, &cfg.reword, Origin::Written).is_some(),
+            RewordPlan::automatic(text.clone(), &cfg.reword, Origin::Written).is_ok(),
             cfg!(feature = "reword"),
             "the case under test is the detaching one; in a build with a client \
              this announcement must be admitted, or the timing below proves nothing"
