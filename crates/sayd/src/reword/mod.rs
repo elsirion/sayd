@@ -897,6 +897,44 @@ fn will_reword(text: &str, cfg: &RewordConfig, state: &RewordState) -> bool {
     state.allow(cfg, Instant::now()).is_ok()
 }
 
+/// The text to speak, and what to speak instead if the engine will not take
+/// it.
+///
+/// CRITICAL 2. A rewrite is admitted by `sayd_core::reword::check` at up to
+/// `original * 3 / 2 + 32` characters, and `Engine::submit` refuses anything
+/// over `max_chars` -- two ceilings that are not related to each other, so a
+/// 1000-character announcement under a 1000-character `max_chars` can come
+/// back as a perfectly valid 1200-character rewrite and be refused. Measured
+/// end to end on a private bus: `text is 1200 characters, limit is 1000`, the
+/// announcement lost, and the daemon in global `State::Error` without ever
+/// having entered `speaking`. Both halves of that are now fixed -- the engine
+/// no longer sets *global* error state for a `Source::Notification` rejection
+/// -- but the announcement is only saved by this: a submission that is
+/// refused is retried with the text the rewrite replaced, which is the text
+/// that would have been spoken with no rewriting feature at all.
+///
+/// [`Spoken::fallback`] is `None` when `text` *is* the original, so a caller
+/// that retries on every refusal cannot submit the same string twice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Spoken {
+    /// The text to submit.
+    pub text: String,
+    /// What to submit instead if the engine refuses [`Spoken::text`], or
+    /// `None` when that already is the text as written.
+    pub fallback: Option<String>,
+}
+
+impl Spoken {
+    /// Text nothing rewrote. There is nothing to fall back to: this is the
+    /// fallback.
+    pub fn as_written(text: String) -> Spoken {
+        Spoken {
+            text,
+            fallback: None,
+        }
+    }
+}
+
 /// The text to speak: the rewrite if one arrived in time and passed the
 /// guard, the original otherwise.
 ///
@@ -918,24 +956,30 @@ async fn reword_or_original(
     cfg: &RewordConfig,
     rewriter: Arc<dyn Rewriter>,
     state: Arc<RewordState>,
-) -> String {
+) -> Spoken {
     let budget = Duration::from_millis(cfg.timeout_ms);
     // No `record` here: `attempt` owns it end to end, because the outcome
     // of an attempt that outlived its deadline is only reachable from
     // inside the job. Recording here as well would count it twice.
     let (outcome, _elapsed) = attempt(rewriter, state, cfg, text.clone(), budget).await;
     let Attempt::Answered(Ok(candidate)) = outcome else {
-        return text;
+        return Spoken::as_written(text);
     };
     match check(&text, &candidate) {
-        Ok(rewritten) => rewritten,
+        // The one branch that carries a fallback: past here the engine is
+        // the only thing left that can refuse this string, and if it does
+        // the announcement must not be lost. See [`Spoken`].
+        Ok(rewritten) => Spoken {
+            text: rewritten,
+            fallback: Some(text),
+        },
         Err(reason) => {
             debug(format_args!(
                 "reword: rejected a candidate ({}): {:?}",
                 reason.phrase(),
                 sayd_core::reword::truncate_for_debug(&candidate, DEBUG_SNIPPET_CHARS)
             ));
-            text
+            Spoken::as_written(text)
         }
     }
 }
@@ -1203,10 +1247,10 @@ impl RewordPlan {
     /// admitted, which is why the plan carries it rather than taking one
     /// here.
     ///
-    /// Holds no `EngineHandle` and returns a `String`: the caller submits, so
-    /// a rewrite that lands past the deadline is dropped rather than spoken
-    /// second. Do not add a submit callback to this signature.
-    pub async fn resolve(self) -> String {
+    /// Holds no `EngineHandle` and returns a [`Spoken`]: the caller submits,
+    /// so a rewrite that lands past the deadline is dropped rather than
+    /// spoken second. Do not add a submit callback to this signature.
+    pub async fn resolve(self) -> Spoken {
         reword_or_original(self.text, &self.cfg, self.rewriter, self.state).await
     }
 }
@@ -1440,8 +1484,10 @@ mod tests {
         .await;
 
         assert_eq!(
-            spoken, original,
-            "past the deadline the original is what gets spoken"
+            spoken,
+            Spoken::as_written(original.clone()),
+            "past the deadline the original is what gets spoken, and it is \
+             already the fallback -- there is nothing to fall back to"
         );
         // And the late answer has nowhere to go: `reword_or_original` has
         // no engine handle at all, so there is no path on which a rewrite
@@ -2125,7 +2171,12 @@ mod tests {
                 state.clone()
             )
             .await,
-            "Alice is asking where you want to go for dinner"
+            Spoken {
+                text: "Alice is asking where you want to go for dinner".into(),
+                fallback: Some(original.clone()),
+            },
+            "an accepted rewrite carries the text it replaced, so a submission \
+             the engine refuses is not the end of the announcement"
         );
 
         let chatty = Stub::new(vec![Ok("Sure!\nHere you go:\nAlice is asking.".into())]);
@@ -2137,7 +2188,7 @@ mod tests {
                 RewordState::new()
             )
             .await,
-            original,
+            Spoken::as_written(original.clone()),
             "a model that explained itself gets the original spoken instead"
         );
 
@@ -2150,7 +2201,7 @@ mod tests {
                 RewordState::new()
             )
             .await,
-            original
+            Spoken::as_written(original.clone())
         );
     }
 
@@ -2476,7 +2527,7 @@ mod tests {
             RewordState::new(),
         )
         .await;
-        assert_eq!(spoken, original);
+        assert_eq!(spoken, Spoken::as_written(original.clone()));
 
         tokio::time::sleep(Duration::from_millis(600)).await;
         assert_eq!(
@@ -2485,7 +2536,7 @@ mod tests {
             "the job ran to completion: it was abandoned, not cancelled"
         );
         assert_ne!(
-            spoken,
+            spoken.text,
             lock(&produced)[0],
             "and the thing it produced is not the thing that got spoken"
         );
@@ -2514,7 +2565,7 @@ mod tests {
             state.clone(),
         )
         .await;
-        assert_eq!(spoken, original);
+        assert_eq!(spoken, Spoken::as_written(original.clone()));
         assert_eq!(
             state.available_permits(),
             REWORD_MAX_INFLIGHT,

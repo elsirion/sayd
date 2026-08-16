@@ -37,7 +37,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use sayd_core::config::Config;
-use sayd_core::engine::SayOpts;
+use sayd_core::engine::{SayOpts, Submitted};
 use sayd_core::handle::EngineHandle;
 use sayd_core::queue::Source;
 
@@ -45,7 +45,7 @@ use zbus::export::futures_core::Stream;
 use zbus::message::Type;
 use zbus::{MatchRule, MessageStream};
 
-use crate::reword::{Origin, RewordPlan};
+use crate::reword::{Origin, RewordPlan, Spoken};
 
 use super::decode::{decode, Decoded};
 use super::policy::{Decision, Limiter};
@@ -655,19 +655,13 @@ fn notification_opts() -> SayOpts {
 /// `max_chars` is checked here, against the *live* config's own limit,
 /// before the text is ever handed to `submit` (Important 3), and before the
 /// rewrite rather than after it: an announcement the engine is going to
-/// refuse must not cost a network round trip first. `Engine::submit`
-/// already rejects an over-long text on its own, but for a source that is
-/// `Idle` or `Speaking`/`Paused`-adjacent it also *sets global `State::Error`*
-/// with that rejection as the reason (`engine.rs:476-492`) -- and a
-/// notification is exactly the case where that is wrong: an allowlisted
-/// application sending one 60,000-character summary should lose that one
-/// announcement, not light `dialog-error-symbolic` on the tray and report
-/// `"error"` on D-Bus for a fault the user watching the tray never caused.
-/// The right long-term fix is `Engine::submit` not setting *global* error
-/// state for a `Source::Notification` rejection in the first place, which
-/// would make every caller of `submit` safe by construction rather than
-/// leaving each one to guard itself -- out of scope for this file, noted
-/// here so it is not lost.
+/// refuse must not cost a network round trip first. It is a cheap gate
+/// rather than the guarantee it once had to be: `Engine::submit` no longer
+/// sets *global* `State::Error` for a `Source::Notification` rejection
+/// (CRITICAL 2), so an allowlisted application sending one 60,000-character
+/// summary loses that one announcement rather than lighting
+/// `dialog-error-symbolic` on the tray and reporting `"error"` on D-Bus for
+/// a fault the user watching the tray never caused.
 async fn speak(
     engine: &EngineHandle,
     text: impl Into<Origin>,
@@ -694,7 +688,7 @@ async fn speak(
         // arriving back to back are still submitted in the order they
         // arrived.
         Err(text) => {
-            submit_announcement(engine, text, failure_logged).await;
+            submit_announcement(engine, Spoken::as_written(text), failure_logged).await;
             return None;
         }
     };
@@ -708,8 +702,8 @@ async fn speak(
         // past the deadline is dropped, never spoken second. It also owns
         // the text it was admitted for, so what is sent is what
         // `will_reword` judged.
-        let text = plan.resolve().await;
-        submit_announcement(&engine, text, &failure_logged).await;
+        let spoken = plan.resolve().await;
+        submit_announcement(&engine, spoken, &failure_logged).await;
     }))
 }
 
@@ -720,13 +714,45 @@ async fn speak(
 /// it verbatim. `failure_logged` is an `Arc<AtomicBool>` rather than the
 /// `&mut bool` it used to be for exactly that reason: a detached task cannot
 /// borrow `run_on`'s local.
+///
+/// CRITICAL 2: a refused submission that carries a [`Spoken::fallback`] is
+/// retried with it, once. The case is not exotic -- the guard admits a
+/// rewrite up to `original * 3 / 2 + 32` characters and the engine refuses
+/// anything over `max_chars`, so a 1000-character announcement under a
+/// 1000-character `max_chars` can be lost to a 1200-character rewrite that
+/// was perfectly valid. Only that one string can be refused this way, and
+/// the fallback is `None` whenever nothing rewrote the text, so the retry
+/// cannot loop and cannot submit the same string twice.
 async fn submit_announcement(
     engine: &EngineHandle,
-    text: String,
+    spoken: Spoken,
     failure_logged: &Arc<AtomicBool>,
 ) {
+    let Spoken { text, fallback } = spoken;
     let e = engine.clone();
     let result = tokio::task::spawn_blocking(move || e.submit(text, notification_opts())).await;
+    if let (Ok(Err(reason)), Some(original)) = (&result, fallback) {
+        eprintln!(
+            "warning: the engine refused a reworded announcement ({reason}); \
+             speaking it as written instead"
+        );
+        let e = engine.clone();
+        let retried =
+            tokio::task::spawn_blocking(move || e.submit(original, notification_opts())).await;
+        return report_submission(retried, failure_logged);
+    }
+    report_submission(result, failure_logged);
+}
+
+/// What one `submit` came back with, folded into the standing-failure latch.
+///
+/// Its own function so the first attempt and CRITICAL 2's retry are reported
+/// identically -- in particular so a retry that succeeds clears the latch
+/// rather than leaving it set by the attempt it replaced.
+fn report_submission(
+    result: Result<Result<Submitted, String>, tokio::task::JoinError>,
+    failure_logged: &Arc<AtomicBool>,
+) {
     match result {
         // `Submitted::TimedOut` lands here too, deliberately: it means the
         // engine already queued or discarded the text before
@@ -920,12 +946,14 @@ mod tests {
     }
 
     /// Important 3: an over-long announcement from an allowlisted
-    /// application must not drive the whole daemon into `State::Error`.
-    /// `Engine::submit`'s own `max_chars` rejection does exactly that for an
-    /// idle engine (`engine.rs:476-492`) -- see `speak`'s doc comment for
-    /// why that is the wrong failure mode for a notification specifically.
+    /// application must not drive the whole daemon into `State::Error`, and
+    /// must not cost a network round trip on the way to being dropped.
     /// `speak` guards on length itself and must never even reach `submit`
-    /// when the text is over the limit.
+    /// when the text is over the limit. (`Engine::submit` no longer sets
+    /// global error state for a notification either -- CRITICAL 2, pinned in
+    /// `engine::tests::a_notification_rejection_is_answered_but_never_lights_the_tray`
+    /// -- so this is now belt and braces, but the belt is the cheap one:
+    /// nothing is sent.)
     #[tokio::test]
     async fn an_overlong_announcement_is_skipped_without_erroring_the_engine() {
         let (engine, spoken) = engine_allowing("Signal");
@@ -948,6 +976,78 @@ mod tests {
             engine.snapshot().state,
             sayd_core::engine::State::Idle,
             "a notification's own length must not put the whole engine into Error"
+        );
+        engine.shutdown();
+    }
+
+    /// CRITICAL 2: an accepted rewrite the engine then refuses does not cost
+    /// the announcement.
+    ///
+    /// The two ceilings are unrelated -- `sayd_core::reword::check` admits a
+    /// candidate up to `original * 3 / 2 + 32` characters, `Engine::submit`
+    /// refuses anything over `max_chars` -- so a 1000-character announcement
+    /// under a 1000-character `max_chars` can be lost to a 1200-character
+    /// rewrite that was perfectly valid. Measured end to end on a private
+    /// bus before the fallback existed: `text is 1200 characters, limit is
+    /// 1000`, silence, and `idle -> error`.
+    ///
+    /// Driven through `submit_announcement` rather than through a provider,
+    /// because the string that matters is the one the guard already passed:
+    /// what is under test is what happens *after* a rewrite is accepted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rewrite_the_engine_refuses_falls_back_to_the_text_it_replaced() {
+        let cfg = Config {
+            max_chars: 40,
+            ..Config::default()
+        };
+        let spoken = Arc::new(Mutex::new(Vec::new()));
+        let engine = EngineHandle::spawn(
+            cfg,
+            Box::new(RecordingSynthesizer {
+                spoken: spoken.clone(),
+            }),
+            Box::new(VecSink::new(24_000 * 60)),
+        );
+
+        let original = "Alice asked about dinner tonight".to_string();
+        let oversize = "a much longer rewrite than the engine will take".repeat(2);
+        assert!(oversize.chars().count() > 40 && original.chars().count() <= 40);
+
+        let logged = Arc::new(AtomicBool::new(false));
+        submit_announcement(
+            &engine,
+            Spoken {
+                text: oversize.clone(),
+                fallback: Some(original.clone()),
+            },
+            &logged,
+        )
+        .await;
+
+        for _ in 0..200 {
+            if engine_has(&spoken, &original) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            engine_has(&spoken, &original),
+            "the announcement is spoken as written rather than lost: {:?}",
+            spoken.lock().expect("spoken mutex")
+        );
+        assert!(
+            !engine_has(&spoken, &oversize),
+            "and the refused rewrite is not spoken as well"
+        );
+        assert!(
+            !logged.load(Ordering::Relaxed),
+            "a submission that ended in the announcement being spoken is not \
+             a standing failure to log"
+        );
+        assert_ne!(
+            engine.snapshot().state,
+            sayd_core::engine::State::Error,
+            "and nothing about it reaches the tray"
         );
         engine.shutdown();
     }

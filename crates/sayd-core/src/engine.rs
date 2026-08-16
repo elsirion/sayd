@@ -494,7 +494,31 @@ impl Engine {
             // when nothing about A is actually wrong. The caller still
             // learns the submission was refused, via the `Err` returned
             // here rather than a shared snapshot field.
-            if self.state != State::Speaking && self.state != State::Paused {
+            //
+            // A notification is excluded whatever the state, and that is the
+            // same argument taken one step further (M-reword CRITICAL 2). The
+            // text of a notification is chosen by the application that sent
+            // it, not by the person watching the tray: an allowlisted
+            // application sending one 60,000-character summary -- or a
+            // rewrite of a long announcement coming back longer than
+            // `max_chars`, which is reachable because the guard's ceiling and
+            // this one are unrelated -- should cost that one announcement,
+            // not light `dialog-error-symbolic` and report `"error"` on
+            // D-Bus for a fault the user never caused and cannot fix.
+            // Measured before this line existed: `idle -> error` on one
+            // 1200-character rewrite, without ever entering `speaking`.
+            // `notify::monitor::speak`'s own doc named this as the right
+            // shape and the reason it had to guard itself instead.
+            //
+            // The two invariants on `error_kind` are untouched: this only
+            // ever declines to *enter* `Error`, so `error_kind` is still
+            // `Some` for every `state == Error` and `None` otherwise, and a
+            // `Rejected` still never displaces a standing `Sink`/`Synth`
+            // (that check is above, and it runs first).
+            if self.state != State::Speaking
+                && self.state != State::Paused
+                && opts.source != Source::Notification
+            {
                 self.state = State::Error;
                 self.error = Some(msg.clone());
                 self.error_kind = Some(ErrorKind::Rejected);
@@ -2971,6 +2995,55 @@ mod tests {
         let s = e.snapshot();
         assert_eq!(s.state, State::Error);
         assert_eq!(s.error.as_deref(), Some(msg.as_str()));
+    }
+
+    /// CRITICAL 2 of the rewording milestone's final review: a rejection is
+    /// answered to the caller, but a *notification* never becomes the
+    /// engine's global error state -- not even on an idle engine, which is
+    /// the one case the check above still enters.
+    ///
+    /// The text of a notification is chosen by the application that sent it.
+    /// Losing one over-long announcement is the right cost; lighting
+    /// `dialog-error-symbolic` on the tray and reporting `"error"` on D-Bus
+    /// for it is not, because the person watching the tray neither caused it
+    /// nor can fix it. Measured before this rule existed, with `max_chars =
+    /// 1000` and a valid 1200-character rewrite of a 1000-character
+    /// announcement: `idle -> error`, without ever entering `speaking`.
+    #[test]
+    fn a_notification_rejection_is_answered_but_never_lights_the_tray() {
+        let cfg = Config {
+            max_chars: 5,
+            ..Config::default()
+        };
+        let mut e = Engine::new(
+            cfg,
+            Box::new(StubSynthesizer::new()),
+            Box::new(VecSink::new(24_000 * 10)),
+        );
+        assert_eq!(e.snapshot().state, State::Idle);
+
+        let result = e.submit(
+            "way too long for the limit".into(),
+            SayOpts {
+                source: Source::Notification,
+                ..SayOpts::default()
+            },
+        );
+
+        let msg = result.expect_err("over-long text must still be rejected");
+        assert!(msg.contains('5'), "got {msg:?}");
+        let s = e.snapshot();
+        assert_eq!(
+            s.state,
+            State::Idle,
+            "the caller was told, and nothing else was"
+        );
+        assert_eq!(s.error, None);
+        assert!(
+            e.error_kind.is_none(),
+            "and no `error_kind` was left behind for the `state == Error` \
+             invariant to contradict"
+        );
     }
 
     #[test]

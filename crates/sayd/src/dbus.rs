@@ -16,6 +16,7 @@ use zbus::interface;
 use zbus::zvariant::{OwnedValue, Str};
 
 use crate::config_watch::{persist_in_background, ConfigStore};
+use crate::reword::Spoken;
 use crate::selection;
 
 pub struct SaydIface {
@@ -113,6 +114,14 @@ impl SaydIface {
     /// keybind must not stop speaking because an optional enhancement is
     /// misconfigured; the diagnosis is in the log, once per run.
     ///
+    /// That sentence was false for one case until CRITICAL 2, and it is the
+    /// case where the rewrite *worked*: the guard admits a candidate up to
+    /// `original * 3 / 2 + 32` characters and `Engine::submit` refuses
+    /// anything over `max_chars`, so a valid rewrite of a long submission can
+    /// be refused after the original would have been accepted. Hence
+    /// [`Spoken`] rather than a `String` -- the refusal is retried with the
+    /// text the rewrite replaced, in [`SaydIface::submit_spoken`].
+    ///
     /// **The config comes from [`ConfigStore::current`], not from
     /// `EngineHandle::config()`.** IMPORTANT 1, and it was measured: that
     /// round trip is bounded by `CONFIG_REPLY_TIMEOUT` at 250 ms, and an
@@ -138,9 +147,9 @@ impl SaydIface {
     ///
     /// The config is read only *after* the opt has been seen, so an ordinary
     /// `Say` pays nothing at all for this -- not even the mutex.
-    async fn maybe_reword(&self, text: String, opts: &HashMap<String, OwnedValue>) -> String {
+    async fn maybe_reword(&self, text: String, opts: &HashMap<String, OwnedValue>) -> Spoken {
         if !wants_reword(opts) {
-            return text;
+            return Spoken::as_written(text);
         }
         let store = self.store.clone();
         let cfg = match tokio::task::spawn_blocking(move || store.current()).await {
@@ -157,7 +166,7 @@ impl SaydIface {
                     "warning: reword: could not read the daemon's own configuration \
                      ({e}); speaking the text as written"
                 );
-                return text;
+                return Spoken::as_written(text);
             }
         };
         // `requested`, never `automatic`: `[reword] enabled` means "rewrite
@@ -169,7 +178,7 @@ impl SaydIface {
             // what `will_reword` judged; `Err` hands the original straight
             // back.
             Ok(plan) => plan.resolve().await,
-            Err(text) => text,
+            Err(text) => Spoken::as_written(text),
         }
     }
 
@@ -198,9 +207,39 @@ impl SaydIface {
             .await
             .map_err(|e| fdo::Error::Failed(format!("{what} read panicked: {e}")))?
             .map_err(fdo::Error::Failed)?;
-        let text = self.maybe_reword(text, opts).await;
-        self.submit(text, say_opts_from(opts, QueueSource::Hotkey))
+        let spoken = self.maybe_reword(text, opts).await;
+        self.submit_spoken(spoken, say_opts_from(opts, QueueSource::Hotkey))
             .await
+    }
+
+    /// Submit what [`SaydIface::maybe_reword`] produced, falling back to the
+    /// text a rewrite replaced if the engine refuses the rewrite.
+    ///
+    /// CRITICAL 2, and the reason it is a method rather than two lines at
+    /// each call site: `Say`, `SaySelection` and `SayClipboard` all reach the
+    /// engine through here, and a caller that submitted `spoken.text` and
+    /// dropped `spoken.fallback` would compile and would silently reinstate
+    /// the loss. [`Spoken::fallback`] is `None` unless something actually
+    /// rewrote the text, so this retries at most once and never submits the
+    /// same string twice.
+    ///
+    /// The retried submission is the one whose id the caller gets, which is
+    /// right: it is the utterance that was queued.
+    async fn submit_spoken(&self, spoken: Spoken, opts: SayOpts) -> fdo::Result<u32> {
+        let Spoken { text, fallback } = spoken;
+        let Some(original) = fallback else {
+            return self.submit(text, opts).await;
+        };
+        match self.submit(text, opts.clone()).await {
+            Err(e) => {
+                eprintln!(
+                    "warning: reword: the engine refused the rewritten text ({e}); \
+                     speaking it as written instead"
+                );
+                self.submit(original, opts).await
+            }
+            ok => ok,
+        }
     }
 
     /// Shared body of `Say`, `SaySelection` and `SayClipboard`.
@@ -282,8 +321,8 @@ impl SaydIface {
     /// `submit`'s doc comment) -- also safe, since the queue does not reach
     /// that id in practice either.
     async fn say(&self, text: String, opts: HashMap<String, OwnedValue>) -> fdo::Result<u32> {
-        let text = self.maybe_reword(text, &opts).await;
-        self.submit(text, say_opts_from(&opts, QueueSource::DBus))
+        let spoken = self.maybe_reword(text, &opts).await;
+        self.submit_spoken(spoken, say_opts_from(&opts, QueueSource::DBus))
             .await
     }
 
@@ -688,6 +727,59 @@ mod tests {
             !wants_reword(&opts_with("reword", OwnedValue::from(Str::from("yes")))),
             "a wrongly-typed value is ignored, not an error"
         );
+    }
+
+    /// CRITICAL 2 on this path: `maybe_reword`'s "every way this can fail
+    /// ends in the original being spoken" has to hold for the way it can fail
+    /// *after succeeding* -- a rewrite the guard accepted and the engine then
+    /// refuses, which is reachable because the guard's ceiling
+    /// (`original * 3 / 2 + 32`) and `max_chars` are unrelated numbers.
+    ///
+    /// The control is the first assertion: the same string submitted without
+    /// a fallback is an error to the caller, so the second assertion is not
+    /// passing for some other reason.
+    #[tokio::test]
+    async fn a_rewrite_the_engine_refuses_is_still_spoken_as_written() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = Config {
+            max_chars: 40,
+            ..Config::default()
+        };
+        let engine = sayd_core::handle::EngineHandle::spawn(
+            cfg.clone(),
+            Box::new(StubSynthesizer::new()),
+            Box::new(VecSink::new(24_000 * 10)),
+        );
+        let store = Arc::new(ConfigStore::new(
+            dir.path().join("config.toml"),
+            engine.clone(),
+            cfg,
+        ));
+        let i = SaydIface::new(engine, store);
+
+        let original = "Alice asked about dinner tonight".to_string();
+        let oversize = "a much longer rewrite than the engine will take".repeat(2);
+        let opts = || say_opts_from(&HashMap::new(), QueueSource::DBus);
+
+        assert!(
+            i.submit(oversize.clone(), opts()).await.is_err(),
+            "control: on its own this submission is refused"
+        );
+        let id = i
+            .submit_spoken(
+                Spoken {
+                    text: oversize,
+                    fallback: Some(original.clone()),
+                },
+                opts(),
+            )
+            .await
+            .expect("the fallback must be accepted rather than the refusal reported");
+        assert!(id > 0, "and it was queued, not discarded");
+        wait_for(&i.engine, "the fallback to be spoken", |s| {
+            s.current_text == original
+        });
+        i.engine.shutdown();
     }
 
     /// The `reword` key is read *only* by `maybe_reword`; it must not leak
