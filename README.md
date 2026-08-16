@@ -423,7 +423,7 @@ no TLS stack, so `enabled = true` in that build is a no-op -- see
     enabled = false                          # rewrite notification announcements
     base_url = "http://localhost:11434/v1"   # any OpenAI-compatible endpoint
     model = "llama3.2:3b"
-    provider = "llama-cpp"                   # "llama-cpp" | "generic"; required when enabled
+    provider = "generic"                     # "llama-cpp" | "generic"; required when enabled -- Ollama, above, is "generic"
     api_key = ""                             # local servers ignore it; see api_key_env
     api_key_env = "SAYD_REWORD_API_KEY"      # this variable wins over api_key
     timeout_ms = 1500                        # 200..=2000
@@ -563,6 +563,13 @@ a minute, and what actually ends a slow request is the client's own 10-second
 ceiling. If a generation reaches the cap, the original is spoken and the
 journal says so.
 
+It is also a cost bound, on any endpoint that meters completion tokens --
+PPQ, OpenAI, and any other paid provider in the table above. A rewrite that
+runs away now bills up to 1200 tokens instead of the fixed 256 this used to
+be capped at, and up to 6000 at `max_chars`'s ceiling of 2000. `max_chars`
+is what bounds it; a lower value lowers the worst case on every failed
+rewrite, not only the successful ones.
+
 ### What is sent, and what is not
 
 What leaves the machine is the composed announcement **after** cleanup: the
@@ -629,12 +636,26 @@ request at all.
 
 ### What can go wrong
 
-Every failure ends the same way: **the original text is spoken.** A dead,
-misconfigured, slow, hostile or absent provider degrades to exactly the
-behaviour of every release before this one, and no notification is ever
-lost. A keybind does not stop speaking because an optional enhancement is
-misconfigured. Rewrites are never retried -- by the time a retry could
-finish, the utterance has already been spoken.
+Every *reword* failure ends the same way: **the original text is spoken.**
+A dead, misconfigured, slow, hostile or absent provider degrades to exactly
+the behaviour of every release before this one, and no notification is ever
+lost. Rewrites are never retried -- by the time a retry could finish, the
+utterance has already been spoken.
+
+One exception, and it is a startup refusal rather than a reword failure:
+`reword.enabled = true` with `reword.provider` unset or unrecognised is a
+contradiction the daemon cannot fill -- automatic rewording was asked for
+and there is no dialect left to tell the provider not to reason in -- so
+it refuses to start at all, taking every keybind and all of TTS down with
+it, rather than silently ignoring the field it was told to act on. The
+message, printed to stderr and so visible in
+`journalctl --user -u sh.sayd.Sayd`, names the values `reword.provider`
+accepts; set it to one of them, or set `reword.enabled = false`. The
+settings window can no longer write this combination -- every endpoint
+preset it offers now commits a provider alongside the URL -- so this is
+reachable only by hand-editing `config.toml`. Everywhere else --
+`--reword` with no provider, a live reload that breaks the field --
+rewording degrades without taking the daemon down; see below.
 
 That uniformity is also the problem: from outside the daemon, a rejected
 key, an unreachable host, a missing model and the feature simply being
@@ -991,14 +1012,20 @@ model server you can reach -- the quickest is Ollama:
 
 1. `cargo build --release --features reword`, put `sayd` and `say` on
    `$PATH`, and restart the daemon.
-2. `say --reword "Alice: where do you want to go for dinner"` -- you should
+2. Open the tray menu, click **Settings…**, and find the **Reword** group.
+   A fresh install has no `reword.provider`, and the field is required
+   before anything can be sent (see
+   [What can go wrong](#what-can-go-wrong) below) -- click the **Endpoint**
+   row's preset menu and choose **Ollama — http://localhost:11434/v1**. A
+   preset button commits `provider` along with the URL, so this one click
+   is enough; leave the window open for step 5.
+3. `say --reword "Alice: where do you want to go for dinner"` -- you should
    hear a sentence, not a label and a fragment. If you hear the original
-   back, something is misconfigured; step 5 below says what.
-3. `journalctl --user -u sh.sayd.Sayd -n 20` (or the terminal you started it
+   back, the journal (next step) or the Test row (step 5) says why.
+4. `journalctl --user -u sh.sayd.Sayd -n 20` (or the terminal you started it
    in) -- exactly one `reword: sending text to ...` line, naming your
    endpoint and model. Send several more and confirm it stays at one line.
-4. Open the tray menu, click **Settings…**, and find the **Reword** group.
-   Press **Test**. Read the result row:
+5. Back in the **Reword** group, press **Test**. Read the result row:
    - the rewritten sentence, and a latency;
    - **compare that latency against the Deadline row.** If the row says the
      answer took longer than the deadline, raise the deadline -- or accept
@@ -1007,20 +1034,20 @@ model server you can reach -- the quickest is Ollama:
    - press Test a second time. It should be faster; the first request
      includes connection setup, and the row says so;
    - press **Speak** on the result row and hear the rewrite.
-5. Break it on purpose, and confirm the row tells you *which* thing is
+6. Break it on purpose, and confirm the row tells you *which* thing is
    broken rather than just failing: change **Model** to `not-a-model` and
    press Test again (the row should say "The provider does not have that
    model"), then change **Endpoint** to `http://localhost:1/v1` and press
    Test once more (the row should say "Could not reach the provider"). Put
    both back.
-6. Turn **Rewrite notifications** on, `notify-send -a Signal "Alice"
+7. Turn **Rewrite notifications** on, `notify-send -a Signal "Alice"
    "where do you want to go for dinner"` (with `Signal` on the allowlist
    and `speak_body = true`) -- you should hear the rewritten form.
-7. Send a burst of five notifications from the same application and let the
+8. Send a burst of five notifications from the same application and let the
    cooldown window close. The `"Signal: 4 more notifications"` follow-up is
-   spoken **as written**: it is already a sentence, and rewriting it would
-   let it overtake the announcement that opened the window.
-8. Stop the model server and send another notification. It is spoken as
+   spoken **as written** -- [Where it applies](#where-it-applies) above has
+   the reasons a coalesced follow-up is never reworded.
+9. Stop the model server and send another notification. It is spoken as
    written, promptly, with one warning in the log -- not silence, and not a
    delay on every notification afterwards.
 

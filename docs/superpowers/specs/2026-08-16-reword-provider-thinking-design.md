@@ -147,6 +147,23 @@ answer that merely carries a populated `reasoning_content` alongside a complete
 three `Ceiling`s do today. This is the half of the fix that still works when
 `provider` is set wrong, or when a model that did not used to reason starts.
 
+Scoped to hardware fast enough to reach the cap at all. `finish_reason:
+"length"` only arrives if the generation *finishes* `max_tokens` inside the
+10 s `REWORD_HTTP_CEILING` -- otherwise the client's own timeout ends the
+request first, as `RewordError::Ceiling`, which *is* transport-class and
+does open the breaker. At the 1200-token default that needs 120 tok/s;
+this machine sustains 8--19 tok/s under load (measured above), so a runaway
+here still times out as `Ceiling` before it can be classified as
+`Truncated`. It was already close to true at the old 256-token cap -- 25.6
+tok/s needed, against a measured ceiling of 19.2 -- and raising the cap to
+1200 moved the requirement further out of reach rather than closer. None of
+this makes the branch wrong: `chat_template_kwargs` is what stops the
+reasoning happening at all, measured at 6/6, and is the actual fix.
+`Truncated` is a real classification for a provider that answers with
+`finish_reason: "length"` well inside the ceiling -- a faster box, a
+smaller model, a remote GPU endpoint -- just not a safety net this reporting
+hardware will see fire.
+
 ## Components
 
 | Unit | Change |
