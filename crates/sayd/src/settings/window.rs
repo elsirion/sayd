@@ -45,10 +45,12 @@ use sayd_core::queue::{Policy, Source as QueueSource};
 
 use super::model::{
     allow_add, allow_contains, allow_remove, icon_file_size_within_limit, icon_pixels_within_limit,
-    IconSource, SettingsModel, Suggestion, SuggestionKind, COOLDOWN_MAX, COOLDOWN_MIN,
-    COOLDOWN_STEP, IDLE_UNLOAD_MAX, IDLE_UNLOAD_MIN, IDLE_UNLOAD_STEP, MAX_CHARS_MAX,
-    MAX_CHARS_MIN, MAX_CHARS_STEP, MODELS, SPEED_MAX, SPEED_MIN, SPEED_MODES, SPEED_STEP,
-    THREADS_MAX, THREADS_MIN, THREADS_STEP,
+    reword_key_row_applies, IconSource, SettingsModel, Suggestion, SuggestionKind, COOLDOWN_MAX,
+    COOLDOWN_MIN, COOLDOWN_STEP, ENDPOINT_PRESETS, IDLE_UNLOAD_MAX, IDLE_UNLOAD_MIN,
+    IDLE_UNLOAD_STEP, MAX_CHARS_MAX, MAX_CHARS_MIN, MAX_CHARS_STEP, MODELS, REWORD_MAX_CHARS_MAX,
+    REWORD_MAX_CHARS_MIN, REWORD_MAX_CHARS_STEP, REWORD_TIMEOUT_MAX, REWORD_TIMEOUT_MIN,
+    REWORD_TIMEOUT_STEP, SPEED_MAX, SPEED_MIN, SPEED_MODES, SPEED_STEP, THREADS_MAX, THREADS_MIN,
+    THREADS_STEP,
 };
 use crate::notify::seen;
 
@@ -605,6 +607,9 @@ fn build(model: Arc<SettingsModel>, engine: EngineHandle) -> Ui {
     page.add(&engine_group(&ui, &cfg));
     page.add(&cleanup_group(&ui, &cfg));
     page.add(&notification_group(&ui, &cfg));
+    page.add(&reword_group(&ui, &cfg));
+    // The allowlist and its two suggestion groups belong together at the
+    // bottom of the page, so the Reword group goes above them.
     page.add(&allowlist_group(&ui, &cfg));
     for (kind, title, description) in SUGGESTION_GROUPS {
         page.add(&suggestions_group(&ui, &cfg, kind, title, description));
@@ -1242,6 +1247,303 @@ fn notification_group(ui: &Ui, cfg: &Config) -> adw::PreferencesGroup {
     group
 }
 
+/// A two-way text row bound to one `String` field of the config.
+///
+/// The commit rule is the reason this is a helper rather than three copies:
+/// **on the apply button and on focus-out, never per keystroke.** A base URL
+/// is invalid for almost the whole time you are typing it, and the model's
+/// `WRITE_DEBOUNCE` was sized for spin-button auto-repeat, not for typing --
+/// committing per keystroke would hand the validator a dozen half-URLs and
+/// write most of them to the file.
+///
+/// `AdwEntryRow`'s `apply` signal covers the button and Enter; it is not
+/// emitted on focus-out, so the focus half is a `GtkEventControllerFocus` on
+/// the row (its `leave` fires when focus leaves the row's whole subtree,
+/// which is what "tabbed out of this field" means -- the widget that
+/// actually holds the focus is the `GtkText` inside). The controller holds a
+/// *weak* reference to the row it is attached to: a strong one would be the
+/// row holding a controller holding the row, the cycle `Combo::choice`
+/// exists to avoid one widget further apart.
+///
+/// The row is populated by the caller *before* this is called, in the order
+/// every other row here uses -- see `quiet`.
+fn bind_entry(
+    ui: &Ui,
+    row: &impl IsA<adw::EntryRow>,
+    get: fn(&Config) -> String,
+    set: fn(&mut Config, String),
+) {
+    // Upcast once: a `PasswordEntryRow` is an `EntryRow`, and everything
+    // below is the parent class's.
+    let row: adw::EntryRow = row.as_ref().clone();
+
+    let r = row.clone();
+    ui.row(move |_, cfg| {
+        let want = get(cfg);
+        // Only when it differs. A redraw fires for every accepted edit
+        // anywhere in the window, and `set_text` on an entry the user is
+        // half-way through moves the cursor to the end and loses what came
+        // after it.
+        if r.text() != want {
+            r.set_text(&want);
+        }
+    });
+
+    let u = ui.downgrade();
+    row.connect_apply(move |row| commit_entry(&u, row, get, set));
+
+    let focus = gtk::EventControllerFocus::new();
+    let u = ui.downgrade();
+    let weak = row.downgrade();
+    focus.connect_leave(move |_| {
+        let Some(row) = weak.upgrade() else { return };
+        commit_entry(&u, &row, get, set);
+    });
+    row.add_controller(focus);
+}
+
+/// Write what a bound entry row holds, unless the config already holds it.
+///
+/// The "unless" is what keeps tabbing through the window from writing the
+/// file once per row: `leave` fires for every field the focus passes
+/// through, whether or not anything was typed into it. It also makes the
+/// apply button idempotent, and -- because a rejected edit redraws the row
+/// back to what the model holds -- keeps the focus-out that follows a
+/// refused apply from asking for the same rejection twice.
+fn commit_entry(
+    u: &WeakUi,
+    row: &adw::EntryRow,
+    get: fn(&Config) -> String,
+    set: fn(&mut Config, String),
+) {
+    let value = row.text().to_string();
+    u.on_user_change(|u| {
+        if get(&u.model.current()) == value {
+            return;
+        }
+        u.apply(move |cfg| set(cfg, value));
+    });
+}
+
+/// A plain string, made safe to hand to `AdwPreferencesGroup:description`.
+///
+/// That property is the one string in this window that `use_markup(false)`
+/// cannot protect: it is parsed as Pango markup and `AdwPreferencesGroup`
+/// exposes no `use-markup` of its own to turn that off (checked against
+/// libadwaita 1.9). Every other description here is a fixed sentence, but
+/// the Reword group's is built from the configured `base_url` -- so an
+/// endpoint of `http://ada&co.lan:11434/v1` made GTK refuse the whole
+/// string: *"Failed to set text ... Entity name 'co.lan. No API key is set'
+/// is not known"*, measured under a headless compositor.
+///
+/// What that costs is worse than the blank row `use_markup` guards against,
+/// because the label keeps whatever it had: the group goes on describing the
+/// endpoint the user came *from*, and the one line telling them where their
+/// text is being sent is quietly a lie. Escaping is the fix rather than
+/// stripping, because the text is meant to be read verbatim -- the markup
+/// parser turns `&amp;` back into `&` for display, so what is rendered is
+/// exactly the string `model.rs` produced.
+fn group_description(text: &str) -> String {
+    glib::markup_escape_text(text).to_string()
+}
+
+/// Where a rewrite is sent, what it is sent as, and what it may cost.
+///
+/// The group with the only two-way text entries in this window; see
+/// [`bind_entry`] for when one of them commits. `use_markup(false)` on every
+/// row, not only the ones showing a config string: the endpoint and the
+/// model name are user-supplied, `AdwPreferencesRow:use-markup` defaults to
+/// `true` and governs the subtitle as well as the title, and a row left on
+/// the default renders **both blank** for a value containing `&` -- which is
+/// exactly the character a URL with a query string carries.
+fn reword_group(ui: &Ui, cfg: &Config) -> adw::PreferencesGroup {
+    // The description names the destination host and says where the key is
+    // coming from -- a user who exports SAYD_REWORD_API_KEY and then sees no
+    // key in the window would otherwise conclude the feature is
+    // unconfigured. Built in `model.rs`, like every other string that
+    // depends on what the config says.
+    let group = adw::PreferencesGroup::builder()
+        .title("Reword")
+        .description(group_description(&ui.model.reword_description_now()))
+        .build();
+    // Redrawn like any row: the destination and the key sentence are what
+    // the Endpoint and API key rows below change. Escaped on both paths --
+    // see `group_description`, and note that the failure it prevents is a
+    // *stale* description rather than a blank one.
+    let g = group.clone();
+    ui.row(move |ui, _| {
+        g.set_description(Some(&group_description(&ui.model.reword_description_now())))
+    });
+
+    // --- Rewrite notifications -------------------------------------------
+    let enabled = adw::SwitchRow::builder()
+        .title("Rewrite notifications")
+        .subtitle("Send each announcement to the endpoint below and speak what comes back")
+        .use_markup(false)
+        .active(cfg.reword.enabled)
+        .build();
+    let r = enabled.clone();
+    ui.row(move |_, cfg| r.set_active(cfg.reword.enabled));
+    let u = ui.downgrade();
+    enabled.connect_active_notify(move |row| {
+        let on = row.is_active();
+        u.on_user_change(|u| u.apply(|c| c.reword.enabled = on));
+    });
+    group.add(&enabled);
+
+    // --- Endpoint ---------------------------------------------------------
+    let endpoint = adw::EntryRow::builder()
+        .title("Endpoint")
+        .use_markup(false)
+        .show_apply_button(true)
+        .text(&*cfg.reword.base_url)
+        .build();
+    // A plain popover of buttons rather than a `GMenu`: this daemon has no
+    // `GtkApplication` and therefore no action group to hang menu items on,
+    // and inventing one for six URLs would be more machinery than the
+    // feature.
+    let presets = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let popover = gtk::Popover::builder().child(&presets).build();
+    let menu = gtk::MenuButton::builder()
+        .icon_name("view-list-symbolic")
+        .tooltip_text("Known endpoints")
+        .valign(gtk::Align::Center)
+        .popover(&popover)
+        .build();
+    menu.add_css_class("flat");
+    for (name, url) in ENDPOINT_PRESETS {
+        let item = gtk::Button::builder()
+            .label(format!("{name} — {url}"))
+            .css_classes(["flat"])
+            .build();
+        let u = ui.downgrade();
+        let pop = popover.downgrade();
+        // Weak, like every other widget a handler here refers to: this
+        // button is inside the popover the MenuButton owns, which is a
+        // suffix of the row.
+        let field = endpoint.downgrade();
+        item.connect_clicked(move |_| {
+            if let Some(pop) = pop.upgrade() {
+                pop.popdown();
+            }
+            let Some(field) = field.upgrade() else { return };
+            u.with(|ui| {
+                // The visible text *and* the config. A preset that filled
+                // the field and left it waiting for the apply button would
+                // look applied and not be.
+                ui.quietly(|| field.set_text(url));
+                ui.apply(|c| c.reword.base_url = url.to_string());
+            });
+        });
+        presets.append(&item);
+    }
+    endpoint.add_suffix(&menu);
+    bind_entry(
+        ui,
+        &endpoint,
+        |cfg| cfg.reword.base_url.clone(),
+        |cfg, v| cfg.reword.base_url = v,
+    );
+    group.add(&endpoint);
+
+    // --- Model ------------------------------------------------------------
+    let model_row = adw::EntryRow::builder()
+        .title("Model")
+        .use_markup(false)
+        .show_apply_button(true)
+        .text(&*cfg.reword.model)
+        .build();
+    bind_entry(
+        ui,
+        &model_row,
+        |cfg| cfg.reword.model.clone(),
+        |cfg, v| cfg.reword.model = v,
+    );
+    group.add(&model_row);
+
+    // --- API key ----------------------------------------------------------
+    // Shown only where a key can be used, which is `reword_key_row_applies`'s
+    // rule and not this layer's: a credential field in front of a server
+    // that takes no credential invites putting a secret into a file the
+    // window rewrites wholesale, for nothing. It never hides a key the file
+    // already holds -- this row is the only way to read or clear one -- and
+    // the group description above says where the key is coming from in the
+    // case where the row is not there to say it.
+    //
+    // The visibility follows the *committed* endpoint, not what is being
+    // typed into it (see `bind_entry`), so it changes at most once per
+    // deliberate change of endpoint rather than flickering under the cursor.
+    let key = adw::PasswordEntryRow::builder()
+        .title("API key")
+        .use_markup(false)
+        .show_apply_button(true)
+        .text(&*cfg.reword.api_key)
+        .build();
+    // A tooltip and not a subtitle: `AdwEntryRow` has no subtitle at all
+    // (`AdwPreferencesRow` does not define one -- checked against
+    // libadwaita 1.9), so the sentence has to go somewhere that exists.
+    key.set_tooltip_text(Some(
+        "Sent to the endpoint as a bearer token. It is stored in config.toml, \
+         which this window rewrites in full; a key in the environment variable \
+         named in the description above is used instead and is never written here.",
+    ));
+    key.set_visible(reword_key_row_applies(&cfg.reword));
+    let r = key.clone();
+    ui.row(move |_, cfg| r.set_visible(reword_key_row_applies(&cfg.reword)));
+    bind_entry(
+        ui,
+        &key,
+        |cfg| cfg.reword.api_key.clone(),
+        |cfg, v| cfg.reword.api_key = v,
+    );
+    group.add(&key);
+
+    // --- Deadline ---------------------------------------------------------
+    let deadline = Spin::new(
+        "Deadline",
+        "Milliseconds a rewrite may take before the original is spoken instead",
+        REWORD_TIMEOUT_MIN,
+        REWORD_TIMEOUT_MAX,
+        REWORD_TIMEOUT_STEP,
+        0,
+    );
+    // `Spin` is shared with four other groups, whose rows show nothing but
+    // numbers; this group's rule is that every row in it is non-markup, so
+    // it is set here rather than by changing what every spin row does.
+    deadline.row.set_use_markup(false);
+    deadline.show(cfg.reword.timeout_ms as f64);
+    let s = deadline.clone();
+    ui.row(move |_, cfg| s.show(cfg.reword.timeout_ms as f64));
+    let u = ui.downgrade();
+    deadline.row.connect_value_notify(move |row| {
+        let value = row.value() as u64;
+        u.on_user_change(|u| u.apply(|c| c.reword.timeout_ms = value));
+    });
+    group.add(&deadline.row);
+
+    // --- Longest text to rewrite -----------------------------------------
+    let ceiling = Spin::new(
+        "Longest text to rewrite",
+        "Characters; anything longer is spoken as written",
+        REWORD_MAX_CHARS_MIN,
+        REWORD_MAX_CHARS_MAX,
+        REWORD_MAX_CHARS_STEP,
+        0,
+    );
+    ceiling.row.set_use_markup(false);
+    ceiling.show(cfg.reword.max_chars as f64);
+    let s = ceiling.clone();
+    ui.row(move |_, cfg| s.show(cfg.reword.max_chars as f64));
+    let u = ui.downgrade();
+    ceiling.row.connect_value_notify(move |row| {
+        let value = row.value() as usize;
+        u.on_user_change(|u| u.apply(|c| c.reword.max_chars = value));
+    });
+    group.add(&ceiling.row);
+
+    group
+}
+
 /// The allowlist: an entry to add a name, and one row per name already on it.
 ///
 /// A group of its own rather than more rows under the switches, for three
@@ -1588,6 +1890,14 @@ fn theme_has(name: &str) -> bool {
 /// whether to hand a stranger's file to an image decoder on the main
 /// thread, and that is a decision with a measurable answer.
 ///
+/// Two later additions ride in the same harness, for the same reason: they
+/// need a real window under a real compositor, which is the only place they
+/// can be wrong. [`a_newly_seen_application_appears_while_the_window_is_open`]
+/// covers the suggestion poll, and the Reword group's pair covers what
+/// nothing else in this window does -- a two-way text entry (when it
+/// commits, and that a redraw does not clobber what is being typed) and
+/// whether closing the window still frees every widget in it.
+///
 /// **One test function, deliberately**, and one that skips unless it can
 /// have the main thread. GTK may only be initialised once and only from the
 /// thread that will use it (gtk4-rs panics with "attempted to initialize GTK
@@ -1634,6 +1944,62 @@ mod tests {
             Config::default(),
         ));
         (model, engine)
+    }
+
+    /// The row of type `T` under `widget` with this title, so a test can
+    /// drive the real widget rather than the model it was built from.
+    ///
+    /// Generic over the row type because the two it is asked for differ only
+    /// in that: an `AdwEntryRow` (and `AdwPasswordEntryRow`, which is one)
+    /// and an `AdwSpinRow`.
+    fn find_row<T: IsA<adw::PreferencesRow> + IsA<gtk::Widget>>(
+        widget: &gtk::Widget,
+        title: &str,
+    ) -> Option<T> {
+        if let Some(row) = widget.downcast_ref::<T>() {
+            if row.title() == title {
+                return Some(row.clone());
+            }
+        }
+        let mut child = widget.first_child();
+        while let Some(w) = child {
+            if let Some(found) = find_row::<T>(&w, title) {
+                return Some(found);
+            }
+            child = w.next_sibling();
+        }
+        None
+    }
+
+    /// Every `GtkLabel`'s text anywhere under `widget`.
+    ///
+    /// What a *rendered* string is: a label GTK refused to set because the
+    /// markup did not parse is empty here, which is the whole failure mode
+    /// `use_markup(false)` exists for and the one an assertion on the config
+    /// would sail straight past.
+    fn label_texts(widget: &gtk::Widget) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+            out.push(label.text().to_string());
+        }
+        let mut child = widget.first_child();
+        while let Some(w) = child {
+            out.extend(label_texts(&w));
+            child = w.next_sibling();
+        }
+        out
+    }
+
+    /// A weak reference to every widget in the tree, for the leak
+    /// measurement: a `WeakRef` that still upgrades after the last strong
+    /// `Ui` is gone is a widget that was not freed.
+    fn weak_widgets(widget: &gtk::Widget, out: &mut Vec<glib::WeakRef<gtk::Widget>>) {
+        out.push(widget.downgrade());
+        let mut child = widget.first_child();
+        while let Some(w) = child {
+            weak_widgets(&w, out);
+            child = w.next_sibling();
+        }
     }
 
     /// Every `AdwActionRow` title anywhere under `widget`.
@@ -1723,6 +2089,226 @@ mod tests {
         );
 
         drop(ui);
+        engine.shutdown();
+    }
+
+    /// The three properties that make a two-way text row different from
+    /// every other row in this window, and the one that makes it dangerous.
+    ///
+    /// There was no text entry bound to a config field anywhere here before
+    /// this milestone. Committing per keystroke would write a dozen
+    /// half-URLs to the file and hand each one to the validator; a redraw
+    /// that set the text unconditionally would move the cursor out from
+    /// under someone typing; and a value with an `&` in it -- which is what
+    /// a URL with a query string is -- renders blank on
+    /// `AdwPreferencesRow:use-markup`'s default.
+    ///
+    /// Drives the real widgets under a real compositor: `set_text` is
+    /// typing, `apply` is the button and Enter, and `grab_focus` elsewhere
+    /// is tabbing away. Asserting on the model without touching a widget
+    /// would test nothing this task added.
+    fn the_reword_entry_rows_commit_on_apply_and_never_clobber_typing(dir: &std::path::Path) {
+        let dir = dir.join("reword-rows");
+        std::fs::create_dir_all(&dir).expect("a config directory of its own");
+        let (model, engine) = model_in(&dir);
+        let ui = build(model.clone(), engine.clone());
+        // Presented, because half of this drives focus and an unmapped
+        // window has none to give.
+        ui.window.present();
+        spin_until(Duration::from_secs(2), || ui.window.is_mapped());
+
+        let titles = row_titles(ui.window.upcast_ref());
+        for expected in [
+            "Rewrite notifications",
+            "Deadline",
+            "Longest text to rewrite",
+        ] {
+            assert!(
+                titles.iter().any(|t| t == expected),
+                "the Reword group must carry a {expected} row: {titles:?}"
+            );
+        }
+
+        let endpoint =
+            find_row::<adw::EntryRow>(ui.window.upcast_ref(), "Endpoint").expect("an Endpoint row");
+        let model_row =
+            find_row::<adw::EntryRow>(ui.window.upcast_ref(), "Model").expect("a Model row");
+        let opened_on = model.current().reword.base_url.clone();
+        assert_eq!(
+            endpoint.text(),
+            opened_on,
+            "a row is populated from the config before its handler is connected"
+        );
+
+        // Typing alone must change nothing: this is the whole commit rule.
+        endpoint.set_text("http://box.lan:11434/v1");
+        assert_eq!(
+            model.current().reword.base_url,
+            opened_on,
+            "typing must not write; a base URL is invalid for almost the whole \
+             time you are typing it"
+        );
+
+        // Applying commits it.
+        endpoint.emit_by_name::<()>("apply", &[]);
+        assert_eq!(model.current().reword.base_url, "http://box.lan:11434/v1");
+
+        // So does tabbing away, which is what a user who does not notice the
+        // apply button does. `grab_focus` on the row focuses the `GtkText`
+        // inside it; the controller is on the row, and its `leave` covers
+        // the whole subtree.
+        let model_opened_on = model.current().reword.model.clone();
+        assert!(model_row.grab_focus(), "the Model row must be focusable");
+        model_row.set_text("qwen2.5:7b");
+        assert_eq!(
+            model.current().reword.model,
+            model_opened_on,
+            "still nothing written while the field has the focus"
+        );
+        assert!(endpoint.grab_focus(), "focus must move to another row");
+        assert_eq!(
+            model.current().reword.model,
+            "qwen2.5:7b",
+            "leaving a field commits what is in it"
+        );
+
+        // An unrelated edit redraws every row. The endpoint row must come
+        // back holding what the config holds -- and, crucially, must not be
+        // rewritten when it already agrees.
+        model.edit(|c| c.reword.timeout_ms = 900).expect("edit");
+        ui.redraw(&model.current());
+        assert_eq!(endpoint.text(), "http://box.lan:11434/v1");
+
+        // A value with an `&` in it, in the row and in the group description
+        // built from it. Both are strings GTK parses as markup unless told
+        // otherwise, and both fail silently when it cannot: the row renders
+        // blank, and the group description -- which has no `use-markup` to
+        // turn off, see `group_description` -- keeps the endpoint it was
+        // last set to and so describes the wrong host.
+        model
+            .edit(|c| c.reword.base_url = "http://ada&co.lan:11434/v1".into())
+            .expect("edit");
+        ui.redraw(&model.current());
+        assert_eq!(endpoint.text(), "http://ada&co.lan:11434/v1");
+        let labels = label_texts(ui.window.upcast_ref());
+        assert!(
+            labels.iter().any(|l| l.contains("ada&co.lan")),
+            "the group description must render the host it names: {labels:?}"
+        );
+
+        // The password row is bound the same way, and is offered only where
+        // a key can be used -- `reword_key_row_applies`'s rule, in
+        // `model.rs`. That endpoint is not this machine, so it is there.
+        let key =
+            find_row::<adw::EntryRow>(ui.window.upcast_ref(), "API key").expect("an API key row");
+        assert!(key.is_visible(), "a remote endpoint may want a key");
+        key.set_text("sk-typed");
+        assert_eq!(model.current().reword.api_key, "");
+        key.emit_by_name::<()>("apply", &[]);
+        assert_eq!(model.current().reword.api_key, "sk-typed");
+
+        // Back to this machine with the key still in the file: the row stays,
+        // because it is the only way to read or clear it.
+        model
+            .edit(|c| c.reword.base_url = "http://localhost:11434/v1".into())
+            .expect("edit");
+        ui.redraw(&model.current());
+        assert!(key.is_visible(), "a key the file holds keeps its row");
+        assert_eq!(key.text(), "sk-typed", "and shows what the file holds");
+
+        // Cleared, and now there is nothing for it to offer.
+        key.set_text("");
+        key.emit_by_name::<()>("apply", &[]);
+        assert_eq!(model.current().reword.api_key, "");
+        assert!(
+            !key.is_visible(),
+            "a local endpoint with no key stored takes no credential"
+        );
+
+        // The two spin rows offer exactly the model's bounds, and cannot
+        // produce a value outside them. The deadline's ceiling is the one
+        // that matters: it is arithmetic in `sayd_core::config` against
+        // sayd-cli's own D-Bus timeout, it moved once already, and a literal
+        // in this file is how the two would drift apart.
+        for (title, min, max, step, held) in [
+            (
+                "Deadline",
+                REWORD_TIMEOUT_MIN,
+                REWORD_TIMEOUT_MAX,
+                REWORD_TIMEOUT_STEP,
+                (|c: &Config| c.reword.timeout_ms as f64) as fn(&Config) -> f64,
+            ),
+            (
+                "Longest text to rewrite",
+                REWORD_MAX_CHARS_MIN,
+                REWORD_MAX_CHARS_MAX,
+                REWORD_MAX_CHARS_STEP,
+                |c: &Config| c.reword.max_chars as f64,
+            ),
+        ] {
+            let row = find_row::<adw::SpinRow>(ui.window.upcast_ref(), title).expect("a spin row");
+            let adjustment = row.adjustment();
+            assert_eq!(
+                (
+                    adjustment.lower(),
+                    adjustment.upper(),
+                    adjustment.step_increment()
+                ),
+                (min, max, step),
+                "{title} must offer the bounds `model.rs` names"
+            );
+            row.set_value(max + step);
+            assert_eq!(row.value(), max, "{title} must stop at its ceiling");
+            assert_eq!(
+                held(&model.current()),
+                max,
+                "{title} writes what it shows, through the model like every other row"
+            );
+        }
+
+        ui.window.destroy();
+        drop(ui);
+        engine.shutdown();
+    }
+
+    /// The leak M5 paid for, guarded at the two places a new one would
+    /// appear: the entry rows' focus controllers and the preset popover's
+    /// buttons, both of which refer to widgets that refer back.
+    ///
+    /// Measured then: 533 of 533 widgets alive after `destroy()`, from two
+    /// reference cycles rather than one, once per opening, for the life of a
+    /// daemon that is supposed to carry no GTK resources between openings. A
+    /// `WeakRef` that still upgrades after the only strong `Ui` is dropped is
+    /// that bug returning, which is why this counts the whole tree rather
+    /// than only the window.
+    fn the_window_is_freed_after_the_reword_group_has_been_built(dir: &std::path::Path) {
+        let dir = dir.join("reword-leak");
+        std::fs::create_dir_all(&dir).expect("a config directory of its own");
+        let (model, engine) = model_in(&dir);
+        let mut widgets = Vec::new();
+        let window = {
+            let ui = build(model, engine.clone());
+            weak_widgets(ui.window.upcast_ref(), &mut widgets);
+            let window = ui.window.downgrade();
+            ui.window.destroy();
+            window
+        };
+        let total = widgets.len();
+        // Finalisation happens on a turn of the main loop, not at the drop.
+        spin_until(Duration::from_secs(2), || {
+            window.upgrade().is_none() && widgets.iter().all(|w| w.upgrade().is_none())
+        });
+        let alive = widgets.iter().filter(|w| w.upgrade().is_some()).count();
+        assert!(
+            window.upgrade().is_none(),
+            "the settings window is still alive after close: something in the \
+             Reword group holds a strong reference back to it"
+        );
+        assert_eq!(
+            alive, 0,
+            "{alive} of {total} widgets survived the close; a handler is holding \
+             a strong Ui, or a controller the widget it is attached to"
+        );
         engine.shutdown();
     }
 
@@ -1818,5 +2404,7 @@ mod tests {
         // from a `#[test]` of its own for the same one-init reason.
         adw::init().expect("libadwaita initialises once GTK has");
         a_newly_seen_application_appears_while_the_window_is_open(dir.path());
+        the_reword_entry_rows_commit_on_apply_and_never_clobber_typing(dir.path());
+        the_window_is_freed_after_the_reword_group_has_been_built(dir.path());
     }
 }

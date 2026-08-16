@@ -102,18 +102,12 @@ pub const COOLDOWN_STEP: f64 = 5.0;
 /// drift this pair exists to prevent.
 pub const REWORD_TIMEOUT_MIN: f64 = sayd_core::config::REWORD_TIMEOUT_MIN_MS as f64;
 pub const REWORD_TIMEOUT_MAX: f64 = sayd_core::config::REWORD_TIMEOUT_MAX_MS as f64;
-// `#[allow(dead_code)]`: unlike `COOLDOWN_STEP` and friends, no spin row
-// consumes this yet -- the Reword group's window.rs wiring is a later task
-// in this milestone. `clamp_ranges` already needs the MIN/MAX pair above, so
-// this is produced now to match, per the interface the later task expects.
-#[allow(dead_code)]
 pub const REWORD_TIMEOUT_STEP: f64 = 100.0;
 /// The floor is not `0`: there is no magic zero here. `enabled` is the off
 /// switch, and `--reword` on an over-long submission is a no-op rather than
 /// an error.
 pub const REWORD_MAX_CHARS_MIN: f64 = 32.0;
 pub const REWORD_MAX_CHARS_MAX: f64 = 2000.0;
-#[allow(dead_code)]
 pub const REWORD_MAX_CHARS_STEP: f64 = 32.0;
 
 /// What the Test row starts with: the example this whole feature exists
@@ -132,7 +126,6 @@ pub const REWORD_TEST_DEFAULT: &str = "Alice: where do you want to go for dinner
 /// stale costs nothing and adding one is a line -- but they live here, not
 /// in `window.rs`, for the reason [`MODELS`] and [`SPEED_MODES`] do: the
 /// window is the one layer with no test coverage.
-#[allow(dead_code)]
 pub const ENDPOINT_PRESETS: [(&str, &str); 6] = [
     ("Ollama", "http://localhost:11434/v1"),
     ("llama.cpp server", "http://localhost:8080/v1"),
@@ -694,10 +687,11 @@ impl SettingsModel {
     }
 
     /// The Reword group's description, against the real environment.
-    // `#[allow(dead_code)]`: the Reword group's widgets are a later task in
-    // this milestone and are the only caller. It is written here, with a
-    // test, because §6's rule is that the window decides nothing.
-    #[allow(dead_code)]
+    ///
+    /// Called by the group at build time and again from its redraw closure,
+    /// so the sentence about where the key comes from follows an edit to the
+    /// endpoint or the key rather than describing the config the window
+    /// happened to open on.
     pub fn reword_description_now(&self) -> String {
         let cfg = self.current().reword;
         // The two halves of `resolve_api_key_with`'s environment rule, kept
@@ -1335,6 +1329,41 @@ fn reword_description(cfg: &RewordConfig, env_value: Option<&str>) -> String {
         "Sends the text about to be spoken to {destination}. {key} \
          Pressing Test below is itself a network call."
     )
+}
+
+/// Whether the API key row has anything to offer for this endpoint.
+///
+/// The rule, not the widget: a credential field in front of a server that
+/// takes no credential is an invitation to put a secret on disk for nothing,
+/// and `config.toml` is a file the settings window rewrites wholesale (which
+/// is why `api_key_env` is the documented way to hold one at all). A
+/// loopback endpoint is the case where that is certain -- `is_loopback` is
+/// the same name-based test `Config::load_str` uses to decide whether plain
+/// HTTP earns a warning, so the two cannot disagree about what "this
+/// machine" means.
+///
+/// Two things it deliberately does *not* do:
+///
+/// - **It never hides a key that is already stored.** A non-empty `api_key`
+///   keeps the row visible whatever the endpoint is, because the row is the
+///   only way to read or clear it; hiding a secret the file still holds
+///   would be worse than showing a field nobody needs.
+/// - **It errs towards visible.** An unparseable `base_url` is not a
+///   loopback claim, so the row stays: the user is mid-repair, and the
+///   description already says the endpoint is unusable.
+///
+/// The environment is not consulted. `api_key_env` supplies the request's
+/// key without this field being involved at all, and [`reword_description`]
+/// is where that is said -- one sentence in the group description, rather
+/// than a row that vanishes for a reason the user cannot see.
+pub fn reword_key_row_applies(cfg: &RewordConfig) -> bool {
+    if !cfg.api_key.is_empty() {
+        return true;
+    }
+    match sayd_core::reword::parse_base_url(&cfg.base_url) {
+        Ok(endpoint) => !sayd_core::reword::is_loopback(&endpoint.host),
+        Err(_) => true,
+    }
 }
 
 /// One deliberate probe of the configured endpoint.
@@ -3869,6 +3898,63 @@ mod tests {
         );
         drop(model);
         engine.shutdown();
+    }
+
+    /// The API key row is offered for the endpoints that can use one, and
+    /// withheld from the ones that cannot -- a credential field in front of
+    /// a server that takes no credential invites putting a secret into a
+    /// file the settings window rewrites wholesale, for nothing.
+    ///
+    /// The two exceptions are the ones that make hiding it safe: a key
+    /// already in the file keeps the row (it is the only way to read or
+    /// clear it), and an endpoint that does not parse is not a claim about
+    /// anything, so the row stays while the user repairs it.
+    #[test]
+    fn the_api_key_row_is_offered_only_where_a_key_can_be_used() {
+        let mut cfg = RewordConfig::default();
+        assert!(
+            !reword_key_row_applies(&cfg),
+            "the default endpoint is this machine, which takes no key"
+        );
+
+        for local in [
+            "http://localhost:11434/v1",
+            "http://127.0.0.1:8080/v1",
+            "http://[::1]:1234/v1",
+            "http://LOCALHOST:8000/v1",
+        ] {
+            cfg.base_url = local.into();
+            assert!(!reword_key_row_applies(&cfg), "{local} is this machine");
+        }
+
+        for remote in ["https://api.ppq.ai/v1", "https://api.openai.com/v1"] {
+            cfg.base_url = remote.into();
+            assert!(reword_key_row_applies(&cfg), "{remote} may want a key");
+        }
+
+        // Whatever the endpoint, a key the file already holds keeps its row:
+        // hiding a secret that is still on disk would be worse than showing
+        // a field nobody needs.
+        cfg.base_url = "http://localhost:11434/v1".into();
+        cfg.api_key = "sk-left-behind".into();
+        assert!(reword_key_row_applies(&cfg));
+
+        // And an unparseable endpoint errs towards visible.
+        cfg.api_key = String::new();
+        cfg.base_url = "nonsense".into();
+        assert!(reword_key_row_applies(&cfg));
+
+        // The environment is not consulted: `api_key_env` supplies the
+        // request's key without this field, and the group description is
+        // where that is said.
+        cfg.base_url = "http://localhost:11434/v1".into();
+        cfg.api_key_env = "SAYD_REWORD_API_KEY".into();
+        assert!(!reword_key_row_applies(&cfg));
+        assert!(
+            reword_description(&cfg, Some("sk-from-env")).contains("SAYD_REWORD_API_KEY"),
+            "with the row hidden, the description is the only place the key's \
+             source is named"
+        );
     }
 
     /// The presets are the six rows of §6's endpoint table. They live in
