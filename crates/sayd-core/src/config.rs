@@ -71,7 +71,8 @@ pub struct NotificationConfig {
     /// the daemon logs each one it declines to speak.
     pub allow: Vec<String>,
     /// Per-application rate-limit window. `0` switches rate limiting off;
-    /// any other value is raised to [`NOTIFY_COOLDOWN_MIN_SECS`] on load.
+    /// any other value is raised to [`notify_cooldown_min_secs`] on load,
+    /// which is a floor only when notification rewriting is on.
     pub cooldown_secs: u64,
     pub speak_app_name: bool,
     /// Bodies are frequently several sentences and often restate the summary,
@@ -91,91 +92,36 @@ impl Default for NotificationConfig {
     }
 }
 
-/// The window `reword.timeout_ms` is honoured in, applied by
-/// [`Config::load_str`] as well as by `settings::model::clamp_ranges`.
+/// The shortest `reword.timeout_ms` [`Config::load_str`] will honour.
 ///
-/// Declared here rather than only beside the settings window's spin rows
-/// because the ceiling is not a matter of taste: `sayd-cli` bounds every
-/// D-Bus interaction at 3 s and `say --reword` waits for the rewrite
-/// inline, so a hand-edited `timeout_ms = 86400000` -- which no spin row
-/// can produce and no `load_str` caller used to reject -- turns a slow
-/// provider into a CLI error instead of a spoken sentence. The value that
-/// reaches `Duration::from_millis` must be inside this window whichever
-/// door the config came through.
+/// **There is no matching ceiling, deliberately.** There used to be one --
+/// 2000 ms, derived from `sayd-cli`'s 3 s bound on a D-Bus call minus the
+/// engine round trip that follows a rewrite -- and it was wrong in kind, not
+/// in value: a local model on someone else's hardware can legitimately need
+/// twenty seconds, and this daemon has no way to know that number. What the
+/// old ceiling actually protected was `sayd-cli`, which bounded every call
+/// at 3 s and would have reported a daemon that was working fine as not
+/// responding. That is now fixed where it lives: `sayd-cli` leaves a `Say`
+/// carrying `reword` unbounded and lets the daemon's own configured
+/// deadline end it (see `sayd-cli`'s `TIMEOUT`), so nothing downstream needs
+/// this value to be small.
+///
+/// The floor stays, and it is not taste either. Below it a "deadline" cannot
+/// be met by any provider on any network, so `enabled = true` with
+/// `timeout_ms = 5` would look like a configured feature and behave like a
+/// switched-off one: every rewrite abandoned, the original spoken, and
+/// nothing in the journal that names the cause. `0` in particular is not a
+/// way to switch rewriting off -- `enabled` is -- so it is raised rather
+/// than honoured.
+///
+/// Applied by [`Config::load_str`] rather than only by
+/// `settings::model::normalize`, because there are four `load_from` callers
+/// and only two of them normalise.
 pub const REWORD_TIMEOUT_MIN_MS: u64 = 200;
-/// See [`REWORD_TIMEOUT_MIN_MS`] for what this ceiling is for. Its *value*
-/// is arithmetic, not taste, and it used to leave no margin at all.
-///
-/// A `Say` carrying `reword` is answered inline, so what `sayd-cli` waits
-/// for is the rewrite, bounded by this, plus `EngineHandle::submit`, bounded
-/// by `SUBMIT_REPLY_TIMEOUT` at 250 ms. (There used to be a third: the
-/// daemon fetched its config with `EngineHandle::config()`, another 250 ms.
-/// It reads `ConfigStore::current` now -- see `dbus::SaydIface::maybe_reword`
-/// -- so that round trip is gone from this sum, and the margin below is
-/// larger than the one 2000 was chosen against.) At 2500 the sum was
-/// 250 + 2500 + 250 = 3000 ms -- exactly `sayd-cli`'s own 3 s bound, which is
-/// to say zero theoretical margin for the bus round trip, for scheduling, or
-/// for the difference between a budget and the moment the runtime notices it
-/// has elapsed. The one failure this clamp exists to prevent was sitting on
-/// its own boundary.
-///
-/// 2000 leaves about a second of it. What that costs a user with a genuinely
-/// slower provider is visible to them: the settings window's Test row
-/// reports the latency it measured, which is how someone discovers they need
-/// a different provider rather than a larger number here.
-///
-/// IMPORTANT 3 (rewording final review): the sum has exactly three terms
-/// because everything else on that path is bounded by nothing measurable and
-/// must therefore cost nothing. The config read is the one that was not:
-/// `sayd::dbus::SaydIface::maybe_reword` took `ConfigStore::current`, and
-/// that mutex is held across an unbounded disk write -- measured, a wedged
-/// write blocked it for 1.500 s, against an allowance here of zero. It reads
-/// `ConfigStore::published` now, an `Arc` clone behind a lock nothing holds
-/// across I/O, so zero is the right allowance rather than an oversight.
-///
-/// MINOR 10: this arithmetic bounds `Say` and nothing else.
-/// `SaySelection`/`SayClipboard` read a selection first, and that read
-/// carries its own bounds -- `selection::SELECTION_READ_TIMEOUT` at 5 s of
-/// inactivity and `SELECTION_READ_OVERALL_CAP` at 30 s overall -- either of
-/// which is on its own past `sayd-cli`'s 3 s. A wedged selection owner is
-/// therefore a "sayd is not responding" no matter what this constant says;
-/// bounding that is the selection module's problem, not this one's.
-pub const REWORD_TIMEOUT_MAX_MS: u64 = 2000;
-
-/// `sayd-cli`'s own bound on any one D-Bus interaction, restated because
-/// `sayd-cli` is a *binary* and nothing can import a constant from it.
-///
-/// It exists only for the assertion below. MINOR 6: [`REWORD_TIMEOUT_MAX_MS`]
-/// derives its value from this number in prose, and nothing related the two
-/// -- the test named as the pin
-/// (`sayd::dbus::tests::a_reword_against_a_silent_provider_still_answers_inside_the_cli_bound`)
-/// asserts only `elapsed < 3 s`, which the old, zero-margin 2500 satisfied
-/// just as well. This is the relationship itself, checked at compile time in
-/// the same style [`NOTIFY_COOLDOWN_MIN_SECS`] uses: raise the ceiling past
-/// what the bound can carry, or lower `sayd-cli`'s `TIMEOUT` under it, and
-/// the workspace stops building rather than shipping a `--reword` that
-/// reports the daemon as dead.
-const CLI_INTERACTION_BOUND_MS: u64 = 3000;
-
-/// `SUBMIT_REPLY_TIMEOUT` from `crate::handle`, which is private there.
-/// The one bounded engine round trip still inside a `--reword` `Say`.
-const SUBMIT_REPLY_BOUND_MS: u64 = 250;
-
-/// The margin the ceiling is chosen to leave: enough for the bus round trip,
-/// for scheduling, and for the gap between a budget elapsing and the runtime
-/// noticing. Half a second, which is what 2000 buys today.
-const REWORD_CLI_MARGIN_MS: u64 = 500;
-
-const _: () = assert!(
-    REWORD_TIMEOUT_MAX_MS + SUBMIT_REPLY_BOUND_MS + REWORD_CLI_MARGIN_MS
-        <= CLI_INTERACTION_BOUND_MS,
-    "reword.timeout_ms's ceiling, plus the engine round trip that follows the \
-     rewrite, plus the margin, must fit inside sayd-cli's own D-Bus timeout -- \
-     or `say --reword` reports a daemon that is working fine as not responding"
-);
 
 /// The shortest non-zero `notifications.cooldown_secs` [`Config::load_str`]
-/// will honour, and the one range in this table that is not about taste.
+/// will honour for `reword`, and the one range in this table that is not
+/// about taste.
 ///
 /// A coalescing window opens when a notification arrives and closes
 /// `cooldown_secs` later, at which point the `"N more notifications"`
@@ -191,14 +137,35 @@ const _: () = assert!(
 /// "Signal: 3 more notifications" before the notification it is counting
 /// from. Measured with the shipped 1500 ms budget and `cooldown_secs = 1`.
 ///
-/// One second past the reword ceiling, derived from it rather than written
-/// out, so the two cannot drift: the opener is submitted at the latest
-/// `REWORD_TIMEOUT_MAX_MS` after it arrived and this leaves the rest of that
-/// second for the submission round trip. `0` is exempt because it means
-/// something else entirely -- `Limiter::decide`'s `cooldown_secs == 0` arm
-/// switches rate limiting off, so no window ever opens and no follow-up is
-/// ever composed, and the ordering this floor protects does not exist.
-pub const NOTIFY_COOLDOWN_MIN_SECS: u64 = REWORD_TIMEOUT_MAX_MS.div_ceil(1000) + 1;
+/// A function rather than the constant it was, because the budget it has to
+/// clear is now the user's own: `reword.timeout_ms` has no ceiling, so there
+/// is no largest value to derive a single number from. One second past the
+/// configured deadline, rounded up, so the opener -- submitted at the latest
+/// `timeout_ms` after it arrived -- still has the rest of that second for
+/// its submission round trip.
+///
+/// Two exemptions, and neither is a softening of the rule:
+///
+/// * **Rewording off.** Nothing delays the opener when `enabled` is false --
+///   the notification path is the only one this ordering concerns, and it
+///   rewrites only when `enabled` is on (`sayd_core::reword::eligible`). An
+///   explicit `say --reword` is not a notification and opens no window. So
+///   the floor is 1: the smallest non-zero cooldown there is, which is to
+///   say no floor at all. Inflating it would take a setting nobody asked
+///   about (a 2-second cooldown on a daemon that does not reword) and raise
+///   it for a reason that does not apply.
+/// * **`cooldown_secs == 0`.** That means something else entirely --
+///   `Limiter::decide`'s zero arm switches rate limiting off, so no window
+///   ever opens and no follow-up is ever composed. The ordering this floor
+///   protects does not exist there. The exemption is applied by the callers
+///   (`Config::load_str` and `settings::model::clamp_ranges`), which is
+///   where the `!= 0` test can be read next to the `max` it guards.
+pub fn notify_cooldown_min_secs(reword: &RewordConfig) -> u64 {
+    if !reword.enabled {
+        return 1;
+    }
+    reword.timeout_ms.div_ceil(1000) + 1
+}
 
 /// Which dialect a provider is told to stop reasoning in.
 ///
@@ -296,11 +263,14 @@ pub struct RewordConfig {
     /// used and `api_key` is ignored.
     pub api_key_env: String,
     /// How long a rewrite may take before the original is spoken instead.
-    /// Clamped to [`REWORD_TIMEOUT_MIN_MS`]..=[`REWORD_TIMEOUT_MAX_MS`] on
-    /// load as well as by `settings::model::clamp_ranges`: `sayd-cli`
-    /// bounds every D-Bus interaction at 3 s, and `say --reword` waits for
-    /// the rewrite inline, so a budget that could exceed it would turn a
-    /// slow provider into a CLI error instead of a spoken sentence.
+    /// Raised to [`REWORD_TIMEOUT_MIN_MS`] on load if it is shorter, and
+    /// bounded above by nothing: a local model may legitimately need far
+    /// longer than any number this daemon could pick. Everything downstream
+    /// derives from the value set here -- the transport's own ceiling
+    /// (`sayd::reword::http_ceiling`), the notification cooldown floor
+    /// ([`notify_cooldown_min_secs`]), and `sayd-cli`, which leaves a `Say`
+    /// carrying `reword` unbounded precisely because it cannot know this
+    /// number.
     pub timeout_ms: u64,
     /// Longer text is spoken as written. Clamped to 32..=2000. The default
     /// is the chunker's `target_chars`: one synthesis chunk, which is the
@@ -528,30 +498,32 @@ impl Config {
     pub fn load_str(txt: &str) -> (Config, Option<String>) {
         match toml::from_str::<Config>(txt) {
             Ok(mut c) => {
-                // The one range this layer enforces itself. Everything else
-                // out of range is a degradation the daemon can report and
-                // carry on with (`settings::model::normalize`), and both
-                // daemon entry points do exactly that. `reword.timeout_ms`
-                // is different in kind: it is handed to
-                // `Duration::from_millis` and awaited inline by `say
-                // --reword`, so a value past `sayd-cli`'s 3 s D-Bus bound
-                // does not degrade the answer, it replaces it with an
-                // error. Enforced at the parse rather than at the use
-                // because there are four `load_from` callers and only two
-                // of them normalise.
-                c.reword.timeout_ms = c
-                    .reword
-                    .timeout_ms
-                    .clamp(REWORD_TIMEOUT_MIN_MS, REWORD_TIMEOUT_MAX_MS);
+                // The one range this layer enforces itself, and only its
+                // floor. Everything else out of range is a degradation the
+                // daemon can report and carry on with
+                // (`settings::model::normalize`), and both daemon entry
+                // points do exactly that. `reword.timeout_ms` is different
+                // in kind at the bottom of its range: it is handed to
+                // `Duration::from_millis`, and a budget no provider can meet
+                // is a feature that looks configured and behaves as if it
+                // were off. There is deliberately no upper bound -- see
+                // `REWORD_TIMEOUT_MIN_MS`. Enforced at the parse rather than
+                // at the use because there are four `load_from` callers and
+                // only two of them normalise.
+                c.reword.timeout_ms = c.reword.timeout_ms.max(REWORD_TIMEOUT_MIN_MS);
                 // The same kind of range for the same kind of reason, and
                 // the other half of the same interaction: a window that
                 // closes before the notification that opened it has been
-                // submitted inverts the two. `0` is left alone -- it is the
-                // off switch, not a short window. See
-                // `NOTIFY_COOLDOWN_MIN_SECS`.
+                // submitted inverts the two. Derived from the deadline just
+                // clamped above, in that order, so the floor clears the
+                // budget this config will actually run with. `0` is left
+                // alone -- it is the off switch, not a short window. See
+                // `notify_cooldown_min_secs`.
                 if c.notifications.cooldown_secs != 0 {
-                    c.notifications.cooldown_secs =
-                        c.notifications.cooldown_secs.max(NOTIFY_COOLDOWN_MIN_SECS);
+                    c.notifications.cooldown_secs = c
+                        .notifications
+                        .cooldown_secs
+                        .max(notify_cooldown_min_secs(&c.reword));
                 }
                 (c, None)
             }
@@ -770,29 +742,35 @@ mod tests {
         assert_eq!(c.reword.timeout_ms, 1500);
     }
 
-    /// A hand-edited `timeout_ms` is clamped by the *parse*, not only by
+    /// A `timeout_ms` under the floor is raised by the *parse*, not only by
     /// the two callers that happen to normalise afterwards.
     ///
-    /// `86400000` reaches `Duration::from_millis` otherwise, and with a
-    /// real client the practical bound becomes the 10 s HTTP ceiling --
-    /// which is past `sayd-cli`'s 3 s D-Bus bound, so `say --reword`
-    /// returns a CLI error rather than a sentence. That is exactly what
-    /// [`REWORD_TIMEOUT_MAX_MS`] exists to prevent.
+    /// The other direction is the point of this milestone and is asserted
+    /// here too: a long deadline is the user's to set. Whoever runs a local
+    /// model that needs thirty seconds gets thirty seconds, and every bound
+    /// that used to be derived from a ceiling is now derived from this
+    /// value.
     #[test]
-    fn a_hand_edited_timeout_is_clamped_by_the_parse_itself() {
-        let (c, err) = Config::load_str("[reword]\ntimeout_ms = 86400000\n");
+    fn a_short_timeout_is_raised_by_the_parse_itself_and_a_long_one_is_kept() {
+        let (c, err) = Config::load_str("[reword]\ntimeout_ms = 0\n");
         assert_eq!(err, None);
-        assert_eq!(c.reword.timeout_ms, REWORD_TIMEOUT_MAX_MS);
-
-        let (c, _) = Config::load_str("[reword]\ntimeout_ms = 0\n");
         assert_eq!(
             c.reword.timeout_ms, REWORD_TIMEOUT_MIN_MS,
-            "and a zero budget is not a way to switch the feature off -- \
+            "a zero budget is not a way to switch the feature off -- \
              `enabled` is"
         );
 
-        // A value inside the window is not touched, which is the case that
-        // matters for every honest config.
+        let (c, err) = Config::load_str("[reword]\ntimeout_ms = 30000\n");
+        assert_eq!(err, None);
+        assert_eq!(
+            c.reword.timeout_ms, 30_000,
+            "there is no ceiling: a local model that needs half a minute is \
+             a real configuration, and no number this daemon could pick would \
+             know that"
+        );
+
+        // A value in the ordinary range is not touched, which is the case
+        // that matters for every honest config.
         let (c, _) = Config::load_str("[reword]\ntimeout_ms = 1200\n");
         assert_eq!(c.reword.timeout_ms, 1200);
     }
@@ -807,16 +785,41 @@ mod tests {
     /// the shipped 1500 ms budget and `cooldown_secs = 1`.
     #[test]
     fn a_cooldown_shorter_than_the_rewrite_budget_is_raised_to_clear_it() {
+        let (c, err) = Config::load_str(
+            "[notifications]\ncooldown_secs = 1\n\
+             [reword]\nenabled = true\ntimeout_ms = 1500\n",
+        );
+        assert_eq!(err, None);
+        assert_eq!(
+            c.notifications.cooldown_secs,
+            notify_cooldown_min_secs(&c.reword)
+        );
+
+        // The floor has to actually clear the budget it is derived from --
+        // otherwise it is decoration -- and it has to keep doing that at a
+        // deadline no ceiling constrains any more. Ten seconds of local
+        // model is the case this milestone exists for.
+        for timeout_ms in [200, 1500, 10_000, 45_000] {
+            let (c, err) = Config::load_str(&format!(
+                "[notifications]\ncooldown_secs = 1\n\
+                 [reword]\nenabled = true\ntimeout_ms = {timeout_ms}\n",
+            ));
+            assert_eq!(err, None);
+            assert!(
+                std::time::Duration::from_secs(c.notifications.cooldown_secs)
+                    > std::time::Duration::from_millis(timeout_ms),
+                "a cooldown of {} does not clear a {timeout_ms} ms rewrite",
+                c.notifications.cooldown_secs
+            );
+        }
+
+        // With rewording off the floor is not a floor: nothing delays the
+        // opener, so a 1-second window is honoured as written rather than
+        // inflated over an interaction this config cannot have.
         let (c, err) = Config::load_str("[notifications]\ncooldown_secs = 1\n");
         assert_eq!(err, None);
-        assert_eq!(c.notifications.cooldown_secs, NOTIFY_COOLDOWN_MIN_SECS);
-
-        assert!(
-            std::time::Duration::from_secs(NOTIFY_COOLDOWN_MIN_SECS)
-                > std::time::Duration::from_millis(REWORD_TIMEOUT_MAX_MS),
-            "the floor has to actually clear the budget it is derived from, \
-             or it is decoration"
-        );
+        assert!(!c.reword.enabled);
+        assert_eq!(c.notifications.cooldown_secs, 1);
 
         let (c, _) = Config::load_str("[notifications]\ncooldown_secs = 0\n");
         assert_eq!(

@@ -165,10 +165,18 @@ const CONFIG_STAMP_READ_TIMEOUT: Duration = Duration::from_millis(250);
 /// records ("SIGTERM left the process sitting for a minute"). This milestone
 /// is what makes it a routine cost rather than a pathological one: the
 /// rewrite's `ureq` call runs on that pool and is bounded only by
-/// `reword::REWORD_HTTP_CEILING`, ten seconds. Measured, one detached
-/// rewrite in flight against a provider that accepts and never answers:
-/// `Runtime::drop` took 9.73 s, so a `systemctl --user restart sayd` in the
-/// middle of one sat for ten seconds.
+/// `reword::http_ceiling`, which is `reword.timeout_ms` plus ten seconds of
+/// grace -- a number the *user* now sets, with no ceiling over it. Measured
+/// at the 1.5 s default, one detached rewrite in flight against a provider
+/// that accepts and never answers: `Runtime::drop` took 9.73 s, so a
+/// `systemctl --user restart sayd` in the middle of one sat for ten seconds.
+/// A minute-long deadline would have made that a minute.
+///
+/// The value below is deliberately **not** derived from that ceiling, and
+/// removing the ceiling on `timeout_ms` did not change it. Waiting for a
+/// rewrite at shutdown buys nothing at any deadline -- see the last
+/// paragraph -- so this is bounded by what a *bounded* task needs, and a
+/// longer deadline only widens the gap between the two.
 ///
 /// 500 ms because that is twice the longest *bounded* thing on this pool --
 /// `sayd_core::handle`'s 250 ms `SUBMIT_REPLY_TIMEOUT` and
@@ -1439,7 +1447,8 @@ fn main() -> std::process::ExitCode {
     // Bounded, rather than letting `rt` drop here: `Runtime::drop` waits
     // without limit for blocking tasks that have started, and since this
     // milestone one of those is a `ureq` request bounded only by
-    // `reword::REWORD_HTTP_CEILING`. See `RUNTIME_SHUTDOWN_GRACE`.
+    // `reword::http_ceiling` -- which is as long as the user's configured
+    // deadline. See `RUNTIME_SHUTDOWN_GRACE`.
     rt.shutdown_timeout(RUNTIME_SHUTDOWN_GRACE);
     code
 }
@@ -1883,22 +1892,25 @@ mod tests {
     /// `main` used to let `rt` drop when the glib loop returned, and
     /// `Runtime::drop` waits -- with no bound of its own -- for every
     /// blocking task that has started. This milestone put a `ureq` request
-    /// on that pool whose only bound is `reword::REWORD_HTTP_CEILING`, ten
-    /// seconds. Measured with `drop(rt)` in place of the call below and one
-    /// rewrite in flight against a provider that accepts and never answers:
-    /// 9.73 s, which is what a `systemctl --user restart sayd` mid-rewrite
-    /// sat for.
+    /// on that pool whose only bound is `reword::http_ceiling`, the
+    /// configured deadline plus `reword::REWORD_HTTP_GRACE`. Measured with
+    /// `drop(rt)` in place of the call below and one rewrite in flight
+    /// against a provider that accepts and never answers: 9.73 s, which is
+    /// what a `systemctl --user restart sayd` mid-rewrite sat for -- at the
+    /// default deadline, and there is no longer any ceiling on how much
+    /// worse a configured one could make it.
     ///
-    /// The stuck task here stands in for that request, and is bounded by the
-    /// same constant it is: nothing shorter would tell the difference between
-    /// a bounded shutdown and a lucky one.
+    /// The stuck task here stands in for that request, and sleeps the grace
+    /// alone rather than a whole ceiling: it only has to be long enough that
+    /// nothing shorter could tell a bounded shutdown from a lucky one, and
+    /// the grace is already twenty times the value under test.
     #[test]
     fn a_stuck_blocking_task_cannot_hold_shutdown_past_the_grace() {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .expect("runtime");
-        rt.spawn_blocking(|| std::thread::sleep(crate::reword::REWORD_HTTP_CEILING));
+        rt.spawn_blocking(|| std::thread::sleep(crate::reword::REWORD_HTTP_GRACE));
         // `Runtime::drop` waits for blocking tasks that have *started*, so
         // the task has to have started for this to be measuring anything.
         std::thread::sleep(Duration::from_millis(100));

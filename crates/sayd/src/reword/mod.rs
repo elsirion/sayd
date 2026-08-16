@@ -11,7 +11,7 @@
 //! **`tokio::time::timeout` abandons the `.await`, never the task behind
 //! it.** The client is blocking, so the request runs on
 //! `tokio::task::spawn_blocking` and the *only* thing that bounds that
-//! thread is the client's own [`REWORD_HTTP_CEILING`]. This is
+//! thread is the client's own [`http_ceiling`]. This is
 //! `NotifyEnabledWatch`'s CRITICAL 1, measured on this daemon: a 250 ms
 //! timeout that abandoned an await but not its task took the process from
 //! 30 to 548 blocking threads in three and a half minutes, hit tokio's
@@ -22,7 +22,9 @@
 //! slow provider accumulate blocking threads at the arrival rate while
 //! pretending to be bounded. Held to completion, the worst case is exactly
 //! [`REWORD_MAX_INFLIGHT`] blocking threads, each living at most
-//! [`REWORD_HTTP_CEILING`].
+//! [`http_ceiling`] -- the configured deadline plus [`REWORD_HTTP_GRACE`],
+//! so the worst case grows with the deadline the user asked for and with
+//! nothing else.
 //!
 //! # Why a late answer cannot be spoken
 //!
@@ -43,9 +45,9 @@
 //! # The answer is dropped; the outcome is not
 //!
 //! Those two rules together used to make the transport breaker inert
-//! against the one provider failure it most exists for. `timeout_ms` is
-//! capped at `REWORD_TIMEOUT_MAX_MS` and the client's ceiling is 10 s, so a
-//! provider that
+//! against the one provider failure it most exists for. The client's
+//! ceiling is [`REWORD_HTTP_GRACE`] past `timeout_ms` and the caller gives
+//! up at `timeout_ms`, so a provider that
 //! accepts a connection and then never answers *always* produces
 //! [`Attempt::Deadline`]: the [`RewordError::Ceiling`] the client eventually
 //! returns died with the abandoned `JoinHandle` and never reached
@@ -111,23 +113,63 @@ use sayd_core::reword::{check, eligible, Ineligible};
 #[cfg(feature = "reword")]
 pub mod http;
 
-/// The client's own ceiling on one request. Set on the `ureq` agent, so it
-/// bounds the *thread*, which `tokio::time::timeout` cannot.
-pub const REWORD_HTTP_CEILING: Duration = Duration::from_secs(10);
+/// How long the client keeps trying *past* the configured deadline before
+/// it gives up on its own.
+///
+/// The client's ceiling has to bound the blocking thread, which
+/// `tokio::time::timeout` cannot (see the module doc). It used to be this
+/// number flat, and 10 s was comfortably longer than the 2 s
+/// `reword.timeout_ms` could ever be. With that ceiling gone the flat value
+/// became a lie in the one direction that matters: a configured deadline of
+/// 30 s against a 10 s transport ceiling is not a 30 s deadline, it is a
+/// 10 s one wearing a larger number, and the setting would not do what it
+/// says.
+///
+/// So the ceiling is [`http_ceiling`], the deadline plus this, and this is
+/// the *grace* -- what it buys is the settings window's Test row, which
+/// deliberately outlives the deadline so it can report how much too slow a
+/// provider is rather than only that it was too slow. Ten seconds of grace
+/// is what that row had when the deadline could not exceed two.
+pub const REWORD_HTTP_GRACE: Duration = Duration::from_secs(10);
+
+/// The client's own ceiling on one request, for the config it will run
+/// under. Set per request on the `ureq` call, so it bounds the *thread*.
+///
+/// **The transport must never be what ends a rewrite first.** It is the one
+/// bound in this path the user did not choose and cannot see: a request the
+/// client cut off at its own ceiling is indistinguishable, from outside,
+/// from a provider that never answered. Strictly longer than the deadline
+/// (by [`REWORD_HTTP_GRACE`]) rather than equal to it, so the ordering does
+/// not rest on which of two clocks started first -- `attempt` starts its
+/// budget before the permit and the `spawn_blocking` hop, and `ureq` starts
+/// this one inside the job, but nothing enforces that gap.
+///
+/// Finite, still: `Runtime::drop` waits for blocking tasks that have
+/// started, and the daemon's worst case is [`REWORD_MAX_INFLIGHT`] threads
+/// each living at most this long. A user who sets a five-minute deadline has
+/// chosen a five-minute worst case, which is the difference between a bound
+/// derived from a setting and a bound with no setting behind it.
+pub fn http_ceiling(cfg: &RewordConfig) -> Duration {
+    Duration::from_millis(cfg.timeout_ms).saturating_add(REWORD_HTTP_GRACE)
+}
 
 /// What the settings window's Test button waits, rather than `timeout_ms`.
 ///
 /// A test that gave up at the configured deadline could only ever say "too
 /// slow" and could never say *how much* too slow -- which is the number
 /// needed to choose a better deadline, or to conclude the provider is
-/// hopeless. Equal to [`REWORD_HTTP_CEILING`] because the client's own
-/// ceiling is what actually ends the request; there is nothing to be gained
-/// by waiting longer and nothing to be gained by giving up sooner.
+/// hopeless. Equal to [`http_ceiling`] because the client's own ceiling is
+/// what actually ends the request; there is nothing to be gained by waiting
+/// longer and nothing to be gained by giving up sooner. That is also why the
+/// grace has to survive an unbounded deadline: at a 30 s deadline a test
+/// that stopped at 30 s would be back to saying only "too slow".
 ///
 /// Read by `settings::model::outcome_for_error`, which is what puts the
-/// number in front of a user: "No answer after 10.0 s", beside the deadline
+/// number in front of a user: "No answer after 11.5 s", beside the deadline
 /// that was not waited.
-pub const REWORD_TEST_CEILING: Duration = REWORD_HTTP_CEILING;
+pub fn test_ceiling(cfg: &RewordConfig) -> Duration {
+    http_ceiling(cfg)
+}
 
 /// How many rewrites may be in flight at once, across every path --
 /// notifications, `--reword`, and the settings window's Test button.
@@ -153,12 +195,19 @@ const TRANSPORT_BREAKER_COOLDOWN: Duration = Duration::from_secs(60);
 /// nothing would ever be attempted again. Every way of taking one without
 /// resolving it is a caller that passed [`RewordState::allow`] and then did
 /// not attempt -- no permit was free, or `context` could not build a
-/// client. [`REWORD_HTTP_CEILING`] is the bound because it is the longest a
-/// real attempt can take, so a probe older than this cannot still be in
-/// flight; the cost of the safety net is at worst one extra request per
-/// ceiling's worth of an open breaker, against a bug whose cost is the
-/// feature never running again.
-const TRANSPORT_PROBE_TTL: Duration = REWORD_HTTP_CEILING;
+/// client. [`http_ceiling`] is the bound because it is the longest a real
+/// attempt can take, so a probe older than this cannot still be in flight;
+/// the cost of the safety net is at worst one extra request per ceiling's
+/// worth of an open breaker, against a bug whose cost is the feature never
+/// running again.
+///
+/// A function of the config rather than the constant it was, for the same
+/// reason [`http_ceiling`] is: with no ceiling on `timeout_ms` there is no
+/// longest attempt to write down. Taken from the `cfg` the caller is asking
+/// about, which is the config that attempt would have run under.
+fn transport_probe_ttl(cfg: &RewordConfig) -> Duration {
+    http_ceiling(cfg)
+}
 /// Backoff after a 429 with no `Retry-After`.
 const RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(60);
 /// The longest a `Retry-After` may hold the breaker shut.
@@ -292,7 +341,7 @@ pub enum RewordError {
     },
     /// DNS, connect or TLS.
     Unreachable(String),
-    /// The client's own [`REWORD_HTTP_CEILING`] was hit. Counted toward the
+    /// The client's own [`http_ceiling`] was hit. Counted toward the
     /// same breaker as [`RewordError::Unreachable`]: this row exists to
     /// bound the thread, not the utterance -- the utterance was spoken
     /// 8.5 s earlier.
@@ -412,7 +461,7 @@ async fn attempt(
             (outcome, started.elapsed())
         }
         // The `.await` on the handle is abandoned here. The job keeps
-        // running (bounded by REWORD_HTTP_CEILING) and keeps its permit
+        // running (bounded by the client's own `http_ceiling`) and keeps its permit
         // (bounded by REWORD_MAX_INFLIGHT), and its eventual answer has
         // nowhere to go -- but its *outcome* still reaches `record` from
         // the job itself, which is what stops a permanently stuck provider
@@ -505,7 +554,7 @@ struct Inner {
     /// token is minted by `allow`, spent by the one caller it admits, and
     /// resolved by that attempt's `record`: an answer closes the breaker, a
     /// transport failure re-arms another full cooldown. See
-    /// [`TRANSPORT_PROBE_TTL`] for what happens to a token nobody resolves.
+    /// [`transport_probe_ttl`] for what happens to a token nobody resolves.
     transport_probe: Option<Window>,
     rate_limited_until: Option<Window>,
     deadlines: u64,
@@ -601,7 +650,7 @@ impl RewordState {
     /// Not a pure predicate: past an expired transport cooldown this is the
     /// transition that mints and spends §8's one probe, so a caller that
     /// asks and then does not attempt costs the run a probe (bounded by
-    /// [`TRANSPORT_PROBE_TTL`]) rather than, as it used to, the whole
+    /// [`transport_probe_ttl`]) rather than, as it used to, the whole
     /// breaker.
     pub fn allow(&self, cfg: &RewordConfig, now: Instant) -> Result<(), Blocked> {
         let mut i = lock(&self.inner);
@@ -630,7 +679,7 @@ impl RewordState {
         }
         // Last, so a caller turned away by a later row does not spend it.
         if probing {
-            i.transport_probe = Some(Window::opening(now, TRANSPORT_PROBE_TTL));
+            i.transport_probe = Some(Window::opening(now, transport_probe_ttl(cfg)));
         }
         Ok(())
     }
@@ -929,7 +978,7 @@ impl Inner {
                     if !i.outage_logged {
                         journal = Some(Journal::Line(format!(
                             "warning: reword: the provider did not answer within {:.0} s",
-                            REWORD_HTTP_CEILING.as_secs_f64()
+                            http_ceiling(cfg).as_secs_f64()
                         )));
                         i.outage_logged = true;
                     }
@@ -1039,7 +1088,7 @@ impl Inner {
 /// **Call it once per arrival, then attempt.** It is not a pure predicate:
 /// past an expired transport cooldown [`RewordState::allow`] mints and
 /// spends §8's one half-open probe, so a caller that asks twice and attempts
-/// once costs the run a probe until [`TRANSPORT_PROBE_TTL`] expires. That is
+/// once costs the run a probe until [`transport_probe_ttl`] expires. That is
 /// why this is private and [`RewordPlan::admit`] is its only caller: one
 /// constructor, one ask, one attempt, and no way for a call site to hold the
 /// answer and then decide something else with it.
@@ -1182,8 +1231,9 @@ pub struct Written(pub String);
 /// an idle engine first and start playing, and `Policy::Front` does not
 /// save the opener: `Front` jumps ahead of what is pending, not ahead of
 /// what is already playing. That is bounded where it lives, by
-/// `sayd_core::config::NOTIFY_COOLDOWN_MIN_SECS`, which keeps every
-/// non-zero cooldown clear of the reword ceiling.
+/// `sayd_core::config::notify_cooldown_min_secs`, which keeps every
+/// non-zero cooldown clear of the configured `reword.timeout_ms` -- clear
+/// of the deadline itself, since there is no ceiling to be clear of.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Composed(pub String);
 
@@ -1275,7 +1325,7 @@ impl Origin {
 /// enforces *at most* one attempt per admission, and nothing enforced at
 /// least one. A plan built and then dropped has already spent a half-open
 /// probe token -- the run does not get that back until
-/// [`TRANSPORT_PROBE_TTL`] expires -- and, on the paths this daemon has, is
+/// [`transport_probe_ttl`] expires -- and, on the paths this daemon has, is
 /// an announcement that was going to be reworded and now silently is not.
 #[must_use = "admitting a plan has already spent §8's half-open probe token; \
               resolve it or the run pays for a rewrite that never happened"]
@@ -1596,6 +1646,38 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// The invariant every other bound in this module now hangs off: **the
+    /// transport's ceiling is strictly longer than the deadline the caller
+    /// is timing against**, at every deadline a config can hold.
+    ///
+    /// It has to hold arithmetically rather than by measurement, because the
+    /// deadline is unbounded: there is no largest case to test. The two ways
+    /// it could fail are a ceiling written as a constant (fine at 1.5 s,
+    /// silently truncating at 30) and an overflow at the top of the range
+    /// turning a huge deadline into a tiny one, which is why `u64::MAX` is
+    /// in the list -- `saturating_add` is what makes that case boring.
+    #[test]
+    fn the_client_ceiling_always_outlasts_the_deadline_it_is_derived_from() {
+        for timeout_ms in [200, 1500, 10_000, 60_000, 3_600_000, u64::MAX] {
+            let cfg = RewordConfig {
+                timeout_ms,
+                ..RewordConfig::default()
+            };
+            assert!(
+                http_ceiling(&cfg) > Duration::from_millis(timeout_ms),
+                "at timeout_ms = {timeout_ms} the transport would end the \
+                 rewrite before the deadline did, which the user cannot see \
+                 and cannot configure around"
+            );
+            assert_eq!(
+                test_ceiling(&cfg),
+                http_ceiling(&cfg),
+                "and the Test row must report the ceiling that was really \
+                 waited"
+            );
+        }
+    }
+
     /// A test double: a queue of canned outcomes and, optionally, a sleep
     /// so a test can drive the deadline. No runtime, no futures, no
     /// associated types -- which is the whole reason the seam is a
@@ -1803,9 +1885,9 @@ mod tests {
     /// daemon actually meets it: a provider that accepts connections and
     /// never answers.
     ///
-    /// `timeout_ms` is capped at `REWORD_TIMEOUT_MAX_MS` and the client's
-    /// own ceiling is 10 s, so every one of those attempts returns
-    /// [`Attempt::Deadline`]
+    /// The client's own ceiling is `REWORD_HTTP_GRACE` past `timeout_ms` and
+    /// the caller gives up at `timeout_ms`, so every one of those attempts
+    /// returns [`Attempt::Deadline`]
     /// to its caller and the [`RewordError::Ceiling`] arrives long after
     /// the caller is gone. With the outcome recorded only by the caller the
     /// breaker never moved -- measured, ten consecutive ceiling-class
@@ -1816,7 +1898,8 @@ mod tests {
     async fn ceiling_failures_open_the_breaker_even_though_every_caller_saw_a_deadline() {
         let stub = Stub::slow(
             // Longer than the budget below, so the caller always gives up
-            // first, exactly as it does against the real 10 s ceiling.
+            // first, exactly as it does against the real client ceiling --
+            // which is that same budget plus the grace.
             Duration::from_millis(150),
             (0..TRANSPORT_FAILURES_TO_OPEN)
                 .map(|_| Err(RewordError::Ceiling))
@@ -2108,7 +2191,7 @@ mod tests {
             "after 60 s one is let through"
         );
 
-        // The client's own 10 s ceiling counts toward the same breaker. The
+        // The client's own ceiling counts toward the same breaker. The
         // first of these is the probe just taken failing, which re-arms the
         // window on its own; the other two are the count starting again.
         for _ in 0..3 {
@@ -2272,7 +2355,10 @@ mod tests {
         // ...and this caller never attempts. Nothing resolves the token.
         assert_eq!(state.allow(&cfg, past), Err(Blocked::TransportOpen));
         assert_eq!(
-            state.allow(&cfg, past + TRANSPORT_PROBE_TTL + Duration::from_secs(1)),
+            state.allow(
+                &cfg,
+                past + transport_probe_ttl(&cfg) + Duration::from_secs(1)
+            ),
             Ok(()),
             "past the ceiling a real attempt could have taken, the probe \
              cannot still be in flight, so the next arrival may take one"

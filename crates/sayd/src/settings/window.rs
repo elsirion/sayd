@@ -49,8 +49,9 @@ use super::model::{
     COOLDOWN_MIN, COOLDOWN_STEP, ENDPOINT_PRESETS, IDLE_UNLOAD_MAX, IDLE_UNLOAD_MIN,
     IDLE_UNLOAD_STEP, MAX_CHARS_MAX, MAX_CHARS_MIN, MAX_CHARS_STEP, MODELS, REWORD_MAX_CHARS_MAX,
     REWORD_MAX_CHARS_MIN, REWORD_MAX_CHARS_STEP, REWORD_TEST_DEFAULT, REWORD_TIMEOUT_MAX,
-    REWORD_TIMEOUT_MIN, REWORD_TIMEOUT_STEP, SPEED_MAX, SPEED_MIN, SPEED_MODES, SPEED_STEP,
-    TEST_INCOMPLETE_TITLE, TEST_IN_PROGRESS_TITLE, THREADS_MAX, THREADS_MIN, THREADS_STEP,
+    REWORD_TIMEOUT_MIN, REWORD_TIMEOUT_PAGE, REWORD_TIMEOUT_STEP, REWORD_TIMEOUT_SUBTITLE,
+    SPEED_MAX, SPEED_MIN, SPEED_MODES, SPEED_STEP, TEST_INCOMPLETE_TITLE, TEST_IN_PROGRESS_TITLE,
+    THREADS_MAX, THREADS_MIN, THREADS_STEP,
 };
 use crate::notify::seen;
 
@@ -830,6 +831,8 @@ struct Spin {
 }
 
 impl Spin {
+    /// A row whose PageUp moves by the same amount its arrows do, which is
+    /// every row here whose range is small enough for that to be usable.
     fn new(
         title: &str,
         subtitle: &'static str,
@@ -838,14 +841,35 @@ impl Spin {
         step: f64,
         digits: u32,
     ) -> Spin {
+        Spin::paged(title, subtitle, min, max, step, step, digits)
+    }
+
+    /// A row with a page increment of its own, for a range too wide to
+    /// cross one arrow click at a time.
+    ///
+    /// The Reword group's deadline is the row this exists for: its arrows
+    /// move 100 ms, because a deadline is tuned in the second or two where
+    /// that matters, and 100 ms steps across the minute the row now offers
+    /// would be 598 clicks. A page increment is what makes the far end of
+    /// the range reachable without making the near end useless.
+    fn paged(
+        title: &str,
+        subtitle: &'static str,
+        min: f64,
+        max: f64,
+        step: f64,
+        page: f64,
+        digits: u32,
+    ) -> Spin {
         let row = adw::SpinRow::builder()
             .title(title)
             .subtitle(subtitle)
             .adjustment(&gtk::Adjustment::new(
-                min, min, max, step, step,
+                min, min, max, step, page,
                 // No page size: a spin button is not a scrollbar, and a
                 // nonzero one would shrink the reachable range by exactly
-                // that much.
+                // that much. Not to be confused with the page *increment*
+                // above, which is how far one PageUp moves.
                 0.0,
             ))
             .digits(digits)
@@ -1601,12 +1625,13 @@ fn reword_group(ui: &Ui, cfg: &Config, engine: EngineHandle) -> adw::Preferences
     group.add(&key);
 
     // --- Deadline ---------------------------------------------------------
-    let deadline = Spin::new(
+    let deadline = Spin::paged(
         "Deadline",
-        "Milliseconds a rewrite may take before the original is spoken instead",
+        REWORD_TIMEOUT_SUBTITLE,
         REWORD_TIMEOUT_MIN,
         REWORD_TIMEOUT_MAX,
         REWORD_TIMEOUT_STEP,
+        REWORD_TIMEOUT_PAGE,
         0,
     );
     // `Spin` is shared with four other groups, whose rows show nothing but
@@ -2667,21 +2692,30 @@ mod tests {
 
         // The two spin rows offer exactly the model's bounds, and cannot
         // produce a value outside them. The deadline's ceiling is the one
-        // that matters: it is arithmetic in `sayd_core::config` against
-        // sayd-cli's own D-Bus timeout, it moved once already, and a literal
-        // in this file is how the two would drift apart.
-        for (title, min, max, step, held) in [
+        // that matters, and for a reason that changed with this milestone:
+        // it is no longer a bound the config has, only one this row has, so
+        // a literal here would be a limit stated in the one file that is
+        // never read next to the value it limits. The page increment is
+        // asserted for the same reason it exists -- 100 ms arrows across a
+        // minute is 598 clicks, so a row that lost its page increment would
+        // be unusable at exactly the deadlines this milestone exists to
+        // allow. How far that increment has to get is checked without a
+        // display, in `model.rs`'s
+        // `the_deadline_row_can_be_crossed_without_hundreds_of_clicks`.
+        for (title, min, max, step, page, held) in [
             (
                 "Deadline",
                 REWORD_TIMEOUT_MIN,
                 REWORD_TIMEOUT_MAX,
                 REWORD_TIMEOUT_STEP,
+                REWORD_TIMEOUT_PAGE,
                 (|c: &Config| c.reword.timeout_ms as f64) as fn(&Config) -> f64,
             ),
             (
                 "Longest text to rewrite",
                 REWORD_MAX_CHARS_MIN,
                 REWORD_MAX_CHARS_MAX,
+                REWORD_MAX_CHARS_STEP,
                 REWORD_MAX_CHARS_STEP,
                 |c: &Config| c.reword.max_chars as f64,
             ),
@@ -2692,9 +2726,10 @@ mod tests {
                 (
                     adjustment.lower(),
                     adjustment.upper(),
-                    adjustment.step_increment()
+                    adjustment.step_increment(),
+                    adjustment.page_increment()
                 ),
-                (min, max, step),
+                (min, max, step, page),
                 "{title} must offer the bounds `model.rs` names"
             );
             row.set_value(max + step);
@@ -3192,7 +3227,8 @@ mod tests {
     /// The one lifetime the Test row adds: a `glib::spawn_future_local` that
     /// outlives the click, holding what it needs to report into. Held
     /// strongly, that future is a widget tree that cannot be freed until a
-    /// provider answers -- up to `REWORD_HTTP_CEILING`, ten seconds, per
+    /// provider answers -- up to `reword::http_ceiling`, the configured
+    /// deadline plus ten seconds of grace, per
     /// opening, on a daemon whose whole arrangement is to carry no GTK
     /// resources between openings.
     fn the_window_is_freed_while_a_test_is_in_flight(dir: &std::path::Path) {

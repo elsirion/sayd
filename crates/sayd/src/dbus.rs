@@ -101,12 +101,15 @@ impl SaydIface {
     /// afterwards would need a text-replacement hook inside the engine, a
     /// far larger change for a caller that is already blocked on a
     /// synchronous method call. So `say --reword "..."` can take up to
-    /// `reword.timeout_ms` to return -- which is why `Config::load_str`
-    /// clamps that at `REWORD_TIMEOUT_MAX_MS`: `sayd-cli` bounds every D-Bus
-    /// interaction at 3 s, and a rewrite that outlived the caller would turn
-    /// an enhancement into "sayd is not responding". The ceiling is set
-    /// against that 3 s with `EngineHandle::submit`'s own 250 ms round trip
-    /// subtracted -- see the constant.
+    /// `reword.timeout_ms` to return, and `reword.timeout_ms` has no ceiling
+    /// -- someone running a local model may have set it to thirty seconds.
+    /// That is why `sayd-cli` does not bound a submission carrying `reword`
+    /// at all (see its `call_submission`): this deadline is the one that
+    /// ends the wait, and the daemon is the only party that knows it. What
+    /// this method owes in exchange is that the wait really is bounded by
+    /// that number -- every path out of `RewordPlan::resolve` is, including
+    /// the transport's own ceiling, which is derived from it rather than
+    /// fixed (`reword::http_ceiling`).
     ///
     /// Every way this can fail ends in the original text being returned and
     /// therefore spoken -- no configured endpoint, no client in this build, a
@@ -144,12 +147,12 @@ impl SaydIface {
     /// mutex, and `ConfigStore::write_locked` holds that across an unbounded
     /// disk write: measured, a wedged write blocked this read for 1.500 s.
     /// The `spawn_blocking` hop kept that off a runtime worker but did
-    /// nothing about the 1.500 s itself, and this read sits inside the sum
-    /// `sayd-core`'s `config.rs` asserts at compile time -- `timeout_ms` plus
-    /// `EngineHandle::submit`'s round trip plus the margin, against
-    /// `sayd-cli`'s 3 s -- which allocates it nothing at all. A stall here
-    /// spends someone else's budget and turns a working daemon into "sayd is
-    /// not responding".
+    /// nothing about the 1.500 s itself. It is time spent before the
+    /// deadline this call promises even starts, on a path whose whole
+    /// contract is that it answers inside `timeout_ms`: a stall here is
+    /// delay the caller was never told about and cannot attribute, and with
+    /// an ordinary `Say` it is delay before an utterance that asked for no
+    /// rewrite at all.
     ///
     /// `published` is the same value behind a lock that is never held across
     /// I/O, so the read is an `Arc` clone and needs no hop at all. The
@@ -861,17 +864,22 @@ mod tests {
 
     /// The relationship the whole inline-await design rests on: a `--reword`
     /// submission against a provider that accepts the connection and then
-    /// never answers must come back with a *spoken utterance*, inside
-    /// `sayd-cli`'s 3 s bound -- not a "sayd is not responding".
+    /// never answers must come back with a *spoken utterance*, at the
+    /// configured deadline -- not an error, and not at some other number.
     ///
-    /// The two halves of that are `reword.timeout_ms`, clamped to
-    /// `REWORD_TIMEOUT_MAX_MS` by `Config::load_str` no matter what the file
-    /// says, and `sayd-cli`'s own `TIMEOUT` of 3 s. They live
-    /// in two crates and neither can import the other's constant, so the
-    /// relationship is checked here the only way it can be: end to end,
-    /// through the real loader, against a real socket, with the deadline the
-    /// clamp actually produced. `86400000` is what a hand-edited config can
-    /// say and no spin row can.
+    /// The deadline here is 3500 ms, chosen because both bounds that used to
+    /// end this wait early are past it: `Config::load_str` used to clamp
+    /// `timeout_ms` to 2000, and `sayd-cli` used to give up on any call at
+    /// 3000. Neither does now -- the clamp is gone and `sayd-cli` leaves a
+    /// submission carrying `reword` unbounded -- so a wait of about 3.5 s is
+    /// the correct behaviour rather than the failure it once was. If either
+    /// bound came back, this test fails: with the clamp, at the assertion
+    /// that the loader kept the number; with a CLI-side bound, at the wait
+    /// itself, which is longer than any constant `sayd-cli` still has.
+    ///
+    /// End to end through the real loader and against a real socket, because
+    /// that is the only way to check it: the deadline is applied by
+    /// `RewordPlan::resolve` in one crate, from a value parsed in another.
     ///
     /// In a build without the `reword` feature there is no client to make a
     /// request with, so this returns at once and still passes -- which is the
@@ -879,22 +887,25 @@ mod tests {
     /// spoken as written rather than refused. `--features reword` is the
     /// configuration where the timing can actually fail.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_reword_against_a_silent_provider_still_answers_inside_the_cli_bound() {
-        // `sayd-cli`'s own bound on any one D-Bus interaction, restated
-        // because this crate cannot import it: `sayd-cli` is a binary.
-        const CLI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+    async fn a_reword_against_a_silent_provider_answers_with_a_spoken_utterance() {
+        /// Past the ceiling `timeout_ms` used to be clamped to (2000) and
+        /// past the bound `sayd-cli` used to put on every call (3000).
+        const BUDGET_MS: u64 = 3500;
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let (base_url, provider) = crate::reword::silent_provider(CLI_TIMEOUT);
+        // Held past the budget, so the provider is still silent when the
+        // deadline fires: a server that closed the socket first would end
+        // the wait for the wrong reason.
+        let (base_url, provider) =
+            crate::reword::silent_provider(std::time::Duration::from_millis(BUDGET_MS + 1_500));
         let (cfg, err) = Config::load_str(&format!(
-            "[reword]\nbase_url = \"{base_url}\"\nprovider = \"generic\"\ntimeout_ms = 86400000\n"
+            "[reword]\nbase_url = \"{base_url}\"\nprovider = \"generic\"\ntimeout_ms = {BUDGET_MS}\n"
         ));
         assert_eq!(err, None);
         assert_eq!(
-            cfg.reword.timeout_ms,
-            sayd_core::config::REWORD_TIMEOUT_MAX_MS,
-            "a hand-edited timeout must be clamped on load, or the wait below \
-             outlives the caller"
+            cfg.reword.timeout_ms, BUDGET_MS,
+            "the loader must keep a deadline past the ceiling it used to \
+             impose -- that ceiling is what this milestone removed"
         );
         assert!(
             !cfg.reword.enabled,
@@ -925,15 +936,15 @@ mod tests {
 
         assert_ne!(id, 0, "the original was queued and will be spoken");
         assert!(
-            elapsed < CLI_TIMEOUT,
-            "Say took {elapsed:?} against sayd-cli's {CLI_TIMEOUT:?} bound; the \
-             caller would have printed \"sayd is not responding\" for a rewrite \
-             that was never going to arrive"
+            elapsed < std::time::Duration::from_millis(BUDGET_MS) * 2,
+            "Say took {elapsed:?} against a {BUDGET_MS} ms deadline: the \
+             deadline the caller was promised is not the one that ended the \
+             wait"
         );
         // ...and in a build that can actually make the request, it really did
         // wait inline rather than passing for the trivial reason. Both bounds
-        // together are the whole design: long enough to be worth having, short
-        // enough that the caller is still listening.
+        // together are the whole design: the wait is the configured deadline,
+        // neither cut short by something else nor unbounded.
         //
         // `endpoint_seen` is the check that the request was made at all --
         // `attempt` sets it once a permit is in hand -- and it is keyed on

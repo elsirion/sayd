@@ -73,7 +73,7 @@ use sayd_core::config::{resolve_api_key, Provider, RewordConfig};
 use sayd_core::reword::{chat_completions_url, parse_base_url};
 use serde::{Deserialize, Serialize};
 
-use super::{RewordError, Rewriter, REWORD_HTTP_CEILING};
+use super::{http_ceiling, RewordError, Rewriter};
 
 /// §3's prompt, verbatim. One request, one system prompt, one user message
 /// containing the text. No history, no tools, no schema.
@@ -518,24 +518,26 @@ pub fn parse_response(
     })
 }
 
-/// One agent, with `ceiling` as its global timeout.
+/// One agent, carrying everything about this client that is not per
+/// request.
 ///
-/// `ceiling` is an argument rather than a read of [`REWORD_HTTP_CEILING`]
-/// for one reason: it is the only way the ceiling can be *tested*. The real
-/// one is 10 s, longer than any test should take, and a test that reached
-/// for the cached agent could only pin it by waiting. Passed in, the same
-/// builder that production uses can be handed 400 ms and pointed at a
-/// server that never answers -- so
-/// `a_provider_that_never_answers_hits_the_ceiling` fails if this line
-/// stops setting a global timeout, which is exactly what a comment could
-/// not do. Note the type: `Duration`, not `Option<Duration>`. "No ceiling
-/// at all" is not expressible here.
-fn build_agent(ceiling: Duration) -> ureq::Agent {
+/// **The global timeout is deliberately not among them.** It used to be:
+/// the agent was built with a flat 10 s ceiling, which was
+/// sound only while `reword.timeout_ms` was clamped to 2 s. It no longer is,
+/// and an agent-level ceiling cannot follow a config that changes at
+/// runtime -- [`agent`] is a `OnceLock` built once per process, so a
+/// deadline raised to 30 s in the settings window would have gone on being
+/// cut off at 10 by a client built before the change. That is the one thing
+/// this path must never do: the transport ending a rewrite before the
+/// configured deadline is indistinguishable, to the user, from a provider
+/// that did not answer.
+///
+/// So the ceiling is set on the *request* instead, by [`send`], from the
+/// config that request is for. It is a required argument there, not an
+/// option with a default, which is what keeps "no ceiling at all" from
+/// being reachable by forgetting something.
+fn build_agent() -> ureq::Agent {
     let config = ureq::Agent::config_builder()
-        // The only thing that bounds the blocking thread.
-        // `tokio::time::timeout` cannot -- see the module doc one level
-        // up.
-        .timeout_global(Some(ceiling))
         // Load-bearing. Left on (the default), a 4xx becomes an `Err`
         // and the body is discarded -- and the body is where
         // `error.message` lives.
@@ -576,10 +578,12 @@ fn build_agent(ceiling: Duration) -> ureq::Agent {
 ///
 /// An `Agent` owns a connection pool, and against a 1.5 s budget a fresh DNS
 /// lookup plus a TLS handshake is most of the budget. It outlives config
-/// changes: `base_url`, `model` and the key are per-request inputs, not
-/// client state, so only a change to [`REWORD_HTTP_CEILING`] would require
-/// rebuilding it -- and that is a constant, which is why a `OnceLock` with
-/// no way to replace its value is the right shape.
+/// changes, and that is now true without qualification: `base_url`, `model`,
+/// the key *and the ceiling* are per-request inputs rather than client
+/// state, so nothing in a config change requires rebuilding it. Which is why
+/// a `OnceLock` with no way to replace its value is the right shape -- and
+/// why the ceiling had to leave it, since a `OnceLock` is exactly the shape
+/// a value that must track the config cannot have.
 ///
 /// Nothing is pre-warmed at startup, because that would be a network call
 /// the user did not ask for. The **first** rewrite of a run is therefore
@@ -588,7 +592,7 @@ fn build_agent(ceiling: Duration) -> ureq::Agent {
 /// on screen.
 fn agent() -> &'static ureq::Agent {
     static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
-    AGENT.get_or_init(|| build_agent(REWORD_HTTP_CEILING))
+    AGENT.get_or_init(build_agent)
 }
 
 pub struct HttpRewriter {
@@ -740,20 +744,40 @@ fn unreachable_from(reason: &str, url: &str) -> RewordError {
     ))
 }
 
-/// Send one request on `agent` and classify what comes back.
+/// Send one request on `agent`, bounded by `ceiling`, and classify what
+/// comes back.
 ///
 /// The agent is a parameter rather than a call to [`agent`] so a test can
 /// drive this whole path -- socket, status, headers, body limit,
-/// classification -- against an agent built by [`build_agent`] with a
-/// ceiling short enough to assert on.
+/// classification -- against a real socket. `ceiling` is a parameter for two
+/// reasons: production needs it per request, because it is derived from a
+/// `reword.timeout_ms` that changes at runtime (see
+/// [`crate::reword::http_ceiling`]), and it is the only way the ceiling can
+/// be *tested* -- the real one is at least ten seconds, longer than any test
+/// should take, so `a_provider_that_never_answers_hits_the_ceiling` hands
+/// this 400 ms and points it at a server that never answers. Note the type:
+/// `Duration`, not `Option<Duration>`. "No ceiling at all" is not
+/// expressible here.
+///
+/// `timeout_global` is ureq's end-to-end bound -- "from DNS lookup to
+/// finishing reading the response body", its own words -- so the body read
+/// further down is inside it too, and not only the headers. Set at request
+/// scope it replaces whatever the agent carries for this call alone
+/// (`ureq::config`'s `RequestScope`, which clones the agent's config and
+/// overrides it), which is what lets one cached agent serve deadlines that
+/// differ per request.
 fn send(
     agent: &ureq::Agent,
     request: &Request,
+    ceiling: Duration,
     model: &str,
     host: &str,
 ) -> Result<String, RewordError> {
     let mut call = agent
         .post(&request.url)
+        .config()
+        .timeout_global(Some(ceiling))
+        .build()
         .header("content-type", "application/json");
     if let Some(auth) = &request.authorization {
         call = call.header("authorization", auth);
@@ -817,7 +841,17 @@ fn send(
 impl Rewriter for HttpRewriter {
     fn reword(&self, text: &str) -> Result<String, RewordError> {
         let request = build_request(&self.cfg, self.key.as_deref(), text);
-        send(agent(), &request, &self.cfg.model, &self.host)
+        // From `self.cfg`, which is the config this rewriter was built for:
+        // `reword::context` rebuilds the rewriter whenever the config
+        // changes, so this is the deadline the caller is timing this very
+        // request against -- never a stale one, and never a constant.
+        send(
+            agent(),
+            &request,
+            http_ceiling(&self.cfg),
+            &self.cfg.model,
+            &self.host,
+        )
     }
 }
 
@@ -1680,7 +1714,7 @@ mod tests {
         /// less is clean.
         const PANICS_AT: usize = 65_536;
 
-        let agent = build_agent(REWORD_HTTP_CEILING);
+        let agent = build_agent();
         let config = agent.config();
 
         assert!(
@@ -1701,6 +1735,36 @@ mod tests {
             0,
             "IMPORTANT 1: this client has exactly one endpoint to talk to"
         );
+    }
+
+    /// **The transport must never be what ends a rewrite first**, and this
+    /// is the half of that promise a slow test could not check.
+    ///
+    /// The agent is a `OnceLock`: whatever ceiling it carries is fixed for
+    /// the life of the process, while `reword.timeout_ms` is not fixed at
+    /// all -- it has no upper bound and it changes under the settings
+    /// window. An agent-level `timeout_global` is therefore the one way to
+    /// reintroduce the bug this milestone removed *invisibly*: a 30 s
+    /// deadline would be cut off at whatever the agent was built with, the
+    /// rewrite would be dropped, and the user would see a provider that did
+    /// not answer rather than a client that stopped asking.
+    ///
+    /// So there is no ceiling here to be stale. The only one is the argument
+    /// [`send`] is given per request, from the config that request is for.
+    #[test]
+    fn the_cached_agent_carries_no_ceiling_that_could_outlive_a_config() {
+        for (what, agent) in [
+            ("a fresh agent", build_agent()),
+            ("the cached one", agent().clone()),
+        ] {
+            assert_eq!(
+                agent.config().timeouts().global,
+                None,
+                "{what} must carry no global timeout: a ceiling fixed for the \
+                 life of the process cannot follow reword.timeout_ms, and a \
+                 lower one would silently truncate it"
+            );
+        }
     }
 
     /// IMPORTANT 1: a redirect is not followed, to any host.
@@ -1796,13 +1860,18 @@ mod tests {
 
     /// **§9's ceiling, pinned rather than commented.**
     ///
-    /// The knob is [`build_agent`]'s `timeout_global`, and it is the single
-    /// most expensive one in this file: it is the *only* thing that bounds
-    /// the blocking thread, because `tokio::time::timeout` abandons an
-    /// `.await` and never the task behind it. Driven here at 400 ms
-    /// through the same builder production hands 10 s, so deleting that
-    /// line -- which used to leave all thirty `reword::` tests passing --
-    /// fails this test instead.
+    /// The knob is [`send`]'s `timeout_global`, and it is the single most
+    /// expensive one in this file: it is the *only* thing that bounds the
+    /// blocking thread, because `tokio::time::timeout` abandons an `.await`
+    /// and never the task behind it. Driven here at 400 ms through the same
+    /// call production makes with `http_ceiling`, so deleting that line --
+    /// which used to leave all thirty `reword::` tests passing -- fails this
+    /// test instead.
+    ///
+    /// It is now also the test that says a ceiling set *per request* still
+    /// bounds the thread at all: the agent this runs against carries no
+    /// global timeout of its own, so nothing but the argument can end this
+    /// call.
     ///
     /// The server accepts the connection, reads the whole request, and
     /// then says nothing at all: there is no other thing in this client
@@ -1819,10 +1888,16 @@ mod tests {
             None
         });
 
-        let agent = build_agent(Duration::from_millis(400));
+        let agent = build_agent();
         let request = build_request(&cfg, None, "Alice: dinner?");
         let started = std::time::Instant::now();
-        let outcome = send(&agent, &request, &cfg.model, "127.0.0.1");
+        let outcome = send(
+            &agent,
+            &request,
+            Duration::from_millis(400),
+            &cfg.model,
+            "127.0.0.1",
+        );
         let elapsed = started.elapsed();
         let _ = release.send(());
         server.join().expect("the server thread");
@@ -1890,7 +1965,7 @@ mod tests {
              `ureq`; the parent sets ALL_PROXY, HTTP_PROXY and HTTPS_PROXY"
         );
         assert!(
-            build_agent(REWORD_HTTP_CEILING).config().proxy().is_none(),
+            build_agent().config().proxy().is_none(),
             "the text goes to base_url and nowhere else (§7)"
         );
     }

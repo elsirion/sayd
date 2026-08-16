@@ -15,32 +15,34 @@ const OBJECT_PATH: &str = "/sh/sayd/Sayd";
 const IFACE: &str = "sh.sayd.Sayd1";
 
 /// How long any single D-Bus interaction -- connecting to the session bus,
-/// resolving the daemon's name, or a method/property call -- may block
-/// before this instance gives up and reports a timeout instead of hanging.
+/// resolving the daemon's name, or an ordinary method/property call -- may
+/// block before this instance gives up and reports a timeout instead of
+/// hanging.
 ///
-/// zbus's own default method-call timeout is close to 25 seconds, which
-/// reads to a caller as "sayd is frozen." A couple of seconds is generous
-/// for a local session-bus round trip, and this binary is forked every
-/// 15-30 seconds by agent narration, so failing fast matters more than
-/// tolerating a slow daemon.
+/// A couple of seconds is generous for a local session-bus round trip, and
+/// this binary is forked every 15-30 seconds by agent narration, so failing
+/// fast matters more than tolerating a slow daemon.
 ///
-/// **It cannot be lowered below the daemon's `reword.timeout_ms` ceiling.**
-/// `--reword` is answered inline -- `Say` returns the utterance id and the
-/// daemon allocates that id from the text, so it cannot hand one back and
-/// rewrite afterwards -- so a `Say` carrying `reword` legitimately takes up
-/// to that ceiling to return. The daemon clamps it to
-/// `sayd_core::config::REWORD_TIMEOUT_MAX_MS` for this reason and no other,
-/// at a value chosen to leave room inside this bound for the engine round
-/// trip that follows the rewrite.
+/// **One interaction is deliberately not bounded by this: a `Say` carrying
+/// `reword`.** See [`call_submission`]. `--reword` is answered inline --
+/// `Say` returns the utterance id and the daemon allocates that id from the
+/// text, so it cannot hand one back and rewrite afterwards -- so such a call
+/// legitimately takes as long as the daemon's `reword.timeout_ms`, and that
+/// setting has no ceiling: someone running a local model may have set it to
+/// thirty seconds. This binary imports no crate of this workspace and reads
+/// no config, so it cannot know the number. Bounding the call at any
+/// constant would mean reporting a daemon that is working exactly as
+/// configured as not responding.
 ///
-/// `sayd-cli` is a binary and depends on no crate of this workspace, so the
-/// relationship cannot be an import in this direction. It is pinned in the
-/// other one instead: `sayd-core`'s `config.rs` restates this 3 s as
-/// `CLI_INTERACTION_BOUND_MS` and asserts at compile time that its own
-/// ceiling, the 250 ms `SUBMIT_REPLY_TIMEOUT` and a margin all fit inside it.
-/// **Changing this constant means changing that one.** End to end, the pair
-/// is exercised by
-/// `sayd::dbus::tests::a_reword_against_a_silent_provider_still_answers_inside_the_cli_bound`.
+/// What that costs is smaller than it sounds, because this constant still
+/// bounds the two interactions that come first. **A daemon that is not
+/// running -- the common failure by a wide margin -- still fails in 3 s**,
+/// at name resolution, before any method is called. What is left is a daemon
+/// that is up, owns its name, and is wedged part-way through a `Say`: rarer,
+/// and no longer something this binary can put a number on.
+///
+/// End to end, `--reword`'s inline wait is exercised by
+/// `sayd::dbus::tests::a_reword_against_a_silent_provider_answers_with_a_spoken_utterance`.
 const TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Parser, Debug)]
@@ -192,13 +194,17 @@ async fn main() -> std::process::ExitCode {
     // the three submission paths (bare text, `selection`, `clipboard`), all
     // of which share this dict. Every other command ignores it.
     let opts = say_opts(&cli);
+    // The three submission methods below are the only ones the daemon may
+    // answer late by design, and only when `--reword` asked it to. See
+    // [`call_submission`].
+    let reword = cli.reword;
     let result = match cli.command {
-        Some(Command::Selection) => call(proxy.call_method("SaySelection", &(opts,)))
-            .await
-            .map(|_| ()),
-        Some(Command::Clipboard) => call(proxy.call_method("SayClipboard", &(opts,)))
-            .await
-            .map(|_| ()),
+        Some(Command::Selection) => {
+            call_submission(reword, proxy.call_method("SaySelection", &(opts,))).await
+        }
+        Some(Command::Clipboard) => {
+            call_submission(reword, proxy.call_method("SayClipboard", &(opts,))).await
+        }
         Some(Command::Pause) => call(proxy.call_method("Pause", &())).await.map(|_| ()),
         Some(Command::Resume) => call(proxy.call_method("Resume", &())).await.map(|_| ()),
         Some(Command::PlayPause) => call(proxy.call_method("PlayPause", &())).await.map(|_| ()),
@@ -225,9 +231,7 @@ async fn main() -> std::process::ExitCode {
         }
         None => {
             let text = cli.text.join(" ");
-            call(proxy.call_method("Say", &(text, opts)))
-                .await
-                .map(|_| ())
+            call_submission(reword, proxy.call_method("Say", &(text, opts))).await
         }
     };
 
@@ -282,6 +286,41 @@ where
         Ok(Err(e)) => Err(CallError::Dbus(e)),
         Err(_) => Err(CallError::Timeout),
     }
+}
+
+/// Await one of the three submission calls -- `Say`, `SaySelection`,
+/// `SayClipboard` -- bounded by [`TIMEOUT`] as everything else is, *unless*
+/// this submission carries `--reword`, in which case it is not bounded here
+/// at all.
+///
+/// The daemon answers a rewording submission only once the rewrite has
+/// finished or its own `reword.timeout_ms` has elapsed, and that setting has
+/// no ceiling (`sayd_core::config::REWORD_TIMEOUT_MIN_MS` says why). The
+/// deadline that ends this wait is therefore the daemon's, deliberately:
+/// it is the only party that knows the number. See [`TIMEOUT`] for what
+/// that costs and what still fails fast.
+///
+/// All three, not only `Say`: `SaySelection` and `SayClipboard` reach the
+/// same inline rewrite through `SaydIface::say_read`, so `say --reword
+/// selection` waits on exactly the same deadline `say --reword "..."` does.
+///
+/// "Not bounded here" is meant literally, and it is worth stating because
+/// the obvious way to get it wrong is to bound it somewhere else by
+/// accident. zbus applies a client-side reply timeout only when the
+/// connection was built with one (`connection::Builder::method_timeout`);
+/// `Connection::session()` leaves it unset, so nothing under this `.await`
+/// caps the wait -- checked against zbus 5.19, whose `Connection::call_method`
+/// wraps the reply future in a timeout only for `Some(_)`. Setting one for
+/// the sake of a number would put back exactly the ceiling this milestone
+/// removed, one layer down and invisible.
+async fn call_submission<F, T>(reword: bool, fut: F) -> Result<(), CallError>
+where
+    F: std::future::Future<Output = zbus::Result<T>>,
+{
+    if reword {
+        return fut.await.map(|_| ()).map_err(CallError::Dbus);
+    }
+    call(fut).await.map(|_| ())
 }
 
 /// Everything that can go wrong making a call once a proxy exists: either

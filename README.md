@@ -397,6 +397,15 @@ speaks, with no coalescing. The setting window's Cooldown row says the same
 thing, because `0` is the one value here that does not mean "no wait": it
 turns the limiter off.
 
+With [rewording](#rewording) enabled, a non-zero `cooldown_secs` is raised on
+load to one second past `reword.timeout_ms`, and the tray says so. The
+follow-up is never reworded, so it goes out the instant the window closes,
+while the notification that *opened* the window is still waiting on its
+rewrite -- a window shorter than the rewrite budget therefore plays "3 more
+notifications" before the message it is counting from. Raise `timeout_ms` and
+this floor follows it. `0` is exempt: with the limiter off no window ever
+opens and no follow-up is ever composed.
+
 Notifications are submitted with the `front` queue policy (the same one
 `opts.policy = "front"` selects on the D-Bus interface): a notification is
 placed ahead of whatever is already queued, but does not interrupt the
@@ -426,7 +435,7 @@ no TLS stack, so `enabled = true` in that build is a no-op -- see
     provider = "generic"                     # "llama-cpp" | "generic"; required when enabled -- Ollama, above, is "generic"
     api_key = ""                             # local servers ignore it; see api_key_env
     api_key_env = "SAYD_REWORD_API_KEY"      # this variable wins over api_key
-    timeout_ms = 1500                        # 200..=2000
+    timeout_ms = 1500                        # at least 200; no upper bound
     max_chars = 400                          # 32..=2000; longer text is spoken as written
 
 This table is not gated on the cargo feature -- the settings window
@@ -468,8 +477,8 @@ would push it later, never earlier. The inversion is real but arrives from
 the other side: the **opener** is what a rewrite delays, and a window that
 closes before its opener has been submitted lets the follow-up be spoken
 first. That is bounded where it lives, by the floor `cooldown_secs` is
-clamped to, which keeps every non-zero cooldown clear of the rewrite
-ceiling.
+raised to, which keeps every non-zero cooldown clear of the deadline that
+config actually sets -- see [Rate limiting](#rate-limiting).
 
 ### Endpoints
 
@@ -535,12 +544,30 @@ operator.
 instead. **It is a budget, not a measurement.** End-to-end latency against a
 real provider has never been measured for this project, and no single
 number could serve both a local `llama3.2:3b` on a laptop and a hosted
-provider over a hotel connection. 1500 ms is chosen to sit under `say`'s own
-3-second D-Bus timeout with room for the bus round trip, and above the
-first-token latency a small model is generally capable of. The ceiling is
-2000 ms, not more: pushed any higher there is no margin left for the bus
-round trip on top of it, and `say --reword` starts reporting a daemon that
-is working fine as not responding.
+provider over a hotel connection. 1500 ms is the default because it is above
+the first-token latency a small model is generally capable of and short
+enough that a missed rewrite is barely a pause.
+
+**There is no upper bound.** The floor is 200 ms -- below that no provider
+answers, so a smaller number is a switched-off feature wearing a deadline
+(`enabled` is the off switch) -- and anything above it is yours. A local
+model on your own hardware may genuinely want twenty or thirty seconds, and
+`sayd` has no way to know that number, so it does not guess one. Two things
+follow from a long deadline, both of them on purpose:
+
+- `say --reword "..."` waits for the answer inline, so it waits that long
+  too. `say` deliberately puts no timeout of its own on a submission that
+  asked for a rewrite -- a daemon that is not running still fails in three
+  seconds, when the name is resolved, but a daemon that is up and working is
+  given as long as you configured.
+- A non-zero `notifications.cooldown_secs` is raised to clear it (see [Rate
+  limiting](#rate-limiting)).
+
+The settings window's Deadline row stops at 60000 ms, because a spin row has
+to stop somewhere. That limit is the window's alone: a larger value written
+into `config.toml` by hand is run as written and is *not* rewritten the next
+time the window saves -- the row says on its face that it stops at 60000,
+and marks itself when the file holds more than it can show.
 
 **Open Settings and press Test to get your own number.** The result row
 reports the measured latency beside the deadline you have configured, and
@@ -559,9 +586,10 @@ token cap is three times `max_chars` -- 1200 by default -- which is generous
 so that an over-long answer arrives whole and is rejected whole, rather than
 arriving truncated mid-sentence and being spoken. It is not a latency bound:
 at the 8 to 19 tokens per second a CPU-only machine sustains, 1200 tokens is
-a minute, and what actually ends a slow request is the client's own 10-second
-ceiling. If a generation reaches the cap, the original is spoken and the
-journal says so.
+a minute, and what actually ends a slow request is the client's own ceiling
+-- your `timeout_ms` plus ten seconds, so that the Test row can tell you how
+much too slow a provider was and not merely that it was. If a generation
+reaches the cap, the original is spoken and the journal says so.
 
 It is also a cost bound, on any endpoint that meters completion tokens --
 PPQ, OpenAI, and any other paid provider in the table above. A rewrite that

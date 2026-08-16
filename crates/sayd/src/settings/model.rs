@@ -80,9 +80,11 @@ pub const MAX_CHARS_STEP: f64 = 500.0;
 /// application is spoken. See the Notifications group's subtitle, which says
 /// that rather than letting `0` read as "no wait between announcements".
 ///
-/// `0` and then `NOTIFY_COOLDOWN_MIN_SECS`, with nothing in between: a typed
-/// `1` or `2` is raised by `clamp_ranges` before it is written, so the row
-/// snaps rather than saving a value the next load would silently change.
+/// `0` and then `notify_cooldown_min_secs`, with nothing in between while
+/// notification rewriting is on: a typed `1` or `2` is raised by
+/// `clamp_ranges` before it is written, so the row snaps rather than saving
+/// a value the next load would silently change. With rewriting off there is
+/// no gap, because there is no rewrite to outlast.
 pub const COOLDOWN_MIN: f64 = 0.0;
 /// An hour, the same ceiling `IDLE_UNLOAD_MAX` uses: past it the spinner is
 /// no longer a control anyone drives to the end, and a longer window is a
@@ -90,19 +92,50 @@ pub const COOLDOWN_MIN: f64 = 0.0;
 /// clamped -- see the doc comment above).
 pub const COOLDOWN_MAX: f64 = 3600.0;
 pub const COOLDOWN_STEP: f64 = 5.0;
-/// What the Reword group's spin rows offer, per spec §6. `timeout_ms`'s
-/// ceiling is the load-bearing one: `sayd-cli` bounds every D-Bus
-/// interaction at 3 s and `say --reword` waits for the rewrite inline, so a
-/// budget past `REWORD_TIMEOUT_MAX_MS` would turn a slow provider into a CLI
-/// error instead of a spoken sentence.
+/// What the Reword group's deadline row offers, per spec §6.
 ///
-/// The numbers themselves live in `sayd_core::config`, because
-/// `Config::load_str` applies the same clamp to a hand-edited file that
-/// never reaches a spin row: two spellings of one window is exactly the
-/// drift this pair exists to prevent.
+/// The floor is the config's own: `Config::load_str` raises anything under
+/// [`sayd_core::config::REWORD_TIMEOUT_MIN_MS`] whichever door it came
+/// through, so a row that offered less would offer a value the next load
+/// would change.
+///
+/// The ceiling is **the row's alone, and it is taste**. `reword.timeout_ms`
+/// has no ceiling any more -- a local model can want a minute -- but
+/// `gtk::Adjustment` has no way to say "unbounded", so the row has to stop
+/// somewhere. A minute is past any deadline someone tuning against the Test
+/// button would choose (the row that reports the measured latency is how a
+/// deadline gets picked, and a provider taking a minute is one to replace,
+/// not to wait for), and it is well inside what the config file will accept
+/// from an editor.
+///
+/// Two consequences, both deliberate:
+///
+/// * `clamp_ranges` does **not** enforce this, unlike the floor. A
+///   hand-written `timeout_ms = 300000` is left exactly as written every
+///   time the window saves, the way `threads = 64` is -- see the doc comment
+///   on `THREADS_MIN`, which is the same rule. A window that quietly reduced
+///   a setting it merely cannot display would be the worst version of this
+///   change, because the window rewrites the whole file.
+/// * The row says so instead. [`REWORD_TIMEOUT_SUBTITLE`] names the limit,
+///   and `window.rs`'s `Spin::show` marks the row whenever the file holds a
+///   value outside the range it offers, so the number on screen is never
+///   mistaken for the number in the file.
 pub const REWORD_TIMEOUT_MIN: f64 = sayd_core::config::REWORD_TIMEOUT_MIN_MS as f64;
-pub const REWORD_TIMEOUT_MAX: f64 = sayd_core::config::REWORD_TIMEOUT_MAX_MS as f64;
+pub const REWORD_TIMEOUT_MAX: f64 = 60_000.0;
+/// One arrow click. Small, because the interesting range is one to three
+/// seconds and that is where a deadline is actually tuned.
 pub const REWORD_TIMEOUT_STEP: f64 = 100.0;
+/// One PageUp, and the reason the row has one at all: 100 ms steps across a
+/// minute is 598 clicks. Five seconds crosses the whole range in twelve.
+pub const REWORD_TIMEOUT_PAGE: f64 = 5_000.0;
+/// Stated on the row, because a limit a user cannot see is one they discover
+/// by having their config quietly disagree with the window. This one is the
+/// window's own -- the file has no such limit -- which is exactly the sort
+/// of thing a subtitle is for.
+pub const REWORD_TIMEOUT_SUBTITLE: &str =
+    "Milliseconds a rewrite may take before the original is spoken instead. \
+     This row stops at 60000; a longer deadline can be set in config.toml \
+     and is kept.";
 /// The floor is not `0`: there is no magic zero here. `enabled` is the off
 /// switch, and `--reword` on an over-long submission is a no-op rather than
 /// an error.
@@ -150,7 +183,12 @@ pub const REWORD_TEST_DEFAULT: &str = "Alice: where do you want to go for dinner
 /// did not change anything about.
 pub const ENDPOINT_PRESETS: [(&str, &str, bool, &str); 6] = [
     ("Ollama", "http://localhost:11434/v1", false, "generic"),
-    ("llama.cpp server", "http://localhost:8080/v1", false, "llama-cpp"),
+    (
+        "llama.cpp server",
+        "http://localhost:8080/v1",
+        false,
+        "llama-cpp",
+    ),
     ("LM Studio", "http://localhost:1234/v1", false, "generic"),
     ("vLLM", "http://localhost:8000/v1", true, "generic"),
     ("PPQ", "https://api.ppq.ai/v1", true, "generic"),
@@ -755,7 +793,7 @@ impl SettingsModel {
     /// thread -- awaits it with `glib::spawn_future_local`, so nothing
     /// blocks the UI; the receiver being dropped when the window closes
     /// mid-flight simply discards the delivery, and the blocking job ends on
-    /// its own at `REWORD_HTTP_CEILING` at the latest.
+    /// its own at `reword::http_ceiling` at the latest.
     ///
     /// The *pending* config, not the last-written file: otherwise a user who
     /// types a key and immediately presses Test is told their old key is
@@ -985,14 +1023,20 @@ fn clamp_ranges(cfg: &mut Config) -> Vec<String> {
         warnings.push("threads = 0 is not a thread count; running with 1".to_string());
         cfg.threads = 1;
     }
-    let timeout = cfg
-        .reword
-        .timeout_ms
-        .clamp(REWORD_TIMEOUT_MIN as u64, REWORD_TIMEOUT_MAX as u64);
+    // The floor only, and `REWORD_TIMEOUT_MAX` is deliberately not here:
+    // that number is what the spin row can *show*, not what the daemon can
+    // run, and this function is reached by `normalize` on every load. A
+    // hand-written `timeout_ms = 300000` clamped here would be silently
+    // rewritten to 60000 the next time the user nudged an unrelated row --
+    // and this window writes the whole file. The floor is different in kind:
+    // `Config::load_str` raises it too, so leaving it out here would let the
+    // window write a value the very next load would change. See
+    // `REWORD_TIMEOUT_MIN`'s doc comment.
+    let timeout = cfg.reword.timeout_ms.max(REWORD_TIMEOUT_MIN as u64);
     if timeout != cfg.reword.timeout_ms {
         warnings.push(format!(
-            "reword.timeout_ms {} is outside {}-{}; using {timeout}",
-            cfg.reword.timeout_ms, REWORD_TIMEOUT_MIN as u64, REWORD_TIMEOUT_MAX as u64
+            "reword.timeout_ms {} is shorter than any provider can answer in; using {timeout}",
+            cfg.reword.timeout_ms
         ));
         cfg.reword.timeout_ms = timeout;
     }
@@ -1000,13 +1044,17 @@ fn clamp_ranges(cfg: &mut Config) -> Vec<String> {
     // was enforced in `Config::load_str` alone. Without it here the settings
     // window could write a `cooldown_secs = 2` that silently became 3 the
     // next time the file was read: a file that disagrees with the running
-    // config, which is the exact drift the `REWORD_TIMEOUT_MIN/MAX` pair
-    // above exists to prevent, in the same function. `0` is exempt because
-    // it means something else entirely -- `Limiter::decide`'s
+    // config, which is the exact drift the `REWORD_TIMEOUT_MIN` floor above
+    // exists to prevent, in the same function. `0` is exempt because it
+    // means something else entirely -- `Limiter::decide`'s
     // `cooldown_secs == 0` arm switches rate limiting off, so no coalescing
     // window ever opens and the ordering the floor protects does not exist.
-    // See `sayd_core::config::NOTIFY_COOLDOWN_MIN_SECS` for what it protects.
-    let floor = sayd_core::config::NOTIFY_COOLDOWN_MIN_SECS;
+    //
+    // Read from the deadline just clamped above, in that order, so the two
+    // doors agree: `Config::load_str` derives its floor from the same field
+    // after applying the same floor to it. See
+    // `sayd_core::config::notify_cooldown_min_secs` for what it protects.
+    let floor = sayd_core::config::notify_cooldown_min_secs(&cfg.reword);
     if cfg.notifications.cooldown_secs != 0 && cfg.notifications.cooldown_secs < floor {
         warnings.push(format!(
             "notifications.cooldown_secs {} is shorter than a rewrite may take; using {floor}",
@@ -1685,7 +1733,7 @@ fn outcome_for_error(e: RewordError, cfg: &RewordConfig) -> TestOutcome {
             endpoint: cfg.base_url.clone(),
         },
         RewordError::Ceiling => TestOutcome::NoAnswer {
-            ceiling: crate::reword::REWORD_TEST_CEILING,
+            ceiling: crate::reword::test_ceiling(cfg),
             deadline: Duration::from_millis(cfg.timeout_ms),
         },
         RewordError::NotConfigured(reason) => TestOutcome::NotConfigured { reason },
@@ -2782,29 +2830,101 @@ mod tests {
         assert_eq!(cfg, before);
     }
 
-    /// A hand-edited `timeout_ms` past `sayd-cli`'s 3 s D-Bus bound must be
-    /// clamped and *warned about*, not refused -- refusing would lock the
-    /// user out of every unrelated settings row, which is exactly what
-    /// `model = "int4"` used to do.
+    /// An out-of-range reword field must be clamped and *warned about*, not
+    /// refused -- refusing would lock the user out of every unrelated
+    /// settings row, which is exactly what `model = "int4"` used to do.
     #[test]
     fn out_of_range_reword_bounds_are_clamped_and_warned_about_not_rejected() {
         let mut cfg = Config::default();
-        cfg.reword.timeout_ms = 9000;
+        cfg.reword.timeout_ms = 50;
         cfg.reword.max_chars = 1;
         let warnings = normalize(&mut cfg);
-        assert_eq!(cfg.reword.timeout_ms, REWORD_TIMEOUT_MAX as u64);
+        assert_eq!(cfg.reword.timeout_ms, REWORD_TIMEOUT_MIN as u64);
         assert_eq!(cfg.reword.max_chars, 32);
         assert_eq!(warnings.len(), 2, "both clamps must say so: {warnings:?}");
 
         let mut cfg = Config::default();
-        cfg.reword.timeout_ms = 9000;
+        cfg.reword.timeout_ms = 50;
         cfg.reword.base_url = "not a url at all".into();
         assert!(
             validate(&mut cfg).is_ok(),
             "an unusable base_url is a degradation reported by the Test row, \
              not a reason to refuse an unrelated edit"
         );
-        assert_eq!(cfg.reword.timeout_ms, REWORD_TIMEOUT_MAX as u64);
+        assert_eq!(cfg.reword.timeout_ms, REWORD_TIMEOUT_MIN as u64);
+    }
+
+    /// The deadline row's range grew by a factor of thirty when the ceiling
+    /// on `timeout_ms` was removed, and its arrows did not: 100 ms steps
+    /// across a minute is 598 clicks, which is a row nobody drives to the
+    /// end.
+    ///
+    /// Here rather than beside the widget because it is a question about
+    /// four numbers and needs no display -- the GTK tests do not run without
+    /// one, and this is exactly the sort of thing that would then be checked
+    /// nowhere. `window.rs` asserts that the row is built with these; this
+    /// asserts that they are usable.
+    #[test]
+    fn the_deadline_row_can_be_crossed_without_hundreds_of_clicks() {
+        let pages = (REWORD_TIMEOUT_MAX - REWORD_TIMEOUT_MIN) / REWORD_TIMEOUT_PAGE;
+        assert!(
+            pages <= 20.0,
+            "the whole range must be a dozen or so PageUps, not {pages}"
+        );
+        const {
+            assert!(
+                REWORD_TIMEOUT_STEP <= 100.0,
+                "and the arrows must still be fine enough to tune a deadline \
+                 in the second or two where that matters"
+            );
+            assert!(
+                REWORD_TIMEOUT_PAGE > REWORD_TIMEOUT_STEP,
+                "a page increment equal to the step is not a page increment"
+            );
+        }
+    }
+
+    /// The other direction, and the one this milestone is about: a deadline
+    /// **larger** than the spin row can display is the user's, and every
+    /// path through this window has to leave it alone.
+    ///
+    /// The hazard is specific to this window and worse than it sounds: it
+    /// rewrites the whole config file, so a clamp here does not merely
+    /// display the wrong number, it deletes the setting from disk the next
+    /// time the user changes something else entirely. `REWORD_TIMEOUT_MAX`
+    /// is what the row can *show*; `window.rs`'s `Spin::show` says so on the
+    /// row when the file holds more, and nothing writes it back.
+    #[test]
+    fn a_deadline_past_what_the_row_can_show_is_left_exactly_as_written() {
+        /// Well past `REWORD_TIMEOUT_MAX`, which is the point.
+        const HAND_EDITED_MS: u64 = 300_000;
+
+        let mut cfg = Config::default();
+        cfg.reword.timeout_ms = HAND_EDITED_MS;
+        assert!(
+            normalize(&mut cfg).is_empty(),
+            "a deadline the daemon can honour is not a degradation to report"
+        );
+        assert_eq!(cfg.reword.timeout_ms, HAND_EDITED_MS);
+
+        // And through the window's own write path, which is the one that
+        // would overwrite the file.
+        let mut cfg = Config::default();
+        cfg.reword.timeout_ms = HAND_EDITED_MS;
+        validate(&mut cfg).expect("a long deadline is not a reason to refuse an edit");
+        assert_eq!(
+            cfg.reword.timeout_ms, HAND_EDITED_MS,
+            "the settings window must not quietly reduce a value it merely \
+             cannot display -- it rewrites the whole file"
+        );
+
+        // Which is only worth anything if the loader agrees: what the window
+        // writes is what the next load produces.
+        let (loaded, err) = sayd_core::config::Config::load_str(&format!(
+            "[reword]\ntimeout_ms = {HAND_EDITED_MS}\n"
+        ));
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!(loaded.reword.timeout_ms, HAND_EDITED_MS);
     }
 
     /// The premise of normalising an unknown model to `FALLBACK_MODEL`: that
@@ -3822,11 +3942,14 @@ mod tests {
         engine.shutdown();
 
         // The client's own ceiling: reported as the ceiling that was
-        // actually waited, next to the deadline that was not.
+        // actually waited, next to the deadline that was not. 11.5 s is the
+        // 1.5 s deadline plus `REWORD_HTTP_GRACE` -- the number this row
+        // prints has to be the one the transport was really given, or the
+        // row is telling the user how long it waited and being wrong.
         let dir = tempfile::tempdir().expect("tempdir");
         let (model, engine) = model_with(dir.path(), Canned::new(Err(RewordError::Ceiling)));
         let out = outcome_of(&model, REWORD_TEST_DEFAULT);
-        assert_eq!(out.title(), "No answer after 10.0 s");
+        assert_eq!(out.title(), "No answer after 11.5 s");
         assert_eq!(
             out.subtitle(),
             "The deadline is 1.5 s, so this provider is not usable for notifications"
@@ -4656,17 +4779,46 @@ mod tests {
     /// config.
     #[test]
     fn a_cooldown_shorter_than_a_rewrite_is_raised_before_it_is_written() {
-        use sayd_core::config::NOTIFY_COOLDOWN_MIN_SECS;
+        use sayd_core::config::notify_cooldown_min_secs;
+
+        /// Long enough that the floor it implies is far from the one a
+        /// fixed number could have carried, so a floor that stopped
+        /// following the deadline fails here rather than passing by
+        /// coincidence.
+        const SLOW_MODEL_MS: u64 = 20_000;
 
         let mut cfg = Config::default();
+        cfg.reword.enabled = true;
+        cfg.reword.timeout_ms = SLOW_MODEL_MS;
         cfg.notifications.cooldown_secs = 2;
         let warnings = clamp_ranges(&mut cfg);
-        assert_eq!(cfg.notifications.cooldown_secs, NOTIFY_COOLDOWN_MIN_SECS);
+        assert_eq!(
+            cfg.notifications.cooldown_secs,
+            notify_cooldown_min_secs(&cfg.reword)
+        );
+        assert!(
+            Duration::from_secs(cfg.notifications.cooldown_secs)
+                > Duration::from_millis(SLOW_MODEL_MS),
+            "the window opened by a notification must outlast the rewrite that \
+             notification is waiting on, whatever deadline the user set: {}",
+            cfg.notifications.cooldown_secs
+        );
         assert_eq!(warnings.len(), 1, "{warnings:?}");
+
+        // With rewriting off there is no rewrite to outlast, so a 2-second
+        // window is honoured rather than inflated over an interaction this
+        // config cannot have.
+        let mut quiet = Config::default();
+        quiet.notifications.cooldown_secs = 2;
+        assert!(!quiet.reword.enabled);
+        assert!(clamp_ranges(&mut quiet).is_empty());
+        assert_eq!(quiet.notifications.cooldown_secs, 2);
 
         // `0` means rate limiting is off, not "no wait": no coalescing window
         // ever opens, so the ordering the floor protects does not exist.
         let mut off = Config::default();
+        off.reword.enabled = true;
+        off.reword.timeout_ms = SLOW_MODEL_MS;
         off.notifications.cooldown_secs = 0;
         assert!(clamp_ranges(&mut off).is_empty());
         assert_eq!(off.notifications.cooldown_secs, 0);
@@ -4674,10 +4826,14 @@ mod tests {
         // And the two doors agree, which is the whole point of mirroring it:
         // what the window writes is what a load of that file produces.
         let mut written = Config::default();
+        written.reword.enabled = true;
+        written.reword.timeout_ms = SLOW_MODEL_MS;
+        written.reword.provider = Some("generic".into());
         written.notifications.cooldown_secs = 2;
         validate(&mut written).expect("a short cooldown is clamped, not refused");
         let (loaded, err) = sayd_core::config::Config::load_str(&format!(
-            "[notifications]\ncooldown_secs = {}\n",
+            "[notifications]\ncooldown_secs = {}\n\
+             [reword]\nenabled = true\nprovider = \"generic\"\ntimeout_ms = {SLOW_MODEL_MS}\n",
             written.notifications.cooldown_secs
         ));
         assert!(err.is_none(), "{err:?}");
