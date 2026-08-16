@@ -300,6 +300,18 @@ pub enum RewordError {
     /// No `choices[0].message.content`, an unparseable body, or an `error`
     /// object that classifies as nothing more specific.
     Malformed(String),
+    /// The generation stopped because it ran out of tokens, not because it
+    /// was finished. `reasoning` records whether the budget went on a
+    /// reasoning block, which is the difference between "your model thinks
+    /// and this provider was not told not to" and "your text needs a longer
+    /// answer than the cap allows".
+    ///
+    /// Deliberately not transport-class. The provider answered, promptly and
+    /// completely; there is nothing for a breaker built out of
+    /// [`RewordError::Unreachable`] and [`RewordError::Ceiling`] to protect
+    /// against, and opening it would take the feature offline for a minute
+    /// over a model that is working exactly as configured.
+    Truncated { reasoning: bool },
 }
 
 /// The seam. One synchronous method, defined by us, so a test double is a
@@ -929,6 +941,22 @@ impl Inner {
                     // the client could not use it -- so this resolves a
                     // probe as an answer, and the next notification still
                     // gets its chance.
+                    i.transport_answered();
+                }
+                RewordError::Truncated { reasoning } => {
+                    journal = Some(Journal::Line(format!(
+                        "warning: reword: the model reached its {cap}-token cap \
+                         without finishing{cause}; speaking text as written",
+                        cap = cfg.max_tokens(),
+                        cause = if *reasoning {
+                            " (it spent the budget reasoning -- set reword.provider \
+                             so it can be told not to)"
+                        } else {
+                            ""
+                        },
+                    )));
+                    // The transport did its job, so this resolves a probe as
+                    // an answer, exactly as `Malformed` does.
                     i.transport_answered();
                 }
             },
@@ -2006,6 +2034,29 @@ mod tests {
             t0,
         );
         assert_eq!(state.allow(&cfg, t0), Ok(()));
+    }
+
+    /// A model that will not stop talking is not a broken transport. Three of
+    /// these in a row must not take the feature offline for a minute the way
+    /// three `Ceiling`s do -- the server answered every time, promptly and
+    /// completely.
+    #[test]
+    fn truncation_does_not_open_the_transport_breaker() {
+        let cfg = RewordConfig::default();
+        let state = RewordState::new();
+        let t0 = Instant::now();
+        for _ in 0..3 {
+            state.record(
+                &cfg,
+                &Attempt::Answered(Err(RewordError::Truncated { reasoning: true })),
+                t0,
+            );
+        }
+        assert_eq!(
+            state.allow(&cfg, t0),
+            Ok(()),
+            "the provider answered three times; nothing about the transport is down"
+        );
     }
 
     /// §8 says "stop attempting for 60 s, **then let one through**", and

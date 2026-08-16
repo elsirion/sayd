@@ -243,12 +243,18 @@ struct ChatResponse {
 struct Choice {
     #[serde(default, deserialize_with = "lenient")]
     message: Option<ChoiceMessage>,
+    #[serde(default, deserialize_with = "lenient")]
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct ChoiceMessage {
     #[serde(default, deserialize_with = "lenient")]
     content: Option<String>,
+    /// Where llama.cpp puts a thinking block. Read only to say *why* a
+    /// generation ran out of room; it is never a candidate, and never spoken.
+    #[serde(default, deserialize_with = "lenient")]
+    reasoning_content: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -479,11 +485,25 @@ pub fn parse_response(
     // No indexing anywhere: an empty `choices`, a `choices` that is not an
     // array, a choice with no `message` and a `content` that is `null` all
     // arrive here as `None`.
-    let content = parsed
-        .choices
-        .unwrap_or_default()
-        .into_iter()
-        .next()
+    let choice = parsed.choices.unwrap_or_default().into_iter().next();
+    // Before the content is looked at, and regardless of whether there is
+    // any. A truncated answer that *has* text is the dangerous case, not the
+    // safe one: it is a sentence cut off mid-clause, it passes the guard's
+    // length check, and it is what gets spoken.
+    if choice
+        .as_ref()
+        .and_then(|c| c.finish_reason.as_deref())
+        .is_some_and(|r| r == "length")
+    {
+        return Err(RewordError::Truncated {
+            reasoning: choice
+                .as_ref()
+                .and_then(|c| c.message.as_ref())
+                .and_then(|m| m.reasoning_content.as_deref())
+                .is_some_and(|r| !r.trim().is_empty()),
+        });
+    }
+    let content = choice
         .and_then(|c| c.message)
         .and_then(|m| m.content)
         .filter(|c| !c.trim().is_empty());
@@ -973,6 +993,47 @@ mod tests {
             parse_response(503, None, b"", "m", "h"),
             Err(RewordError::Malformed(_))
         ));
+    }
+
+    /// What a thinking model actually returns: the whole budget spent in
+    /// `reasoning_content`, `content` empty, `finish_reason` "length". Today
+    /// this is reported as a malformed response, which is wrong -- the response
+    /// was perfectly well formed and the model simply never got to the answer.
+    #[test]
+    fn a_generation_that_hit_the_cap_is_not_called_malformed() {
+        let body = br#"{"choices":[{"finish_reason":"length","message":
+            {"role":"assistant","content":"","reasoning_content":"Thinking Process:\n1."}}]}"#;
+        assert_eq!(
+            parse_response(200, None, body, "gemma", "localhost"),
+            Err(RewordError::Truncated { reasoning: true })
+        );
+    }
+
+    /// The more dangerous half, and the reason the trigger is `finish_reason`
+    /// alone. An answer cut off mid-sentence is *text*, so it passes the guard's
+    /// length check and reaches the speaker -- the exact failure the generous
+    /// token cap exists to prevent.
+    #[test]
+    fn a_truncated_answer_with_text_in_it_is_still_refused() {
+        let body = br#"{"choices":[{"finish_reason":"length","message":
+            {"content":"Alice is asking where you want to go for"}}]}"#;
+        assert_eq!(
+            parse_response(200, None, body, "gemma", "localhost"),
+            Err(RewordError::Truncated { reasoning: false })
+        );
+    }
+
+    /// Reasoning is not the fault; not finishing is. A model that thinks and
+    /// then answers inside the cap has done exactly what was asked.
+    #[test]
+    fn reasoning_beside_a_finished_answer_is_accepted() {
+        let body = br#"{"choices":[{"finish_reason":"stop","message":
+            {"content":"Alice is asking where you want to go for dinner",
+             "reasoning_content":"brief"}}]}"#;
+        assert_eq!(
+            parse_response(200, None, body, "gemma", "localhost").as_deref(),
+            Ok("Alice is asking where you want to go for dinner")
+        );
     }
 
     /// **The ordering rule, against the bodies that broke the old one.**

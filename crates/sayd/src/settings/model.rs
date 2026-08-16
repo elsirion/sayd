@@ -1662,6 +1662,27 @@ fn outcome_for_error(e: RewordError, cfg: &RewordConfig) -> TestOutcome {
         },
         RewordError::NotConfigured(reason) => TestOutcome::NotConfigured { reason },
         RewordError::Unavailable => TestOutcome::Unavailable,
+        // `Unusable` rather than a row of its own: the endpoint answered and
+        // the answer could not be used, which is exactly what that row says
+        // and exactly the investigation the user needs. The detail is what
+        // makes it actionable.
+        RewordError::Truncated { reasoning } => TestOutcome::Unusable {
+            detail: if reasoning {
+                format!(
+                    "the model spent its whole {} token budget reasoning instead \
+                     of answering; set reword.provider to llama-cpp to turn \
+                     thinking off, or choose a model that does not reason",
+                    cfg.max_tokens()
+                )
+            } else {
+                format!(
+                    "the answer was cut off at the {} token cap; raise \
+                     reword.max_chars or shorten the text",
+                    cfg.max_tokens()
+                )
+            },
+            endpoint: cfg.base_url.clone(),
+        },
         // A body that came back and could not be used. *Not* an unreachable
         // provider: the request completed and something answered it, so a
         // row titled "could not reach" would send the user to check that the
