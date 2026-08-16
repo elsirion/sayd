@@ -69,7 +69,7 @@
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use sayd_core::config::{resolve_api_key, RewordConfig};
+use sayd_core::config::{resolve_api_key, Provider, RewordConfig};
 use sayd_core::reword::{chat_completions_url, parse_base_url};
 use serde::{Deserialize, Serialize};
 
@@ -174,6 +174,23 @@ struct ChatRequest<'a> {
     stream: bool,
     temperature: f64,
     max_tokens: u32,
+    /// Absent for every provider but llama.cpp, and absent rather than
+    /// `null`: a remote OpenAI-compatible service rejects an unknown
+    /// top-level field, so this must not reach one at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chat_template_kwargs: Option<ChatTemplateKwargs>,
+}
+
+/// llama.cpp's spelling of "do not reason".
+///
+/// A nested object rather than a flat field because that is the shape the
+/// server's chat-template layer reads; the kwargs are handed to the
+/// template, not to the sampler. `reasoning_budget: 0` is the obvious
+/// alternative and does not work -- measured, 6 requests of 6 still
+/// reasoned.
+#[derive(Serialize)]
+struct ChatTemplateKwargs {
+    enable_thinking: bool,
 }
 
 #[derive(Serialize)]
@@ -267,6 +284,12 @@ pub fn build_request(cfg: &RewordConfig, key: Option<&str>, text: &str) -> Reque
         stream: false,
         temperature: TEMPERATURE,
         max_tokens: MAX_TOKENS,
+        chat_template_kwargs: match cfg.resolved_provider() {
+            Some(Provider::LlamaCpp) => Some(ChatTemplateKwargs {
+                enable_thinking: false,
+            }),
+            Some(Provider::Generic) | None => None,
+        },
     };
     Request {
         url: chat_completions_url(&cfg.base_url),
@@ -548,11 +571,55 @@ pub struct HttpRewriter {
     host: String,
 }
 
+/// Hand-written because `key` is not a value that already sits in a file --
+/// for an `api_key_env` configuration it is the live secret read out of the
+/// process environment -- and `cfg` carries `api_key` inline, so deriving
+/// `Debug` on either field puts a credential one `dbg!()`, one debug log
+/// line, or one panic-message interpolation away from plaintext. This file
+/// already refuses a key containing a character an HTTP header cannot carry
+/// (see `is_header_safe`); the same care applies here, just pointed the
+/// other way -- at what this type is willing to print rather than what a
+/// provider is willing to accept.
+///
+/// This impl exists only so `{other:?}` keeps compiling on the
+/// `Result<HttpRewriter, RewordError>` that
+/// `a_client_cannot_be_built_without_a_usable_provider` matches on below --
+/// no production code formats a rewriter today. It prints the fields worth
+/// having when a rewrite goes wrong (`host`, and `cfg`'s endpoint and model)
+/// and, for the key, only whether one resolved at all: that distinguishes
+/// "no key configured" from "key rejected" without ever showing what the
+/// key is.
+impl std::fmt::Debug for HttpRewriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpRewriter")
+            .field("host", &self.host)
+            .field("base_url", &self.cfg.base_url)
+            .field("model", &self.cfg.model)
+            .field("key", &self.key.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
 impl HttpRewriter {
     /// Refuses an unusable `base_url` -- and an unusable key -- here rather
     /// than at request time, so the daemon logs it once at first use instead
     /// of once per utterance.
     pub fn new(cfg: &RewordConfig) -> Result<HttpRewriter, RewordError> {
+        // Before `base_url`, because a config with neither wants the field it
+        // has never heard of named first. Reported here rather than at
+        // startup because `--reword` does not require `enabled`, so this is
+        // reachable on a daemon that was right to start.
+        if cfg.resolved_provider().is_none() {
+            let names = Provider::NAMES.join(", ");
+            return Err(RewordError::NotConfigured(match cfg.provider.as_deref() {
+                None => format!("reword.provider is unset; set it to one of: {names}"),
+                Some(bad) => format!(
+                    "reword.provider = {bad:?} is not a provider this build \
+                     knows; set it to one of: {names}"
+                ),
+            }));
+        }
+
         let endpoint = parse_base_url(&cfg.base_url)
             .map_err(|e| RewordError::NotConfigured(format!("reword.base_url: {e}")))?;
         let key = resolve_api_key(cfg);
@@ -740,6 +807,10 @@ mod tests {
             enabled: true,
             base_url: "https://api.ppq.ai/v1".into(),
             model: "gpt-4o-mini".into(),
+            // Every test that is not *about* the provider wants the one that
+            // sends nothing extra, so the body under assertion is the common
+            // request.
+            provider: Some("generic".into()),
             ..RewordConfig::default()
         }
     }
@@ -1041,6 +1112,7 @@ mod tests {
             // typographed the hyphen actually contains.
             api_key: "sk\u{2013}0123456789".into(),
             api_key_env: String::new(),
+            provider: Some("generic".into()),
             ..RewordConfig::default()
         };
 
@@ -1362,6 +1434,7 @@ mod tests {
             model: "test-model".into(),
             api_key: "sk-loopback".into(),
             api_key_env: String::new(),
+            provider: Some("generic".into()),
             ..RewordConfig::default()
         };
         (cfg, handle)
@@ -1431,6 +1504,7 @@ mod tests {
         let cfg = RewordConfig {
             base_url: "http://exa mple.com/v1".into(),
             api_key_env: String::new(),
+            provider: Some("generic".into()),
             ..RewordConfig::default()
         };
         let rewriter = HttpRewriter::new(&cfg).expect("the scheme and host are readable");
@@ -1482,6 +1556,7 @@ mod tests {
         let cfg = RewordConfig {
             base_url: format!("http://127.0.0.1:{port}/v1"),
             api_key_env: String::new(),
+            provider: Some("generic".into()),
             ..RewordConfig::default()
         };
         let rewriter = HttpRewriter::new(&cfg).expect("a usable client");
@@ -1835,5 +1910,97 @@ mod tests {
             Err(RewordError::Malformed(_))
         ));
         server.join().expect("the server thread");
+    }
+
+    /// The measured fix. A thinking model asked nothing special reasons on 9
+    /// requests of 10 and blows through any cap it is given; this field is what
+    /// stops it, verified against the local llama.cpp router on 6 of 6.
+    #[test]
+    fn llama_cpp_asks_the_model_not_to_think() {
+        let mut c = cfg();
+        c.provider = Some("llama-cpp".into());
+        let r = build_request(&c, None, "Alice: dinner?");
+        assert_eq!(
+            r.body["chat_template_kwargs"]["enable_thinking"],
+            serde_json::json!(false)
+        );
+    }
+
+    /// The other half, and the half that must be asserted on the *body*: a
+    /// remote OpenAI-compatible provider rejects an unknown top-level field
+    /// rather than ignoring it, so "generic sends nothing extra" is a promise
+    /// about bytes, not about intent.
+    #[test]
+    fn generic_sends_the_common_request_and_nothing_else() {
+        let r = build_request(&cfg(), None, "Alice: dinner?");
+        let obj = r.body.as_object().expect("a JSON object");
+        assert!(
+            !obj.contains_key("chat_template_kwargs"),
+            "the key must be absent, not null: {}",
+            r.body
+        );
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["max_tokens", "messages", "model", "stream", "temperature"],
+            "a provider that is not llama.cpp sees exactly the request it saw before"
+        );
+    }
+
+    /// Reported where every other unusable setting is: once per run, on the row
+    /// that says the endpoint is not configured, with the text spoken as
+    /// written. Not a startup failure -- `--reword` is a submission, and the
+    /// daemon may have been started with `enabled = false`.
+    #[test]
+    fn a_client_cannot_be_built_without_a_usable_provider() {
+        let mut c = cfg();
+        c.provider = None;
+        match HttpRewriter::new(&c) {
+            Err(RewordError::NotConfigured(reason)) => {
+                assert!(reason.contains("reword.provider"), "{reason}");
+                for name in sayd_core::config::Provider::NAMES {
+                    assert!(reason.contains(name), "{name} must be offered: {reason}");
+                }
+            }
+            other => panic!("an unset provider must not build a client: {other:?}"),
+        }
+
+        c.provider = Some("llama.cpp".into());
+        match HttpRewriter::new(&c) {
+            Err(RewordError::NotConfigured(reason)) => {
+                assert!(
+                    reason.contains("llama.cpp"),
+                    "the typo must be quoted: {reason}"
+                )
+            }
+            other => panic!("an unrecognised provider must not build a client: {other:?}"),
+        }
+    }
+
+    /// The regression guard for the hand-written `Debug` impl above:
+    /// nothing else in this file would notice a derive quietly creeping back
+    /// in, since `{other:?}` in
+    /// `a_client_cannot_be_built_without_a_usable_provider` only ever hits
+    /// the `Err` arm and never has a key to leak. This builds a rewriter
+    /// that *does* hold one and checks the formatted output both omits it
+    /// and still carries `host`, so the impl earns its keep on both halves
+    /// of the trade.
+    #[test]
+    fn debug_never_prints_the_api_key() {
+        let mut c = cfg();
+        c.api_key = "sk-SECRETVALUE".into();
+        c.api_key_env = String::new();
+        let rewriter = HttpRewriter::new(&c).expect("cfg() is a usable provider");
+
+        let debug = format!("{rewriter:?}");
+        assert!(
+            !debug.contains("SECRETVALUE"),
+            "the key must never appear in Debug output: {debug}"
+        );
+        assert!(
+            debug.contains(&rewriter.host),
+            "host is the useful field Debug exists to keep: {debug}"
+        );
     }
 }

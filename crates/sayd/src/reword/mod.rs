@@ -1583,6 +1583,7 @@ mod tests {
         RewordConfig {
             enabled: true,
             timeout_ms: 100,
+            provider: Some("generic".into()),
             ..RewordConfig::default()
         }
     }

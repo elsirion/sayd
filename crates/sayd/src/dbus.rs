@@ -887,7 +887,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let (base_url, provider) = crate::reword::silent_provider(CLI_TIMEOUT);
         let (cfg, err) = Config::load_str(&format!(
-            "[reword]\nbase_url = \"{base_url}\"\ntimeout_ms = 86400000\n"
+            "[reword]\nbase_url = \"{base_url}\"\nprovider = \"generic\"\ntimeout_ms = 86400000\n"
         ));
         assert_eq!(err, None);
         assert_eq!(

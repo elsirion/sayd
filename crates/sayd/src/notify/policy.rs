@@ -467,6 +467,7 @@ mod tests {
         };
         let reword = sayd_core::config::RewordConfig {
             enabled: true,
+            provider: Some("generic".into()),
             ..sayd_core::config::RewordConfig::default()
         };
         assert!(

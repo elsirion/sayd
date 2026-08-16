@@ -1067,6 +1067,7 @@ mod tests {
         Config {
             reword: Box::new(RewordConfig {
                 enabled: true,
+                provider: Some("generic".into()),
                 ..RewordConfig::default()
             }),
             ..Config::default()
@@ -1834,6 +1835,7 @@ mod tests {
             enabled: true,
             base_url,
             timeout_ms: 400,
+            provider: Some("generic".into()),
             ..RewordConfig::default()
         };
         assert!(
