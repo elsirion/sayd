@@ -105,7 +105,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use sayd_core::cleanup::clean;
-use sayd_core::config::{CleanupConfig, RewordConfig};
+use sayd_core::config::{CleanupConfig, Provider, RewordConfig};
 use sayd_core::reword::{check, eligible, Ineligible};
 
 #[cfg(feature = "reword")]
@@ -529,6 +529,16 @@ struct Inner {
     /// nothing a user edits will clear it, so saying it twice would be
     /// saying it twice for the life of the process.
     unavailable_logged: bool,
+    /// A1: every other row in [`Inner::fold`]'s match gates its line behind
+    /// a latch like this one; `Truncated` did not. Because `Truncated`
+    /// deliberately does not open the transport breaker (§8: it is not
+    /// transport-class), nothing else throttles the attempts either -- a
+    /// reasoning model behind `provider = "generic"` truncates on nearly
+    /// every request, and an ungated line here was one `warning:` per
+    /// notification, forever. Cleared on success alongside
+    /// [`Inner::outage_logged`] and [`Inner::rate_limit_logged`], so a
+    /// standing truncation is one line rather than one per rewrite.
+    truncated_logged: bool,
 }
 
 impl RewordState {
@@ -819,6 +829,7 @@ impl Inner {
                 i.transport_answered();
                 i.outage_logged = false;
                 i.rate_limit_logged = false;
+                i.truncated_logged = false;
             }
             Attempt::Answered(Err(e)) => match e {
                 RewordError::Auth {
@@ -944,17 +955,42 @@ impl Inner {
                     i.transport_answered();
                 }
                 RewordError::Truncated { reasoning } => {
-                    journal = Some(Journal::Line(format!(
-                        "warning: reword: the model reached its {cap}-token cap \
-                         without finishing{cause}; speaking text as written",
-                        cap = cfg.max_tokens(),
-                        cause = if *reasoning {
-                            " (it spent the budget reasoning -- set reword.provider \
-                             so it can be told not to)"
-                        } else {
-                            ""
-                        },
-                    )));
+                    // A1: gated like every other row, for the reason
+                    // `Inner::truncated_logged`'s doc comment gives.
+                    if !i.truncated_logged {
+                        journal = Some(Journal::Line(format!(
+                            "warning: reword: the model reached its {cap}-token cap \
+                             without finishing{cause}; speaking text as written",
+                            cap = cfg.max_tokens(),
+                            // A2: `HttpRewriter::new` refuses any config whose
+                            // provider does not resolve before a request ever
+                            // leaves the machine, so a config that reached
+                            // this arm is already `generic` or `llama-cpp` --
+                            // never unset. The two need different advice:
+                            // `generic` sends nothing to suppress reasoning,
+                            // so naming `llama-cpp` is real advice; a config
+                            // already on `llama-cpp` sent
+                            // `chat_template_kwargs` and the server reasoned
+                            // anyway, so repeating the same suggestion would
+                            // be a circle -- the honest statement is that the
+                            // server did not honour the request.
+                            cause = match reasoning {
+                                false => String::new(),
+                                true if cfg.resolved_provider() == Some(Provider::LlamaCpp) => {
+                                    " (it spent the budget reasoning even though \
+                                     reword.provider is already \"llama-cpp\"; the \
+                                     server did not honour the request -- try a \
+                                     model that does not reason)"
+                                        .to_string()
+                                }
+                                true => " (it spent the budget reasoning -- set \
+                                    reword.provider = \"llama-cpp\" so it can be \
+                                    told not to)"
+                                    .to_string(),
+                            },
+                        )));
+                        i.truncated_logged = true;
+                    }
                     // The transport did its job, so this resolves a probe as
                     // an answer, exactly as `Malformed` does.
                     i.transport_answered();
@@ -1880,6 +1916,71 @@ mod tests {
         assert!(
             printed_line(inner.fold(&cfg, &limited(None), now)).is_some(),
             "a second, later rate limit is a second event"
+        );
+    }
+
+    /// A1: `Truncated` did not gate its line the way every other row in
+    /// §8's table does, and it is the one row nothing else throttles --
+    /// deliberately not transport-class, so it never opens the breaker
+    /// either. A reasoning model behind `provider = "generic"` truncates
+    /// on nearly every request; an ungated line would be one `warning:`
+    /// per notification, forever.
+    ///
+    /// A2: the advice used to say "set reword.provider" unconditionally.
+    /// `HttpRewriter::new` refuses any config whose provider does not
+    /// resolve before a request ever leaves the machine, so by the time
+    /// this fires `provider` is already `generic` or `llama-cpp`, and the
+    /// two need different advice -- see `Inner::fold`'s `Truncated` arm.
+    #[test]
+    fn a_truncation_says_so_once_per_run_and_names_the_real_fix() {
+        let mut inner = Inner::default();
+        let now = Instant::now();
+        let truncated =
+            |reasoning: bool| Attempt::Answered(Err(RewordError::Truncated { reasoning }));
+
+        // `generic`, the default `cfg()` uses: it sends nothing to
+        // suppress reasoning, so pointing at `llama-cpp` is real advice.
+        let line = printed_line(inner.fold(&cfg(), &truncated(true), now))
+            .expect("the first truncation is worth a line");
+        assert!(line.contains("token cap"), "{line}");
+        assert!(
+            line.contains("reword.provider = \"llama-cpp\""),
+            "generic sends nothing to suppress reasoning, so naming \
+             llama-cpp is the real fix: {line}"
+        );
+
+        assert_eq!(
+            printed_line(inner.fold(&cfg(), &truncated(true), now)),
+            None,
+            "a reasoning model that truncates on every request must not \
+             log once per notification -- Truncated deliberately does not \
+             open the transport breaker, so nothing else throttles it"
+        );
+
+        // A success is what clears the latch, like every other once-per-run
+        // row.
+        inner.fold(&cfg(), &Attempt::Answered(Ok("a rewrite".into())), now);
+        assert!(
+            printed_line(inner.fold(&cfg(), &truncated(false), now)).is_some(),
+            "a second, later truncation is a second event"
+        );
+
+        // `llama-cpp` already sent `chat_template_kwargs`; telling the user
+        // to set it again would be a circle, not advice.
+        let mut llama = cfg();
+        llama.provider = Some("llama-cpp".into());
+        let mut inner_llama = Inner::default();
+        let line = printed_line(inner_llama.fold(&llama, &truncated(true), now))
+            .expect("the first truncation is worth a line");
+        assert!(
+            !line.contains("set reword.provider"),
+            "provider is already llama-cpp, so this advice would be \
+             circular: {line}"
+        );
+        assert!(
+            line.contains("did not honour the request"),
+            "the honest statement is that the server ignored what it was \
+             told: {line}"
         );
     }
 
