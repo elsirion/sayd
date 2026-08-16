@@ -490,10 +490,16 @@ pub fn parse_response(
     // any. A truncated answer that *has* text is the dangerous case, not the
     // safe one: it is a sentence cut off mid-clause, it passes the guard's
     // length check, and it is what gets spoken.
+    //
+    // Matched case-insensitively against both "length" and "max_tokens":
+    // OpenAI and llama.cpp send `"length"`, but Gemini- and
+    // Anthropic-compatibility shims send `MAX_TOKENS` / `max_tokens`. Missing
+    // either spelling does not fail safe -- it is the mid-sentence
+    // truncation above that reaches the speaker uncaught.
     if choice
         .as_ref()
         .and_then(|c| c.finish_reason.as_deref())
-        .is_some_and(|r| r == "length")
+        .is_some_and(|r| r.eq_ignore_ascii_case("length") || r.eq_ignore_ascii_case("max_tokens"))
     {
         return Err(RewordError::Truncated {
             reasoning: choice
@@ -1019,6 +1025,29 @@ mod tests {
             {"content":"Alice is asking where you want to go for"}}]}"#;
         assert_eq!(
             parse_response(200, None, body, "gemma", "localhost"),
+            Err(RewordError::Truncated { reasoning: false })
+        );
+    }
+
+    /// OpenAI and llama.cpp both spell it `"length"`, but Gemini- and
+    /// Anthropic-compatibility shims spell it `MAX_TOKENS` / `max_tokens` --
+    /// against those, an unmatched string used to let the mid-sentence
+    /// truncation this check exists to prevent fall through and be spoken,
+    /// exactly the failure `a_truncated_answer_with_text_in_it_is_still_refused`
+    /// pins for the `"length"` spelling.
+    #[test]
+    fn other_spellings_of_a_truncated_finish_reason_are_recognised() {
+        let shouting = br#"{"choices":[{"finish_reason":"MAX_TOKENS","message":
+            {"content":"Alice is asking where you want to go for"}}]}"#;
+        assert_eq!(
+            parse_response(200, None, shouting, "gemma", "localhost"),
+            Err(RewordError::Truncated { reasoning: false })
+        );
+
+        let mixed_case = br#"{"choices":[{"finish_reason":"Length","message":
+            {"content":"Alice is asking where you want to go for"}}]}"#;
+        assert_eq!(
+            parse_response(200, None, mixed_case, "gemma", "localhost"),
             Err(RewordError::Truncated { reasoning: false })
         );
     }
