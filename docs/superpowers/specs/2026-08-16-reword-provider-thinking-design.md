@@ -154,12 +154,17 @@ three `Ceiling`s do today. This is the half of the fix that still works when
 | `sayd-core::config` | `RewordConfig::provider: Option<String>`; `Provider` enum with `from_config`; `reword_startup_refusal(&RewordConfig) -> Option<String>` |
 | `sayd::reword::http` | `ChatRequest.chat_template_kwargs` (skipped when `None`); `max_tokens` derived from `max_chars`; parse `finish_reason` and `reasoning_content`; new truncation error |
 | `sayd::main` | call `reword_startup_refusal` after `Config::load`, exit 1 with the message, behind the feature gate |
-| `sayd::config_watch` | same predicate on reload: warn and disable, never exit |
 | `sayd::settings::model` | render the new error in the Test row |
 | `README.md` | rewrite *Endpoints*' opening paragraph; add `provider` to the config example; note thinking in *The deadline* |
 
 `reword_startup_refusal` is a pure function over `RewordConfig` precisely so
 the rule is testable without `main()`.
+
+`config_watch` needs no change. `build_rewriter` -> `HttpRewriter::new` is the
+single production construction point and it is called per attempt, so
+rejecting an unusable `provider` there is what produces `NotConfigured` on the
+`--reword` path, on the Test row, and after a live reload alike. One check,
+three behaviours, no reload-specific code.
 
 ## Testing
 
