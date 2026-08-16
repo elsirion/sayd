@@ -124,6 +124,15 @@ pub const REWORD_TIMEOUT_MIN_MS: u64 = 200;
 /// reports the latency it measured, which is how someone discovers they need
 /// a different provider rather than a larger number here.
 ///
+/// IMPORTANT 3 (rewording final review): the sum has exactly three terms
+/// because everything else on that path is bounded by nothing measurable and
+/// must therefore cost nothing. The config read is the one that was not:
+/// `sayd::dbus::SaydIface::maybe_reword` took `ConfigStore::current`, and
+/// that mutex is held across an unbounded disk write -- measured, a wedged
+/// write blocked it for 1.500 s, against an allowance here of zero. It reads
+/// `ConfigStore::published` now, an `Arc` clone behind a lock nothing holds
+/// across I/O, so zero is the right allowance rather than an oversight.
+///
 /// MINOR 10: this arithmetic bounds `Say` and nothing else.
 /// `SaySelection`/`SayClipboard` read a selection first, and that read
 /// carries its own bounds -- `selection::SELECTION_READ_TIMEOUT` at 5 s of

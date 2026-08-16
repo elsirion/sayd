@@ -122,7 +122,7 @@ impl SaydIface {
     /// [`Spoken`] rather than a `String` -- the refusal is retried with the
     /// text the rewrite replaced, in [`SaydIface::submit_spoken`].
     ///
-    /// **The config comes from [`ConfigStore::current`], not from
+    /// **The config comes from the [`ConfigStore`], not from
     /// `EngineHandle::config()`.** IMPORTANT 1, and it was measured: that
     /// round trip is bounded by `CONFIG_REPLY_TIMEOUT` at 250 ms, and an
     /// engine thread that is mid-chunk simply does not answer inside it. The
@@ -133,17 +133,28 @@ impl SaydIface {
     /// state: the normal use of `say --reword selection` on a keybind is to
     /// press it while the daemon is already speaking, so the feature worked
     /// on an idle daemon and quietly stopped under exactly the load it exists
-    /// for. `ConfigStore::current` is the daemon's own last-known config and
-    /// needs no engine at all -- which is what `EngineHandle::config`'s own
-    /// doc tells a caller that needs *some* answer rather than none to fall
-    /// back to. The two agree on `[reword]` because every change to it
-    /// reaches the engine through this same store's `ApplyConfig`.
+    /// for. The store is the daemon's own last-known config and needs no
+    /// engine at all -- which is what `EngineHandle::config`'s own doc tells
+    /// a caller that needs *some* answer rather than none to fall back to.
+    /// The two agree on `[reword]` because every change to it reaches the
+    /// engine through this same store's `ApplyConfig`.
     ///
-    /// Still on the blocking pool: `current` takes the stamp mutex, and
-    /// `ConfigStore::write_locked` holds that across an unbounded disk write
-    /// (see `ConfigStore::generation`, IMPORTANT 2 there). That is a far
-    /// rarer stall than a busy engine thread and it has no 250 ms cliff, but
-    /// it is still not something to hold a runtime worker on. C2 again.
+    /// **[`ConfigStore::published`], not `current`, and not on the blocking
+    /// pool.** IMPORTANT 3 of the final review. `current` takes the stamp
+    /// mutex, and `ConfigStore::write_locked` holds that across an unbounded
+    /// disk write: measured, a wedged write blocked this read for 1.500 s.
+    /// The `spawn_blocking` hop kept that off a runtime worker but did
+    /// nothing about the 1.500 s itself, and this read sits inside the sum
+    /// `sayd-core`'s `config.rs` asserts at compile time -- `timeout_ms` plus
+    /// `EngineHandle::submit`'s round trip plus the margin, against
+    /// `sayd-cli`'s 3 s -- which allocates it nothing at all. A stall here
+    /// spends someone else's budget and turns a working daemon into "sayd is
+    /// not responding".
+    ///
+    /// `published` is the same value behind a lock that is never held across
+    /// I/O, so the read is an `Arc` clone and needs no hop at all. The
+    /// `spawn_blocking` that used to wrap it is gone with it, along with the
+    /// `JoinError` arm that existed only because of it.
     ///
     /// The config is read only *after* the opt has been seen, so an ordinary
     /// `Say` pays nothing at all for this -- not even the mutex.
@@ -151,24 +162,7 @@ impl SaydIface {
         if !wants_reword(opts) {
             return Spoken::as_written(text);
         }
-        let store = self.store.clone();
-        let cfg = match tokio::task::spawn_blocking(move || store.current()).await {
-            Ok(cfg) => cfg,
-            // The one remaining way this hands back the original without
-            // having tried, and the reason it is logged rather than silent:
-            // the drop above was invisible, and a drop nobody can see is the
-            // failure IMPORTANT 1 is about. `spawn_blocking` only fails if
-            // the closure panicked, which means the stamp mutex or a `Config`
-            // clone did -- not something to swallow, and not something that
-            // repeats often enough to need a once-per-run latch.
-            Err(e) => {
-                eprintln!(
-                    "warning: reword: could not read the daemon's own configuration \
-                     ({e}); speaking the text as written"
-                );
-                return Spoken::as_written(text);
-            }
-        };
+        let cfg = self.store.published();
         // `requested`, never `automatic`: `[reword] enabled` means "rewrite
         // my notifications without being asked", and this caller is asking.
         // Everything else -- endpoint, eligibility, all three breakers -- is
@@ -734,6 +728,67 @@ mod tests {
         );
     }
 
+    /// IMPORTANT 3: `--reword` reads the config without taking the stamp.
+    ///
+    /// The stamp is held across `ConfigStore::write_locked`'s unbounded disk
+    /// write -- measured, a wedged write blocked this read for 1.500 s --
+    /// and this read sits inside a budget `sayd-core`'s `config.rs` asserts
+    /// at compile time and allocates it nothing. "Did not take a lock" is
+    /// invisible in anything the call returns, so the store counts the reads
+    /// (the same instrument, and the same reasoning, as
+    /// `settings::model::tests::refresh_does_not_touch_the_store_while_a_write_is_in_flight`).
+    ///
+    /// `base_url` is deliberately unusable, so nothing is attempted and the
+    /// test needs no provider: what is under test is the read in front of
+    /// the attempt, not the attempt.
+    #[tokio::test]
+    async fn a_reword_reads_the_config_without_taking_the_stamp() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = Config {
+            reword: Box::new(sayd_core::config::RewordConfig {
+                base_url: String::new(),
+                api_key_env: String::new(),
+                ..sayd_core::config::RewordConfig::default()
+            }),
+            ..Config::default()
+        };
+        let engine = sayd_core::handle::EngineHandle::spawn(
+            cfg.clone(),
+            Box::new(StubSynthesizer::new()),
+            Box::new(VecSink::new(24_000 * 10)),
+        );
+        let store = Arc::new(ConfigStore::new(
+            dir.path().join("config.toml"),
+            engine.clone(),
+            cfg,
+        ));
+        let i = SaydIface::new(engine, store);
+
+        let stamp_before = i.store.stamp_reads();
+        let published_before = i.store.published_reads();
+        let text = "Alice: where do you want to go for dinner".to_string();
+        let spoken = i
+            .maybe_reword(text.clone(), &opts_with("reword", OwnedValue::from(true)))
+            .await;
+
+        assert_eq!(
+            i.store.stamp_reads(),
+            stamp_before,
+            "the stamp is held across a disk write; this read must not want it"
+        );
+        assert_eq!(
+            i.store.published_reads(),
+            published_before + 1,
+            "...and it must still have read the config: not reading it at all \
+             is the other way to pass the assertion above"
+        );
+        assert_eq!(
+            spoken.text, text,
+            "and an unusable endpoint speaks it as written"
+        );
+        i.engine.shutdown();
+    }
+
     /// CRITICAL 2 on this path: `maybe_reword`'s "every way this can fail
     /// ends in the original being spoken" has to hold for the way it can fail
     /// *after succeeding* -- a rewrite the guard accepted and the engine then
@@ -949,10 +1004,11 @@ mod tests {
     /// to its limit and is deterministic rather than a race against a
     /// synthesiser: `config()` cannot answer at all.
     ///
-    /// `stamp_reads` is what is asserted because it is the mechanism itself,
-    /// and it is the same fact in a build with the `reword` feature and one
-    /// without: `maybe_reword` reads `ConfigStore::current` exactly once per
-    /// `--reword` and never otherwise, so 0 is "the request was dropped
+    /// `published_reads` is what is asserted because it is the mechanism
+    /// itself, and it is the same fact in a build with the `reword` feature
+    /// and one without: `maybe_reword` reads `ConfigStore::published` exactly
+    /// once per `--reword` and never otherwise, so 0 is "the request was
+    /// dropped
     /// before anything so much as looked at a configuration" and 1 is "it
     /// reached `RewordPlan::requested`". What happens past that point belongs
     /// to `crate::reword` and is pinned there. An `endpoint_seen` assertion
@@ -971,7 +1027,7 @@ mod tests {
              starts passing, the condition being reproduced is gone"
         );
 
-        let before = i.store.stamp_reads();
+        let before = i.store.published_reads();
         // The submission itself fails -- there is no engine left to take it --
         // and that is not what is under test here.
         let _ = i
@@ -981,7 +1037,7 @@ mod tests {
             )
             .await;
         assert_eq!(
-            i.store.stamp_reads(),
+            i.store.published_reads(),
             before + 1,
             "a --reword whose engine cannot answer must still read the daemon's \
              own last-known config and offer the text to the rewrite path"
@@ -989,10 +1045,10 @@ mod tests {
 
         // ...and the other half of the promise: an ordinary `Say` pays
         // nothing for a feature it did not ask for, not even the mutex.
-        let before = i.store.stamp_reads();
+        let before = i.store.published_reads();
         let _ = i.say("hello there.".into(), HashMap::new()).await;
         assert_eq!(
-            i.store.stamp_reads(),
+            i.store.published_reads(),
             before,
             "a Say without the opt must not read the config at all"
         );
@@ -1008,7 +1064,7 @@ mod tests {
     /// methods be driven at all; see its doc comment for why the seam is
     /// there rather than a reader injected into `SaydIface`.
     ///
-    /// Asserted on `stamp_reads` for the reason
+    /// Asserted on `published_reads` for the reason
     /// `a_reword_is_not_dropped_when_the_engine_cannot_answer` gives.
     #[tokio::test]
     async fn the_selection_paths_offer_their_text_to_the_rewrite() {
@@ -1018,24 +1074,24 @@ mod tests {
         let _seam = selection::test_seam::install(move |_source| Ok(spoken.to_string()));
 
         // Without the opt: read and submitted, and the config never touched.
-        let before = i.store.stamp_reads();
+        let before = i.store.published_reads();
         let id = i.say_selection(HashMap::new()).await.expect("accepted");
         assert_ne!(id, 0, "the selection was read and queued");
         let id = i.say_clipboard(HashMap::new()).await.expect("accepted");
         assert_ne!(id, 0, "the clipboard was read and queued");
         assert_eq!(
-            i.store.stamp_reads(),
+            i.store.published_reads(),
             before,
             "neither path may pay for a rewrite nobody asked for"
         );
 
         // With it: each one offers its text to the rewrite path exactly once.
-        let before = i.store.stamp_reads();
+        let before = i.store.published_reads();
         i.say_selection(opts_with("reword", OwnedValue::from(true)))
             .await
             .expect("accepted");
         assert_eq!(
-            i.store.stamp_reads(),
+            i.store.published_reads(),
             before + 1,
             "SaySelection dropped the --reword on the floor"
         );
@@ -1043,7 +1099,7 @@ mod tests {
             .await
             .expect("accepted");
         assert_eq!(
-            i.store.stamp_reads(),
+            i.store.published_reads(),
             before + 2,
             "SayClipboard dropped the --reword on the floor"
         );

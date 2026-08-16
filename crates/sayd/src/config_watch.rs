@@ -94,11 +94,42 @@ pub struct ConfigStore {
     path: PathBuf,
     engine: EngineHandle,
     last_written: Mutex<Config>,
+    /// The same value as [`ConfigStore::last_written`], behind a lock that
+    /// is never held across I/O.
+    ///
+    /// IMPORTANT 3 (rewording final review). `current()` takes the stamp,
+    /// and the stamp is held across `write_locked`'s unbounded `save_to` --
+    /// measured, a wedged write blocked a `current()` for 1.500 s. That is
+    /// fine for the callers that want "whatever the file currently says" as
+    /// a seed for an edit, which is what the stamp *is*. It is not fine for
+    /// `dbus::SaydIface::maybe_reword`, which reads it on every
+    /// `say --reword` inside a budget that `sayd-core`'s `config.rs` asserts
+    /// at compile time and that allocates this read exactly zero
+    /// milliseconds.
+    ///
+    /// So the same config is published a second time, in an `Arc` behind a
+    /// lock that is only ever held for a clone of that `Arc`. Written by
+    /// [`ConfigStore::publish`], which is also what bumps
+    /// [`ConfigStore::generation`] -- one function, so the two cannot come
+    /// to describe different configs.
+    ///
+    /// Not a replacement for the stamp: a reader that must not race a write
+    /// in progress still wants the stamp, and gets it by asking for
+    /// `current()`.
+    published: Mutex<Arc<Config>>,
     status: Arc<ConfigStatus>,
     applied_reloads: AtomicUsize,
     /// Bumped once per config change that actually reached the engine. See
     /// [`ConfigStore::generation`].
     generation: AtomicU64,
+    /// Test-only: how many times [`ConfigStore::published`] was read.
+    ///
+    /// Same instrument as `stamp_reads` and for the same reason -- "this
+    /// call site reached the config" is otherwise invisible in anything the
+    /// call returns -- but counting the door `dbus::SaydIface::maybe_reword`
+    /// actually uses since IMPORTANT 3 moved it off the stamp.
+    #[cfg(test)]
+    published_reads: AtomicUsize,
     /// Test-only: how many times `current` took the stamp.
     ///
     /// Finding 6 is about a caller on the glib main thread taking this lock
@@ -119,10 +150,13 @@ impl ConfigStore {
         ConfigStore {
             path,
             engine,
+            published: Mutex::new(Arc::new(running.clone())),
             last_written: Mutex::new(running),
             status: Arc::new(ConfigStatus::default()),
             applied_reloads: AtomicUsize::new(0),
             generation: AtomicU64::new(0),
+            #[cfg(test)]
+            published_reads: AtomicUsize::new(0),
             #[cfg(test)]
             stamp_reads: AtomicUsize::new(0),
         }
@@ -185,6 +219,47 @@ impl ConfigStore {
         self.stamp().clone()
     }
 
+    /// The config this store describes, read without the stamp's lock.
+    ///
+    /// The same value [`ConfigStore::current`] returns, and the same value
+    /// the engine was last told about, for every caller that wants to *read*
+    /// a setting rather than build an edit on top of one. Bounded by an
+    /// `Arc` clone under a lock nothing holds across I/O -- see the field --
+    /// where `current()` can be held up for as long as a disk write takes.
+    ///
+    /// `dbus::SaydIface::maybe_reword` is the caller this exists for, and its
+    /// doc says why. The publish loop's `generation`-then-`current` pattern
+    /// stays as it is: it wants the stamp precisely because it is
+    /// reconciling against a write.
+    pub fn published(&self) -> Arc<Config> {
+        #[cfg(test)]
+        self.published_reads.fetch_add(1, Ordering::Relaxed);
+        match self.published.lock() {
+            Ok(g) => g.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    /// Make `cfg` what [`ConfigStore::published`] returns, and mark the
+    /// change.
+    ///
+    /// The two are one call because they are one fact, and because the order
+    /// between them is load-bearing in the direction [`ConfigStore::generation`]
+    /// describes: the value is in place before the counter says so, so an
+    /// observer that sees a new generation and then reads either accessor
+    /// finds that config or a newer one, never the previous one.
+    ///
+    /// Called from the two places a config becomes behaviour -- `write_locked`
+    /// and `reload`'s applied path -- with the stamp still held, so what is
+    /// published is what the stamp holds.
+    fn publish(&self, cfg: &Config) {
+        match self.published.lock() {
+            Ok(mut g) => *g = Arc::new(cfg.clone()),
+            Err(poisoned) => *poisoned.into_inner() = Arc::new(cfg.clone()),
+        }
+        self.generation.fetch_add(1, Ordering::Release);
+    }
+
     /// A counter that changes exactly when the config this store describes
     /// changes -- readable without taking the stamp's lock.
     ///
@@ -224,6 +299,13 @@ impl ConfigStore {
     #[cfg(test)]
     pub(crate) fn stamp_reads(&self) -> usize {
         self.stamp_reads.load(Ordering::Relaxed)
+    }
+
+    /// How many times [`ConfigStore::published`] has been read. Test-only;
+    /// see the field's doc comment.
+    #[cfg(test)]
+    pub(crate) fn published_reads(&self) -> usize {
+        self.published_reads.load(Ordering::Relaxed)
     }
 
     /// The stamp, taken poison-tolerantly.
@@ -340,7 +422,7 @@ impl ConfigStore {
         self.engine.send(Command::ApplyConfig(cfg));
         // Last, under the stamp's lock: see `generation`'s doc comment for
         // why the order matters.
-        self.generation.fetch_add(1, Ordering::Release);
+        self.publish(stamp);
         Ok(())
     }
 
@@ -555,7 +637,7 @@ impl ConfigStore {
         // generation moves -- last, under the stamp's lock, exactly as in
         // `write_locked`. A hand edit that flips `notifications.enabled` is
         // otherwise invisible to the publish loop's gate.
-        self.generation.fetch_add(1, Ordering::Release);
+        self.publish(&stamp);
         ReloadOutcome::Applied
     }
 
@@ -1342,6 +1424,69 @@ mod tests {
             ReloadOutcome::OwnWrite,
             "own-write suppression must survive it too"
         );
+        engine.shutdown();
+    }
+
+    /// IMPORTANT 3: the lock-free copy says the same thing as the stamp,
+    /// through both doors a config comes in by.
+    ///
+    /// A second copy of a value is a second thing to forget to update, and
+    /// the failure would be silent and long-lived -- `say --reword` would go
+    /// on using the endpoint the daemon started with, forever, with the
+    /// settings window showing the new one. `publish` is called from
+    /// `write_locked` and from `reload`'s applied path, which are the two
+    /// places a config becomes behaviour, and it is the same call that moves
+    /// the generation, so a site that forgot one would have forgotten both.
+    #[test]
+    fn the_lock_free_config_tracks_the_stamp_through_a_save_and_a_reload() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let engine = engine();
+        let store = ConfigStore::new(path.clone(), engine.clone(), Config::default());
+
+        assert_eq!(
+            *store.published(),
+            Config::default(),
+            "seeded with the config the engine was spawned with"
+        );
+
+        // Our own write.
+        let saved = Config {
+            voice: "am_fenrir".into(),
+            ..Config::default()
+        };
+        store.save(&saved).expect("save");
+        assert_eq!(*store.published(), saved);
+        assert_eq!(*store.published(), store.current());
+
+        // A hand edit, arriving through `reload`.
+        let mut edited = saved.clone();
+        edited.max_chars = 1234;
+        edited.save_to(&path).expect("hand edit");
+        assert_eq!(store.reload(), ReloadOutcome::Applied);
+        assert_eq!(*store.published(), edited);
+        assert_eq!(*store.published(), store.current());
+
+        // A write that fails changes neither: `write_locked` restores what
+        // it displaced and never reaches `publish`.
+        let before = store.published();
+        // A *file* where a directory would have to be, so nothing on
+        // `save_to`'s path can create it.
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"not a directory").expect("blocker");
+        let unwritable = ConfigStore::new(
+            blocker.join("config.toml"),
+            engine.clone(),
+            (*before).clone(),
+        );
+        assert!(unwritable
+            .save(&Config {
+                voice: "af_heart".into(),
+                ..Config::default()
+            })
+            .is_err());
+        assert_eq!(*unwritable.published(), *before);
+
         engine.shutdown();
     }
 
