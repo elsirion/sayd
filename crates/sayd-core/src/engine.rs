@@ -1720,6 +1720,21 @@ mod tests {
                     muted: true,
                     ..Config::default()
                 }),
+                // CRITICAL 2 (rewording final review): the one submission
+                // that is refused and deliberately does *not* enter
+                // `Error`. Every other rejection in this list either
+                // enters it or was never eligible to, so without this the
+                // sweep never checks that *declining* to set the state
+                // leaves both invariants intact -- in particular from
+                // `error`, where the `Rejected` clear above runs first and
+                // then nothing re-enters.
+                Command::Say {
+                    text: "x".repeat(Config::default().max_chars + 1),
+                    opts: SayOpts {
+                        source: Source::Notification,
+                        ..SayOpts::default()
+                    },
+                },
                 Command::Shutdown,
             ]
         }
