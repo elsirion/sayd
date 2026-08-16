@@ -50,7 +50,7 @@ use super::model::{
     IDLE_UNLOAD_STEP, MAX_CHARS_MAX, MAX_CHARS_MIN, MAX_CHARS_STEP, MODELS, REWORD_MAX_CHARS_MAX,
     REWORD_MAX_CHARS_MIN, REWORD_MAX_CHARS_STEP, REWORD_TEST_DEFAULT, REWORD_TIMEOUT_MAX,
     REWORD_TIMEOUT_MIN, REWORD_TIMEOUT_STEP, SPEED_MAX, SPEED_MIN, SPEED_MODES, SPEED_STEP,
-    THREADS_MAX, THREADS_MIN, THREADS_STEP,
+    TEST_INCOMPLETE_TITLE, TEST_IN_PROGRESS_TITLE, THREADS_MAX, THREADS_MIN, THREADS_STEP,
 };
 use crate::notify::seen;
 
@@ -1641,97 +1641,151 @@ fn reword_group(ui: &Ui, cfg: &Config, engine: EngineHandle) -> adw::Preferences
     // session load and a queue interaction into a settings check that has
     // nothing to do with it. But a rewrite is written to be *heard*, and
     // reading it is not the same, so hearing it is one click.
+    //
+    // The tooltip does not say "rewritten": a `Rejected` row's title is a
+    // provider's raw answer, not a rewrite, and hearing it is that row's
+    // whole point (see [`TestOutcome::speech`]).
     let speak = gtk::Button::builder()
         .label("Speak")
         .valign(gtk::Align::Center)
-        .tooltip_text("Hear the rewritten text")
+        .tooltip_text("Hear what the provider answered")
+        // Hidden until an outcome says there is something to hear --
+        // [`TestOutcome::speech`] is `None` while the row shows "Testing…"
+        // and for every status row that is a sentence about the button or
+        // the transport rather than provider text. Starting hidden, rather
+        // than relying on the first redraw to hide it, is what keeps a
+        // freshly opened window from ever showing Speak next to nothing.
+        .visible(false)
         .build();
     result.add_suffix(&speak);
+    // What Speak plays, kept beside the row rather than read back off it:
+    // `result.title()` is also "Testing…" and a provider's raw `Rejected`
+    // answer past `shown_answer`'s 200-character cut, and neither is what
+    // [`TestOutcome::speech`] says is worth hearing. `Rc<RefCell<_>>`, not a
+    // widget property, because nothing here is a `gtk::Widget`; it closes no
+    // cycle because nothing a widget owns holds it.
+    let speech: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
     let u = ui.downgrade();
     let e = engine.clone();
-    // Weak, because `speak` is a suffix *of* `result`: a strong clone would
-    // be the row holding a button holding the row, which outlives the window
-    // that used to contain it.
-    let r = result.downgrade();
+    let text = speech.clone();
     speak.connect_clicked(move |_| {
-        let Some(row) = r.upgrade() else { return };
-        // The row's title, not the Test field's text: what is worth hearing
-        // is what came back.
-        u.with(|ui| audition(ui, &e, &row.title()));
+        let Some(text) = text.borrow().clone() else {
+            return;
+        };
+        u.with(|ui| audition(ui, &e, &text));
     });
     group.add(&result);
 
     // One action, two ways to ask for it. `Rc` because both handlers need it
     // and a `Fn` closure cannot be cloned into two of them; it closes no
-    // cycle, because everything it captures is weak.
+    // cycle, because everything it captures is weak (or, for `speech`, holds
+    // no widget).
     let u = ui.downgrade();
     let field = test.downgrade();
     let row = result.downgrade();
     let button = run.downgrade();
+    let speak_button = speak.downgrade();
     let start_test = Rc::new(move || {
         let (Some(field), Some(row), Some(button)) =
             (field.upgrade(), row.upgrade(), button.upgrade())
         else {
             return;
         };
-        let Some(state) = u.0.upgrade() else { return };
-        let ui = Ui(state);
 
-        // Commit whatever entry has focus first, so an endpoint typed and not
-        // yet applied is what gets tested. Moving focus away is what fires
-        // the rows' focus controllers (see `bind_entry`); `test_reword` then
-        // reads the *pending* config, which by this point holds it.
+        // Enter reaches this closure through a field that stays sensitive
+        // even while a test is in flight -- only the button disables itself
+        // (below) -- so the button's own sensitivity is what a second Enter
+        // has to be checked against; a second flag on the field would just
+        // be one more thing that could disagree with it.
         //
-        // Written out rather than as a method call because `GtkWindowExt` and
-        // `RootExt` both define `set_focus` and `adw::prelude` brings both
-        // into scope.
-        gtk::prelude::GtkWindowExt::set_focus(&ui.window, None::<&gtk::Widget>);
+        // Measured without this guard: one click followed by two Enters put
+        // two rewrites in flight at once, and the permit pool they draw from
+        // is two, process-wide, shared with the notification path -- so the
+        // settings window alone can hold both, and a real notification
+        // arriving in that moment silently falls back to speaking the
+        // original, which is exactly the degradation this row exists to
+        // make visible. Two in-flight tests can also answer in either order,
+        // letting the row settle on the older result.
+        if !button.is_sensitive() {
+            return;
+        }
 
-        button.set_sensitive(false);
-        row.set_title("Testing…");
-        row.set_subtitle("");
-        row.set_visible(true);
+        u.with(|ui| {
+            // Commit whatever entry has focus first, so an endpoint typed and
+            // not yet applied is what gets tested. Moving focus away is what
+            // fires the rows' focus controllers (see `bind_entry`);
+            // `test_reword` then reads the *pending* config, which by this
+            // point holds it.
+            //
+            // Written out rather than as a method call because
+            // `GtkWindowExt` and `RootExt` both define `set_focus` and
+            // `adw::prelude` brings both into scope.
+            gtk::prelude::GtkWindowExt::set_focus(&ui.window, None::<&gtk::Widget>);
 
-        let rx = ui.model.test_reword(field.text().to_string());
-        let weak_row = row.downgrade();
-        let weak_button = button.downgrade();
-        // The main thread does not wait. The request is blocking and runs on
-        // the daemon's blocking pool; this future only awaits its answer. If
-        // the window closes mid-flight the receiver is dropped with it and
-        // the delivery is discarded, and the job ends on its own at the
-        // client's own ceiling at the latest.
-        glib::spawn_future_local(async move {
-            let outcome = rx.recv().await;
-            if let Some(button) = weak_button.upgrade() {
-                button.set_sensitive(true);
+            button.set_sensitive(false);
+            row.set_title(TEST_IN_PROGRESS_TITLE);
+            row.set_subtitle("");
+            row.set_visible(true);
+            if let Some(speak) = speak_button.upgrade() {
+                speak.set_visible(false);
             }
-            let Some(row) = weak_row.upgrade() else {
-                return;
-            };
-            match outcome {
-                Ok(outcome) => {
-                    // Two labels and a visibility, and no rule of its own:
-                    // every number and every string in them was produced in
-                    // `settings::model`, which is the layer with tests. If a
-                    // truncation, a unit or a comparison is wanted, it goes
-                    // there.
-                    row.set_title(&outcome.title());
-                    row.set_subtitle(&outcome.subtitle());
+            *speech.borrow_mut() = None;
+
+            let rx = ui.model.test_reword(field.text().to_string());
+            let weak_row = row.downgrade();
+            let weak_button = button.downgrade();
+            let weak_speak = speak_button.clone();
+            let speech = speech.clone();
+            // The main thread does not wait. The request is blocking and
+            // runs on the daemon's blocking pool; this future only awaits
+            // its answer. If the window closes mid-flight the receiver is
+            // dropped with it and the delivery is discarded, and the job
+            // ends on its own at the client's own ceiling at the latest.
+            glib::spawn_future_local(async move {
+                let outcome = rx.recv().await;
+                if let Some(button) = weak_button.upgrade() {
+                    button.set_sensitive(true);
                 }
-                // The sender was dropped without answering, which means the
-                // model's thread died. Nothing to diagnose from here.
-                Err(_) => {
-                    row.set_title("The test did not complete");
-                    row.set_subtitle("");
+                let Some(row) = weak_row.upgrade() else {
+                    return;
+                };
+                match outcome {
+                    Ok(outcome) => {
+                        // Two labels and a visibility, and no rule of its
+                        // own: every number and every string in them was
+                        // produced in `settings::model`, which is the layer
+                        // with tests. If a truncation, a unit or a
+                        // comparison is wanted, it goes there.
+                        row.set_title(&outcome.title());
+                        row.set_subtitle(&outcome.subtitle());
+                        let text = outcome.speech();
+                        if let Some(speak) = weak_speak.upgrade() {
+                            speak.set_visible(text.is_some());
+                        }
+                        *speech.borrow_mut() = text;
+                    }
+                    // The sender was dropped without answering, which means
+                    // the model's thread died. Nothing to diagnose from
+                    // here, and nothing for Speak to say either.
+                    Err(_) => {
+                        row.set_title(TEST_INCOMPLETE_TITLE);
+                        row.set_subtitle("");
+                        if let Some(speak) = weak_speak.upgrade() {
+                            speak.set_visible(false);
+                        }
+                        *speech.borrow_mut() = None;
+                    }
                 }
-            }
+            });
         });
     });
     let go = start_test.clone();
     run.connect_clicked(move |_| go());
     // Pressing Enter in the field is the same action as pressing the button;
     // a test row you have to reach for the mouse to use is a test row nobody
-    // uses twice.
+    // uses twice. `start_test`'s own sensitivity guard is what stops this
+    // from being a second, unthrottled way to start a test while one is
+    // already running.
     test.connect_entry_activated(move |_| start_test());
 
     group
@@ -2175,14 +2229,24 @@ mod tests {
     /// latency sentence -- this task's deliverable -- assertable at all, and
     /// makes it assert the same thing with and without `--features reword`
     /// (where a real endpoint would report `Unavailable` and nothing else).
+    ///
+    /// The returned counter is how many times `reword` actually ran --
+    /// process-wide state a click or an Enter cannot fake past, unlike the
+    /// row's own title, which two racing answers could still land on
+    /// correctly by chance.
     fn model_answering(
         dir: &std::path::Path,
         answer: &str,
         delay: Duration,
-    ) -> (Arc<SettingsModel>, EngineHandle) {
-        struct Canned(String, Duration);
+    ) -> (
+        Arc<SettingsModel>,
+        EngineHandle,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        struct Canned(String, Duration, Arc<std::sync::atomic::AtomicUsize>);
         impl crate::reword::Rewriter for Canned {
             fn reword(&self, _text: &str) -> Result<String, crate::reword::RewordError> {
+                self.2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 // On the model's own thread, never this one -- which is
                 // exactly what the "did not block" assertion below is about.
                 std::thread::sleep(self.1);
@@ -2190,6 +2254,7 @@ mod tests {
             }
         }
 
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let engine = EngineHandle::spawn(
             Config::default(),
             Box::new(sayd_core::synth::StubSynthesizer::new()),
@@ -2200,14 +2265,15 @@ mod tests {
             engine.clone(),
             Config::default(),
         ));
-        let canned: Arc<dyn crate::reword::Rewriter> = Arc::new(Canned(answer.to_string(), delay));
+        let canned: Arc<dyn crate::reword::Rewriter> =
+            Arc::new(Canned(answer.to_string(), delay, calls.clone()));
         let model = Arc::new(SettingsModel::new_with_rewriter(
             store,
             dir.to_path_buf(),
             Config::default(),
             Arc::new(move |_| Ok(canned.clone())),
         ));
-        (model, engine)
+        (model, engine, calls)
     }
 
     /// The `AdwPreferencesGroup` with this title.
@@ -2666,10 +2732,12 @@ mod tests {
     fn await_answer(run: &gtk::Button, result: &adw::ActionRow) {
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
-            spin_until(Duration::from_secs(20), || result.title() != "Testing…");
+            spin_until(Duration::from_secs(20), || {
+                result.title() != TEST_IN_PROGRESS_TITLE
+            });
             assert_ne!(
                 result.title(),
-                "Testing…",
+                TEST_IN_PROGRESS_TITLE,
                 "the result never arrived; the glib future is not being driven"
             );
             if result.title() != TestOutcome::Busy.title() || std::time::Instant::now() > deadline {
@@ -2713,7 +2781,7 @@ mod tests {
         // window whose title a provider writes, so it is the one where that
         // character cannot be ruled out.
         let answer = "Alice & Bob are asking whereabouts you would like to go for dinner";
-        let (model, engine) = model_answering(&dir, answer, Duration::from_millis(300));
+        let (model, engine, _calls) = model_answering(&dir, answer, Duration::from_millis(300));
         model
             .edit(|c| {
                 // An endpoint key nothing else in this binary uses. Whether a
@@ -2756,16 +2824,26 @@ mod tests {
             "the button handler blocked the main thread for {handler_took:?}"
         );
         assert!(result.is_visible(), "a test in flight has to be visible");
-        assert_eq!(result.title(), "Testing…");
+        assert_eq!(result.title(), TEST_IN_PROGRESS_TITLE);
         assert!(
             !run.is_sensitive(),
             "a test in flight disables its own button"
+        );
+        let speak = find_button(result.upcast_ref(), "Speak").expect("a Speak button");
+        assert!(
+            !speak.is_visible(),
+            "Speak must hide while the row reads \"Testing…\" -- speaking that \
+             would load a ~1.27 GB ORT session to say one word of UI chrome"
         );
 
         await_answer(&run, &result);
         assert!(
             run.is_sensitive(),
             "the button has to come back, or the row works once per window"
+        );
+        assert!(
+            speak.is_visible(),
+            "Speak must reappear once there is a rewrite to hear"
         );
 
         // The rewritten text is the title, because it is the point.
@@ -2858,17 +2936,24 @@ mod tests {
         test.emit_by_name::<()>("entry-activated", &[]);
         assert_eq!(
             result.title(),
-            "Testing…",
+            TEST_IN_PROGRESS_TITLE,
             "pressing Enter in the field runs the test too"
         );
+        assert!(
+            !speak.is_visible(),
+            "Speak hides again for this new in-flight test"
+        );
         await_answer(&run, &result);
+        assert!(speak.is_visible(), "and reappears once this one answers");
 
-        // Speak submits the *row's title*, not the Test field's text. Proved
-        // by making them disagree: a field that trims to nothing submits
-        // nothing at all, so anything reaching the engine came from the row.
+        // Speak submits the outcome's own speech text, kept apart from the
+        // row -- not whatever the Test field or the row's title happen to
+        // show right now. Proved by making all three disagree: the field is
+        // trimmed to nothing and the row's title is overwritten below, so
+        // anything that reaches the engine came from neither.
         assert_eq!(result.title(), answer);
         test.set_text("   ");
-        let speak = find_button(result.upcast_ref(), "Speak").expect("a Speak button");
+        result.set_title("mutated after the outcome arrived");
         speak.emit_clicked();
         spin_until(Duration::from_secs(5), || {
             engine.snapshot().current_text == answer
@@ -2876,7 +2961,83 @@ mod tests {
         assert_eq!(
             engine.snapshot().current_text,
             answer,
-            "Speak must audition what came back, not what is in the Test field"
+            "Speak must audition the outcome it received, not the row's \
+             current title"
+        );
+
+        // Typed and not applied: pressing Test must still commit it first,
+        // or a user who edits the endpoint above and presses Test would
+        // silently test the *old* value -- the spec calls that "the single
+        // most confusing thing this row could do".
+        let endpoint =
+            find_row::<adw::EntryRow>(ui.window.upcast_ref(), "Endpoint").expect("an Endpoint row");
+        assert!(endpoint.grab_focus(), "the endpoint row must be focusable");
+        endpoint.set_text("http://committed-by-test.invalid/v1");
+        press_test(&run, &result);
+        assert_eq!(
+            model.current().reword.base_url,
+            "http://committed-by-test.invalid/v1",
+            "pressing Test must commit whatever the endpoint field holds first"
+        );
+
+        ui.window.destroy();
+        drop(ui);
+        engine.shutdown();
+    }
+
+    /// Enter must not start a second test while one is already in flight.
+    ///
+    /// The button disables itself the moment a test starts, but the Test
+    /// *row* -- an `AdwEntryRow`, activated by Enter -- has no sensitivity of
+    /// its own and stays live. Before `start_test` grew a guard on the
+    /// button's sensitivity, one click followed by two Enters put two
+    /// rewrites in flight at once, provably: the process-wide permit pool
+    /// `crate::reword::state()` hands out is exactly two, shared with the
+    /// notification path, so two settings-window requests can exhaust it
+    /// outright and make a real notification fall back to speaking the
+    /// original -- the exact failure this row exists to make visible. Two
+    /// in-flight tests can also answer in either order, letting the row
+    /// settle on the older one. The row's own title cannot tell a fixed run
+    /// from a broken one that got lucky on ordering, so this counts calls
+    /// into the injected client instead.
+    fn pressing_enter_while_a_test_runs_does_not_start_a_second_one(dir: &std::path::Path) {
+        let dir = dir.join("reword-enter-guard");
+        std::fs::create_dir_all(&dir).expect("a config directory of its own");
+        let (model, engine, calls) = model_answering(&dir, "answered", Duration::from_millis(400));
+        model
+            .edit(|c| c.reword.model = "window-test-enter-guard".into())
+            .expect("edit");
+        let ui = build(model, engine.clone());
+        ui.window.present();
+        spin_until(Duration::from_secs(2), || ui.window.is_mapped());
+
+        let group = find_group(ui.window.upcast_ref(), "Reword").expect("a Reword group");
+        let test = find_row::<adw::EntryRow>(group.upcast_ref(), "Test").expect("a Test row");
+        let run = find_button(group.upcast_ref(), "Test").expect("a Test button");
+        let result = find_result_row(ui.window.upcast_ref()).expect("a result row");
+
+        run.emit_clicked();
+        assert_eq!(
+            result.title(),
+            TEST_IN_PROGRESS_TITLE,
+            "the click started one"
+        );
+        assert!(!run.is_sensitive(), "the button disables itself");
+        assert!(
+            test.is_sensitive(),
+            "the row itself stays sensitive -- the premise this test pins"
+        );
+
+        // Two Enters while that first request is still outstanding.
+        test.emit_by_name::<()>("entry-activated", &[]);
+        test.emit_by_name::<()>("entry-activated", &[]);
+
+        await_answer(&run, &result);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "Enter must not run the rewriter again while a request is already \
+             in flight"
         );
 
         ui.window.destroy();
@@ -2902,7 +3063,7 @@ mod tests {
         // whether the capture was weak or not. Measured -- a deliberately
         // strong capture is invisible to a 5 s spin against a 1.5 s stub and
         // holds all 861 widgets against this one.
-        let (model, engine) = model_answering(&dir, "answered", Duration::from_secs(4));
+        let (model, engine, _calls) = model_answering(&dir, "answered", Duration::from_secs(4));
         model
             .edit(|c| c.reword.model = "window-test-inflight".into())
             .expect("edit");
@@ -2914,7 +3075,11 @@ mod tests {
             let run = find_button(group.upcast_ref(), "Test").expect("a Test button");
             let result = find_result_row(ui.window.upcast_ref()).expect("a result row");
             run.emit_clicked();
-            assert_eq!(result.title(), "Testing…", "the test is in flight");
+            assert_eq!(
+                result.title(),
+                TEST_IN_PROGRESS_TITLE,
+                "the test is in flight"
+            );
 
             weak_widgets(ui.window.upcast_ref(), &mut widgets);
             let window = ui.window.downgrade();
@@ -3080,6 +3245,7 @@ mod tests {
         the_reword_entry_rows_commit_on_apply_and_never_clobber_typing(dir.path());
         the_key_row_visibility_follows_the_clicked_preset(dir.path());
         the_test_row_reports_the_latency_against_the_deadline(dir.path());
+        pressing_enter_while_a_test_runs_does_not_start_a_second_one(dir.path());
         the_window_is_freed_after_the_reword_group_has_been_built(dir.path());
         the_window_is_freed_while_a_test_is_in_flight(dir.path());
     }

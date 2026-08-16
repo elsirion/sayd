@@ -1234,7 +1234,35 @@ fn first_note(first: bool) -> &'static str {
 /// thing the [`TestOutcome::Rejected`] row exists to let a user recognise --
 /// and short enough that the row stays a row. Characters and not bytes,
 /// because it bounds what is *read*.
+///
+/// Measured, not arbitrary: a 201-character title -- one character past this
+/// cap -- occupies 3 lines and 47 px in a row that is otherwise 92 px tall,
+/// which is exactly what "the row stays a row" cashes out to.
+///
+/// [`TestOutcome::Rewritten`] and [`TestOutcome::Slower`] carry a title (the
+/// rewrite itself) with no cap of their own, and that is deliberate rather
+/// than an oversight: a rewrite is bounded by what the user typed into the
+/// Test field, not by a provider's own unbounded free text the way a
+/// rejected answer is, so it cannot run further than its own input already
+/// did. Which also means the Test field is the escape hatch this cap does
+/// not close: a user who pastes 5,000 characters in and gets a `Rewritten`
+/// row back has produced a very tall row by their own hand, not by anything
+/// a provider volunteered.
 const ANSWER_DISPLAY_MAX_CHARS: usize = 200;
+
+/// The result row's title while a request is outstanding.
+///
+/// Named here rather than in `window.rs`: it is user-facing result-row
+/// content exactly like every [`TestOutcome`] title and subtitle, and this
+/// module's rule is that none of that is authored in the window -- there is
+/// no reason "no outcome has arrived yet" should be the one exception.
+pub const TEST_IN_PROGRESS_TITLE: &str = "Testing…";
+
+/// The result row's title when the receiver was dropped without an answer.
+///
+/// That happens when the model's own thread died mid-request; there is
+/// nothing to diagnose from the window, only to say plainly.
+pub const TEST_INCOMPLETE_TITLE: &str = "The test did not complete";
 
 /// A provider's answer, made fit to be a row title.
 ///
@@ -1376,6 +1404,40 @@ impl TestOutcome {
             TestOutcome::NotConfigured { reason } => reason.clone(),
             TestOutcome::Unavailable => "Rebuild with --features reword to use this".to_string(),
             TestOutcome::Busy => "Both rewrite slots are in use; try again in a moment".to_string(),
+        }
+    }
+
+    /// The text worth speaking aloud, if this outcome has one.
+    ///
+    /// `None` for every row whose title is a status sentence about the
+    /// transport or the button rather than something a provider wrote --
+    /// `window.rs` maps that onto Speak being hidden, because a click on
+    /// "Both rewrite slots are in use" would load a ~1.27 GB ORT session to
+    /// say a sentence about the button, not about any text a provider
+    /// produced.
+    ///
+    /// [`TestOutcome::Rejected`] is included on purpose, and not run through
+    /// [`shown_answer`]'s 200-character cap the way its own title is:
+    /// hearing what the model actually wrote, in full, is that row's whole
+    /// point, and the cap on the title exists only to keep a *row* a row --
+    /// it says nothing about how much of the answer is worth playing back.
+    /// It is still trimmed, for the same reason the title is: a model that
+    /// opens with blank lines should not be heard pausing before it speaks.
+    pub fn speech(&self) -> Option<String> {
+        match self {
+            TestOutcome::Rewritten { text, .. } | TestOutcome::Slower { text, .. } => {
+                Some(text.clone())
+            }
+            TestOutcome::Rejected { answer, .. } => Some(answer.trim().to_string()),
+            TestOutcome::AuthRejected { .. }
+            | TestOutcome::Unreachable { .. }
+            | TestOutcome::Unusable { .. }
+            | TestOutcome::NoSuchModel { .. }
+            | TestOutcome::RateLimited { .. }
+            | TestOutcome::NoAnswer { .. }
+            | TestOutcome::NotConfigured { .. }
+            | TestOutcome::Unavailable
+            | TestOutcome::Busy => None,
         }
     }
 }
@@ -3660,6 +3722,14 @@ mod tests {
             TestOutcome::Busy.subtitle(),
             "Both rewrite slots are in use; try again in a moment"
         );
+
+        // The row's two non-outcome strings -- shown before any
+        // `TestOutcome` exists, or when none ever arrived -- pinned here for
+        // the same reason every other sentence in this test is: this module
+        // is the one with tests, so nothing user-facing is authored where
+        // there are none.
+        assert_eq!(TEST_IN_PROGRESS_TITLE, "Testing…");
+        assert_eq!(TEST_INCOMPLETE_TITLE, "The test did not complete");
     }
 
     /// The only arithmetic in the row, and the branch that makes the latency
@@ -3810,6 +3880,87 @@ mod tests {
         );
         drop(model);
         engine.shutdown();
+    }
+
+    /// `speech()` is Speak's whole contract: `window.rs` hides the button on
+    /// `None` and otherwise plays back exactly this string, so every rule
+    /// about what is worth hearing has to live here, provably, or it is not
+    /// tested at all.
+    #[test]
+    fn speech_is_the_providers_own_text_and_nothing_else() {
+        let rewritten = TestOutcome::Rewritten {
+            text: "Alice is asking about dinner".into(),
+            elapsed: Duration::from_millis(1),
+            deadline: Duration::from_millis(1),
+            first: false,
+        };
+        assert_eq!(
+            rewritten.speech().as_deref(),
+            Some("Alice is asking about dinner")
+        );
+
+        let slower = TestOutcome::Slower {
+            text: "Alice is asking about dinner".into(),
+            elapsed: Duration::from_millis(1),
+            deadline: Duration::from_millis(1),
+            first: false,
+        };
+        assert_eq!(
+            slower.speech().as_deref(),
+            Some("Alice is asking about dinner")
+        );
+
+        // Untrimmed by the title's 200-character cap: hearing the model's
+        // answer in full is this row's whole point.
+        let long_answer = format!("  {}", "z".repeat(300));
+        let rejected = TestOutcome::Rejected {
+            answer: long_answer.clone(),
+            reason: sayd_core::reword::Rejection::TooLong {
+                chars: 300,
+                limit: 93,
+            },
+        };
+        assert_eq!(rejected.speech(), Some("z".repeat(300)));
+        assert_eq!(
+            rejected.speech().unwrap().chars().count(),
+            300,
+            "not cut to ANSWER_DISPLAY_MAX_CHARS the way the title is"
+        );
+
+        // Every status row has a sentence about the button or the transport
+        // and nothing a provider wrote, so there is nothing for Speak to say.
+        let nothing_to_speak: Vec<TestOutcome> = vec![
+            TestOutcome::AuthRejected {
+                status: 401,
+                host: "h".into(),
+                env_var: "E".into(),
+                message: None,
+            },
+            TestOutcome::Unreachable {
+                detail: "d".into(),
+                endpoint: "e".into(),
+            },
+            TestOutcome::Unusable {
+                detail: "d".into(),
+                endpoint: "e".into(),
+            },
+            TestOutcome::NoSuchModel {
+                status: 404,
+                model: "m".into(),
+                message: None,
+            },
+            TestOutcome::RateLimited { retry_after: None },
+            TestOutcome::NoAnswer {
+                ceiling: Duration::from_secs(1),
+                deadline: Duration::from_secs(1),
+            },
+            TestOutcome::NotConfigured { reason: "r".into() },
+            TestOutcome::Unavailable,
+            TestOutcome::Busy,
+        ];
+        for status in nothing_to_speak {
+            assert!(status.speech().is_none(), "{status:?}");
+        }
     }
 
     /// The first request against an endpoint pays for DNS and a handshake,
