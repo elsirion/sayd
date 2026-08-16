@@ -1,11 +1,16 @@
 # sayd
 
-Local text-to-speech for Wayland. Select text, press a key, hear it — with
-nothing leaving your machine.
+Local text-to-speech for Wayland. Select text, press a key, hear it.
 
 Kokoro-82M runs locally through ONNX Runtime with a misaki-derived English
-frontend. There is no cloud inference, no telemetry, and no network access at
-runtime.
+frontend. Speech synthesis never touches the network and nothing about it
+leaves your machine. The optional rewording feature (`[reword]`, off by
+default, and absent from the binary entirely unless built with
+`--features reword`) is the one exception: it sends the text about to be
+spoken to whatever endpoint you configure. Point it at a model server on
+localhost -- the default -- and the original promise holds unchanged. See
+the workspace README's Rewording section for what is sent, what is logged,
+and what can go wrong.
 
 ## Status
 
@@ -17,7 +22,11 @@ reload for hand edits) and M5 (speaking desktop notifications, off by
 default -- see the workspace README's Notifications section) are done. Text
 in, chunk-streamed speech out, starting about a second after the keypress
 regardless of how much was selected. That is the whole of the original
-build order; nothing further is queued.
+build order.
+
+Past the original build order: optional LLM rewording (see the workspace
+README's Rewording section), off by default and absent from a default
+build entirely.
 
 The workspace README (in the source repository, not shipped in this crate's
 package) has the sway keybinds, a sample systemd unit, and the full D-Bus

@@ -1,8 +1,13 @@
 # sayd
 
 Local text-to-speech for sway/Wayland. Select text, press a key, hear it.
-Kokoro-82M runs locally via ONNX Runtime with the misaki-en G2P frontend --
-no network access at runtime, nothing leaves your machine.
+Kokoro-82M runs locally via ONNX Runtime with the misaki-en G2P frontend.
+Speech synthesis never touches the network and nothing about it leaves your
+machine. The optional rewording feature ([`[reword]`](#rewording), off by
+default, and absent from the binary entirely unless built with
+`--features reword`) is the one exception: it sends the text about to be
+spoken to whatever endpoint you configure. Point it at a model server on
+localhost -- the default -- and the original promise holds unchanged.
 
 `sayd` is the resident daemon: it owns the speech engine and the audio
 device, and serves the `sh.sayd.Sayd1` interface on the session bus. `say`
@@ -15,6 +20,15 @@ skip, ask for status.
     cargo build --release
 
 Put `target/release/sayd` and `target/release/say` on `$PATH`.
+
+To include the optional [rewording](#rewording) feature -- the one thing in
+`sayd` that makes a network request -- build it in explicitly:
+
+    cargo build --release --features reword
+
+A default build has no HTTP client and no TLS stack in it at all, which is
+what makes "nothing leaves your machine" a property of the binary rather
+than a property of the configuration.
 
 ### Native dependencies
 
@@ -390,6 +404,208 @@ utterance currently playing. Mute applies to notifications exactly as it does
 to every other source -- a muted daemon accepts and silently discards them,
 so nothing piles up to be spoken once you unmute.
 
+## Rewording
+
+Notifications are written to be read at a glance. Read aloud verbatim they
+are terse and frequently not sentences: `Alice: where do you want to go for
+dinner` is a label, a colon and a fragment. Spoken, it should be `Alice is
+asking where you want to go for dinner`.
+
+`sayd` can put a small language model in front of the speaker to do exactly
+that, and nothing else. It is off by default, it requires an endpoint, and
+when anything at all goes wrong the original text is spoken instead. Doing
+any of this at all needs `sayd` built with `--features reword` (see
+[Build](#build) above); a default build has no rewriter, no HTTP client, and
+no TLS stack, so `enabled = true` in that build is a no-op -- see
+[What can go wrong](#what-can-go-wrong) below.
+
+    [reword]
+    enabled = false                          # rewrite notification announcements
+    base_url = "http://localhost:11434/v1"   # any OpenAI-compatible endpoint
+    model = "llama3.2:3b"
+    api_key = ""                             # local servers ignore it; see api_key_env
+    api_key_env = "SAYD_REWORD_API_KEY"      # this variable wins over api_key
+    timeout_ms = 1500                        # 200..=2000
+    max_chars = 400                          # 32..=2000; longer text is spoken as written
+
+This table is not gated on the cargo feature -- the settings window
+serialises the whole config on every save, so a gated field would be
+silently deleted the first time a feature-off daemon wrote the file. It is
+always present, always preserved, and only ever acted on when the feature
+is compiled in.
+
+### Where it applies
+
+Two entry points, and only two:
+
+- **Notification announcements**, when `enabled = true`.
+- **Any submission that asks for it** -- `say --reword "..."`, and
+  `"reword": true` in the D-Bus `opts` map. Selection and clipboard reads go
+  through the same submission path, so `say --reword selection` works.
+
+`--reword` does *not* require `enabled = true`. `enabled` means "rewrite my
+notifications without being asked"; `--reword` is being asked. Both need a
+configured endpoint, and both are absent from a build without
+`--features reword`.
+
+There is no switch to rewrite everything by default. Every submission
+through a paid or slow endpoint is a cost and a delay the caller did not ask
+for.
+
+A coalesced follow-up -- `Signal: 3 more notifications` -- is never
+reworded, whatever `enabled` says: it is already a sentence, and rewriting
+it would let it overtake the announcement that opened the coalescing
+window.
+
+### Endpoints
+
+There is no `provider` setting, because there is nothing to choose between:
+PPQ, Ollama, llama.cpp's `server`, LM Studio, vLLM and OpenAI all speak the
+same request. `base_url` says where; nothing else needs to.
+
+| Endpoint | `base_url` | Key |
+|---|---|---|
+| Ollama | `http://localhost:11434/v1` | ignored |
+| llama.cpp `server` | `http://localhost:8080/v1` | ignored |
+| LM Studio | `http://localhost:1234/v1` | ignored |
+| vLLM | `http://localhost:8000/v1` | as configured |
+| PPQ | `https://api.ppq.ai/v1` | `sk-...` |
+| OpenAI | `https://api.openai.com/v1` | `sk-...` |
+
+The default is a **local** Ollama, not a remote provider. With
+`enabled = false` nothing happens either way, but the configuration you
+first see should be the one that keeps the promise at the top of this file;
+choosing a remote endpoint should be an act.
+
+If `api_key_env` names a variable that is set and non-empty, that value is
+used and `api_key` is ignored. Prefer it: a key in a shell profile or a
+systemd `EnvironmentFile` can be rotated without touching a file the
+settings window rewrites wholesale, and it keeps the key out of that file
+entirely. A config that does carry an inline `api_key` is written `0600`.
+
+Plain `http://` to a host that is not loopback is allowed -- a trusted LAN
+box running Ollama is a legitimate setup and `sayd` does not know your
+network -- but it is warned about once per run, because cleartext on the
+wire is a fact about the transport rather than an opinion about the
+operator.
+
+### The deadline
+
+`timeout_ms` is how long a rewrite may take before the original is spoken
+instead. **It is a budget, not a measurement.** End-to-end latency against a
+real provider has never been measured for this project, and no single
+number could serve both a local `llama3.2:3b` on a laptop and a hosted
+provider over a hotel connection. 1500 ms is chosen to sit under `say`'s own
+3-second D-Bus timeout with room for the bus round trip, and above the
+first-token latency a small model is generally capable of. The ceiling is
+2000 ms, not more: pushed any higher there is no margin left for the bus
+round trip on top of it, and `say --reword` starts reporting a daemon that
+is working fine as not responding.
+
+**Open Settings and press Test to get your own number.** The result row
+reports the measured latency beside the deadline you have configured, and
+says in as many words whether a real notification would have made it. That
+is the number to set `timeout_ms` from. A second press is expected to be
+faster than the first: the first request of a run includes a DNS lookup and
+a TLS handshake, and the row says so.
+
+The first rewrite after the daemon starts is expected to miss the deadline
+and speak the original. That is the fallback working, not a bug -- nothing
+is pre-warmed at startup, because that would be a network call you did not
+ask for.
+
+### What is sent, and what is not
+
+What leaves the machine is the composed announcement **after** cleanup: the
+application name (if `speak_app_name`), the summary, and the body (if
+`speak_body`) -- or, on the explicit path, the cleaned submission text.
+Nothing else. No application identity beyond the name it announces itself
+as, no timestamps, no queue state, no other utterances. Cleanup runs first,
+so code fences are already gone and URLs are already reduced to the word
+`link`.
+
+Pressing **Test** in the settings window sends whatever is in the Test
+field. It is the one send that happens with `enabled = false`: it is a
+deliberate button press, it is logged like any other, and the group's own
+description names it as a network call.
+
+The daemon logs the destination once per run, per resolved endpoint, at
+info, the first time it sends anything there:
+
+    info: reword: sending text to https://api.ppq.ai/v1 (model gpt-4o-mini)
+
+Once per run, not per utterance -- where text goes must be discoverable in
+the journal without reading the config. **The text itself is never logged
+at that level**: duplicating locally what is being sent remotely helps
+nobody. A rejected candidate is logged at debug, truncated to 80 characters
+-- see [Environment variables](#environment-variables) below for
+`SAYD_DEBUG`.
+
+Retention is the endpoint's business and `sayd` makes no promise about it.
+**`sayd` cannot see past `base_url`**: it reports where text is going and
+leaves the trust judgement to you, because you know something it does not.
+Treating every remote endpoint as hostile would be dishonest about the
+deployment this feature was designed for -- an inference provider running
+in a trusted execution environment, where "not on this machine" and "handed
+to a third party to do as they like with" are different statements -- and
+users learn to ignore warnings that are wrong. If retention matters to you,
+it is a question a TEE-hosted provider exists to answer, and the answer
+comes from them rather than from here. There is no tray indicator for any
+of this: turning the rewriter on is already a conscious act -- a cargo
+feature at build time, a config switch, and an endpoint typed by hand -- so
+a permanent "data is leaving" badge would be both redundant and misleading.
+The settings window's group description and the once-per-run log line above
+are where the destination is stated.
+
+Any OpenAI-compatible server on localhost keeps the original promise
+intact. That is the default, and a default build cannot make a network
+request at all.
+
+### What can go wrong
+
+Every failure ends the same way: **the original text is spoken.** A dead,
+misconfigured, slow, hostile or absent provider degrades to exactly the
+behaviour of every release before this one, and no notification is ever
+lost. A keybind does not stop speaking because an optional enhancement is
+misconfigured. Rewrites are never retried -- by the time a retry could
+finish, the utterance has already been spoken.
+
+That uniformity is also the problem: from outside the daemon, a rejected
+key, an unreachable host, a missing model and the feature simply being
+switched off all look identical. **The settings window's Test row is where
+they are told apart**, and it is the first place to look when rewording
+appears to do nothing. Two specific cases worth knowing:
+
+- **No endpoint configured** (empty or unparseable `base_url`), and
+  **built without the `reword` feature** with `enabled = true`, both speak
+  the original and log once -- the first naming the field, the second
+  telling you to rebuild with `--features reword`.
+- **`--reword` with no provider available** logs the same diagnosis, once
+  per run, even though `enabled` was never asked about: an explicit request
+  that cannot be honoured still owes the caller a reason.
+
+The daemon also protects itself: a rejected key stops further attempts
+until the configuration changes, three consecutive transport failures stop
+them for a minute, and a `429` is honoured (its `Retry-After`, when the
+provider sends one). At most two rewrites are ever in flight; a third is
+spoken as written immediately rather than queued.
+
+### The limitation worth knowing about
+
+A rewrite can be **fluent, short and wrong** -- a name changed, a number
+dropped, a question turned into a statement. The guard checks length, line
+count and formatting; it cannot check truth, and there is no cheap local
+test for it. The mitigations are structural rather than algorithmic: the
+input is one short notification, the temperature is low, and the model is
+meant to be a small one.
+
+So this feature is **unsuitable for notifications whose exact wording
+matters** -- one-time codes, alerts, the thing you are on call for. Use
+`[notifications] allow` to keep those applications out of it.
+
+No model has been evaluated for this task. `llama3.2:3b` is a default
+chosen for size, not for measured output quality.
+
 ## `say`, the control CLI
 
     say "text"        say selection      say clipboard
@@ -527,6 +743,17 @@ side.
   `/dev/snd`, PulseAudio refusing to start, CI). **This is a testing aid,
   not a supported way to run `sayd`** -- there is no audio output in this
   mode, and utterances finish instantly since nothing paces playback.
+- `SAYD_REWORD_API_KEY` -- the API key for [rewording](#rewording),
+  overriding `[reword] api_key` in the config file. The variable's *name*
+  is itself configurable via `[reword] api_key_env`; this is only the
+  default. An unset or empty variable falls back to the file, and no key
+  anywhere means no `Authorization` header is sent at all -- which is
+  exactly right for a local server.
+- `SAYD_DEBUG=1` -- prints `debug:` lines the daemon otherwise keeps quiet
+  about, including the first 80 characters of any model answer the
+  rewording guard rejected. Diagnosing a guard that rejects everything
+  needs the string; printing it unconditionally would duplicate locally
+  what is being sent remotely.
 
 The daemon also reacquires the audio device automatically after a failure
 (device unplugged, PulseAudio/PipeWire restart), retrying every couple of
@@ -677,6 +904,50 @@ Walk this yourself once, after installing, with `notify-send` available
    row should move out of Seen notifying and appear as a new row under
    **Applications to announce** instead.
 
+## Verify rewording
+
+The settings window's Reword group is not covered by automated tests
+either (no display in a CI or agent environment, same as the two sections
+above), and neither is the quality of any given model's rewrites, which is
+a judgement no assertion makes. Needs a build with the feature in it and a
+model server you can reach -- the quickest is Ollama:
+`ollama serve` and `ollama pull llama3.2:3b`.
+
+1. `cargo build --release --features reword`, put `sayd` and `say` on
+   `$PATH`, and restart the daemon.
+2. `say --reword "Alice: where do you want to go for dinner"` -- you should
+   hear a sentence, not a label and a fragment. If you hear the original
+   back, something is misconfigured; step 5 below says what.
+3. `journalctl --user -u sh.sayd.Sayd -n 20` (or the terminal you started it
+   in) -- exactly one `reword: sending text to ...` line, naming your
+   endpoint and model. Send several more and confirm it stays at one line.
+4. Open the tray menu, click **Settings…**, and find the **Reword** group.
+   Press **Test**. Read the result row:
+   - the rewritten sentence, and a latency;
+   - **compare that latency against the Deadline row.** If the row says the
+     answer took longer than the deadline, raise the deadline -- or accept
+     that this provider will usually be too slow for notifications and use
+     `--reword` explicitly instead of turning **Rewrite notifications** on;
+   - press Test a second time. It should be faster; the first request
+     includes connection setup, and the row says so;
+   - press **Speak** on the result row and hear the rewrite.
+5. Break it on purpose, and confirm the row tells you *which* thing is
+   broken rather than just failing: change **Model** to `not-a-model` and
+   press Test again (the row should say "The provider does not have that
+   model"), then change **Endpoint** to `http://localhost:1/v1` and press
+   Test once more (the row should say "Could not reach the provider"). Put
+   both back.
+6. Turn **Rewrite notifications** on, `notify-send -a Signal "Alice"
+   "where do you want to go for dinner"` (with `Signal` on the allowlist
+   and `speak_body = true`) -- you should hear the rewritten form.
+7. Send a burst of five notifications from the same application and let the
+   cooldown window close. The `"Signal: 4 more notifications"` follow-up is
+   spoken **as written**: it is already a sentence, and rewriting it would
+   let it overtake the announcement that opened the window.
+8. Stop the model server and send another notification. It is spoken as
+   written, promptly, with one warning in the log -- not silence, and not a
+   delay on every notification afterwards.
+
 ## Troubleshooting
 
 **`could not read the primary selection: ... -- WAYLAND_DISPLAY is not set`**
@@ -709,9 +980,11 @@ clipboard reading, single-instance handling), M3 (StatusNotifierItem tray,
 MPRIS2), M4 (the GTK4/libadwaita settings window, config write-through, and
 an inotify reload for hand edits) and M5 (notification narration -- see
 [Notifications](#notifications) above) are done. That is the whole of the
-original build order from the main design doc's plan: nothing is queued up
-after M5, so what comes next is whatever is chosen from here, not a milestone
-already on the books.
+original build order from the main design doc's plan.
+
+Past the original build order: optional LLM rewording (see
+[Rewording](#rewording)), off by default and absent from a default build
+entirely.
 
 ## Publishing
 
