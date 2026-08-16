@@ -101,18 +101,18 @@ Rules:
 /// a proxy log.
 const TEMPERATURE: f64 = 0.2;
 
-/// Generous on purpose, against a strict character ceiling in the guard. A
-/// tight token limit truncates mid-sentence, and a truncated sentence passes
-/// a length check and gets *spoken*; a generous one means an over-long
-/// answer arrives complete and is rejected whole.
-const MAX_TOKENS: u32 = 256;
-
 /// How much of a response body is read before the read fails.
 ///
 /// The body is untrusted, so an unbounded read is a memory bug: a server
-/// that streams gigabytes must not be able to grow this process. 64 KiB is
-/// far more than [`MAX_TOKENS`] of UTF-8 plus the envelope, and far more
-/// than any `error.message` worth reading.
+/// that streams gigabytes must not be able to grow this process. At
+/// [`RewordConfig::max_chars`]'s ceiling of 2000, [`RewordConfig::max_tokens`]
+/// is 6000 -- around 24 KB of UTF-8 -- so 64 KiB still clears it plus the
+/// envelope, but by a factor of about two and a half now that the cap
+/// moves with configuration, not by the order of magnitude it was when
+/// this was a fixed 256-token cap. Still far more than any `error.message`
+/// worth reading. A body that does exceed the limit is not a crash or a
+/// leak: the read fails and the attempt classifies as `Malformed`, the
+/// same as any other response this client cannot make sense of.
 const BODY_LIMIT: u64 = 64 * 1024;
 
 /// How much of a provider's `error.message` may reach a log line.
@@ -283,7 +283,7 @@ pub fn build_request(cfg: &RewordConfig, key: Option<&str>, text: &str) -> Reque
         ],
         stream: false,
         temperature: TEMPERATURE,
-        max_tokens: MAX_TOKENS,
+        max_tokens: cfg.max_tokens(),
         chat_template_kwargs: match cfg.resolved_provider() {
             Some(Provider::LlamaCpp) => Some(ChatTemplateKwargs {
                 enable_thinking: false,
@@ -842,7 +842,7 @@ mod tests {
         let r = build_request(&cfg(), None, "Alice: where do you want to go for dinner");
         assert_eq!(r.body["model"], "gpt-4o-mini");
         assert_eq!(r.body["stream"], false);
-        assert_eq!(r.body["max_tokens"], 256);
+        assert_eq!(r.body["max_tokens"], 1200);
         assert_eq!(r.body["temperature"], 0.2);
         let messages = r.body["messages"].as_array().expect("an array");
         assert_eq!(messages.len(), 2);
@@ -2002,5 +2002,24 @@ mod tests {
             debug.contains(&rewriter.host),
             "host is the useful field Debug exists to keep: {debug}"
         );
+    }
+
+    /// The body must carry the configured cap, not a constant. Task 1 pins the
+    /// arithmetic; this pins the wiring.
+    #[test]
+    fn the_request_carries_the_configured_token_cap() {
+        let mut c = cfg();
+
+        assert_eq!(
+            build_request(&c, None, "x").body["max_tokens"],
+            1200,
+            "the default max_chars of 400"
+        );
+
+        c.max_chars = 32;
+        assert_eq!(build_request(&c, None, "x").body["max_tokens"], 96);
+
+        c.max_chars = 2000;
+        assert_eq!(build_request(&c, None, "x").body["max_tokens"], 6000);
     }
 }
