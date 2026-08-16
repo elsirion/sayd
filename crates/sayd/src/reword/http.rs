@@ -562,6 +562,40 @@ impl HttpRewriter {
     }
 }
 
+/// A transport failure, with both halves of what it will say bounded.
+///
+/// `ureq`'s transport errors name what went wrong (`io: Connection refused`)
+/// and never *where*: the address lives in the separate once-per-run
+/// `sending text to …` line, which is not the line a user pastes into an
+/// issue. Appending the URL is what makes the one warning they do paste say
+/// which endpoint could not be reached.
+///
+/// IMPORTANT 2, and the reason this is a function with a doc comment rather
+/// than the closure it was: `reason` is not ours. It is `ureq`'s `Display`
+/// over an error whose text can carry bytes the *provider* chose, and it
+/// goes verbatim into a `warning: reword:` line and into the settings
+/// window's Test subtitle. Measured unbounded: a 60,000-character `Location`
+/// header produced a 60,094-byte `warning:` line and a 60 KB subtitle, a
+/// crafted one put a forged `warning: reword: your API key was revoked`
+/// inside sayd's own warning line, and a TAB survived into the journal.
+/// That is exactly the hazard [`sanitise_message`] closes for
+/// `error.message`, reached through a different variant, so it is closed the
+/// same way and to the same [`MESSAGE_CHARS`].
+///
+/// The URL goes through it too. It is the user's own configuration rather
+/// than a provider's, so it is not hostile -- but a bound on half of a line
+/// is not a bound on the line.
+fn unreachable_from(reason: &str, url: &str) -> RewordError {
+    fn bounded(s: &str, absent: &str) -> String {
+        sanitise_message(s).unwrap_or_else(|| absent.to_string())
+    }
+    RewordError::Unreachable(format!(
+        "{} ({})",
+        bounded(reason, "no reason given"),
+        bounded(url, "no endpoint")
+    ))
+}
+
 /// Send one request on `agent` and classify what comes back.
 ///
 /// The agent is a parameter rather than a call to [`agent`] so a test can
@@ -580,12 +614,7 @@ fn send(
     if let Some(auth) = &request.authorization {
         call = call.header("authorization", auth);
     }
-    // `ureq`'s transport errors name what went wrong (`io: Connection
-    // refused`) and never *where*: the address lives in the separate
-    // once-per-run `sending text to …` line, which is not the line a user
-    // pastes into an issue. Appended here, the one warning they do paste
-    // says which endpoint could not be reached.
-    let unreachable = |e: ureq::Error| RewordError::Unreachable(format!("{e} ({})", request.url));
+    let unreachable = |e: ureq::Error| unreachable_from(&e.to_string(), &request.url);
     let mut response = match call.send_json(&request.body) {
         Ok(r) => r,
         Err(ureq::Error::Timeout(_)) => return Err(RewordError::Ceiling),
@@ -934,6 +963,57 @@ mod tests {
         assert_eq!(
             parse_response(500, None, br#"{"error":{"message":"  boom  "}}"#, "m", "h"),
             Err(RewordError::Malformed("boom".into()))
+        );
+    }
+
+    /// IMPORTANT 2: the same bound, reached through the other variant.
+    ///
+    /// `RewordError::Unreachable`'s detail is `ureq`'s own error text, and
+    /// that text can quote bytes the provider chose -- a `Location` header,
+    /// a hostname. It lands in a `warning: reword:` line and in the settings
+    /// window's Test subtitle, so unbounded it is the identical hazard
+    /// `sanitise_message` already closes for `error.message`. Measured
+    /// before this: a 60,000-character `Location` produced a 60,094-byte
+    /// warning line and a 60 KB subtitle, and a TAB survived.
+    #[test]
+    fn an_unreachable_providers_reason_cannot_write_the_journal() {
+        let hostile = format!(
+            "io: \tconnect\u{1b}[2J to warning: reword: your API key was revoked {}",
+            "A".repeat(60_000)
+        );
+        let url = format!("http://box.lan/{}/v1/chat/completions", "p".repeat(60_000));
+
+        let RewordError::Unreachable(detail) = unreachable_from(&hostile, &url) else {
+            panic!("this variant is the one under test");
+        };
+
+        // Two halves of `MESSAGE_CHARS` plus their ellipses, and the
+        // ` (` and `)` between and after them. The *whole* line is bounded,
+        // not half of it: a 60 KB URL is still a 60 KB warning.
+        assert_eq!(
+            detail.chars().count(),
+            2 * (MESSAGE_CHARS + 1) + " ()".len()
+        );
+        assert!(
+            !detail.chars().any(char::is_control),
+            "no TAB, no escape, no newline reaches the journal: {detail:?}"
+        );
+        assert!(
+            detail.contains("connect"),
+            "the reason still reaches the user, which is the whole point: {detail}"
+        );
+        assert!(
+            detail.contains("box.lan"),
+            "and so does the endpoint that could not be reached: {detail}"
+        );
+
+        // An ordinary failure is passed through untouched: the cap must not
+        // become a tax on every real outage.
+        assert_eq!(
+            unreachable_from("io: Connection refused", "http://localhost:11434/v1"),
+            RewordError::Unreachable(
+                "io: Connection refused (http://localhost:11434/v1)".to_string()
+            )
         );
     }
 
