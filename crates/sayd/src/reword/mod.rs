@@ -502,7 +502,14 @@ struct Inner {
     plain_http_logged: bool,
     too_long_logged: bool,
     outage_logged: bool,
-    auth_logged: bool,
+    /// MINOR 2's row. §8 gives every failure a line, and a 429 was the one
+    /// that had none: the window was set, the feature stopped rewriting for
+    /// up to an hour, and the journal said nothing at all -- while the
+    /// provider's own `error.message`, which the client had already parsed
+    /// and sanitised, was dropped on the floor. Latched like
+    /// [`Inner::outage_logged`] and cleared by the same success, so a
+    /// standing rate limit is one line rather than one per notification.
+    rate_limit_logged: bool,
     model_logged: bool,
     /// MINOR 5's row: an explicit `--reword` against a build that has no
     /// client in it. Its own latch rather than one of the others because it
@@ -621,116 +628,7 @@ impl RewordState {
     /// `select!` arm takes on every arrival.
     pub fn record(&self, cfg: &RewordConfig, outcome: &Attempt, now: Instant) {
         let mut i = lock(&self.inner);
-        let mut journal = None;
-        match outcome {
-            // Nothing was sent, so nothing was learned -- and if this
-            // caller was holding §8's probe, it hands it back unspent
-            // rather than sitting on it for the TTL.
-            Attempt::Busy => i.transport_probe = None,
-            Attempt::Deadline => {
-                i.deadlines += 1;
-                if i.deadlines == 1 || i.deadlines.is_multiple_of(DEADLINE_LOG_EVERY) {
-                    journal = Some(Journal::Line(format!(
-                        "info: a rewrite did not answer within {} ms; spoke the text as \
-                         written ({} so far this run)",
-                        cfg.timeout_ms, i.deadlines
-                    )));
-                }
-            }
-            Attempt::Answered(Ok(_)) => {
-                i.transport_answered();
-                i.outage_logged = false;
-            }
-            Attempt::Answered(Err(e)) => match e {
-                RewordError::Auth {
-                    status,
-                    host,
-                    message,
-                } => {
-                    if !i.auth_logged {
-                        journal = Some(Journal::Line(format!(
-                            "warning: reword: {host} rejected the API key (HTTP {status}{}); \
-                             speaking text as written until the configuration changes",
-                            message
-                                .as_deref()
-                                .map(|m| format!(": {m}"))
-                                .unwrap_or_default()
-                        )));
-                        i.auth_logged = true;
-                    }
-                    i.auth_latched_for = Some(cfg.clone());
-                    i.transport_answered();
-                }
-                RewordError::NoSuchModel {
-                    status,
-                    model,
-                    message,
-                } => {
-                    if !i.model_logged {
-                        journal = Some(Journal::Line(format!(
-                            "warning: reword: the provider does not have model {model:?} \
-                             (HTTP {status}{}); speaking text as written",
-                            message
-                                .as_deref()
-                                .map(|m| format!(": {m}"))
-                                .unwrap_or_default()
-                        )));
-                        i.model_logged = true;
-                    }
-                    i.transport_answered();
-                }
-                RewordError::RateLimited { retry_after, .. } => {
-                    let wait = retry_after
-                        .unwrap_or(RATE_LIMIT_BACKOFF)
-                        .min(RATE_LIMIT_MAX_BACKOFF);
-                    let opening = Window::opening(now, wait);
-                    // Extended, never replaced: see `Window::later`.
-                    i.rate_limited_until = Some(match i.rate_limited_until {
-                        Some(standing) => standing.later(opening),
-                        None => opening,
-                    });
-                    i.transport_answered();
-                }
-                RewordError::Unreachable(detail) => {
-                    if !i.outage_logged {
-                        journal = Some(Journal::Line(format!(
-                            "warning: reword: could not reach the provider: {detail}"
-                        )));
-                        i.outage_logged = true;
-                    }
-                    i.fail_transport(now);
-                }
-                RewordError::Ceiling => {
-                    if !i.outage_logged {
-                        journal = Some(Journal::Line(format!(
-                            "warning: reword: the provider did not answer within {:.0} s",
-                            REWORD_HTTP_CEILING.as_secs_f64()
-                        )));
-                        i.outage_logged = true;
-                    }
-                    i.fail_transport(now);
-                }
-                RewordError::NotConfigured(reason) => {
-                    if !i.not_configured_logged {
-                        journal = Some(Journal::Line(format!(
-                            "warning: reword: {reason}; speaking text as written"
-                        )));
-                        i.not_configured_logged = true;
-                    }
-                }
-                RewordError::Unavailable => {}
-                RewordError::Malformed(detail) => {
-                    journal = Some(Journal::Debug(format!(
-                        "reword: unusable response: {detail}"
-                    )));
-                    // The transport did its job -- something came back and
-                    // the client could not use it -- so this resolves a
-                    // probe as an answer, and the next notification still
-                    // gets its chance.
-                    i.transport_answered();
-                }
-            },
-        }
+        let journal = i.fold(cfg, outcome, now);
         drop(i);
         self.emit(journal);
     }
@@ -875,6 +773,169 @@ impl RewordState {
 }
 
 impl Inner {
+    /// The whole of [`RewordState::record`]'s decision: fold `outcome` into
+    /// the breakers and return the line §8 says this row owes, if any.
+    ///
+    /// Split out of `record` so both halves are reachable from a test. The
+    /// lines are the part of §8 that has no other observable: a latch that
+    /// is set and a line that is printed are two different promises, and
+    /// MINOR 2 and MINOR 3 were both a row keeping one of them and not the
+    /// other. Building the line here and printing it in the caller is also
+    /// [`Journal`]'s rule -- nothing under this mutex may perform I/O.
+    fn fold(&mut self, cfg: &RewordConfig, outcome: &Attempt, now: Instant) -> Option<Journal> {
+        // Bound rather than spelled `self` throughout: this body moved here
+        // whole from `record`, where the guard it read through was `i`, and
+        // a rename would have made the diff of a fix look like a rewrite.
+        let i = self;
+        let mut journal = None;
+        match outcome {
+            // Nothing was sent, so nothing was learned -- and if this
+            // caller was holding §8's probe, it hands it back unspent
+            // rather than sitting on it for the TTL.
+            Attempt::Busy => i.transport_probe = None,
+            Attempt::Deadline => {
+                i.deadlines += 1;
+                if i.deadlines == 1 || i.deadlines.is_multiple_of(DEADLINE_LOG_EVERY) {
+                    journal = Some(Journal::Line(format!(
+                        "info: a rewrite did not answer within {} ms; spoke the text as \
+                         written ({} so far this run)",
+                        cfg.timeout_ms, i.deadlines
+                    )));
+                }
+            }
+            Attempt::Answered(Ok(_)) => {
+                i.transport_answered();
+                i.outage_logged = false;
+                i.rate_limit_logged = false;
+            }
+            Attempt::Answered(Err(e)) => match e {
+                RewordError::Auth {
+                    status,
+                    host,
+                    message,
+                } => {
+                    // MINOR 3: the *latch* is what decides whether this
+                    // line is owed, rather than a `bool` of its own. They
+                    // used to disagree -- the latch is per-config and the
+                    // log latch was global and per-run -- so a 403 from a
+                    // second endpoint (a settings-window edit, an
+                    // `api_key_env` pointing somewhere else) latched
+                    // silently and the user was left with a feature that
+                    // had stopped and no line saying why. One condition
+                    // cannot drift from itself: the line is said exactly
+                    // when a config that was not latched becomes latched,
+                    // and `clear_auth_latch` therefore also restores the
+                    // right to say it again, which is right -- a key that
+                    // tested good and then failed is news.
+                    if i.auth_latched_for.as_ref() != Some(cfg) {
+                        journal = Some(Journal::Line(format!(
+                            "warning: reword: {host} rejected the API key (HTTP {status}{}); \
+                             speaking text as written until the configuration changes",
+                            message
+                                .as_deref()
+                                .map(|m| format!(": {m}"))
+                                .unwrap_or_default()
+                        )));
+                    }
+                    i.auth_latched_for = Some(cfg.clone());
+                    i.transport_answered();
+                }
+                RewordError::NoSuchModel {
+                    status,
+                    model,
+                    message,
+                } => {
+                    if !i.model_logged {
+                        journal = Some(Journal::Line(format!(
+                            "warning: reword: the provider does not have model {model:?} \
+                             (HTTP {status}{}); speaking text as written",
+                            message
+                                .as_deref()
+                                .map(|m| format!(": {m}"))
+                                .unwrap_or_default()
+                        )));
+                        i.model_logged = true;
+                    }
+                    i.transport_answered();
+                }
+                RewordError::RateLimited {
+                    retry_after,
+                    message,
+                } => {
+                    let wait = retry_after
+                        .unwrap_or(RATE_LIMIT_BACKOFF)
+                        .min(RATE_LIMIT_MAX_BACKOFF);
+                    let opening = Window::opening(now, wait);
+                    // Extended, never replaced: see `Window::later`.
+                    i.rate_limited_until = Some(match i.rate_limited_until {
+                        Some(standing) => standing.later(opening),
+                        None => opening,
+                    });
+                    // MINOR 2: this row owed a line and had none. The
+                    // feature stops rewriting for `wait` -- up to an hour
+                    // with a `Retry-After` -- and a user watching
+                    // rewriting quietly stop deserves the reason, not a
+                    // silence indistinguishable from the feature being
+                    // switched off. The provider's own words are already
+                    // parsed and bounded by the client; dropping them here
+                    // threw away the only part that says *which* limit.
+                    if !i.rate_limit_logged {
+                        journal = Some(Journal::Line(format!(
+                            "warning: reword: the provider is rate limiting (HTTP 429{}); \
+                             not attempting another rewrite for {:.0} s",
+                            message
+                                .as_deref()
+                                .map(|m| format!(": {m}"))
+                                .unwrap_or_default(),
+                            wait.as_secs_f64()
+                        )));
+                        i.rate_limit_logged = true;
+                    }
+                    i.transport_answered();
+                }
+                RewordError::Unreachable(detail) => {
+                    if !i.outage_logged {
+                        journal = Some(Journal::Line(format!(
+                            "warning: reword: could not reach the provider: {detail}"
+                        )));
+                        i.outage_logged = true;
+                    }
+                    i.fail_transport(now);
+                }
+                RewordError::Ceiling => {
+                    if !i.outage_logged {
+                        journal = Some(Journal::Line(format!(
+                            "warning: reword: the provider did not answer within {:.0} s",
+                            REWORD_HTTP_CEILING.as_secs_f64()
+                        )));
+                        i.outage_logged = true;
+                    }
+                    i.fail_transport(now);
+                }
+                RewordError::NotConfigured(reason) => {
+                    if !i.not_configured_logged {
+                        journal = Some(Journal::Line(format!(
+                            "warning: reword: {reason}; speaking text as written"
+                        )));
+                        i.not_configured_logged = true;
+                    }
+                }
+                RewordError::Unavailable => {}
+                RewordError::Malformed(detail) => {
+                    journal = Some(Journal::Debug(format!(
+                        "reword: unusable response: {detail}"
+                    )));
+                    // The transport did its job -- something came back and
+                    // the client could not use it -- so this resolves a
+                    // probe as an answer, and the next notification still
+                    // gets its chance.
+                    i.transport_answered();
+                }
+            },
+        }
+        journal
+    }
+
     /// One transport-class failure: [`RewordError::Unreachable`] and
     /// [`RewordError::Ceiling`] are the same row of §8's table and must
     /// count toward the same breaker, so they share the one body rather
@@ -1727,6 +1788,113 @@ mod tests {
              every caller was handed a Deadline and the answers themselves \
              were dropped unread"
         );
+    }
+
+    /// The `warning:`/`info:` line an outcome owes, or `None`. A `Debug`
+    /// entry is not one: those are `SAYD_DEBUG`-only and no §8 row is
+    /// satisfied by one.
+    fn printed_line(journal: Option<Journal>) -> Option<String> {
+        match journal {
+            Some(Journal::Line(line)) => Some(line),
+            Some(Journal::Debug(_)) | None => None,
+        }
+    }
+
+    /// MINOR 2: §8 gives every failure a line, and a 429 had none.
+    ///
+    /// The window was set, the feature stopped rewriting for up to an hour,
+    /// and the journal said nothing -- indistinguishable, to the user
+    /// watching it stop, from the feature being switched off. The
+    /// provider's own `error.message` had already been parsed and bounded
+    /// by the client and was then dropped, which is the part that says
+    /// *which* limit was hit.
+    #[test]
+    fn a_rate_limit_says_so_once_and_carries_the_providers_words() {
+        let mut inner = Inner::default();
+        let cfg = cfg();
+        let now = Instant::now();
+        let limited = |message: Option<&str>| {
+            Attempt::Answered(Err(RewordError::RateLimited {
+                retry_after: Some(Duration::from_secs(120)),
+                message: message.map(str::to_string),
+            }))
+        };
+
+        let line = printed_line(inner.fold(
+            &cfg,
+            &limited(Some("Rate limit reached for gpt-4o-mini")),
+            now,
+        ))
+        .expect("§8 owes this row a line");
+        assert!(
+            line.starts_with("warning: reword: the provider is rate limiting (HTTP 429"),
+            "{line}"
+        );
+        assert!(
+            line.contains("Rate limit reached for gpt-4o-mini"),
+            "the provider's own words are the useful half: {line}"
+        );
+        assert!(
+            line.contains("120 s"),
+            "and how long rewriting stops for: {line}"
+        );
+
+        assert_eq!(
+            printed_line(inner.fold(&cfg, &limited(None), now)),
+            None,
+            "a standing rate limit is one line, not one per notification"
+        );
+
+        // A success is what clears it, the same event that clears a
+        // standing outage: a limit that has lifted and come back is news.
+        inner.fold(&cfg, &Attempt::Answered(Ok("a rewrite".into())), now);
+        assert!(
+            printed_line(inner.fold(&cfg, &limited(None), now)).is_some(),
+            "a second, later rate limit is a second event"
+        );
+    }
+
+    /// MINOR 3: the auth line is owed per *config*, like the latch it
+    /// belongs to.
+    ///
+    /// They used to disagree -- the breaker latch is keyed on the exact
+    /// `RewordConfig`, the log latch was one global `bool` for the run --
+    /// so a 403 from a second endpoint latched silently and left the user
+    /// with a feature that had stopped and nothing saying why. The
+    /// condition is now the latch itself, so the two cannot drift.
+    #[test]
+    fn a_rejected_key_on_a_second_endpoint_is_logged_as_well() {
+        let mut inner = Inner::default();
+        let now = Instant::now();
+        let first = cfg();
+        let mut second = cfg();
+        second.base_url = "https://api.ppq.ai/v1".into();
+        let rejected = |host: &str| {
+            Attempt::Answered(Err(RewordError::Auth {
+                status: 403,
+                host: host.to_string(),
+                message: None,
+            }))
+        };
+
+        let line = printed_line(inner.fold(&first, &rejected("box.lan"), now))
+            .expect("the first rejection is worth a line");
+        assert!(line.contains("box.lan"), "{line}");
+        assert_eq!(
+            printed_line(inner.fold(&first, &rejected("box.lan"), now)),
+            None,
+            "the same config again is the same fact"
+        );
+
+        let line = printed_line(inner.fold(&second, &rejected("api.ppq.ai"), now))
+            .expect("a different endpoint rejecting a different key is a different fact");
+        assert!(line.contains("api.ppq.ai"), "{line}");
+
+        // And a key that tested good and then failed is news again: the
+        // latch is what carries the answer, so clearing it restores the
+        // right to say so.
+        inner.auth_latched_for = None;
+        assert!(printed_line(inner.fold(&second, &rejected("api.ppq.ai"), now)).is_some());
     }
 
     /// §8's auth latch. A bad key does not fix itself, and every retry
