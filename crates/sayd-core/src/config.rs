@@ -393,6 +393,39 @@ pub fn resolve_api_key(cfg: &RewordConfig) -> Option<String> {
     resolve_api_key_with(cfg, |name| std::env::var(name).ok())
 }
 
+/// Why the daemon must not start, or `None` to carry on.
+///
+/// `enabled = true` with no usable `provider` is the one configuration that
+/// is a contradiction rather than a degradation: the user asked for
+/// notifications to be rewritten automatically, and there is no dialect to
+/// ask a provider in. Everything else degrades, because a hard exit
+/// elsewhere costs more than it buys -- the settings window is reached
+/// through the running daemon's tray, so a daemon that refuses to boot has
+/// taken away the GUI this field would be set with. `--reword` on a
+/// submission, a live config reload and the Test row all reach
+/// `HttpRewriter::new` instead, which reports the same problem as
+/// `NotConfigured` and speaks the text as written.
+///
+/// A free function over `RewordConfig` rather than a method, and returning
+/// the sentence rather than printing it, so the rule is testable without
+/// `main()` and without a process that exits.
+pub fn reword_startup_refusal(cfg: &RewordConfig) -> Option<String> {
+    if !cfg.enabled || cfg.resolved_provider().is_some() {
+        return None;
+    }
+    let names = Provider::NAMES.join(", ");
+    Some(match cfg.provider.as_deref() {
+        None => format!(
+            "reword.enabled = true but reword.provider is unset. \
+             Set reword.provider to one of: {names}"
+        ),
+        Some(bad) => format!(
+            "reword.enabled = true but reword.provider = {bad:?} is not a \
+             provider this build knows. Set reword.provider to one of: {names}"
+        ),
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -884,6 +917,71 @@ mod tests {
         assert_eq!(Provider::parse("vllm"), None, "unverified dialects are not offered");
         assert_eq!(Provider::parse(""), None);
         assert_eq!(Provider::NAMES.len(), 2);
+    }
+
+    /// The only combination that refuses. `enabled = true` is the user asking
+    /// for automatic rewording; without a provider it cannot be delivered, and
+    /// a daemon that starts anyway is one that silently does nothing.
+    #[test]
+    fn only_enabled_without_a_usable_provider_refuses_to_start() {
+        let mut c = RewordConfig {
+            enabled: false,
+            provider: None,
+            ..RewordConfig::default()
+        };
+
+        assert_eq!(
+            reword_startup_refusal(&c),
+            None,
+            "the table is inert when disabled, and must not block a boot"
+        );
+
+        c.provider = Some("nonsense".into());
+        assert_eq!(reword_startup_refusal(&c), None, "still disabled");
+
+        c.enabled = true;
+        c.provider = Some("llama-cpp".into());
+        assert_eq!(reword_startup_refusal(&c), None);
+
+        c.provider = Some("generic".into());
+        assert_eq!(reword_startup_refusal(&c), None);
+
+        c.provider = None;
+        let unset = reword_startup_refusal(&c).expect("unset must refuse");
+
+        c.provider = Some("llama.cpp".into());
+        let wrong = reword_startup_refusal(&c).expect("unrecognised must refuse");
+        assert_ne!(
+            unset, wrong,
+            "a user who typed something wrong and one who typed nothing need \
+             different sentences"
+        );
+    }
+
+    /// A refusal that does not say what to type is a refusal the user has to
+    /// go and read source code about.
+    #[test]
+    fn the_refusal_names_the_field_and_every_value_it_accepts() {
+        let c = RewordConfig {
+            enabled: true,
+            provider: None,
+            ..RewordConfig::default()
+        };
+        let msg = reword_startup_refusal(&c).expect("must refuse");
+        assert!(msg.contains("reword.provider"), "{msg}");
+        for name in Provider::NAMES {
+            assert!(msg.contains(name), "{name} must be offered: {msg}");
+        }
+
+        let c = RewordConfig {
+            provider: Some("llama.cpp".into()),
+            ..c
+        };
+        let msg = reword_startup_refusal(&c).expect("must refuse");
+        assert!(
+            msg.contains("llama.cpp"),
+            "the rejected value must be quoted back so the typo is visible: {msg}"
+        );
     }
 
     /// The settings window serialises the whole `Config` on every save. A `None`

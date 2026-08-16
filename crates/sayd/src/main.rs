@@ -812,6 +812,18 @@ async fn run_daemon() -> std::process::ExitCode {
         None => None,
     };
 
+    // A contradiction rather than a degradation, so it is the one reword
+    // misconfiguration that stops a boot: automatic rewriting was asked for
+    // and cannot be delivered. Gated, because in a build without the feature
+    // `enabled = true` is already an inert no-op with its own diagnostic, and
+    // refusing to start over a table that build never reads would be a
+    // failure invented out of nothing.
+    #[cfg(feature = "reword")]
+    if let Some(refusal) = sayd_core::config::reword_startup_refusal(&cfg.reword) {
+        eprintln!("error: {}: {refusal}", Config::path().display());
+        return std::process::ExitCode::FAILURE;
+    }
+
     // Finding 2: load and validate the ONNX Runtime dylib now, up front,
     // where a failure can be reported with a clean exit -- rather than
     // letting the first synthesis discover it lazily inside `ort`, which
