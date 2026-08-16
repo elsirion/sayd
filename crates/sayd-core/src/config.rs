@@ -200,6 +200,51 @@ const _: () = assert!(
 /// ever composed, and the ordering this floor protects does not exist.
 pub const NOTIFY_COOLDOWN_MIN_SECS: u64 = REWORD_TIMEOUT_MAX_MS.div_ceil(1000) + 1;
 
+/// Which dialect a provider is told to stop reasoning in.
+///
+/// The one thing `base_url` cannot say. Every endpoint in §6's table speaks
+/// the same `/chat/completions`, which is why there was no `provider`
+/// setting for so long -- but they do not agree on how to switch a thinking
+/// model's thinking off, and a model that thinks cannot answer inside
+/// `timeout_ms`. Measured against the local llama.cpp router:
+/// `chat_template_kwargs` suppressed reasoning on 6 requests of 6, while
+/// `reasoning_budget` was ignored on 6 of 6 and the unmodified request
+/// reasoned on 9 of 10 -- 13 to 33 s each, all of them past the client
+/// ceiling.
+///
+/// Two values, because only two are measured. vLLM documents the same
+/// `chat_template_kwargs` upstream and Ollama and LM Studio have their own
+/// spellings, but none of the three has been tested here, and a dialect
+/// guessed wrong is a 400 on a path whose whole design is to fail quietly.
+/// Adding one later is a match arm and a test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Provider {
+    /// Sends `chat_template_kwargs: {"enable_thinking": false}`.
+    LlamaCpp,
+    /// Sends nothing beyond the common request. Correct for a provider that
+    /// does not reason, and for any remote one: OpenAI-compatible services
+    /// reject unknown top-level fields rather than ignoring them.
+    Generic,
+}
+
+impl Provider {
+    /// Every accepted spelling, for the messages that have to list them.
+    pub const NAMES: [&'static str; 2] = ["llama-cpp", "generic"];
+
+    /// `None` for anything not in [`Provider::NAMES`].
+    ///
+    /// Surrounding whitespace is forgiven because a hand-edited TOML value
+    /// is where this comes from; case is not, because the value is a token
+    /// rather than prose and accepting `"Generic"` invites `"Llama.CPP"`.
+    pub fn parse(name: &str) -> Option<Provider> {
+        match name.trim() {
+            "llama-cpp" => Some(Provider::LlamaCpp),
+            "generic" => Some(Provider::Generic),
+            _ => None,
+        }
+    }
+}
+
 /// Rewriting text for the ear before it is spoken.
 ///
 /// Off by default, and pointed at a *local* endpoint by default. With
@@ -219,12 +264,29 @@ pub struct RewordConfig {
     /// notifications automatically", `--reword` is being asked.
     pub enabled: bool,
     /// Any OpenAI-compatible endpoint. PPQ, Ollama, llama.cpp's `server`,
-    /// LM Studio and vLLM all speak the same request, so there is no
-    /// `provider` field -- it would have one meaningful value and four ways
-    /// to get it wrong. A trailing `/` is stripped before
-    /// `/chat/completions` is appended, so both spellings work.
+    /// LM Studio and vLLM all speak the same request, which is why `base_url`
+    /// alone once said everything. What they do not agree on is how a thinking
+    /// model is told to stop reasoning; that is what [`RewordConfig::provider`]
+    /// carries. A trailing `/` is stripped before `/chat/completions` is
+    /// appended, so both spellings work.
     pub base_url: String,
     pub model: String,
+    /// Which provider is at `base_url`, and so how it is told not to reason.
+    ///
+    /// A `String` rather than a [`Provider`], and resolved by
+    /// [`RewordConfig::resolved_provider`] at use. As an enum, one typo
+    /// fails the parse of the whole document and `load_str` returns
+    /// `Config::default()` -- every other setting in the file discarded over
+    /// a misspelling. Parse leniently, refuse at use: the same shape
+    /// `timeout_ms`'s clamp and `settings::model::normalize` already have.
+    ///
+    /// Required when `enabled` is true; see
+    /// [`reword_startup_refusal`]. `skip_serializing_if` because the
+    /// settings window rewrites the whole file and an unset provider must
+    /// come back as an absent key rather than as something that will not
+    /// parse.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     /// Local servers ignore this. Prefer `api_key_env`: a key in a shell
     /// profile or a systemd `EnvironmentFile` can be rotated without
     /// touching a file the settings window rewrites wholesale, and it keeps
@@ -253,6 +315,7 @@ impl Default for RewordConfig {
             enabled: false,
             base_url: "http://localhost:11434/v1".into(),
             model: "llama3.2:3b".into(),
+            provider: None,
             api_key: String::new(),
             api_key_env: "SAYD_REWORD_API_KEY".into(),
             // A budget, not an observation: chosen to sit under sayd-cli's
@@ -264,6 +327,44 @@ impl Default for RewordConfig {
             timeout_ms: 1500,
             max_chars: 400,
         }
+    }
+}
+
+impl RewordConfig {
+    /// The configured provider, or `None` if it is unset or unrecognised.
+    ///
+    /// Callers may not distinguish the two by the return value on purpose:
+    /// both mean "there is no dialect to speak", and the two messages that
+    /// *do* tell them apart are built where they are shown.
+    pub fn resolved_provider(&self) -> Option<Provider> {
+        Provider::parse(self.provider.as_deref()?)
+    }
+
+    /// The token cap for one rewrite: three times the longest text the
+    /// feature accepts.
+    ///
+    /// Generous against a strict character ceiling in the guard, and
+    /// generous on purpose -- a tight cap truncates mid-sentence, and a
+    /// truncated sentence passes a length check and gets *spoken*, while a
+    /// generous one means an over-long answer arrives complete and is
+    /// rejected whole.
+    ///
+    /// Here, in the config crate, rather than beside the request it is
+    /// serialised into: the client sends it, the breaker's journal line
+    /// quotes it and the settings window's Test row explains it, and three
+    /// copies of one multiplier is three places to miss when it changes.
+    ///
+    /// This is **not** a bound on latency and is not meant to be one: at the
+    /// 8-19 tok/s a CPU-only box sustains, 1200 tokens is a minute. The
+    /// client's own ceiling is what bounds the request, as it already did
+    /// when this was a fixed 256.
+    ///
+    /// Saturating rather than wrapping: `max_chars` is clamped to
+    /// 32..=2000 by `settings::model::normalize`, but a hand-edited file
+    /// reaches some callers first, and a wrapped cap of 3 tokens would
+    /// truncate every answer.
+    pub fn max_tokens(&self) -> u32 {
+        u32::try_from(self.max_chars.saturating_mul(3)).unwrap_or(u32::MAX)
     }
 }
 
@@ -716,6 +817,100 @@ mod tests {
         let (back, err) = Config::load_from(&p);
         assert_eq!(err, None);
         assert_eq!(back, c);
+    }
+
+    /// The field is absent from every config written before it existed, and
+    /// absent is not the same as wrong: it parses, and the daemon decides what
+    /// to do about it. See `reword_startup_refusal`.
+    #[test]
+    fn an_absent_provider_parses_as_none() {
+        let (c, err) = Config::load_str("[reword]\nmodel = \"gemma\"\n");
+        assert_eq!(err, None);
+        assert_eq!(c.reword.provider, None);
+        assert_eq!(c.reword.resolved_provider(), None);
+        assert_eq!(c.reword.model, "gemma", "the rest of the table still parses");
+    }
+
+    /// The reason `provider` is an `Option<String>` and not an enum. As an enum
+    /// this typo fails `toml::from_str` for the *whole document*, `load_str`
+    /// hands back `Config::default()`, and every other setting in the user's
+    /// file is silently discarded over one misspelt word.
+    #[test]
+    fn an_unrecognised_provider_does_not_discard_the_rest_of_the_config() {
+        let (c, err) = Config::load_str(
+            "[reword]\nprovider = \"llama.cpp\"\nmodel = \"gemma\"\nmax_chars = 512\n",
+        );
+        assert_eq!(err, None, "a bad provider is not a parse failure");
+        assert_eq!(c.reword.provider.as_deref(), Some("llama.cpp"));
+        assert_eq!(
+            c.reword.resolved_provider(),
+            None,
+            "it is preserved verbatim and refused at use, not at parse"
+        );
+        assert_eq!(c.reword.model, "gemma");
+        assert_eq!(c.reword.max_chars, 512);
+    }
+
+    /// The cap follows the longest text the feature accepts rather than sitting
+    /// at a constant a long notification outgrows. Both ends of `max_chars`'s
+    /// 32..=2000 clamp, so the arithmetic is pinned rather than the default.
+    #[test]
+    fn the_token_cap_is_three_times_the_longest_text_accepted() {
+        let mut c = RewordConfig::default();
+
+        assert_eq!(c.max_chars, 400, "the default this multiplies");
+        assert_eq!(c.max_tokens(), 1200);
+
+        c.max_chars = 32;
+        assert_eq!(c.max_tokens(), 96);
+
+        c.max_chars = 2000;
+        assert_eq!(c.max_tokens(), 6000);
+
+        // Not reachable through the settings window, which clamps, but a
+        // hand-edited file reaches some callers before anything normalises it.
+        // Saturating rather than wrapping: a cap of 3 tokens would truncate
+        // every answer.
+        c.max_chars = usize::MAX;
+        assert_eq!(c.max_tokens(), u32::MAX);
+    }
+
+    #[test]
+    fn the_two_provider_names_parse_and_nothing_else_does() {
+        assert_eq!(Provider::parse("llama-cpp"), Some(Provider::LlamaCpp));
+        assert_eq!(Provider::parse("generic"), Some(Provider::Generic));
+        assert_eq!(Provider::parse(" generic "), Some(Provider::Generic));
+        assert_eq!(Provider::parse("Generic"), None, "the value is a token, not prose");
+        assert_eq!(Provider::parse("vllm"), None, "unverified dialects are not offered");
+        assert_eq!(Provider::parse(""), None);
+        assert_eq!(Provider::NAMES.len(), 2);
+    }
+
+    /// The settings window serialises the whole `Config` on every save. A `None`
+    /// that serialises as a TOML value rather than as an absent key would either
+    /// fail the write or write something that does not parse back.
+    ///
+    /// `to_string_pretty` because that is the call `Config::save_to` makes; a
+    /// test that round-trips through a different serialiser is not testing the
+    /// write that happens.
+    #[test]
+    fn an_absent_provider_round_trips_through_a_whole_config_write() {
+        let mut c = Config::default();
+        c.reword.provider = None;
+        let text = toml::to_string_pretty(&c).expect("a default config must serialise");
+        assert!(
+            !text.contains("provider"),
+            "an unset provider is an absent key, not an empty one: {text}"
+        );
+        let (back, err) = Config::load_str(&text);
+        assert_eq!(err, None);
+        assert_eq!(back.reword.provider, None);
+
+        c.reword.provider = Some("llama-cpp".into());
+        let text = toml::to_string_pretty(&c).expect("must serialise");
+        let (back, err) = Config::load_str(&text);
+        assert_eq!(err, None);
+        assert_eq!(back.reword.resolved_provider(), Some(Provider::LlamaCpp));
     }
 
     /// A key pasted into the settings window must not land in a
