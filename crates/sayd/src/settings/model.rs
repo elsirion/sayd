@@ -1695,19 +1695,40 @@ fn outcome_for_error(e: RewordError, cfg: &RewordConfig) -> TestOutcome {
         // and exactly the investigation the user needs. The detail is what
         // makes it actionable.
         RewordError::Truncated { reasoning } => TestOutcome::Unusable {
-            detail: if reasoning {
-                format!(
+            // C3: same problem as A2, same fix -- `HttpRewriter::new`
+            // refuses any config whose provider does not resolve before a
+            // request is sent, so by the time this fires `provider` is
+            // already `generic` or `llama-cpp`. Naming `llama-cpp` again to
+            // someone already on it is a circle; the honest statement there
+            // is that the server did not honour the request.
+            detail: match reasoning {
+                true if cfg.resolved_provider() == Some(Provider::LlamaCpp) => format!(
+                    "the model spent its whole {} token budget reasoning even \
+                     though reword.provider is already llama-cpp; the server did \
+                     not honour the request -- try a model that does not reason",
+                    cfg.max_tokens()
+                ),
+                true => format!(
                     "the model spent its whole {} token budget reasoning instead \
-                     of answering; set reword.provider to llama-cpp to turn \
-                     thinking off, or choose a model that does not reason",
+                     of answering; set reword.provider to llama-cpp so it can be \
+                     told not to",
                     cfg.max_tokens()
-                )
-            } else {
-                format!(
-                    "the answer was cut off at the {} token cap; raise \
-                     reword.max_chars or shorten the text",
+                ),
+                // C2: raising `max_chars` does not move the guard's rejection
+                // ceiling. `sayd_core::reword::length_ceiling` derives it from
+                // the *input* text -- about 1.5x its length plus 32 characters
+                // -- not from `max_chars`; an answer long enough to reach the
+                // 1200-token default cap is roughly 4800 characters and is
+                // rejected whatever `max_chars` says. The honest statement is
+                // that the model produced far more text than a rewritten
+                // notification should contain.
+                false => format!(
+                    "the answer was cut off at the {} token cap, having already \
+                     written far more text than a rewritten notification should \
+                     contain; try a different model, or instruct this one to \
+                     answer in one short sentence",
                     cfg.max_tokens()
-                )
+                ),
             },
             endpoint: cfg.base_url.clone(),
         },
@@ -3844,6 +3865,77 @@ mod tests {
         let out = outcome_of(&model, REWORD_TEST_DEFAULT);
         assert_eq!(out.title(), "The endpoint answered something unusable");
         assert_eq!(out.subtitle(), "no choices[0] — http://localhost:11434/v1");
+        drop(model);
+        engine.shutdown();
+
+        // Truncated while reasoning, with the provider already told to stop:
+        // `reword.provider` is already `llama-cpp`, which already sends
+        // `chat_template_kwargs`, so telling the user to set it again would
+        // be a circle. The honest statement is that the server ignored the
+        // request.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (model, engine) = model_with(
+            dir.path(),
+            Canned::new(Err(RewordError::Truncated { reasoning: true })),
+        );
+        model
+            .edit(|c| c.reword.provider = Some("llama-cpp".into()))
+            .expect("llama-cpp is a provider this build knows");
+        let out = outcome_of(&model, REWORD_TEST_DEFAULT);
+        assert_eq!(out.title(), "The endpoint answered something unusable");
+        assert!(
+            out.subtitle().contains("did not honour the request"),
+            "provider is already llama-cpp, so this is the honest \
+             statement rather than another suggestion to set the same \
+             field: {:?}",
+            out.subtitle()
+        );
+        assert!(
+            !out.subtitle().contains("set reword.provider"),
+            "that advice would be circular: {:?}",
+            out.subtitle()
+        );
+        drop(model);
+        engine.shutdown();
+
+        // Truncated while reasoning, with `generic` -- which sends nothing
+        // to suppress it -- naming `llama-cpp` is real advice.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (model, engine) = model_with(
+            dir.path(),
+            Canned::new(Err(RewordError::Truncated { reasoning: true })),
+        );
+        model
+            .edit(|c| c.reword.provider = Some("generic".into()))
+            .expect("generic is a provider this build knows");
+        let out = outcome_of(&model, REWORD_TEST_DEFAULT);
+        assert_eq!(out.title(), "The endpoint answered something unusable");
+        assert!(
+            out.subtitle().contains("reword.provider") && out.subtitle().contains("llama-cpp"),
+            "generic sends nothing to suppress reasoning, so naming \
+             llama-cpp is the real fix: {:?}",
+            out.subtitle()
+        );
+        drop(model);
+        engine.shutdown();
+
+        // Truncated without reasoning: the guard's rejection ceiling
+        // (`sayd_core::reword::length_ceiling`) is derived from the
+        // *input* text, not from `max_chars`, so raising `max_chars` would
+        // not have helped an answer long enough to reach this cap.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (model, engine) = model_with(
+            dir.path(),
+            Canned::new(Err(RewordError::Truncated { reasoning: false })),
+        );
+        let out = outcome_of(&model, REWORD_TEST_DEFAULT);
+        assert_eq!(out.title(), "The endpoint answered something unusable");
+        assert!(
+            !out.subtitle().contains("max_chars"),
+            "raising max_chars does not move the guard's rejection \
+             ceiling, which is derived from the input text: {:?}",
+            out.subtitle()
+        );
         drop(model);
         engine.shutdown();
 
