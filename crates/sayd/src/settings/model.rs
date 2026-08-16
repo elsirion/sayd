@@ -126,13 +126,23 @@ pub const REWORD_TEST_DEFAULT: &str = "Alice: where do you want to go for dinner
 /// stale costs nothing and adding one is a line -- but they live here, not
 /// in `window.rs`, for the reason [`MODELS`] and [`SPEED_MODES`] do: the
 /// window is the one layer with no test coverage.
-pub const ENDPOINT_PRESETS: [(&str, &str); 6] = [
-    ("Ollama", "http://localhost:11434/v1"),
-    ("llama.cpp server", "http://localhost:8080/v1"),
-    ("LM Studio", "http://localhost:1234/v1"),
-    ("vLLM", "http://localhost:8000/v1"),
-    ("PPQ", "https://api.ppq.ai/v1"),
-    ("OpenAI", "https://api.openai.com/v1"),
+///
+/// The third field is the table's Key column, collapsed to a bool:
+/// `false` for the row's "ignored", `true` for "as configured" or `sk-…`.
+/// [`reword_key_row_applies`] reads it back out to decide whether the API
+/// key row is offered for a *loopback* preset -- vLLM is the one local
+/// server in this table whose Key column is not "ignored" (`vllm serve
+/// --api-key …` is a real invocation), so it cannot be folded into "this
+/// machine, therefore no credential" the way Ollama, llama.cpp `server` and
+/// LM Studio can. PPQ and OpenAI are `true` here too, for completeness with
+/// the table, but their row is already shown by the loopback check alone.
+pub const ENDPOINT_PRESETS: [(&str, &str, bool); 6] = [
+    ("Ollama", "http://localhost:11434/v1", false),
+    ("llama.cpp server", "http://localhost:8080/v1", false),
+    ("LM Studio", "http://localhost:1234/v1", false),
+    ("vLLM", "http://localhost:8000/v1", true),
+    ("PPQ", "https://api.ppq.ai/v1", true),
+    ("OpenAI", "https://api.openai.com/v1", true),
 ];
 
 /// How long a burst of edits is allowed to keep collapsing into one write.
@@ -686,14 +696,33 @@ impl SettingsModel {
         p.last_write_error.clone().map_or(Ok(()), Err)
     }
 
-    /// The Reword group's description, against the real environment.
+    /// The Reword group's description, against the real environment and
+    /// this model's own idea of the current config.
     ///
-    /// Called by the group at build time and again from its redraw closure,
-    /// so the sentence about where the key comes from follows an edit to the
-    /// endpoint or the key rather than describing the config the window
-    /// happened to open on.
+    /// Called once, at build time, when there is no redraw-supplied `Config`
+    /// yet to describe. The redraw closure itself calls
+    /// [`Self::reword_description_for`] with the `Config` it was handed
+    /// instead -- see that method for why the two must not collapse into
+    /// one.
     pub fn reword_description_now(&self) -> String {
-        let cfg = self.current().reword;
+        self.reword_description_for(&self.current())
+    }
+
+    /// The Reword group's description for a specific config, against the
+    /// real environment.
+    ///
+    /// Every call site today passes `self.current()` -- either directly, via
+    /// [`Self::reword_description_now`], or as the `cfg` a row redraw is
+    /// handed, which is always the model's current config too (see
+    /// [`Ui::redraw`] in `window.rs`). But the redraw closure is handed that
+    /// `Config` for a reason: a description built by re-reading `current()`
+    /// instead would happen to agree with every call site today and still
+    /// describe the wrong config the day one doesn't, showing a destination
+    /// or a key sentence that does not match the rows next to it. Taking
+    /// `cfg` as a parameter is what makes that impossible rather than
+    /// merely untested.
+    pub fn reword_description_for(&self, cfg: &Config) -> String {
+        let cfg = cfg.reword.clone();
         // The two halves of `resolve_api_key_with`'s environment rule, kept
         // in step with it deliberately: an empty `api_key_env` names no
         // variable and is never looked up (here), and a variable that is set
@@ -1407,12 +1436,20 @@ fn reword_description(cfg: &RewordConfig, env_value: Option<&str>) -> String {
 /// takes no credential is an invitation to put a secret on disk for nothing,
 /// and `config.toml` is a file the settings window rewrites wholesale (which
 /// is why `api_key_env` is the documented way to hold one at all). A
-/// loopback endpoint is the case where that is certain -- `is_loopback` is
-/// the same name-based test `Config::load_str` uses to decide whether plain
-/// HTTP earns a warning, so the two cannot disagree about what "this
-/// machine" means.
+/// loopback endpoint is *usually* the case where that is certain --
+/// `is_loopback` is the same name-based test `Config::load_str` uses to
+/// decide whether plain HTTP earns a warning, so the two cannot disagree
+/// about what "this machine" means -- but "on this machine" and "takes no
+/// credential" are not the same claim, and §6's own endpoint table says so:
+/// vLLM's row is a loopback `base_url` with Key **"as configured"**, because
+/// `vllm serve --api-key sk-…` (and a local LiteLLM or llama.cpp built with
+/// auth) are real invocations. [`ENDPOINT_PRESETS`]' third field carries
+/// that column, and this function checks it before falling back to the
+/// loopback test -- so vLLM's preset keeps the row while Ollama, llama.cpp
+/// `server` and LM Studio still lose it, exactly as their "ignored" cells
+/// say.
 ///
-/// Two things it deliberately does *not* do:
+/// Three things it deliberately does *not* do:
 ///
 /// - **It never hides a key that is already stored.** A non-empty `api_key`
 ///   keeps the row visible whatever the endpoint is, because the row is the
@@ -1421,6 +1458,15 @@ fn reword_description(cfg: &RewordConfig, env_value: Option<&str>) -> String {
 /// - **It errs towards visible.** An unparseable `base_url` is not a
 ///   loopback claim, so the row stays: the user is mid-repair, and the
 ///   description already says the endpoint is unusable.
+/// - **It does not try to recognise "a vLLM-shaped URL" in general.** The
+///   exemption is an exact match against [`ENDPOINT_PRESETS`]' key-taking
+///   rows -- what the preset button actually writes into `base_url` -- not
+///   a guess at every host:port a user might run vLLM on. A user who points
+///   `base_url` at vLLM by hand rather than through the preset and wants the
+///   row back has the same escape the row exists to avoid needing: type the
+///   key in once the row is visible (from the preset, or after fixing the
+///   URL to match it), and the "already stored" exception above keeps it
+///   visible from then on.
 ///
 /// The environment is not consulted. `api_key_env` supplies the request's
 /// key without this field being involved at all, and [`reword_description`]
@@ -1428,6 +1474,12 @@ fn reword_description(cfg: &RewordConfig, env_value: Option<&str>) -> String {
 /// than a row that vanishes for a reason the user cannot see.
 pub fn reword_key_row_applies(cfg: &RewordConfig) -> bool {
     if !cfg.api_key.is_empty() {
+        return true;
+    }
+    let is_key_taking_preset = ENDPOINT_PRESETS
+        .iter()
+        .any(|(_, url, takes_key)| *takes_key && *url == cfg.base_url);
+    if is_key_taking_preset {
         return true;
     }
     match sayd_core::reword::parse_base_url(&cfg.base_url) {
@@ -4069,6 +4121,12 @@ mod tests {
     /// already in the file keeps the row (it is the only way to read or
     /// clear it), and an endpoint that does not parse is not a claim about
     /// anything, so the row stays while the user repairs it.
+    ///
+    /// A third case sits alongside those two rather than among the hidden
+    /// ones: vLLM's loopback preset. §6's table marks its Key column "as
+    /// configured", not "ignored" like the other three local presets, so
+    /// the loopback test alone would wrongly hide the only place to enter a
+    /// key `vllm serve --api-key …` is waiting for.
     #[test]
     fn the_api_key_row_is_offered_only_where_a_key_can_be_used() {
         let mut cfg = RewordConfig::default();
@@ -4081,7 +4139,10 @@ mod tests {
             "http://localhost:11434/v1",
             "http://127.0.0.1:8080/v1",
             "http://[::1]:1234/v1",
-            "http://LOCALHOST:8000/v1",
+            // Same host as the vLLM preset, different port: not a match for
+            // the exemption, so this is still "ignored" by the loopback
+            // rule -- unlike the exact preset string tested below.
+            "http://LOCALHOST:9999/v1",
         ] {
             cfg.base_url = local.into();
             assert!(!reword_key_row_applies(&cfg), "{local} is this machine");
@@ -4091,6 +4152,15 @@ mod tests {
             cfg.base_url = remote.into();
             assert!(reword_key_row_applies(&cfg), "{remote} may want a key");
         }
+
+        // vLLM is a loopback endpoint whose Key column is not "ignored": the
+        // preset exemption keeps the row offered even though it never
+        // leaves this machine.
+        cfg.base_url = "http://localhost:8000/v1".into();
+        assert!(
+            reword_key_row_applies(&cfg),
+            "vLLM's preset may be running with --api-key"
+        );
 
         // Whatever the endpoint, a key the file already holds keeps its row:
         // hiding a secret that is still on disk would be worse than showing
@@ -4123,8 +4193,11 @@ mod tests {
     #[test]
     fn the_endpoint_presets_are_the_documented_table() {
         assert_eq!(ENDPOINT_PRESETS.len(), 6);
-        assert_eq!(ENDPOINT_PRESETS[0], ("Ollama", "http://localhost:11434/v1"));
-        for (name, url) in ENDPOINT_PRESETS {
+        assert_eq!(
+            ENDPOINT_PRESETS[0],
+            ("Ollama", "http://localhost:11434/v1", false)
+        );
+        for (name, url, _takes_key) in ENDPOINT_PRESETS {
             assert!(
                 sayd_core::reword::parse_base_url(url).is_ok(),
                 "{name}'s preset must be a usable endpoint"
@@ -4133,10 +4206,28 @@ mod tests {
         assert!(
             ENDPOINT_PRESETS
                 .iter()
-                .any(|(_, url)| *url == RewordConfig::default().base_url),
+                .any(|(_, url, _)| *url == RewordConfig::default().base_url),
             "the default endpoint must be offered as a preset, so a user who \
              wandered away from it can get back"
         );
+
+        // The Key column, collapsed to a bool: "ignored" for the three
+        // local servers whose loopback address is enough on its own, "as
+        // configured" or `sk-…` for the three that can (or must) carry one.
+        for name in ["Ollama", "llama.cpp server", "LM Studio"] {
+            let &(_, _, takes_key) = ENDPOINT_PRESETS
+                .iter()
+                .find(|(n, _, _)| *n == name)
+                .expect("preset present");
+            assert!(!takes_key, "{name}'s Key column is \"ignored\"");
+        }
+        for name in ["vLLM", "PPQ", "OpenAI"] {
+            let &(_, _, takes_key) = ENDPOINT_PRESETS
+                .iter()
+                .find(|(n, _, _)| *n == name)
+                .expect("preset present");
+            assert!(takes_key, "{name}'s Key column is not \"ignored\"");
+        }
     }
 
     /// The cooldown floor was enforced on load and nowhere else, so the

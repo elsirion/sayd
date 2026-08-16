@@ -1282,6 +1282,24 @@ fn notification_group(ui: &Ui, cfg: &Config) -> adw::PreferencesGroup {
 ///
 /// The row is populated by the caller *before* this is called, in the order
 /// every other row here uses -- see `quiet`.
+///
+/// The redraw closure below only rewrites the row when its text disagrees
+/// with the config (see the comment on that check), which reads as if that
+/// inequality were the one thing standing between a user mid-keystroke and
+/// a redraw overwriting them. It is not doing that much work in practice.
+/// Every route to a redraw that a mouse or keyboard press could take goes
+/// through *this row losing focus first* -- clicking another row, Tab, the
+/// preset menu, all move focus off this entry before anything downstream
+/// can call `apply` -- and losing focus is exactly what commits this row's
+/// own text (see the `EventControllerFocus` below). So by the time such a
+/// redraw arrives, there is nothing left half-typed here to lose: either
+/// the commit matched what the row already showed, or it changed the config
+/// and this redraw is the one putting the row's text back in sync with it.
+/// The redraws that *do* arrive with focus still in this row -- and so are
+/// the ones the inequality check is actually protecting -- are the
+/// write-failure drain (an async task, not routed through any widget) and
+/// `open()`'s re-present (before the user has typed anything at all, so
+/// there is nothing at stake either way).
 fn bind_entry(
     ui: &Ui,
     row: &impl IsA<adw::EntryRow>,
@@ -1386,8 +1404,10 @@ fn reword_group(ui: &Ui, cfg: &Config, engine: EngineHandle) -> adw::Preferences
     // see `group_description`, and note that the failure it prevents is a
     // *stale* description rather than a blank one.
     let g = group.clone();
-    ui.row(move |ui, _| {
-        g.set_description(Some(&group_description(&ui.model.reword_description_now())))
+    ui.row(move |ui, cfg| {
+        g.set_description(Some(&group_description(
+            &ui.model.reword_description_for(cfg),
+        )))
     });
 
     // --- Rewrite notifications -------------------------------------------
@@ -1426,7 +1446,7 @@ fn reword_group(ui: &Ui, cfg: &Config, engine: EngineHandle) -> adw::Preferences
         .popover(&popover)
         .build();
     menu.add_css_class("flat");
-    for (name, url) in ENDPOINT_PRESETS {
+    for (name, url, _takes_key) in ENDPOINT_PRESETS {
         let item = gtk::Button::builder()
             .label(format!("{name} — {url}"))
             .css_classes(["flat"])
@@ -1442,7 +1462,14 @@ fn reword_group(ui: &Ui, cfg: &Config, engine: EngineHandle) -> adw::Preferences
                 pop.popdown();
             }
             let Some(field) = field.upgrade() else { return };
-            u.with(|ui| {
+            // `on_user_change` rather than the bare `with` every other
+            // widget-owning closure in this file could get away with: a
+            // button click is a user change like any other row's, and nothing
+            // here makes it safe to skip the `echo()` guard except that a
+            // redraw never clicks a button. That safety margin is free to
+            // keep and costly to lose track of the one time this handler is
+            // copied somewhere it is not so safe.
+            u.on_user_change(|ui| {
                 // The visible text *and* the config. A preset that filled
                 // the field and left it waiting for the apply button would
                 // look applied and not be.
@@ -2558,6 +2585,61 @@ mod tests {
         engine.shutdown();
     }
 
+    /// The API key row's visibility, driven from the preset *buttons*
+    /// themselves rather than from an edited `base_url` -- the path a
+    /// review finding measured wrong for vLLM: its preset is a loopback
+    /// `base_url`, which `reword_key_row_applies` used to treat as
+    /// certain proof of "no credential", hiding the only row that could
+    /// hold a key for `vllm serve --api-key …`.
+    ///
+    /// [`ENDPOINT_PRESETS`]' third field is §6's Key column, collapsed to a
+    /// bool, and it is also this test's expectation: "ignored" (`false`)
+    /// for the three purely local servers, "as configured" or `sk-…`
+    /// (`true`) for vLLM and the two remote providers. Reading the
+    /// expectation back out of the same table the buttons are built from
+    /// means a preset added there without a visibility check present would
+    /// fail loudly here rather than needing a seventh row spelled out by
+    /// hand.
+    fn the_key_row_visibility_follows_the_clicked_preset(dir: &std::path::Path) {
+        let dir = dir.join("reword-preset-key-visibility");
+        std::fs::create_dir_all(&dir).expect("a config directory of its own");
+        let (model, engine) = model_in(&dir);
+        let ui = build(model.clone(), engine.clone());
+        // Presented, like `the_reword_entry_rows_commit_on_apply_and_never_
+        // clobber_typing` -- a row's own `visible` property is set
+        // synchronously by `set_visible`, but reading it back through an
+        // unmapped, unpresented top-level is not this test's business to
+        // rely on either way, and every other real-window test in this
+        // module presents first.
+        ui.window.present();
+        spin_until(Duration::from_secs(2), || ui.window.is_mapped());
+
+        let key =
+            find_row::<adw::EntryRow>(ui.window.upcast_ref(), "API key").expect("an API key row");
+
+        for (name, url, takes_key) in ENDPOINT_PRESETS {
+            let label = format!("{name} — {url}");
+            let button = find_button(ui.window.upcast_ref(), &label)
+                .unwrap_or_else(|| panic!("a preset button labelled {label:?}"));
+            button.emit_clicked();
+            assert_eq!(
+                model.current().reword.base_url,
+                url,
+                "{name}'s preset button must commit its own URL"
+            );
+            assert_eq!(
+                key.is_visible(),
+                takes_key,
+                "{name} ({url}): key row visible = {}, want {takes_key} per §6's Key column",
+                key.is_visible()
+            );
+        }
+
+        ui.window.destroy();
+        drop(ui);
+        engine.shutdown();
+    }
+
     /// An `AdwActionRow`'s subtitle. `Option<GString>` because libadwaita
     /// distinguishes "no subtitle" from an empty one; nothing here does.
     fn subtitle_of(row: &adw::ActionRow) -> String {
@@ -2996,6 +3078,7 @@ mod tests {
         adw::init().expect("libadwaita initialises once GTK has");
         a_newly_seen_application_appears_while_the_window_is_open(dir.path());
         the_reword_entry_rows_commit_on_apply_and_never_clobber_typing(dir.path());
+        the_key_row_visibility_follows_the_clicked_preset(dir.path());
         the_test_row_reports_the_latency_against_the_deadline(dir.path());
         the_window_is_freed_after_the_reword_group_has_been_built(dir.path());
         the_window_is_freed_while_a_test_is_in_flight(dir.path());
