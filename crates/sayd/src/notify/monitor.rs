@@ -639,18 +639,20 @@ fn notification_opts() -> SayOpts {
 /// and bounded the same way: an announcement can land at most `timeout_ms`
 /// after `enabled` goes false.
 ///
-/// The composed text is *not* cleaned here, even though `policy::compose`
-/// leaves runs of whitespace and newlines behind and its module doc says the
-/// announcement must go through `sayd_core::cleanup::clean`. It does:
-/// `Engine::submit` cleans every submission with the engine's own
-/// `cleanup` config before queueing it (`sayd-core/src/engine.rs`, "let
-/// cleaned = clean(&text, &self.cfg.cleanup)"), and this path reaches the
-/// engine through exactly that call. Cleaning here as well would run the
-/// whole regex pipeline twice per notification for an identical result, and
-/// -- worse -- would leave two places claiming responsibility for an
-/// invariant only one of them actually enforces. The rewrite sits between
-/// the two cleans, which is sound because `clean` is idempotent -- pinned by
-/// `cleanup::tests::clean_is_idempotent`.
+/// The composed text is *not* cleaned here, and that is now a statement
+/// about where the clean happens rather than about there being only one.
+/// `policy::compose` leaves runs of whitespace and newlines behind and its
+/// module doc says the announcement must go through
+/// `sayd_core::cleanup::clean`. Two calls do it: `RewordPlan::admit_with`
+/// cleans on the way *in*, so what leaves the machine is the spoken form
+/// (CRITICAL 1 -- see `crate::reword`'s module doc for what a fake provider
+/// received before it did), and `Engine::submit` cleans every submission
+/// with the engine's own `cleanup` config before queueing it
+/// (`sayd-core/src/engine.rs`, "let cleaned = clean(&text, &self.cfg.cleanup)").
+/// The rewrite sits between the two, which is sound because `clean` is
+/// idempotent -- pinned by `cleanup::tests::clean_is_idempotent`. Neither
+/// call belongs here: this function would have to do it twice, once for
+/// each arm, and an arm that forgot would be invisible.
 ///
 /// `max_chars` is checked here, against the *live* config's own limit,
 /// before the text is ever handed to `submit` (Important 3), and before the
@@ -681,7 +683,7 @@ async fn speak(
 
     // `automatic`, never `requested`: this path is the standing ask that
     // `[reword] enabled` governs. `--reword` is the other one, in `dbus.rs`.
-    let plan = match RewordPlan::automatic(text, &cfg.reword) {
+    let plan = match RewordPlan::automatic(text, &cfg.reword, &cfg.cleanup) {
         Ok(plan) => plan,
         // Not being reworded, and here is the text back. Today's path
         // exactly, awaited: nothing was spawned, so two announcements
@@ -1084,14 +1086,19 @@ mod tests {
         let off = Config::default();
         assert!(!off.reword.enabled, "the shipped default is off");
         assert!(
-            RewordPlan::automatic(Written(text.into()), &off.reword).is_err(),
+            RewordPlan::automatic(Written(text.into()), &off.reword, &off.cleanup).is_err(),
             "`enabled = false` must not even look for a client"
         );
         // And in a build with no client in it, not even `enabled = true`
         // can produce a plan.
         #[cfg(not(feature = "reword"))]
         assert!(
-            RewordPlan::automatic(Written(text.into()), &rewording_on().reword).is_err(),
+            RewordPlan::automatic(
+                Written(text.into()),
+                &rewording_on().reword,
+                &rewording_on().cleanup
+            )
+            .is_err(),
             "a build without the `reword` feature has nothing to rewrite with"
         );
     }
@@ -1167,7 +1174,7 @@ mod tests {
             "the follow-up is eligible on length; the exclusion must be the rule"
         );
         assert!(
-            RewordPlan::automatic(Composed(followup.clone()), &cfg.reword).is_err(),
+            RewordPlan::automatic(Composed(followup.clone()), &cfg.reword, &cfg.cleanup).is_err(),
             "a follow-up must never be admitted to a rewrite"
         );
         // The positive control: the same text under the same config *is*
@@ -1175,7 +1182,7 @@ mod tests {
         // admit it to. Without this the assertion above would also pass
         // against a config that could never rewrite anything.
         assert_eq!(
-            RewordPlan::automatic(Written(followup.clone()), &cfg.reword).is_ok(),
+            RewordPlan::automatic(Written(followup.clone()), &cfg.reword, &cfg.cleanup).is_ok(),
             cfg!(feature = "reword"),
             "only the origin should decide this, and only a build with a client \
              can say yes at all"
@@ -1221,7 +1228,7 @@ mod tests {
 
         let text = "Alice: where do you want to go for dinner".to_string();
         assert_eq!(
-            RewordPlan::automatic(Written(text.clone()), &cfg.reword).is_ok(),
+            RewordPlan::automatic(Written(text.clone()), &cfg.reword, &cfg.cleanup).is_ok(),
             cfg!(feature = "reword"),
             "the case under test is the detaching one; in a build with a client \
              this announcement must be admitted, or the timing below proves nothing"

@@ -475,7 +475,12 @@ mod tests {
              would be false for a reason that has nothing to do with provenance"
         );
         assert_eq!(
-            crate::reword::RewordPlan::automatic(text, &reword).is_ok(),
+            crate::reword::RewordPlan::automatic(
+                text,
+                &reword,
+                &sayd_core::config::CleanupConfig::default()
+            )
+            .is_ok(),
             cfg!(feature = "reword"),
             "an application's own notification is what §1's rewrite exists for; \
              only a build with no client in it may refuse it"

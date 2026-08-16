@@ -173,7 +173,12 @@ impl SaydIface {
         // my notifications without being asked", and this caller is asking.
         // Everything else -- endpoint, eligibility, all three breakers -- is
         // the same code, because both constructors share `admit`.
-        match crate::reword::RewordPlan::requested(text, &cfg.reword) {
+        //
+        // `cleanup` goes with it: the plan cleans the text before it sends
+        // it, so an explicit `say --reword` puts the same spoken form on the
+        // wire that a notification does, and no code fence or URL from the
+        // caller's own submission leaves the machine (CRITICAL 1).
+        match crate::reword::RewordPlan::requested(text, &cfg.reword, &cfg.cleanup) {
             // The plan owns the text it was admitted for, so what is sent is
             // what `will_reword` judged; `Err` hands the original straight
             // back.

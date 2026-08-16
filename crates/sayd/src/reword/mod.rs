@@ -71,12 +71,41 @@
 //! slow but working perfectly, which is a different failure with a
 //! different right answer (`timeout_ms` is too low), and it would double
 //! count the stuck provider that this one already catches.
+//!
+//! # What leaves the machine is cleaned first
+//!
+//! §2's pipeline is `compose -> clean -> [reword] -> submit -> clean`, and
+//! the *first* clean is [`RewordPlan::admit_with`]'s, on the way in. It was
+//! missing until the final review of this milestone measured what a fake
+//! provider actually received from one notification:
+//!
+//! ````text
+//! Signal: Alice sent a link. reset here https://example.com/reset?token=SECRET123
+//! ```\nexport AWS_SECRET=hunter2\n``` **bold** _em_ ESC[31mRED ESC[0m
+//! ````
+//!
+//! -- a reset token, a fenced shell secret, markdown and an ANSI escape,
+//! verbatim, to whatever `base_url` names. The README told the user the
+//! opposite in as many words. Cleaning here is what makes that sentence
+//! true: a code fence is dropped whole, a URL is already the word `link`,
+//! and the string the guard measures is the string that gets spoken.
+//!
+//! Three consequences, all deliberate. `sayd_core::reword::check` rejects a
+//! candidate containing a code fence, and the model can no longer be shown
+//! one, so that rejection stops firing on text this daemon handed it.
+//! §4's eligibility ceiling now measures the cleaned string, which is
+//! shorter -- so a notification whose raw form was over `reword.max_chars`
+//! but whose spoken form is not becomes eligible, which is what §2 asked
+//! for. And `Engine::submit` cleans again, so `clean` runs twice over the
+//! same string; that is sound because it is idempotent, pinned by
+//! `sayd_core::cleanup::tests::clean_is_idempotent`.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
-use sayd_core::config::RewordConfig;
+use sayd_core::cleanup::clean;
+use sayd_core::config::{CleanupConfig, RewordConfig};
 use sayd_core::reword::{check, eligible, Ineligible};
 
 #[cfg(feature = "reword")]
@@ -1128,7 +1157,7 @@ impl Origin {
 pub struct RewordPlan {
     rewriter: Arc<dyn Rewriter>,
     state: Arc<RewordState>,
-    /// The exact text `will_reword` said yes to.
+    /// The exact text `will_reword` said yes to -- **after cleanup**.
     ///
     /// Owned by the plan rather than handed to `resolve` later, and this is
     /// the whole of the difference: `admit` judged *this* string against
@@ -1136,6 +1165,13 @@ pub struct RewordPlan {
     /// Measured on the previous shape -- `resolve(self, text: String)` taking
     /// any string at all -- a plan minted for a 40-character announcement
     /// could be handed 60 KB, and it compiled.
+    ///
+    /// Cleaned by [`RewordPlan::admit_with`] rather than by either call site,
+    /// for the same reason it is owned here rather than passed later: what is
+    /// judged, what is sent and what the guard measures against have to be
+    /// one string, and a call site that cleans is a call site that can
+    /// forget. See this module's doc for what was measured leaving the
+    /// machine before it did.
     text: String,
     /// The exact config the decision was taken under, cloned once here
     /// rather than read again later: `notify::monitor` refreshes its cached
@@ -1167,7 +1203,11 @@ impl RewordPlan {
     /// so the caller never names one: it passes the [`Written`] or
     /// [`Composed`] it is holding and the type decides. See [`Written`] for
     /// the two mutations that shape exists to make unspellable.
-    pub fn automatic(text: impl Into<Origin>, cfg: &RewordConfig) -> Result<RewordPlan, String> {
+    pub fn automatic(
+        text: impl Into<Origin>,
+        cfg: &RewordConfig,
+        cleanup: &CleanupConfig,
+    ) -> Result<RewordPlan, String> {
         let text = match text.into().0 {
             Provenance::Written(text) => text,
             // Matched rather than compared, so a third kind of text cannot
@@ -1177,7 +1217,7 @@ impl RewordPlan {
         if !cfg.enabled {
             return Err(text);
         }
-        RewordPlan::admit(text, cfg)
+        RewordPlan::admit(text, cfg, cleanup)
     }
 
     /// This caller's explicit ask: `say --reword`, or `reword` in the D-Bus
@@ -1204,8 +1244,12 @@ impl RewordPlan {
     /// exact rather than a guess at the reason: in a build without the
     /// feature `context` can never return a client, so it is the *first*
     /// thing `admit` fails on and `Unavailable` is the only reason there is.
-    pub fn requested(text: String, cfg: &RewordConfig) -> Result<RewordPlan, String> {
-        RewordPlan::requested_in(text, cfg, &state())
+    pub fn requested(
+        text: String,
+        cfg: &RewordConfig,
+        cleanup: &CleanupConfig,
+    ) -> Result<RewordPlan, String> {
+        RewordPlan::requested_in(text, cfg, cleanup, &state())
     }
 
     /// [`RewordPlan::requested`] with its process-wide state handed in, so
@@ -1214,23 +1258,59 @@ impl RewordPlan {
     fn requested_in(
         text: String,
         cfg: &RewordConfig,
+        cleanup: &CleanupConfig,
         state: &RewordState,
     ) -> Result<RewordPlan, String> {
-        let plan = RewordPlan::admit(text, cfg);
+        let plan = RewordPlan::admit(text, cfg, cleanup);
         if plan.is_err() && !cfg!(feature = "reword") {
             state.note_unavailable();
         }
         plan
     }
 
-    /// The shared body, and the only place [`will_reword`] is called.
+    /// The shared body: resolve a client for `cfg`, then judge the text.
     ///
     /// `Err` is not a failure: it is "this text is not being reworded, here
     /// it is back", and every caller speaks it as written.
-    fn admit(text: String, cfg: &RewordConfig) -> Result<RewordPlan, String> {
+    ///
+    /// The client is resolved *before* anything touches the text, so a build
+    /// without the `reword` feature -- where `context` can never return one
+    /// -- still pays nothing at all: no cleanup pass, no clone of the config,
+    /// no mutex.
+    fn admit(
+        text: String,
+        cfg: &RewordConfig,
+        cleanup: &CleanupConfig,
+    ) -> Result<RewordPlan, String> {
         let Some((rewriter, state)) = context(cfg) else {
             return Err(text);
         };
+        RewordPlan::admit_with(text, cfg, cleanup, rewriter, state)
+    }
+
+    /// [`RewordPlan::admit`] with its client handed in, and **the one place
+    /// the text is cleaned**.
+    ///
+    /// Split out for exactly that: `admit` reaches `context`, a process-wide
+    /// cache that builds a real HTTP client, so nothing that goes through it
+    /// can be driven by a test double. Here the cleanup, the eligibility rule
+    /// and the breakers can all be exercised against a `Rewriter` that
+    /// records what it was handed -- which is what pins the module doc's
+    /// promise that what leaves the machine is cleaned, in both builds.
+    ///
+    /// Order is load-bearing. Cleanup comes first, so [`will_reword`] judges
+    /// the string that will actually be spoken (§4) rather than one that may
+    /// be twice as long before its code block is dropped, and so the `Err`
+    /// hands back that same string: `Engine::submit` cleans it again to the
+    /// same value, because `clean` is idempotent.
+    fn admit_with(
+        text: String,
+        cfg: &RewordConfig,
+        cleanup: &CleanupConfig,
+        rewriter: Arc<dyn Rewriter>,
+        state: Arc<RewordState>,
+    ) -> Result<RewordPlan, String> {
+        let text = clean(&text, cleanup);
         if !will_reword(&text, cfg, &state) {
             return Err(text);
         }
@@ -1399,6 +1479,10 @@ mod tests {
         outcomes: Mutex<std::collections::VecDeque<Result<String, RewordError>>>,
         sleep: Duration,
         calls: AtomicUsize,
+        /// Every string this was handed, in order. What a provider would
+        /// have received, which is the only way to check CRITICAL 1 without
+        /// a socket.
+        seen: Mutex<Vec<String>>,
     }
 
     impl Stub {
@@ -1407,6 +1491,7 @@ mod tests {
                 outcomes: Mutex::new(outcomes.into()),
                 sleep: Duration::ZERO,
                 calls: AtomicUsize::new(0),
+                seen: Mutex::new(Vec::new()),
             })
         }
 
@@ -1415,13 +1500,15 @@ mod tests {
                 outcomes: Mutex::new(outcomes.into()),
                 sleep,
                 calls: AtomicUsize::new(0),
+                seen: Mutex::new(Vec::new()),
             })
         }
     }
 
     impl Rewriter for Stub {
-        fn reword(&self, _text: &str) -> Result<String, RewordError> {
+        fn reword(&self, text: &str) -> Result<String, RewordError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            lock(&self.seen).push(text.to_string());
             if !self.sleep.is_zero() {
                 std::thread::sleep(self.sleep);
             }
@@ -2058,6 +2145,106 @@ mod tests {
         ));
     }
 
+    /// CRITICAL 1: what is sent is the *cleaned* text, and the guard measures
+    /// that same string.
+    ///
+    /// The reviewer's own reproduction, cut down to the parts that matter:
+    /// one announcement carrying a URL with a reset token in its query, a
+    /// fenced shell secret, markdown emphasis and an ANSI escape. Measured
+    /// against a fake provider before this was fixed, every byte of it went
+    /// out verbatim; the README told the user the opposite. Every assertion
+    /// below fails if the `clean` in `admit_with` is deleted.
+    ///
+    /// Not gated on the `reword` feature: the plan, the cleanup and the guard
+    /// are all in the default build, and only the client that would carry the
+    /// string to a socket is not.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn what_leaves_the_machine_is_cleaned_before_it_leaves() {
+        let raw = "Alice sent a link. reset here \
+                   https://example.com/reset?token=SECRET123 \
+                   ```\nexport AWS_SECRET=hunter2\n``` **bold** _em_\u{1b}[31mRED\u{1b}[0m";
+        let stub = Stub::new(vec![Ok("Alice sent a link about a reset".into())]);
+        let state = RewordState::new();
+
+        let plan = RewordPlan::admit_with(
+            raw.to_string(),
+            &cfg(),
+            &CleanupConfig::default(),
+            stub.clone() as Arc<dyn Rewriter>,
+            state,
+        )
+        .expect("the announcement is eligible");
+        let spoken = plan.resolve().await;
+
+        let sent = lock(&stub.seen)[0].clone();
+        assert!(
+            !sent.contains("SECRET123"),
+            "a token in a URL must not reach the provider: {sent:?}"
+        );
+        assert!(
+            !sent.contains("AWS_SECRET"),
+            "a fenced block is dropped whole, contents and all: {sent:?}"
+        );
+        assert!(
+            !sent.contains("```"),
+            "and so is the fence itself: {sent:?}"
+        );
+        assert!(
+            !sent.contains("**") && !sent.contains('_'),
+            "markdown emphasis is stripped: {sent:?}"
+        );
+        assert!(
+            !sent.contains('\u{1b}'),
+            "and an ANSI escape cannot travel: {sent:?}"
+        );
+        assert!(
+            sent.contains("link"),
+            "the URL is reduced to the word `link`, not deleted: {sent:?}"
+        );
+
+        // The same string is what the fallback speaks, and what §4 and §3
+        // measure: `Engine::submit` cleans it again to itself.
+        assert_eq!(
+            spoken.fallback.as_deref(),
+            Some(sent.as_str()),
+            "the text a rewrite replaced is the cleaned one, not the raw one"
+        );
+        assert_eq!(clean(&sent, &CleanupConfig::default()), sent);
+    }
+
+    /// The other half of CRITICAL 1: cleaning happens *before* the
+    /// eligibility rule, so §4's ceiling measures the string that gets spoken.
+    ///
+    /// A fenced build log is the case. Raw it is over `reword.max_chars` and
+    /// was refused as `TooLong`; cleaned it is a short sentence -- and a short
+    /// sentence is exactly what this feature exists to improve.
+    #[test]
+    fn eligibility_is_decided_on_the_cleaned_text_not_the_raw_one() {
+        let raw = format!(
+            "The build failed with this error\n```\n{}\n```",
+            "x".repeat(600)
+        );
+        let mut c = cfg();
+        c.max_chars = 400;
+        assert!(
+            eligible(&raw, c.max_chars).is_err(),
+            "raw, this is over the ceiling"
+        );
+
+        let stub = Stub::new(vec![Ok("The build failed.".into())]);
+        assert!(
+            RewordPlan::admit_with(
+                raw,
+                &c,
+                &CleanupConfig::default(),
+                stub as Arc<dyn Rewriter>,
+                RewordState::new(),
+            )
+            .is_ok(),
+            "cleaned, it is a short sentence and is worth rewriting"
+        );
+    }
+
     /// The two asks, and the one difference between them: `enabled` governs
     /// the automatic rewrite and nothing else. "Rewrite my notifications
     /// without being asked" is what that switch says, and `--reword` is
@@ -2080,18 +2267,18 @@ mod tests {
         off.enabled = false;
 
         assert_eq!(
-            RewordPlan::automatic(Written(text.into()), &off).err(),
+            RewordPlan::automatic(Written(text.into()), &off, &CleanupConfig::default()).err(),
             Some(text.to_string()),
             "`enabled = false` must not even look for a client, and the text \
              comes straight back"
         );
         assert_eq!(
-            RewordPlan::requested(text.into(), &off).is_ok(),
+            RewordPlan::requested(text.into(), &off, &CleanupConfig::default()).is_ok(),
             cfg!(feature = "reword"),
             "an explicit --reword does not need `enabled`"
         );
         assert_eq!(
-            RewordPlan::automatic(Written(text.into()), &cfg()).is_ok(),
+            RewordPlan::automatic(Written(text.into()), &cfg(), &CleanupConfig::default()).is_ok(),
             cfg!(feature = "reword")
         );
     }
@@ -2107,14 +2294,16 @@ mod tests {
     fn composed_text_is_never_admitted() {
         let followup = "Signal: 3 more notifications";
         assert_eq!(
-            RewordPlan::automatic(Composed(followup.into()), &cfg()).err(),
+            RewordPlan::automatic(Composed(followup.into()), &cfg(), &CleanupConfig::default())
+                .err(),
             Some(followup.to_string()),
             "a follow-up is refused, and gets its own text back to speak"
         );
         // ...and not because it was ineligible on its own account: the same
         // string with the other origin is admitted wherever there is a client.
         assert_eq!(
-            RewordPlan::automatic(Written(followup.into()), &cfg()).is_ok(),
+            RewordPlan::automatic(Written(followup.into()), &cfg(), &CleanupConfig::default())
+                .is_ok(),
             cfg!(feature = "reword"),
             "the exclusion must be the origin, not the length"
         );
@@ -2137,7 +2326,7 @@ mod tests {
     fn an_explicit_reword_says_so_when_the_build_cannot_rewrite() {
         let state = RewordState::new();
         let text = "Alice: where do you want to go for dinner";
-        let plan = RewordPlan::requested_in(text.into(), &cfg(), &state);
+        let plan = RewordPlan::requested_in(text.into(), &cfg(), &CleanupConfig::default(), &state);
         assert_eq!(plan.is_ok(), cfg!(feature = "reword"));
         assert_eq!(
             state.unavailable_logged(),
