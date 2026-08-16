@@ -719,9 +719,6 @@ impl SettingsModel {
     /// The *pending* config, not the last-written file: otherwise a user who
     /// types a key and immediately presses Test is told their old key is
     /// rejected, which is the single most confusing thing this row could do.
-    // `#[allow(dead_code)]`: the Test row's widgets are a later task in this
-    // milestone and are the only caller.
-    #[allow(dead_code)]
     pub fn test_reword(&self, text: String) -> async_channel::Receiver<TestOutcome> {
         // Bounded at one: there is exactly one outcome, and the button is
         // disabled until it arrives.
@@ -1108,6 +1105,11 @@ pub enum TestOutcome {
     },
     /// Answered, and §3's guard threw it away. The answer is still shown:
     /// that is how a user discovers their model likes to explain itself.
+    ///
+    /// `answer` is the candidate exactly as it came off the wire -- untrimmed
+    /// and unbounded. [`TestOutcome::title`] is what makes it fit in a row --
+    /// see `shown_answer` -- and note that nothing but the guard's own
+    /// `Oversized` check bounds what can be in here.
     Rejected {
         answer: String,
         reason: sayd_core::reword::Rejection,
@@ -1118,7 +1120,26 @@ pub enum TestOutcome {
         env_var: String,
         message: Option<String>,
     },
+    /// Nothing answered: DNS, the connection or the transport failed.
     Unreachable {
+        detail: String,
+        endpoint: String,
+    },
+    /// Something answered, and it was not a chat completion this client can
+    /// read -- no `choices[0].message.content` in the body.
+    ///
+    /// Its own variant rather than a second spelling of
+    /// [`TestOutcome::Unreachable`], because the two send a user to different
+    /// places. "Could not reach the provider" is an instruction to check that
+    /// the server is up and that no firewall is in the way; a reverse proxy
+    /// answering its own error page, a health endpoint, or Ollama's native
+    /// `/api/chat` on a URL that should have been `/v1` is a server that is
+    /// up, reachable, and answering -- and every minute spent on the first
+    /// investigation is a minute not spent looking at the URL. The subtitle
+    /// is the same shape as `Unreachable`'s, because the detail and the
+    /// endpoint are what both rows have to show; it is the *title* that must
+    /// not claim something the request disproved.
+    Unusable {
         detail: String,
         endpoint: String,
     },
@@ -1177,21 +1198,67 @@ fn first_note(first: bool) -> &'static str {
     }
 }
 
-// `#[allow(dead_code)]`: the Test row's widgets are a later task in this
-// milestone and are the only caller of these two. They are written here,
-// with a test each, because `window.rs` is the one layer with no test
+/// The longest a provider's own answer may be when it is put in front of a
+/// user as a row title.
+///
+/// Generous enough to show a chatty model's whole preamble -- which is the
+/// thing the [`TestOutcome::Rejected`] row exists to let a user recognise --
+/// and short enough that the row stays a row. Characters and not bytes,
+/// because it bounds what is *read*.
+const ANSWER_DISPLAY_MAX_CHARS: usize = 200;
+
+/// A provider's answer, made fit to be a row title.
+///
+/// Two things, both of which the window is forbidden to decide for itself:
+///
+/// - **Trimmed.** [`TestOutcome::Rejected`] carries the candidate as it
+///   arrived, before `sayd_core::reword::check` trims it -- which is the
+///   right thing to carry, since the leading blank lines are part of what the
+///   user is being shown. But a model answering `"\n\nSure!\nHere:"` would
+///   otherwise put two empty lines at the top of the row and push the text
+///   the row is *about* out of sight.
+/// - **Bounded.** Nothing between the guard and here caps this. The guard's
+///   `Oversized` check rejects a candidate past four bytes per character of
+///   its ceiling -- for the default test text that is about 372 bytes -- and
+///   the HTTP client caps its read at 64 KiB, so anything in between reaches
+///   this function verbatim. A local model with a runaway generation against
+///   a server that ignores `max_tokens` is the ordinary way to get there, and
+///   that user is exactly who this row is for: they need to see that the
+///   model is rambling, not to have the rambling pasted into their window.
+///
+/// The ellipsis is a single `…` and is added only when something was
+/// actually cut, so a 200-character answer does not read as a truncated one.
+fn shown_answer(answer: &str) -> String {
+    let answer = answer.trim();
+    match answer.char_indices().nth(ANSWER_DISPLAY_MAX_CHARS) {
+        // `char_indices` gives a boundary by construction, so this cannot
+        // split a multi-byte character.
+        Some((end, _)) => format!("{}…", &answer[..end]),
+        None => answer.to_string(),
+    }
+}
+
+// The Reword group's result row is the only caller of these two. They are
+// here, with a test each, because `window.rs` is the one layer with no test
 // coverage and so must not decide anything -- it maps a variant onto two
-// labels and a visibility and holds no rule of its own.
-#[allow(dead_code)]
+// labels and a visibility and holds no rule of its own. That includes the
+// truncation in `title()`: a window that decided for itself how much of a
+// provider's answer to show would be deciding it untested.
 impl TestOutcome {
     /// The result row's title: the rewritten text where there is one,
     /// because the rewritten text is the point.
     pub fn title(&self) -> String {
         match self {
             TestOutcome::Rewritten { text, .. } | TestOutcome::Slower { text, .. } => text.clone(),
-            TestOutcome::Rejected { answer, .. } => answer.clone(),
+            // Trimmed and bounded here rather than in the window: see
+            // `shown_answer`, and note that this is a row title in a GTK
+            // label, fed by a string a provider chose.
+            TestOutcome::Rejected { answer, .. } => shown_answer(answer),
             TestOutcome::AuthRejected { .. } => "The provider rejected the API key".into(),
             TestOutcome::Unreachable { .. } => "Could not reach the provider".into(),
+            // Not "could not reach": it was reached, and it answered. See
+            // [`TestOutcome::Unusable`].
+            TestOutcome::Unusable { .. } => "The endpoint answered something unusable".into(),
             TestOutcome::NoSuchModel { .. } => "The provider does not have that model".into(),
             TestOutcome::RateLimited { .. } => "The provider is rate limiting".into(),
             TestOutcome::NoAnswer { ceiling, .. } => {
@@ -1255,7 +1322,10 @@ impl TestOutcome {
                     parenthesised(message)
                 )
             }
-            TestOutcome::Unreachable { detail, endpoint } => format!("{detail} — {endpoint}"),
+            // One shape for both: what went wrong, and the endpoint it went
+            // wrong against. The titles are what tell them apart.
+            TestOutcome::Unreachable { detail, endpoint }
+            | TestOutcome::Unusable { detail, endpoint } => format!("{detail} — {endpoint}"),
             TestOutcome::NoSuchModel {
                 status,
                 model,
@@ -1478,11 +1548,13 @@ fn outcome_for_error(e: RewordError, cfg: &RewordConfig) -> TestOutcome {
         },
         RewordError::NotConfigured(reason) => TestOutcome::NotConfigured { reason },
         RewordError::Unavailable => TestOutcome::Unavailable,
-        // A body that came back and could not be used. Reported as an
-        // unreachable provider rather than as its own row because the fix is
-        // the same one -- look at what is answering on that endpoint -- and
-        // the detail, which is where the difference actually is, is shown.
-        RewordError::Malformed(detail) => TestOutcome::Unreachable {
+        // A body that came back and could not be used. *Not* an unreachable
+        // provider: the request completed and something answered it, so a
+        // row titled "could not reach" would send the user to check that the
+        // server is running and that no firewall is in the way -- the one
+        // investigation the answer has already ruled out. See
+        // [`TestOutcome::Unusable`].
+        RewordError::Malformed(detail) => TestOutcome::Unusable {
             detail,
             endpoint: cfg.base_url.clone(),
         },
@@ -3499,18 +3571,20 @@ mod tests {
         drop(model);
         engine.shutdown();
 
-        // A body that came back and could not be used. Same row as an
-        // unreachable provider -- the fix is to look at what is answering on
-        // that endpoint -- with the detail that distinguishes them.
+        // A body that came back and could not be used. The subtitle is the
+        // same shape as an unreachable provider's -- the detail and the
+        // endpoint are what both rows have to show -- but the title must not
+        // say the provider could not be reached, because it was: it answered,
+        // and what it answered is the thing to look at. A user sent to check
+        // whether their server is up is a user not looking at their URL.
         let dir = tempfile::tempdir().expect("tempdir");
         let (model, engine) = model_with(
             dir.path(),
             Canned::new(Err(RewordError::Malformed("no choices[0]".into()))),
         );
-        assert_eq!(
-            outcome_of(&model, REWORD_TEST_DEFAULT).subtitle(),
-            "no choices[0] — http://localhost:11434/v1"
-        );
+        let out = outcome_of(&model, REWORD_TEST_DEFAULT);
+        assert_eq!(out.title(), "The endpoint answered something unusable");
+        assert_eq!(out.subtitle(), "no choices[0] — http://localhost:11434/v1");
         drop(model);
         engine.shutdown();
 
@@ -3598,6 +3672,92 @@ mod tests {
              notification would have been spoken as written (first request — \
              includes connection setup)"
         );
+    }
+
+    /// A rejected answer is the one string in this window a provider writes
+    /// straight into a row title, and it arrives with nothing bounding it.
+    ///
+    /// The guard's `Oversized` check rejects a candidate past four bytes per
+    /// character of its ceiling -- about 372 bytes for the default test text
+    /// -- and the HTTP client stops reading at 64 KiB, so every answer
+    /// between those two bounds reaches `title()` verbatim. A local model
+    /// with a runaway generation against a server that ignores `max_tokens`
+    /// is the ordinary way to produce one, and that user is precisely who
+    /// this row is for. It also arrives *before* `check` trims it, so a model
+    /// that opens with two blank lines would push its own text out of the
+    /// top of the row.
+    #[test]
+    fn a_rejected_answer_is_trimmed_and_bounded_before_it_becomes_a_title() {
+        // Trimmed. The variant keeps the candidate as it came off the wire;
+        // `title()` is what makes it fit in a row.
+        let padded = TestOutcome::Rejected {
+            answer: "\n\nSure!\nHere:\n".into(),
+            reason: sayd_core::reword::Rejection::ExtraLines(1),
+        };
+        assert_eq!(
+            padded.title(),
+            "Sure!\nHere:",
+            "leading blank lines would push the text the row is about out of sight"
+        );
+
+        // Bounded, with an ellipsis so the cut is visible rather than a
+        // sentence that appears to end mid-word.
+        let runaway = "x".repeat(1000);
+        let long = TestOutcome::Rejected {
+            answer: runaway.clone(),
+            reason: sayd_core::reword::Rejection::TooLong {
+                chars: 1000,
+                limit: 93,
+            },
+        };
+        let title = long.title();
+        assert_eq!(title.chars().count(), ANSWER_DISPLAY_MAX_CHARS + 1);
+        assert!(title.ends_with('…'));
+        assert!(title.starts_with(&runaway[..ANSWER_DISPLAY_MAX_CHARS]));
+
+        // Exactly at the bound is not a truncation, so it does not claim to
+        // be one.
+        let exact = "y".repeat(ANSWER_DISPLAY_MAX_CHARS);
+        assert_eq!(
+            TestOutcome::Rejected {
+                answer: exact.clone(),
+                reason: sayd_core::reword::Rejection::CodeFence,
+            }
+            .title(),
+            exact
+        );
+
+        // Multi-byte, because the cut is by character and the string is
+        // whatever a provider chose to send: an index computed in bytes
+        // would panic here rather than truncate.
+        let wide = "é".repeat(400);
+        let title = TestOutcome::Rejected {
+            answer: wide,
+            reason: sayd_core::reword::Rejection::CodeFence,
+        }
+        .title();
+        assert_eq!(title.chars().count(), ANSWER_DISPLAY_MAX_CHARS + 1);
+
+        // And end to end, so the bound is on what the row actually shows
+        // rather than on a variant a test built by hand. 300 characters is
+        // over the guard's 93-character ceiling for this text and under the
+        // byte bound at which it stops counting, which is the window this
+        // cap exists for.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (model, engine) = model_with(
+            dir.path(),
+            Canned::new(Ok(format!("  {}", "z".repeat(300)))),
+        );
+        let out = outcome_of(&model, REWORD_TEST_DEFAULT);
+        assert!(matches!(out, TestOutcome::Rejected { .. }), "{out:?}");
+        assert_eq!(out.title().chars().count(), ANSWER_DISPLAY_MAX_CHARS + 1);
+        assert!(
+            out.title().starts_with('z'),
+            "the leading spaces are trimmed: {:?}",
+            out.title()
+        );
+        drop(model);
+        engine.shutdown();
     }
 
     /// The first request against an endpoint pays for DNS and a handshake,
