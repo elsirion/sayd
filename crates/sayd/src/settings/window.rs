@@ -38,7 +38,7 @@ use std::time::Duration;
 
 use adw::prelude::*;
 use gtk4 as gtk;
-use sayd_core::config::{CleanupConfig, Config, NotificationConfig, UrlPolicy};
+use sayd_core::config::{CleanupConfig, Config, NotificationConfig, Provider, UrlPolicy};
 use sayd_core::engine::SayOpts;
 use sayd_core::handle::EngineHandle;
 use sayd_core::queue::{Policy, Source as QueueSource};
@@ -1446,7 +1446,60 @@ fn reword_group(ui: &Ui, cfg: &Config, engine: EngineHandle) -> adw::Preferences
         .popover(&popover)
         .build();
     menu.add_css_class("flat");
-    for (name, url, _takes_key) in ENDPOINT_PRESETS {
+    endpoint.add_suffix(&menu);
+    bind_entry(
+        ui,
+        &endpoint,
+        |cfg| cfg.reword.base_url.clone(),
+        |cfg, v| cfg.reword.base_url = v,
+    );
+    group.add(&endpoint);
+
+    // --- Provider -----------------------------------------------------------
+    // `Combo`, not a bare `adw::ComboRow`: `AdwComboRow` has no "nothing is
+    // selected" state (see `Combo`'s doc comment), and an unset or
+    // unrecognised `provider` is exactly that state -- the fresh-install
+    // default, and any file `validate` has not had a chance to refuse yet.
+    // A bare row would force a real selection into view and make an unset
+    // field look configured.
+    //
+    // The choices are `Provider::NAMES` itself, not the two strings written
+    // out here: a third provider must be addable without touching this
+    // file, per the module doc comment's rule that the window is wiring
+    // only.
+    let provider_row = Combo::new("Provider", &Provider::NAMES, |p| {
+        if p.is_empty() {
+            "not set — required while Rewrite notifications is on".to_string()
+        } else {
+            format!("‘{p}’ — not a provider this build knows")
+        }
+    });
+    let provider_position = |name: &str| Provider::NAMES.iter().position(|n| *n == name);
+    let current_provider = cfg.reword.provider.clone().unwrap_or_default();
+    provider_row.show(&current_provider, provider_position(&current_provider));
+    let c = provider_row.clone();
+    ui.row(move |_, cfg| {
+        let current = cfg.reword.provider.clone().unwrap_or_default();
+        c.show(&current, provider_position(&current));
+    });
+    let u = ui.downgrade();
+    let synthetic = provider_row.synthetic.clone();
+    provider_row.row.connect_selected_notify(move |row| {
+        u.on_user_change(|u| {
+            match Combo::choice(row, &synthetic).and_then(|i| Provider::NAMES.get(i)) {
+                Some(name) => {
+                    let name = (*name).to_string();
+                    u.apply(|c| c.reword.provider = Some(name));
+                }
+                None => u.redraw(&u.model.current()),
+            }
+        });
+    });
+    group.add(&provider_row.row);
+
+    // The preset buttons are populated only now, so a click can reach the
+    // Provider row it must also update -- see the loop body.
+    for (name, url, _takes_key, provider) in ENDPOINT_PRESETS {
         let item = gtk::Button::builder()
             .label(format!("{name} — {url}"))
             .css_classes(["flat"])
@@ -1455,8 +1508,14 @@ fn reword_group(ui: &Ui, cfg: &Config, engine: EngineHandle) -> adw::Preferences
         let pop = popover.downgrade();
         // Weak, like every other widget a handler here refers to: this
         // button is inside the popover the MenuButton owns, which is a
-        // suffix of the row.
+        // suffix of the Endpoint row.
         let field = endpoint.downgrade();
+        // Not weak: the Provider row is not in this button's own ownership
+        // chain (it is a sibling row added straight to `group`), so a
+        // strong clone here cannot form the cycle the comment above is
+        // guarding against -- `Combo::row`'s own handlers never refer back
+        // to this button or anything that owns it.
+        let pr = provider_row.clone();
         item.connect_clicked(move |_| {
             if let Some(pop) = pop.upgrade() {
                 pop.popdown();
@@ -1470,23 +1529,24 @@ fn reword_group(ui: &Ui, cfg: &Config, engine: EngineHandle) -> adw::Preferences
             // keep and costly to lose track of the one time this handler is
             // copied somewhere it is not so safe.
             u.on_user_change(|ui| {
-                // The visible text *and* the config. A preset that filled
-                // the field and left it waiting for the apply button would
-                // look applied and not be.
-                ui.quietly(|| field.set_text(url));
-                ui.apply(|c| c.reword.base_url = url.to_string());
+                // The visible text *and* the config, for both rows. A
+                // preset that filled the fields and left them waiting for
+                // Apply would look applied and not be -- and a preset that
+                // committed `base_url` without `provider` would reproduce
+                // the exact bug this task exists to close (see
+                // `ENDPOINT_PRESETS`'s doc comment on the fourth field).
+                ui.quietly(|| {
+                    field.set_text(url);
+                    pr.show(provider, provider_position(provider));
+                });
+                ui.apply(|c| {
+                    c.reword.base_url = url.to_string();
+                    c.reword.provider = Some(provider.to_string());
+                });
             });
         });
         presets.append(&item);
     }
-    endpoint.add_suffix(&menu);
-    bind_entry(
-        ui,
-        &endpoint,
-        |cfg| cfg.reword.base_url.clone(),
-        |cfg, v| cfg.reword.base_url = v,
-    );
-    group.add(&endpoint);
 
     // --- Model ------------------------------------------------------------
     let model_row = adw::EntryRow::builder()
@@ -2683,7 +2743,7 @@ mod tests {
         let key =
             find_row::<adw::EntryRow>(ui.window.upcast_ref(), "API key").expect("an API key row");
 
-        for (name, url, takes_key) in ENDPOINT_PRESETS {
+        for (name, url, takes_key, _provider) in ENDPOINT_PRESETS {
             let label = format!("{name} — {url}");
             let button = find_button(ui.window.upcast_ref(), &label)
                 .unwrap_or_else(|| panic!("a preset button labelled {label:?}"));
@@ -2700,6 +2760,88 @@ mod tests {
                 key.is_visible()
             );
         }
+
+        ui.window.destroy();
+        drop(ui);
+        engine.shutdown();
+    }
+
+    /// Same premise as `the_key_row_visibility_follows_the_clicked_preset`,
+    /// for the field that preset used to leave unset entirely: one click on
+    /// a preset button must commit `reword.provider` as well as
+    /// `base_url`, because [`ENDPOINT_PRESETS`]'s fourth field exists
+    /// precisely so the endpoint presets stop reproducing the boot trap
+    /// this task closes.
+    fn clicking_a_preset_commits_its_provider_too(dir: &std::path::Path) {
+        let dir = dir.join("reword-preset-provider");
+        std::fs::create_dir_all(&dir).expect("a config directory of its own");
+        let (model, engine) = model_in(&dir);
+        let ui = build(model.clone(), engine.clone());
+        ui.window.present();
+        spin_until(Duration::from_secs(2), || ui.window.is_mapped());
+
+        for (name, url, _takes_key, provider) in ENDPOINT_PRESETS {
+            let label = format!("{name} — {url}");
+            let button = find_button(ui.window.upcast_ref(), &label)
+                .unwrap_or_else(|| panic!("a preset button labelled {label:?}"));
+            button.emit_clicked();
+            assert_eq!(
+                model.current().reword.provider.as_deref(),
+                Some(provider),
+                "{name}'s preset button must commit its own provider, not just its URL"
+            );
+        }
+
+        ui.window.destroy();
+        drop(ui);
+        engine.shutdown();
+    }
+
+    /// The reason `Combo` and not a bare `adw::ComboRow` backs the Provider
+    /// row (see `reword_group`'s comment on it): an unset or unrecognised
+    /// `provider` must still be shown as what it is, rather than the row
+    /// silently settling on its first real entry (`"llama-cpp"`) the way a
+    /// bare `AdwComboRow`'s forced autoselect would -- see `Combo`'s own
+    /// doc comment for the measured version of that failure. `Combo::
+    /// show`'s tell is its subtitle: non-empty while it is describing a
+    /// value it cannot express as a real choice, cleared once it is.
+    fn the_provider_row_does_not_silently_rewrite_an_unset_or_unrecognised_value(
+        dir: &std::path::Path,
+    ) {
+        let dir = dir.join("reword-provider-unset");
+        std::fs::create_dir_all(&dir).expect("a config directory of its own");
+        let (model, engine) = model_in(&dir);
+        let ui = build(model.clone(), engine.clone());
+        ui.window.present();
+        spin_until(Duration::from_secs(2), || ui.window.is_mapped());
+
+        let provider_row = find_row::<adw::ComboRow>(ui.window.upcast_ref(), "Provider")
+            .expect("a Provider row");
+
+        // The fresh-install default: unset, per `RewordConfig::default`.
+        assert!(
+            !provider_row.subtitle().unwrap_or_default().is_empty(),
+            "an unset provider must not display as the first real entry"
+        );
+        assert_eq!(
+            model.current().reword.provider, None,
+            "merely displaying the row must not have written anything"
+        );
+
+        // A hand-edited value this build does not recognise, with
+        // `enabled` left false -- exactly the file state `normalize`
+        // leaves alone on load, and the asymmetry `validate_accepts_
+        // reword_disabled_regardless_of_provider` pins on the model side.
+        ui.apply(|c| c.reword.provider = Some("azure-nonsense".to_string()));
+        assert!(
+            !provider_row.subtitle().unwrap_or_default().is_empty(),
+            "an unrecognised provider must not display as the first real entry either"
+        );
+        assert_eq!(
+            model.current().reword.provider.as_deref(),
+            Some("azure-nonsense"),
+            "the row must not have silently rewritten the value it cannot express"
+        );
 
         ui.window.destroy();
         drop(ui);
@@ -3244,6 +3386,8 @@ mod tests {
         a_newly_seen_application_appears_while_the_window_is_open(dir.path());
         the_reword_entry_rows_commit_on_apply_and_never_clobber_typing(dir.path());
         the_key_row_visibility_follows_the_clicked_preset(dir.path());
+        clicking_a_preset_commits_its_provider_too(dir.path());
+        the_provider_row_does_not_silently_rewrite_an_unset_or_unrecognised_value(dir.path());
         the_test_row_reports_the_latency_against_the_deadline(dir.path());
         pressing_enter_while_a_test_runs_does_not_start_a_second_one(dir.path());
         the_window_is_freed_after_the_reword_group_has_been_built(dir.path());

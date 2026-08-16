@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
-use sayd_core::config::{Config, RewordConfig};
+use sayd_core::config::{Config, Provider, RewordConfig};
 
 use crate::config_watch::ConfigStore;
 use crate::notify::seen::{self, SeenApp};
@@ -136,13 +136,25 @@ pub const REWORD_TEST_DEFAULT: &str = "Alice: where do you want to go for dinner
 /// machine, therefore no credential" the way Ollama, llama.cpp `server` and
 /// LM Studio can. PPQ and OpenAI are `true` here too, for completeness with
 /// the table, but their row is already shown by the loopback check alone.
-pub const ENDPOINT_PRESETS: [(&str, &str, bool); 6] = [
-    ("Ollama", "http://localhost:11434/v1", false),
-    ("llama.cpp server", "http://localhost:8080/v1", false),
-    ("LM Studio", "http://localhost:1234/v1", false),
-    ("vLLM", "http://localhost:8000/v1", true),
-    ("PPQ", "https://api.ppq.ai/v1", true),
-    ("OpenAI", "https://api.openai.com/v1", true),
+///
+/// The fourth field is the `reword.provider` value this endpoint must be
+/// driven with, i.e. what the Provider row (`window.rs`'s `reword_group`)
+/// commits alongside the URL when a preset button is clicked -- one click
+/// configures both, rather than leaving `provider` unset the way it was
+/// before this field existed (see
+/// [`sayd_core::config::reword_startup_refusal`] for what an unset
+/// provider costs). Only `"llama.cpp server"` carries `"llama-cpp"`; every
+/// other row carries `"generic"`, because `Provider`'s doc comment is
+/// explicit that `llama-cpp` is the only dialect measured, and `"generic"`
+/// is the byte-identical-to-before choice for the five presets this field
+/// did not change anything about.
+pub const ENDPOINT_PRESETS: [(&str, &str, bool, &str); 6] = [
+    ("Ollama", "http://localhost:11434/v1", false, "generic"),
+    ("llama.cpp server", "http://localhost:8080/v1", false, "llama-cpp"),
+    ("LM Studio", "http://localhost:1234/v1", false, "generic"),
+    ("vLLM", "http://localhost:8000/v1", true, "generic"),
+    ("PPQ", "https://api.ppq.ai/v1", true, "generic"),
+    ("OpenAI", "https://api.openai.com/v1", true, "generic"),
 ];
 
 /// How long a burst of edits is allowed to keep collapsing into one write.
@@ -1044,6 +1056,22 @@ fn validate(cfg: &mut Config) -> Result<(), String> {
             known_speed_modes()
         ));
     }
+    // Gated on `enabled`, exactly as `reword_startup_refusal` is: turning
+    // Rewrite notifications *off* with no provider set is fine and must
+    // stay fine, since nothing reads `provider` while it is off. With it
+    // on, an unset or unrecognised provider is the file
+    // `reword_startup_refusal` would then refuse to boot from -- refusing
+    // the edit here is what keeps the window from ever writing one, which
+    // is the whole point: the settings window is reached through the
+    // running daemon's tray, so a daemon that will not start has taken the
+    // GUI away along with it.
+    if cfg.reword.enabled && cfg.reword.resolved_provider().is_none() {
+        return Err(format!(
+            "reword.provider ({}) is not a provider this build knows; expected one of {}",
+            cfg.reword.provider.as_deref().unwrap_or("unset"),
+            Provider::NAMES.join(", ")
+        ));
+    }
     Ok(())
 }
 
@@ -1540,7 +1568,7 @@ pub fn reword_key_row_applies(cfg: &RewordConfig) -> bool {
     }
     let is_key_taking_preset = ENDPOINT_PRESETS
         .iter()
-        .any(|(_, url, takes_key)| *takes_key && *url == cfg.base_url);
+        .any(|(_, url, takes_key, _)| *takes_key && *url == cfg.base_url);
     if is_key_taking_preset {
         return true;
     }
@@ -2798,6 +2826,102 @@ mod tests {
         };
         assert!(!normalize(&mut from_file).is_empty());
         assert_eq!(from_file.model, FALLBACK_MODEL);
+    }
+
+    /// The boot trap this task exists to close: `reword.enabled = true`
+    /// with no usable `provider` used to pass `validate` untouched, get
+    /// written to disk, and then be refused at the next daemon start by
+    /// `reword_startup_refusal` -- taking the tray, and so the settings
+    /// window, down with it. `validate` must refuse the edit before it
+    /// reaches disk, for both ways a provider can fail to resolve: unset,
+    /// and set to something this build does not recognise.
+    #[test]
+    fn validate_refuses_reword_enabled_with_no_usable_provider() {
+        let mut unset = Config {
+            reword: Box::new(RewordConfig {
+                enabled: true,
+                provider: None,
+                ..RewordConfig::default()
+            }),
+            ..Config::default()
+        };
+        let err = validate(&mut unset).expect_err("an unset provider must be refused");
+        assert!(
+            err.contains("reword.provider"),
+            "the message must name the field: {err:?}"
+        );
+        for name in Provider::NAMES {
+            assert!(
+                err.contains(name),
+                "the message must list every known provider, missing {name:?}: {err:?}"
+            );
+        }
+
+        let mut bad = Config {
+            reword: Box::new(RewordConfig {
+                enabled: true,
+                provider: Some("azure-nonsense".into()),
+                ..RewordConfig::default()
+            }),
+            ..Config::default()
+        };
+        let err = validate(&mut bad).expect_err("an unrecognised provider must be refused");
+        assert!(
+            err.contains("reword.provider"),
+            "the message must name the field: {err:?}"
+        );
+        for name in Provider::NAMES {
+            assert!(
+                err.contains(name),
+                "the message must list every known provider, missing {name:?}: {err:?}"
+            );
+        }
+    }
+
+    /// The two providers this build actually knows must not be refused --
+    /// otherwise the Provider row could not be used to escape the trap
+    /// `validate_refuses_reword_enabled_with_no_usable_provider` pins.
+    #[test]
+    fn validate_accepts_reword_enabled_with_each_known_provider() {
+        for name in Provider::NAMES {
+            let mut cfg = Config {
+                reword: Box::new(RewordConfig {
+                    enabled: true,
+                    provider: Some(name.to_string()),
+                    ..RewordConfig::default()
+                }),
+                ..Config::default()
+            };
+            assert!(
+                validate(&mut cfg).is_ok(),
+                "{name} is in Provider::NAMES and must be accepted"
+            );
+        }
+    }
+
+    /// The deliberate asymmetry against `reword_startup_refusal`, pinned on
+    /// the window side: flipping Rewrite notifications *off* must stay fine
+    /// regardless of what `provider` says, including nonsense left over
+    /// from before the switch was turned off and no provider at all. The
+    /// daemon never reads `provider` while `enabled` is false, so there is
+    /// nothing here to refuse.
+    #[test]
+    fn validate_accepts_reword_disabled_regardless_of_provider() {
+        for provider in [None, Some("nonsense".to_string())] {
+            let mut cfg = Config {
+                reword: Box::new(RewordConfig {
+                    enabled: false,
+                    provider,
+                    ..RewordConfig::default()
+                }),
+                ..Config::default()
+            };
+            assert!(
+                validate(&mut cfg).is_ok(),
+                "reword.enabled = false must accept any provider value: {:?}",
+                cfg.reword.provider
+            );
+        }
     }
 
     /// IMPORTANT 3, the part the user actually hits: a file the window
@@ -4367,9 +4491,9 @@ mod tests {
         assert_eq!(ENDPOINT_PRESETS.len(), 6);
         assert_eq!(
             ENDPOINT_PRESETS[0],
-            ("Ollama", "http://localhost:11434/v1", false)
+            ("Ollama", "http://localhost:11434/v1", false, "generic")
         );
-        for (name, url, _takes_key) in ENDPOINT_PRESETS {
+        for (name, url, _takes_key, _provider) in ENDPOINT_PRESETS {
             assert!(
                 sayd_core::reword::parse_base_url(url).is_ok(),
                 "{name}'s preset must be a usable endpoint"
@@ -4378,7 +4502,7 @@ mod tests {
         assert!(
             ENDPOINT_PRESETS
                 .iter()
-                .any(|(_, url, _)| *url == RewordConfig::default().base_url),
+                .any(|(_, url, _, _)| *url == RewordConfig::default().base_url),
             "the default endpoint must be offered as a preset, so a user who \
              wandered away from it can get back"
         );
@@ -4387,18 +4511,50 @@ mod tests {
         // local servers whose loopback address is enough on its own, "as
         // configured" or `sk-…` for the three that can (or must) carry one.
         for name in ["Ollama", "llama.cpp server", "LM Studio"] {
-            let &(_, _, takes_key) = ENDPOINT_PRESETS
+            let &(_, _, takes_key, _) = ENDPOINT_PRESETS
                 .iter()
-                .find(|(n, _, _)| *n == name)
+                .find(|(n, _, _, _)| *n == name)
                 .expect("preset present");
             assert!(!takes_key, "{name}'s Key column is \"ignored\"");
         }
         for name in ["vLLM", "PPQ", "OpenAI"] {
-            let &(_, _, takes_key) = ENDPOINT_PRESETS
+            let &(_, _, takes_key, _) = ENDPOINT_PRESETS
                 .iter()
-                .find(|(n, _, _)| *n == name)
+                .find(|(n, _, _, _)| *n == name)
                 .expect("preset present");
             assert!(takes_key, "{name}'s Key column is not \"ignored\"");
+        }
+
+        // The fourth field, `reword.provider`'s value for this endpoint,
+        // must always be something `Provider::parse` accepts -- a preset
+        // that wrote a value the config layer refuses would be the exact
+        // trap this task exists to close, just moved one click earlier.
+        for (name, _url, _takes_key, provider) in ENDPOINT_PRESETS {
+            assert!(
+                Provider::parse(provider).is_some(),
+                "{name}'s preset provider {provider:?} must be one Provider::parse accepts"
+            );
+        }
+
+        // llama.cpp `server` is the only endpoint here whose thinking-mode
+        // dialect has actually been measured (see `Provider`'s doc
+        // comment); every other row must stay `"generic"`, the choice that
+        // was correct -- and byte-identical -- before this field existed.
+        let &(_, _, _, llama_cpp_provider) = ENDPOINT_PRESETS
+            .iter()
+            .find(|(n, _, _, _)| *n == "llama.cpp server")
+            .expect("preset present");
+        assert_eq!(
+            llama_cpp_provider, "llama-cpp",
+            "llama.cpp server is the one dialect this build has measured"
+        );
+        for (name, _url, _takes_key, provider) in ENDPOINT_PRESETS {
+            if name != "llama.cpp server" {
+                assert_eq!(
+                    provider, "generic",
+                    "{name} must stay \"generic\": only llama.cpp's dialect is measured"
+                );
+            }
         }
     }
 
