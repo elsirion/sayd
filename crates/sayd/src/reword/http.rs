@@ -27,23 +27,44 @@
 //! documentation describes. Every response field here is an `Option` that
 //! tolerates the wrong type as well as `null`, nothing is indexed, and there
 //! is no `unwrap`, `expect` or `panic!` on any value that arrived over the
-//! wire. The read is length-limited for the same reason, and the one string
-//! that reaches a log line -- `error.message` -- is cut to
-//! [`MESSAGE_CHARS`] and stripped of control characters before it gets
-//! there. Unbounded, a provider could write a 60 KB warning line, forge
-//! further `warning: reword:` lines inside it and run ANSI escapes at
-//! whoever reads `journalctl`.
+//! wire. The read is length-limited for the same reason, and every string
+//! that reaches a log line -- `error.message`, and the transport reason
+//! carried by [`RewordError::Unreachable`] -- goes through
+//! [`sanitise_message`], which cuts it to [`MESSAGE_CHARS`] and replaces
+//! control characters. Unbounded, a provider could write a 60 KB warning
+//! line, forge further `warning: reword:` lines inside it and run ANSI
+//! escapes at whoever reads `journalctl`. Measured on the second of those
+//! before it was bounded: a 60,000-character `Location` header produced a
+//! 60,094-byte `warning:` line and a 60 KB subtitle in the settings window,
+//! and a crafted one put a forged `warning: reword: your API key was
+//! revoked` inside sayd's own warning line.
+//!
+//! "No panic on anything off the socket" is a claim about this file, and it
+//! was not a claim about the parser underneath it: a response header name of
+//! 65,536 bytes or more panics inside `ureq-proto`. That is why the agent
+//! sets [`RESPONSE_HEADER_LIMIT`] below where the crash lives.
 //!
 //! # The request goes to `base_url` and nowhere else
 //!
 //! §7 tells the user their text goes to `base_url`, and the `info: reword:
-//! sending text to …` line names `base_url`. `ureq` picks a proxy out of
-//! `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` by default, which would make both
-//! statements false in a shell that happens to have one set -- the request
-//! would be tunnelled through a host the user was never told about. The
-//! agent therefore sets `proxy(None)` explicitly.
-//! A user who must egress through a proxy puts it in `base_url`, where the
-//! line that announces it can name it.
+//! sending text to …` line names `base_url`. Two of `ureq`'s defaults would
+//! make both statements false, and [`build_agent`] turns both off.
+//!
+//! `ureq` picks a proxy out of `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` by
+//! default, so in a shell that happens to have one set the request would be
+//! tunnelled through a host the user was never told about. The agent
+//! therefore sets `proxy(None)` explicitly. A user who must egress through a
+//! proxy puts it in `base_url`, where the line that announces it can name
+//! it.
+//!
+//! `ureq` also follows up to 10 redirects by default, over plain HTTP as
+//! readily as HTTPS. The notification text and the API key do not survive
+//! one -- `ureq` downgrades to GET on 301/302/303 and refuses 307/308 with a
+//! body -- but a GET still goes to whatever host and port the *provider*
+//! named: loopback, `169.254.169.254`, anything on the LAN. And the answer
+//! that came back from there, not from `base_url`, would be the candidate
+//! that reached `check()` and the speaker. The agent therefore sets
+//! `max_redirects(0)`.
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -103,6 +124,48 @@ const BODY_LIMIT: u64 = 64 * 1024;
 /// unbounded it is a 64 KB log entry, and one containing a newline is a
 /// forged second warning line.
 const MESSAGE_CHARS: usize = 80;
+
+/// How much status line and how many header bytes the client will read
+/// before it gives up on a response.
+///
+/// IMPORTANT 4, and the number is chosen against a crash rather than
+/// against a budget. `ureq`'s default is exactly 64 KiB, and `run.rs` calls
+/// `try_response` *before* it compares what it has read against that limit,
+/// so a header name of 65,536 bytes or more panics inside `ureq-proto`'s
+/// parser rather than being refused. Bisected exactly on this dependency:
+/// 65,535 clean, 65,536 panics. The panic is contained -- [`super::attempt`]
+/// turns the `JoinError` into [`RewordError::Malformed`], the permit is
+/// released by the unwind and the runtime survives -- but it falsifies this
+/// module's panic-freedom claim and puts a backtrace on the daemon's
+/// stderr, and anyone who can answer the socket can fire it, including a
+/// host a redirect named.
+///
+/// 16 KiB, and [`INPUT_BUFFER_SIZE`] below it, because one number is not
+/// enough: `ureq` compares this against `input.len()` *after* the parse, so
+/// what actually has to stay under 65,536 is how many bytes can be in the
+/// read buffer at once. With the shipped 128 KiB buffer a 70,000-byte name
+/// arrives whole and is parsed -- measured, and flaky in exactly the way
+/// that implies: the same test passed and then panicked depending on how
+/// the reads landed.
+///
+/// No real provider's response headers come near 16 KiB: the
+/// OpenAI-compatible answer this client reads carries a status line, a
+/// content type, a length and a handful of rate-limit counters.
+const RESPONSE_HEADER_LIMIT: usize = 16 * 1024;
+
+/// How many bytes of a response may sit in `ureq`'s read buffer at once.
+///
+/// The other half of [`RESPONSE_HEADER_LIMIT`], and the half that actually
+/// keeps `ureq-proto`'s parser away from the header name that panics it:
+/// the parser only ever sees what is in this buffer, so at 32 KiB a
+/// 65,536-byte name cannot be assembled in it at all. Strictly larger than
+/// the header limit, so the limit is what reports the failure -- a buffer
+/// that filled to exactly the limit would leave `check_size > limit` false
+/// and the loop with nothing to say.
+///
+/// `ureq`'s default is 128 KiB. Smaller costs a few more `read` calls on a
+/// body that is already capped at [`BODY_LIMIT`].
+const INPUT_BUFFER_SIZE: usize = 32 * 1024;
 
 #[derive(Serialize)]
 struct ChatRequest<'a> {
@@ -433,6 +496,29 @@ fn build_agent(ceiling: Duration) -> ureq::Agent {
         // request through a host neither §7's privacy statement nor the
         // `sending text to …` line names. See the module doc.
         .proxy(None)
+        // IMPORTANT 1, and the other half of the same sentence. `ureq`'s
+        // default is 10, and a followed redirect is a request to a host
+        // and port the *provider* chose: loopback, `169.254.169.254`, or
+        // anything on the LAN. `https_only` is false by default too, so an
+        // `https://` base could be bounced to plain `http://` -- and the
+        // cleartext warning is computed from `base_url` alone, so it would
+        // never fire. Zero, not one: the redirect target also chooses the
+        // candidate that reaches `check()` and the speaker, and this client
+        // has exactly one endpoint to talk to. With no redirects allowed
+        // the 3xx is returned as-is and classifies as `Malformed`, which
+        // is the truth -- it carried no `choices[0].message.content`.
+        //
+        // `max_redirects_will_error` is deliberately left alone: it "has no
+        // meaning if `max_redirects` is 0" (ureq's own doc), so setting it
+        // would suggest a behaviour it does not have.
+        .max_redirects(0)
+        // IMPORTANT 4, both lines: `ureq`'s defaults are 64 KiB and
+        // 128 KiB, and a header name of 65,536 bytes panics the parser
+        // underneath them. See the two constants -- the buffer is what
+        // bounds what the parser can be handed, and the header limit is
+        // what reports it.
+        .max_response_header_size(RESPONSE_HEADER_LIMIT)
+        .input_buffer_size(INPUT_BUFFER_SIZE)
         .build();
     ureq::Agent::new_with_config(config)
 }
@@ -503,6 +589,16 @@ fn send(
     let mut response = match call.send_json(&request.body) {
         Ok(r) => r,
         Err(ureq::Error::Timeout(_)) => return Err(RewordError::Ceiling),
+        // Headers past [`RESPONSE_HEADER_LIMIT`]. The same reasoning as
+        // `BodyExceedsLimit` below: this is a *response* this client will
+        // not read, not a provider that is down, so it must not count
+        // toward the transport breaker -- otherwise three fat answers, or
+        // three hostile ones, switch the feature off for a minute.
+        Err(ureq::Error::LargeResponseHeader(read, limit)) => {
+            return Err(RewordError::Malformed(format!(
+                "the response headers reached {read} bytes, past the {limit}-byte limit"
+            )))
+        }
         // Nothing was sent: the URL or a header value could not go into
         // a request at all. `parse_base_url` checks the scheme and
         // picks out the host, which is not the same as being a URI, and
@@ -1211,6 +1307,139 @@ mod tests {
                  will leave out: {detail}"
             ),
             other => panic!("a closed port is unreachable, got {other:?}"),
+        }
+    }
+
+    /// The three numbers IMPORTANT 1 and IMPORTANT 4 set, asserted on the
+    /// agent production builds rather than on its behaviour.
+    ///
+    /// Not a substitute for the two tests below -- they are what says the
+    /// numbers *do* anything -- but the necessary complement to one of them:
+    /// whether a 70,000-byte header name reaches `ureq-proto`'s parser
+    /// depends on how the reads land, so the header-size test was measured
+    /// passing and then panicking on the same code. The buffer bound is what
+    /// makes that deterministic and it cannot be observed from outside, so
+    /// it is pinned here.
+    ///
+    /// The relationships, not the values: raising either limit is allowed,
+    /// raising it past what the parser survives is not.
+    #[test]
+    fn the_agent_cannot_be_handed_a_header_that_panics_its_parser() {
+        /// The header-name length `ureq-proto` panics on. Bisected: one
+        /// less is clean.
+        const PANICS_AT: usize = 65_536;
+
+        let agent = build_agent(REWORD_HTTP_CEILING);
+        let config = agent.config();
+
+        assert!(
+            config.input_buffer_size() < PANICS_AT,
+            "the parser only sees what is in the read buffer, so this is what \
+             keeps a name that long from ever being assembled: {}",
+            config.input_buffer_size()
+        );
+        assert!(
+            config.max_response_header_size() < config.input_buffer_size(),
+            "and the header limit has to be reached *before* the buffer fills, \
+             or nothing reports the failure: {} vs {}",
+            config.max_response_header_size(),
+            config.input_buffer_size()
+        );
+        assert_eq!(
+            config.max_redirects(),
+            0,
+            "IMPORTANT 1: this client has exactly one endpoint to talk to"
+        );
+    }
+
+    /// IMPORTANT 1: a redirect is not followed, to any host.
+    ///
+    /// `ureq`'s default is 10 redirects, over plain HTTP as readily as
+    /// HTTPS, and the target is chosen by the provider. The text and the
+    /// key do not survive the hop, but the *request* does -- an SSRF
+    /// primitive against loopback, `169.254.169.254` and the LAN -- and
+    /// whatever answers there, not `base_url`, would be the candidate that
+    /// reached `check()` and the speaker.
+    ///
+    /// The second listener is the whole test: it is bound and never
+    /// answered, so "was it contacted" is a question this can ask. Delete
+    /// `max_redirects(0)` and the `accept` below succeeds.
+    #[test]
+    fn a_redirect_is_refused_rather_than_followed() {
+        let elsewhere = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = elsewhere.local_addr().expect("addr").port();
+        elsewhere
+            .set_nonblocking(true)
+            .expect("non-blocking listener");
+
+        let (cfg, server) = serve(move |_request| {
+            Some(http(
+                302,
+                &format!("location: http://127.0.0.1:{port}/v1/chat/completions\r\n"),
+                "",
+            ))
+        });
+
+        let rewriter = HttpRewriter::new(&cfg).expect("a usable client");
+        let out = rewriter.reword("Alice: where do you want to go for dinner");
+        server.join().expect("the server thread");
+
+        assert!(
+            matches!(out, Err(RewordError::Malformed(_))),
+            "a 3xx carries no choices[0].message.content, which is exactly \
+             what `Malformed` says: {out:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            elsewhere.accept().is_err(),
+            "the host the provider named must never be contacted"
+        );
+    }
+
+    /// IMPORTANT 4: a hostile response *header* cannot panic the request
+    /// thread.
+    ///
+    /// `ureq`'s default `max_response_header_size` is 64 KiB, and `run.rs`
+    /// calls `try_response` before comparing what it has read against it --
+    /// so a header name of exactly that size or larger panics inside
+    /// `ureq-proto`'s parser. Bisected on this dependency: 65,535 clean,
+    /// 65,536 panics. It is contained (the `JoinError` becomes `Malformed`,
+    /// the permit is released by the unwind), but it puts a backtrace on the
+    /// daemon's stderr and anyone who can answer the socket can fire it,
+    /// including a host a redirect named.
+    ///
+    /// This test would be worth having with no assertion at all: with either
+    /// limit removed it *panics*, and a panicking test fails. The
+    /// classification is asserted as well because a hostile provider must
+    /// not be able to open the transport breaker with it -- `Malformed` is
+    /// the row that leaves the next notification its chance, the same call
+    /// `BodyExceedsLimit` gets.
+    ///
+    /// Driven through the cached production agent, which is the one that has
+    /// to survive this.
+    #[test]
+    fn a_hostile_response_header_is_refused_rather_than_panicked_on() {
+        let name = "x".repeat(70_000);
+        let (cfg, server) = serve(move |_request| {
+            Some(http(
+                200,
+                &format!("{name}: y\r\n"),
+                r#"{"choices":[{"message":{"content":"Alice is asking about dinner"}}]}"#,
+            ))
+        });
+
+        let rewriter = HttpRewriter::new(&cfg).expect("a usable client");
+        let out = rewriter.reword("Alice: where do you want to go for dinner");
+        // The server may have been killed mid-write by the client giving up
+        // on the response, so its own thread is allowed to have failed.
+        let _ = server.join();
+
+        match out {
+            Err(RewordError::Malformed(detail)) => assert!(
+                detail.contains("headers"),
+                "the reason must name what was refused: {detail}"
+            ),
+            other => panic!("a response this client will not read is not an answer: {other:?}"),
         }
     }
 
