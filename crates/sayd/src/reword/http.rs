@@ -549,16 +549,67 @@ pub struct HttpRewriter {
 }
 
 impl HttpRewriter {
-    /// Refuses an unusable `base_url` here rather than at request time, so
-    /// the daemon logs it once at first use instead of once per utterance.
+    /// Refuses an unusable `base_url` -- and an unusable key -- here rather
+    /// than at request time, so the daemon logs it once at first use instead
+    /// of once per utterance.
     pub fn new(cfg: &RewordConfig) -> Result<HttpRewriter, RewordError> {
         let endpoint = parse_base_url(&cfg.base_url)
             .map_err(|e| RewordError::NotConfigured(format!("reword.base_url: {e}")))?;
+        let key = resolve_api_key(cfg);
+        if let Some(key) = &key {
+            if let Some(bad) = key.chars().find(|c| !is_header_safe(*c)) {
+                // MINOR 4. Left to `send`, this arrives as
+                // `ureq::Error::Protocol("authorization header is not a
+                // string")`, which falls through that function's catch-all
+                // into `RewordError::Unreachable` -- measured -- and three
+                // notifications then open the transport breaker over a
+                // configuration nothing about the network will fix. The
+                // arm beside it says in as many words that a key which
+                // cannot go into a header belongs on the row that is said
+                // once per run; this is what puts it there.
+                return Err(RewordError::NotConfigured(format!(
+                    "{source} holds a character an HTTP header cannot carry ({bad:?}); \
+                     an en-dash or a smart quote from a copied web page is the usual \
+                     cause",
+                    source = key_source(cfg),
+                )));
+            }
+        }
         Ok(HttpRewriter {
             cfg: cfg.clone(),
-            key: resolve_api_key(cfg),
+            key,
             host: endpoint.host,
         })
+    }
+}
+
+/// May `c` appear in an HTTP header value?
+///
+/// The `http` crate's `HeaderValue` accepts visible ASCII plus space and
+/// tab, and nothing else; a `char` outside that range is what
+/// `ureq_proto` refuses with "authorization header is not a string". This
+/// is the same rule stated where the *configuration* is checked, so the
+/// failure is reported as one.
+///
+/// Deliberately narrower than the RFC, which also permits obs-text (0x80 to
+/// 0xFF): those bytes are not `char`s, no provider issues a key containing
+/// them, and `HeaderValue::from_str` would refuse them anyway.
+fn is_header_safe(c: char) -> bool {
+    c == '\t' || (' '..='~').contains(&c)
+}
+
+/// Which setting the key came out of, for the line that says it is unusable.
+///
+/// Naming it matters here more than most places: a key supplied through
+/// `api_key_env` is not in the file the settings window writes, so "check
+/// `reword.api_key`" would send the user to look at an empty field.
+fn key_source(cfg: &RewordConfig) -> String {
+    let from_env =
+        !cfg.api_key_env.is_empty() && std::env::var(&cfg.api_key_env).is_ok_and(|v| !v.is_empty());
+    if from_env {
+        format!("the API key in ${}", cfg.api_key_env)
+    } else {
+        "reword.api_key".to_string()
     }
 }
 
@@ -966,6 +1017,73 @@ mod tests {
         );
     }
 
+    /// MINOR 4: a key that cannot go into a header is a *configuration*
+    /// failure, and must never reach the transport breaker.
+    ///
+    /// An en-dash or a smart quote in a pasted key is the whole of the case.
+    /// Measured before this check existed: `ureq` refused the header with
+    /// `protocol: authorization header is not a string`, `send`'s catch-all
+    /// turned that into `RewordError::Unreachable`, and three notifications
+    /// opened the transport breaker for a minute over something no cooldown
+    /// will fix -- against the explicit statement, in the arm right beside
+    /// that catch-all, that such a key "belongs on the row that says so once
+    /// per run".
+    ///
+    /// Refused in `HttpRewriter::new` rather than in `send`, so it is said
+    /// once at first use rather than once per utterance, exactly like an
+    /// unusable `base_url`. No server is involved: nothing is sent.
+    #[test]
+    fn a_key_an_http_header_cannot_carry_is_a_configuration_failure() {
+        let cfg = RewordConfig {
+            enabled: true,
+            base_url: "http://127.0.0.1:11434/v1".into(),
+            // An en-dash, which is what a key copied out of a web page that
+            // typographed the hyphen actually contains.
+            api_key: "sk\u{2013}0123456789".into(),
+            api_key_env: String::new(),
+            ..RewordConfig::default()
+        };
+
+        match HttpRewriter::new(&cfg).map(|_| "a client") {
+            Err(RewordError::NotConfigured(reason)) => {
+                assert!(
+                    reason.contains("reword.api_key"),
+                    "the line has to name the setting to fix: {reason}"
+                );
+                assert!(
+                    reason.contains("en-dash"),
+                    "and the cause, because the character is invisible in a \
+                     settings field: {reason}"
+                );
+            }
+            other => panic!("a key like this is not an outage, got {other:?}"),
+        }
+
+        // An ordinary key, and no key at all, are both fine -- the check
+        // must not become a tax on every local server.
+        let plain = RewordConfig {
+            api_key: "sk-0123456789".into(),
+            ..cfg.clone()
+        };
+        assert!(HttpRewriter::new(&plain).is_ok());
+        let none = RewordConfig {
+            api_key: String::new(),
+            ..cfg.clone()
+        };
+        assert!(HttpRewriter::new(&none).is_ok());
+
+        // A newline is the other way a pasted key arrives broken, and the
+        // one that would forge a header rather than merely fail to encode.
+        let newline = RewordConfig {
+            api_key: "sk-abc\ndef".into(),
+            ..cfg
+        };
+        assert!(matches!(
+            HttpRewriter::new(&newline).map(|_| "a client"),
+            Err(RewordError::NotConfigured(_))
+        ));
+    }
+
     /// IMPORTANT 2: the same bound, reached through the other variant.
     ///
     /// `RewordError::Unreachable`'s detail is `ureq`'s own error text, and
@@ -1303,6 +1421,11 @@ mod tests {
     /// refuses. That is a configuration failure rather than an outage, and
     /// classifying it as one keeps three notifications from opening the
     /// transport breaker over a typo that no cooldown will fix.
+    ///
+    /// The other half of a request a user types -- the key -- used to be
+    /// checked here too, at request time. It is refused when the client is
+    /// built now (MINOR 4), so it lives in
+    /// [`a_key_an_http_header_cannot_carry_is_a_configuration_failure`].
     #[test]
     fn a_base_url_ureq_will_not_parse_is_a_configuration_failure() {
         let cfg = RewordConfig {
@@ -1317,23 +1440,6 @@ mod tests {
                 Err(RewordError::NotConfigured(_))
             ),
             "a URL that cannot be requested is not a provider that is down"
-        );
-
-        // The same row for the other half of a request a user types: a key
-        // pasted with a newline in it is not a header value.
-        let cfg = RewordConfig {
-            base_url: "http://127.0.0.1:1/v1".into(),
-            api_key: "sk-abc\ndef".into(),
-            api_key_env: String::new(),
-            ..RewordConfig::default()
-        };
-        let rewriter = HttpRewriter::new(&cfg).expect("the base_url is fine");
-        assert!(
-            matches!(
-                rewriter.reword("Alice: dinner?"),
-                Err(RewordError::NotConfigured(_))
-            ),
-            "a key that cannot be a header value is a configuration failure"
         );
     }
 
