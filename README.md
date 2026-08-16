@@ -423,6 +423,7 @@ no TLS stack, so `enabled = true` in that build is a no-op -- see
     enabled = false                          # rewrite notification announcements
     base_url = "http://localhost:11434/v1"   # any OpenAI-compatible endpoint
     model = "llama3.2:3b"
+    provider = "llama-cpp"                   # "llama-cpp" | "generic"; required when enabled
     api_key = ""                             # local servers ignore it; see api_key_env
     api_key_env = "SAYD_REWORD_API_KEY"      # this variable wins over api_key
     timeout_ms = 1500                        # 200..=2000
@@ -472,9 +473,35 @@ ceiling.
 
 ### Endpoints
 
-There is no `provider` setting, because there is nothing to choose between:
+`base_url` says where the request goes. `provider` says who is on the other
+end -- not because the request differs, but because of one field that does.
+
 PPQ, Ollama, llama.cpp's `server`, LM Studio, vLLM and OpenAI all speak the
-same request. `base_url` says where; nothing else needs to.
+same `/chat/completions`, and for a long time that was the whole story. They
+do not agree on how to tell a *thinking* model not to think, and a model that
+thinks cannot answer inside `timeout_ms`: measured against a local llama.cpp
+router, `gemma-4-E4B-it-Q4_K_M` emitted a reasoning block on 9 of 10
+notification rewrites, never finished one inside its token cap, and so took
+13 to 33 seconds to return nothing usable. `chat_template_kwargs` switched
+that off on 6 requests of 6.
+
+| `provider` | What it sends | For |
+|---|---|---|
+| `llama-cpp` | `chat_template_kwargs: {"enable_thinking": false}` | llama.cpp `server` |
+| `generic` | nothing beyond the common request | everything else |
+
+Two values, because two are measured. vLLM documents the same
+`chat_template_kwargs` and Ollama and LM Studio have their own spellings, but
+none has been tested here, and a dialect guessed wrong is a rejected request
+on a path designed to fail quietly. Use `generic` for those; if the model
+reasons, the Test row will say so in as many words.
+
+`provider` is **required when `enabled = true`** -- automatic rewording that
+cannot name its provider is a request the daemon cannot fill, so it refuses to
+start and says which values it accepts. Everywhere else a missing provider
+degrades like any other unusable endpoint: `say --reword` speaks the text as
+written and logs the reason once, and a config reload that breaks the field
+switches rewording off without taking the daemon with it.
 
 | Endpoint | `base_url` | Key |
 |---|---|---|
@@ -526,6 +553,15 @@ The first rewrite after the daemon starts is expected to miss the deadline
 and speak the original. That is the fallback working, not a bug -- nothing
 is pre-warmed at startup, because that would be a network call you did not
 ask for.
+
+A reasoning model cannot meet this deadline and is not meant to try. The
+token cap is three times `max_chars` -- 1200 by default -- which is generous
+so that an over-long answer arrives whole and is rejected whole, rather than
+arriving truncated mid-sentence and being spoken. It is not a latency bound:
+at the 8 to 19 tokens per second a CPU-only machine sustains, 1200 tokens is
+a minute, and what actually ends a slow request is the client's own 10-second
+ceiling. If a generation reaches the cap, the original is spoken and the
+journal says so.
 
 ### What is sent, and what is not
 
