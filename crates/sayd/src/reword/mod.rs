@@ -1606,7 +1606,9 @@ fn context_in(
 /// `notify::monitor` and `dbus` need exactly this server, for the two halves
 /// of the same rule: the notification path must not wait for a stuck
 /// provider, and the D-Bus path must wait for it and still answer inside
-/// `sayd-cli`'s 3 s bound.
+/// the daemon's own configured `reword.timeout_ms` -- the only bound left on
+/// a `--reword` call, since `sayd-cli` deliberately puts none of its own on
+/// this path (see `sayd_cli`'s `TIMEOUT` doc comment).
 #[cfg(test)]
 pub fn silent_provider(hold: Duration) -> (String, std::thread::JoinHandle<()>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");

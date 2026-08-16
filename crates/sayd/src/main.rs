@@ -119,9 +119,20 @@ const FANOUT_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 /// How long a forwarding call to an already-running daemon may block before
 /// this instance gives up and reports a timeout instead of hanging.
 ///
-/// zbus's own default method-call timeout is close to 25 seconds, which
-/// reads to a user as "sayd is frozen." A couple of seconds is generous for
-/// a local session-bus round trip.
+/// zbus applies no timeout of its own here: `Connection::call_method` only
+/// wraps the reply in a `tokio::time::timeout` when the connection was built
+/// with `Builder::method_timeout`, and this one was not -- `Builder::new`
+/// leaves `method_timeout: None` (checked against zbus 5.19's source).
+/// Without this constant, a forwarding call to a wedged daemon would hang
+/// indefinitely, not merely for "close to 25 seconds" as an earlier version
+/// of this comment claimed. A couple of seconds is generous for a local
+/// session-bus round trip.
+///
+/// On a zbus upgrade: if a future version starts giving `Builder::new` a
+/// non-`None` default `method_timeout`, that default would apply
+/// underneath this one silently -- harmless as long as it stays above 3 s,
+/// but worth checking `method_timeout` in that release's `Builder::new` and
+/// how `Connection::call_method` uses it before trusting this comment again.
 const FORWARD_CALL_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// How long the publish loop waits for [`NotifyEnabledWatch`]'s

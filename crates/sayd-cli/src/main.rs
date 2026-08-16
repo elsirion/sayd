@@ -34,12 +34,42 @@ const IFACE: &str = "sh.sayd.Sayd1";
 /// constant would mean reporting a daemon that is working exactly as
 /// configured as not responding.
 ///
-/// What that costs is smaller than it sounds, because this constant still
-/// bounds the two interactions that come first. **A daemon that is not
-/// running -- the common failure by a wide margin -- still fails in 3 s**,
-/// at name resolution, before any method is called. What is left is a daemon
-/// that is up, owns its name, and is wedged part-way through a `Say`: rarer,
-/// and no longer something this binary can put a number on.
+/// **A daemon that is not running -- the common failure by a wide margin --
+/// still fails fast today (measured: ~8 ms), but not because this constant
+/// bounds "name resolution" as a separate step.** `zbus::Proxy::new` does no
+/// round trip: `Builder::build_internal` is synchronous, and property
+/// caching defaults to `CacheProperties::Lazily`, so building the proxy
+/// never blocks on the bus at all (checked in zbus 5.19's source). What
+/// actually answers is the bus itself, replying `ServiceUnknown` to the
+/// `Say` call as fast as it replies to anything -- and for a `--reword`
+/// call, that reply arrives on the *unbounded* path above, not this one. It
+/// only looks bounded today because a `ServiceUnknown` reply costs the bus
+/// nothing to produce. If a D-Bus activation `.service` file is ever added
+/// for this name (routine packaging), the daemon-not-running case becomes
+/// "start it and wait for it to claim the name" instead of an instant
+/// error, and `say --reword` would have no client-side bound at all while
+/// activation runs -- this constant would not be saving it, because it
+/// never was.
+///
+/// What is left, either way, is a daemon that is up, owns its name, and is
+/// wedged part-way through a `Say`: rarer, and no longer something this
+/// binary can put a number on. That case costs more than it used to, and
+/// deliberately: this binary is forked anew every 15-30 seconds by agent
+/// narration, so where a wedged daemon used to fail each fork at 3 s and let
+/// it exit, it now hangs each one indefinitely -- one stuck `say` process
+/// per narration cycle, accumulating for as long as the daemon stays wedged.
+/// The trade was made in exchange for never reporting a daemon that is
+/// working exactly as configured as "not responding" (see the paragraph
+/// above).
+///
+/// `SaySelection` and `SayClipboard` are unbounded here for the same reason
+/// `Say` is: both reach the same inline rewrite through `SaydIface::say_read`.
+/// But both read a selection first, on the daemon side, under their own,
+/// unrelated limits (`selection::SELECTION_READ_TIMEOUT`, 5 s of read
+/// inactivity, and `selection::SELECTION_READ_OVERALL_CAP`, 30 s overall,
+/// regardless of activity) -- so a wedged selection *owner* now blocks `say
+/// --reword selection` for up to about 30 s, where it used to stop at this
+/// constant's 3 s.
 ///
 /// End to end, `--reword`'s inline wait is exercised by
 /// `sayd::dbus::tests::a_reword_against_a_silent_provider_answers_with_a_spoken_utterance`.

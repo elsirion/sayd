@@ -557,11 +557,22 @@ follow from a long deadline, both of them on purpose:
 
 - `say --reword "..."` waits for the answer inline, so it waits that long
   too. `say` deliberately puts no timeout of its own on a submission that
-  asked for a rewrite -- a daemon that is not running still fails in three
-  seconds, when the name is resolved, but a daemon that is up and working is
-  given as long as you configured.
+  asked for a rewrite. A daemon that is not running still fails in
+  milliseconds today, but not because of a client-side bound -- the session
+  bus itself answers "no such service" as fast as it answers anything, and
+  that reply is on the same unbounded path. A daemon that is up and working
+  is given as long as you configured, and so, for what it's worth, would a
+  daemon that is not running behind D-Bus activation, if this project ever
+  ships a `.service` file for one.
 - A non-zero `notifications.cooldown_secs` is raised to clear it (see [Rate
-  limiting](#rate-limiting)).
+  limiting](#rate-limiting)) -- and that floor scales with the deadline you
+  set here. `timeout_ms = 300000` (five minutes) with `cooldown_secs = 4`
+  raises the cooldown to **301 seconds** on load, and the raised value is
+  what gets written back to `config.toml`. A five-minute notification
+  coalescing window is a surprising thing to acquire by setting a long
+  rewrite deadline, but the alternative is worse: a cooldown shorter than
+  the deadline lets the "N more notifications" follow-up reach the engine
+  before the notification it is counting from has even been submitted.
 
 The settings window's Deadline row stops at 60000 ms, because a spin row has
 to stop somewhere. That limit is the window's alone: a larger value written

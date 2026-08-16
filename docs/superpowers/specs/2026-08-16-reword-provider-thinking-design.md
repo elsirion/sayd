@@ -3,6 +3,17 @@
 Date: 2026-08-16
 Status: approved, not yet implemented
 
+> **2026-08-16 update, later commit:** the ceiling numbers below --
+> `reword.timeout_ms`'s 2000 ms ceiling ("The problem, measured", "Out of
+> scope") and the flat 10 s `REWORD_HTTP_CEILING` ("Scoped to hardware fast
+> enough...") -- were both removed by a later commit so a local model can be
+> given as long as it legitimately needs. They are left as written here
+> because they were accurate measurements and constraints at the time this
+> document was approved, and rewriting them in place would misrepresent what
+> this design was reasoned against. Do not read either number as current
+> behaviour; see `RewordConfig::timeout_ms` and
+> `sayd::reword::http::http_ceiling` for what replaced them.
+
 ## The problem, measured
 
 `gemma-4-E4B-it-Q4_K_M` served by a local llama.cpp router is thinking-capable.

@@ -144,6 +144,19 @@ pub const REWORD_TIMEOUT_MIN_MS: u64 = 200;
 /// `timeout_ms` after it arrived -- still has the rest of that second for
 /// its submission round trip.
 ///
+/// This is required, not incidental, and it is worth being explicit about
+/// the size it can reach: `timeout_ms = 300_000` (five minutes, for a local
+/// model on slow hardware) with `cooldown_secs = 4` in the same file raises
+/// the cooldown to **301** on load -- `300_000.div_ceil(1000) + 1` -- and
+/// `Config::save_to` writes that raised value back to `config.toml`, not the
+/// 4 the user typed. That is not a bug this function could avoid by being
+/// gentler: a five-second window is still shorter than the five-minute
+/// budget the opener may need, so honouring the user's `4` would let the
+/// ordering bug this floor exists to prevent happen anyway, every time,
+/// silently, for as long as the deadline stays long. Surprising as "setting
+/// a long rewrite deadline acquires minutes-long notification coalescing"
+/// reads, the alternative is a race the user asked for without knowing it.
+///
 /// Two exemptions, and neither is a softening of the rule:
 ///
 /// * **Rewording off.** Nothing delays the opener when `enabled` is false --
@@ -176,8 +189,8 @@ pub fn notify_cooldown_min_secs(reword: &RewordConfig) -> u64 {
 /// `timeout_ms`. Measured against the local llama.cpp router:
 /// `chat_template_kwargs` suppressed reasoning on 6 requests of 6, while
 /// `reasoning_budget` was ignored on 6 of 6 and the unmodified request
-/// reasoned on 9 of 10 -- 13 to 33 s each, all of them past the client
-/// ceiling.
+/// reasoned on 9 of 10 -- 13 to 33 s each, an order of magnitude past the
+/// 1500 ms default deadline this whole table exists to avoid missing.
 ///
 /// Two values, because only two are measured. vLLM documents the same
 /// `chat_template_kwargs` upstream and Ollama and LM Studio have their own
@@ -288,12 +301,15 @@ impl Default for RewordConfig {
             provider: None,
             api_key: String::new(),
             api_key_env: "SAYD_REWORD_API_KEY".into(),
-            // A budget, not an observation: chosen to sit under sayd-cli's
-            // 3 s D-Bus timeout with room for the bus round trip, and above
-            // the first-token latency a small model is generally capable
-            // of. End-to-end provider latency has not been measured -- the
-            // settings window's Test row is how a user gets their own
-            // number on their own setup and sets this against it.
+            // A budget, not an observation: above the first-token latency a
+            // small local model is generally capable of, and short enough
+            // that a missed rewrite -- the original spoken instead -- reads
+            // as a brief pause rather than a stall. It does not answer to
+            // any ceiling above it; `timeout_ms` has none
+            // (REWORD_TIMEOUT_MIN_MS explains why the floor stays and the
+            // ceiling doesn't). End-to-end provider latency has not been
+            // measured -- the settings window's Test row is how a user gets
+            // their own number on their own setup and sets this against it.
             timeout_ms: 1500,
             max_chars: 400,
         }
