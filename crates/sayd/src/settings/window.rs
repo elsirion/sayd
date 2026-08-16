@@ -48,9 +48,9 @@ use super::model::{
     reword_key_row_applies, IconSource, SettingsModel, Suggestion, SuggestionKind, COOLDOWN_MAX,
     COOLDOWN_MIN, COOLDOWN_STEP, ENDPOINT_PRESETS, IDLE_UNLOAD_MAX, IDLE_UNLOAD_MIN,
     IDLE_UNLOAD_STEP, MAX_CHARS_MAX, MAX_CHARS_MIN, MAX_CHARS_STEP, MODELS, REWORD_MAX_CHARS_MAX,
-    REWORD_MAX_CHARS_MIN, REWORD_MAX_CHARS_STEP, REWORD_TIMEOUT_MAX, REWORD_TIMEOUT_MIN,
-    REWORD_TIMEOUT_STEP, SPEED_MAX, SPEED_MIN, SPEED_MODES, SPEED_STEP, THREADS_MAX, THREADS_MIN,
-    THREADS_STEP,
+    REWORD_MAX_CHARS_MIN, REWORD_MAX_CHARS_STEP, REWORD_TEST_DEFAULT, REWORD_TIMEOUT_MAX,
+    REWORD_TIMEOUT_MIN, REWORD_TIMEOUT_STEP, SPEED_MAX, SPEED_MIN, SPEED_MODES, SPEED_STEP,
+    THREADS_MAX, THREADS_MIN, THREADS_STEP,
 };
 use crate::notify::seen;
 
@@ -211,6 +211,15 @@ const SUGGESTION_ICON_PX: i32 = 32;
 /// What it does *not* do is redraw once a second; see
 /// [`Ui::redraw_suggestions_if_changed`].
 const SEEN_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The Reword group's result row, by `GtkWidget:name`.
+///
+/// It is the one row in this window with no stable title: its title *is* what
+/// it reports, which is a provider's answer or a failure sentence. Every
+/// structural property it has -- a non-activatable `AdwActionRow` with
+/// unlimited title lines -- is shared with rows built elsewhere on the page,
+/// so identity is the only thing left to find it by.
+const RESULT_ROW_NAME: &str = "reword-test-result";
 
 /// The two suggestion groups, in the order the page shows them: what has
 /// actually notified, then the built-in guesses.
@@ -603,11 +612,12 @@ fn build(model: Arc<SettingsModel>, engine: EngineHandle) -> Ui {
     ui.refresh_suggestions();
 
     let page = adw::PreferencesPage::new();
-    page.add(&voice_group(&ui, &cfg, engine));
+    page.add(&voice_group(&ui, &cfg, engine.clone()));
     page.add(&engine_group(&ui, &cfg));
     page.add(&cleanup_group(&ui, &cfg));
     page.add(&notification_group(&ui, &cfg));
-    page.add(&reword_group(&ui, &cfg));
+    // The Reword group needs one too: its result row speaks what came back.
+    page.add(&reword_group(&ui, &cfg, engine));
     // The allowlist and its two suggestion groups belong together at the
     // bottom of the page, so the Reword group goes above them.
     page.add(&allowlist_group(&ui, &cfg));
@@ -975,29 +985,34 @@ fn voice_group(ui: &Ui, cfg: &Config, engine: EngineHandle) -> adw::PreferencesG
     let field = test.downgrade();
     speak.connect_clicked(move |_| {
         let Some(field) = field.upgrade() else { return };
-        u.with(|ui| audition(ui, &e, &field));
+        u.with(|ui| audition(ui, &e, &field.text()));
     });
     let u = ui.downgrade();
     // Pressing Enter in the field is the same action as pressing the button;
     // a test row you have to reach for the mouse to use is a test row nobody
     // uses twice.
-    test.connect_entry_activated(move |row| u.with(|ui| audition(ui, &engine, row)));
+    test.connect_entry_activated(move |row| u.with(|ui| audition(ui, &engine, &row.text())));
     group.add(&test);
 
     group
 }
 
-/// Speak the Test row's text through the engine.
+/// Speak `text` through the engine.
 ///
-/// Writes nothing: this is the one control in the window that is not a view
-/// of the config, so it goes straight to `EngineHandle` rather than through
-/// `Ui::apply` -- and it is the only place an `EngineHandle` is needed,
-/// which is why one is passed here rather than carried in [`Ui`].
-fn audition(ui: &Ui, engine: &EngineHandle, entry: &adw::EntryRow) {
-    let text = entry.text().to_string();
+/// Writes nothing: the callers are the voice group's Test row and the Reword
+/// group's result row, neither of which is a view of the config, so this goes
+/// straight to `EngineHandle` rather than through `Ui::apply` -- and they are
+/// the only place an `EngineHandle` is needed, which is why one is passed
+/// here rather than carried in [`Ui`].
+///
+/// Takes the string rather than the widget it came from: the Reword group's
+/// result row is an `AdwActionRow` with a title, not an entry, and a helper
+/// that insisted on an `AdwEntryRow` would have to be written twice.
+fn audition(ui: &Ui, engine: &EngineHandle, text: &str) {
     if text.trim().is_empty() {
         return;
     }
+    let text = text.to_string();
     let opts = SayOpts {
         // `Replace` so repeated presses audition the current settings
         // instead of queueing up behind each other. Set explicitly, which is
@@ -1356,7 +1371,7 @@ fn group_description(text: &str) -> String {
 /// `true` and governs the subtitle as well as the title, and a row left on
 /// the default renders **both blank** for a value containing `&` -- which is
 /// exactly the character a URL with a query string carries.
-fn reword_group(ui: &Ui, cfg: &Config) -> adw::PreferencesGroup {
+fn reword_group(ui: &Ui, cfg: &Config, engine: EngineHandle) -> adw::PreferencesGroup {
     // The description names the destination host and says where the key is
     // coming from -- a user who exports SAYD_REWORD_API_KEY and then sees no
     // key in the window would otherwise conclude the feature is
@@ -1540,6 +1555,157 @@ fn reword_group(ui: &Ui, cfg: &Config) -> adw::PreferencesGroup {
         u.on_user_change(|u| u.apply(|c| c.reword.max_chars = value));
     });
     group.add(&ceiling.row);
+
+    // --- Test -------------------------------------------------------------
+    // Every failure in the design's §8 degrades to "speak the original",
+    // which is correct and indistinguishable from the feature being switched
+    // off. A typo in the endpoint, a stale key, a model name the provider
+    // does not have: all of them produce a daemon that behaves exactly as it
+    // did before, with nothing in this window to look at. This row is where
+    // the difference becomes visible -- and it is the only place anybody ever
+    // learns what their provider actually costs, because nothing else in this
+    // project measures end-to-end provider latency.
+    let test = adw::EntryRow::builder()
+        .title("Test")
+        .use_markup(false)
+        .text(REWORD_TEST_DEFAULT)
+        .build();
+    let run = gtk::Button::builder()
+        .label("Test")
+        .valign(gtk::Align::Center)
+        .tooltip_text("Send this text to the endpoint above")
+        .build();
+    test.add_suffix(&run);
+    // Not registered with `Ui::row`: this is scratch, not a view of the
+    // config, and clobbering what the user typed on every edit elsewhere
+    // would be its own bug. The default comes back when the window is
+    // rebuilt, which is what "restored whenever the window opens" means --
+    // the window is built on demand and freed on close.
+    group.add(&test);
+
+    // --- The result -------------------------------------------------------
+    // `use_markup(false)` because both labels are provider-supplied: the
+    // title is the model's own answer and the subtitle can carry a transport
+    // error or a message the provider wrote. `title_lines(0)` and
+    // `subtitle_lines(0)` so a rewritten sentence and a long failure reason
+    // *wrap* rather than being ellipsised -- the text is the point of the
+    // row, and a row that cuts it off has reported the outcome without
+    // reporting the thing the outcome is about.
+    //
+    // Not registered with `Ui::row`, for a stronger reason than the Test row
+    // above: it is the one thing in this window that reports something other
+    // than the config's own state, so a redraw would have nothing to draw it
+    // from and would simply erase the answer the user is reading.
+    //
+    // A row rather than a toast because a toast cannot be re-read, and the
+    // whole activity here is compare, edit an endpoint, press again.
+    let result = adw::ActionRow::builder()
+        .use_markup(false)
+        .title_lines(0)
+        .subtitle_lines(0)
+        .activatable(false)
+        .visible(false)
+        // Named so the test can find it by identity rather than by title --
+        // its title is the thing under test, and every other property it has
+        // is shared with rows this window already builds elsewhere.
+        .name(RESULT_ROW_NAME)
+        .build();
+    // It does not speak on its own: synthesis would drag a ~1.27 GB ORT
+    // session load and a queue interaction into a settings check that has
+    // nothing to do with it. But a rewrite is written to be *heard*, and
+    // reading it is not the same, so hearing it is one click.
+    let speak = gtk::Button::builder()
+        .label("Speak")
+        .valign(gtk::Align::Center)
+        .tooltip_text("Hear the rewritten text")
+        .build();
+    result.add_suffix(&speak);
+    let u = ui.downgrade();
+    let e = engine.clone();
+    // Weak, because `speak` is a suffix *of* `result`: a strong clone would
+    // be the row holding a button holding the row, which outlives the window
+    // that used to contain it.
+    let r = result.downgrade();
+    speak.connect_clicked(move |_| {
+        let Some(row) = r.upgrade() else { return };
+        // The row's title, not the Test field's text: what is worth hearing
+        // is what came back.
+        u.with(|ui| audition(ui, &e, &row.title()));
+    });
+    group.add(&result);
+
+    // One action, two ways to ask for it. `Rc` because both handlers need it
+    // and a `Fn` closure cannot be cloned into two of them; it closes no
+    // cycle, because everything it captures is weak.
+    let u = ui.downgrade();
+    let field = test.downgrade();
+    let row = result.downgrade();
+    let button = run.downgrade();
+    let start_test = Rc::new(move || {
+        let (Some(field), Some(row), Some(button)) =
+            (field.upgrade(), row.upgrade(), button.upgrade())
+        else {
+            return;
+        };
+        let Some(state) = u.0.upgrade() else { return };
+        let ui = Ui(state);
+
+        // Commit whatever entry has focus first, so an endpoint typed and not
+        // yet applied is what gets tested. Moving focus away is what fires
+        // the rows' focus controllers (see `bind_entry`); `test_reword` then
+        // reads the *pending* config, which by this point holds it.
+        //
+        // Written out rather than as a method call because `GtkWindowExt` and
+        // `RootExt` both define `set_focus` and `adw::prelude` brings both
+        // into scope.
+        gtk::prelude::GtkWindowExt::set_focus(&ui.window, None::<&gtk::Widget>);
+
+        button.set_sensitive(false);
+        row.set_title("Testing…");
+        row.set_subtitle("");
+        row.set_visible(true);
+
+        let rx = ui.model.test_reword(field.text().to_string());
+        let weak_row = row.downgrade();
+        let weak_button = button.downgrade();
+        // The main thread does not wait. The request is blocking and runs on
+        // the daemon's blocking pool; this future only awaits its answer. If
+        // the window closes mid-flight the receiver is dropped with it and
+        // the delivery is discarded, and the job ends on its own at the
+        // client's own ceiling at the latest.
+        glib::spawn_future_local(async move {
+            let outcome = rx.recv().await;
+            if let Some(button) = weak_button.upgrade() {
+                button.set_sensitive(true);
+            }
+            let Some(row) = weak_row.upgrade() else {
+                return;
+            };
+            match outcome {
+                Ok(outcome) => {
+                    // Two labels and a visibility, and no rule of its own:
+                    // every number and every string in them was produced in
+                    // `settings::model`, which is the layer with tests. If a
+                    // truncation, a unit or a comparison is wanted, it goes
+                    // there.
+                    row.set_title(&outcome.title());
+                    row.set_subtitle(&outcome.subtitle());
+                }
+                // The sender was dropped without answering, which means the
+                // model's thread died. Nothing to diagnose from here.
+                Err(_) => {
+                    row.set_title("The test did not complete");
+                    row.set_subtitle("");
+                }
+            }
+        });
+    });
+    let go = start_test.clone();
+    run.connect_clicked(move |_| go());
+    // Pressing Enter in the field is the same action as pressing the button;
+    // a test row you have to reach for the mouse to use is a test row nobody
+    // uses twice.
+    test.connect_entry_activated(move |_| start_test());
 
     group
 }
@@ -1915,7 +2081,9 @@ fn theme_has(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::model::MAX_ICON_PIXELS;
+    // `TestOutcome` only to name the one row this module has to *skip* -- see
+    // `press_test`. The window itself never matches on a variant.
+    use crate::settings::model::{TestOutcome, MAX_ICON_PIXELS};
     use gtk::gdk_pixbuf::{Colorspace, Pixbuf};
 
     /// Write a PNG of exactly `width`x`height` to `path`.
@@ -1969,6 +2137,125 @@ mod tests {
             child = w.next_sibling();
         }
         None
+    }
+
+    /// A model that answers the Test row from `answer` after `delay`,
+    /// instead of from a provider.
+    ///
+    /// The Test row's whole contract is a thing that takes time and then
+    /// reports a number, and neither half can be driven against a real
+    /// endpoint in a committed test. Injecting the client is what makes the
+    /// latency sentence -- this task's deliverable -- assertable at all, and
+    /// makes it assert the same thing with and without `--features reword`
+    /// (where a real endpoint would report `Unavailable` and nothing else).
+    fn model_answering(
+        dir: &std::path::Path,
+        answer: &str,
+        delay: Duration,
+    ) -> (Arc<SettingsModel>, EngineHandle) {
+        struct Canned(String, Duration);
+        impl crate::reword::Rewriter for Canned {
+            fn reword(&self, _text: &str) -> Result<String, crate::reword::RewordError> {
+                // On the model's own thread, never this one -- which is
+                // exactly what the "did not block" assertion below is about.
+                std::thread::sleep(self.1);
+                Ok(self.0.clone())
+            }
+        }
+
+        let engine = EngineHandle::spawn(
+            Config::default(),
+            Box::new(sayd_core::synth::StubSynthesizer::new()),
+            Box::new(sayd_core::audio::VecSink::new(24_000 * 10)),
+        );
+        let store = Arc::new(crate::config_watch::ConfigStore::new(
+            dir.join("config.toml"),
+            engine.clone(),
+            Config::default(),
+        ));
+        let canned: Arc<dyn crate::reword::Rewriter> = Arc::new(Canned(answer.to_string(), delay));
+        let model = Arc::new(SettingsModel::new_with_rewriter(
+            store,
+            dir.to_path_buf(),
+            Config::default(),
+            Arc::new(move |_| Ok(canned.clone())),
+        ));
+        (model, engine)
+    }
+
+    /// The `AdwPreferencesGroup` with this title.
+    ///
+    /// Needed because a walk from the window is not specific enough: two rows
+    /// in this window are titled "Test" -- the voice group's and the Reword
+    /// group's -- and the first one a depth-first walk meets is whichever
+    /// group `build` added first.
+    fn find_group(widget: &gtk::Widget, title: &str) -> Option<adw::PreferencesGroup> {
+        if let Some(group) = widget.downcast_ref::<adw::PreferencesGroup>() {
+            if group.title() == title {
+                return Some(group.clone());
+            }
+        }
+        let mut child = widget.first_child();
+        while let Some(w) = child {
+            if let Some(found) = find_group(&w, title) {
+                return Some(found);
+            }
+            child = w.next_sibling();
+        }
+        None
+    }
+
+    /// The Reword group's result row, by the name `reword_group` gave it.
+    ///
+    /// By identity and not by title, because its title *is* the thing under
+    /// test; and not by shape either, because `AdwSwitchRow` and
+    /// `AdwSpinRow` are both `AdwActionRow`s and this group has three of
+    /// them.
+    fn find_result_row(widget: &gtk::Widget) -> Option<adw::ActionRow> {
+        if let Some(row) = widget.downcast_ref::<adw::ActionRow>() {
+            if row.widget_name() == RESULT_ROW_NAME {
+                return Some(row.clone());
+            }
+        }
+        let mut child = widget.first_child();
+        while let Some(w) = child {
+            if let Some(found) = find_result_row(&w) {
+                return Some(found);
+            }
+            child = w.next_sibling();
+        }
+        None
+    }
+
+    /// The `GtkButton` under `widget` with this label.
+    fn find_button(widget: &gtk::Widget, label: &str) -> Option<gtk::Button> {
+        if let Some(button) = widget.downcast_ref::<gtk::Button>() {
+            if button.label().is_some_and(|l| l == label) {
+                return Some(button.clone());
+            }
+        }
+        let mut child = widget.first_child();
+        while let Some(w) = child {
+            if let Some(found) = find_button(&w, label) {
+                return Some(found);
+            }
+            child = w.next_sibling();
+        }
+        None
+    }
+
+    /// Every `GtkLabel` anywhere under `widget`.
+    fn labels(widget: &gtk::Widget) -> Vec<gtk::Label> {
+        let mut out = Vec::new();
+        if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+            out.push(label.clone());
+        }
+        let mut child = widget.first_child();
+        while let Some(w) = child {
+            out.extend(labels(&w));
+            child = w.next_sibling();
+        }
+        out
     }
 
     /// Every `GtkLabel`'s text anywhere under `widget`.
@@ -2271,6 +2558,310 @@ mod tests {
         engine.shutdown();
     }
 
+    /// An `AdwActionRow`'s subtitle. `Option<GString>` because libadwaita
+    /// distinguishes "no subtitle" from an empty one; nothing here does.
+    fn subtitle_of(row: &adw::ActionRow) -> String {
+        row.subtitle().unwrap_or_default().to_string()
+    }
+
+    /// Wait for a test already in flight to report, pressing again only if
+    /// what came back was `Busy`.
+    ///
+    /// `Busy` is not flakiness in the row but sharing in the suite:
+    /// `crate::reword::state()`'s two permits are process-wide, and
+    /// `settings::model`'s own tests take them from another thread of the
+    /// same binary. It is a real row with its own wording, asserted from the
+    /// variant in `model.rs`; what it is not is a thing these tests are
+    /// about. Retrying it is safe for the first-request caveat too: `Busy` is
+    /// returned before `note_endpoint`, so a refused press cannot consume the
+    /// flag.
+    ///
+    /// Waits *before* pressing, and one press is one request: `emit_clicked`
+    /// ignores sensitivity, so a helper that pressed on the way in would put
+    /// a second request in flight behind the caller's own and leave which
+    /// answer landed last to chance -- and the second is never the first
+    /// against its endpoint.
+    fn await_answer(run: &gtk::Button, result: &adw::ActionRow) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            spin_until(Duration::from_secs(20), || result.title() != "Testing…");
+            assert_ne!(
+                result.title(),
+                "Testing…",
+                "the result never arrived; the glib future is not being driven"
+            );
+            if result.title() != TestOutcome::Busy.title() || std::time::Instant::now() > deadline {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            run.emit_clicked();
+        }
+    }
+
+    /// Press Test and wait for what it reports.
+    fn press_test(run: &gtk::Button, result: &adw::ActionRow) {
+        run.emit_clicked();
+        await_answer(run, result);
+    }
+
+    /// The Test row's whole contract, driven through the real widgets.
+    ///
+    /// The latency sentence is what this task exists for. Nothing in this
+    /// project measures end-to-end provider latency and nothing else will, so
+    /// this row is the only route by which anyone learns what their own
+    /// provider costs -- and the comparison against the *configured* deadline
+    /// is the only thing that answers the question the number is for. A row
+    /// that reported the outcome but not the latency, or the latency but not
+    /// the comparison, would satisfy nobody, so all three are asserted on the
+    /// string that actually reached a `GtkLabel`.
+    ///
+    /// Against an injected client rather than a socket: the number has to be
+    /// compared against a deadline this test chooses, on both sides of it,
+    /// and the first-request caveat has to be seen appearing once and not
+    /// twice. None of that is drivable against a real provider, and against a
+    /// dead port the whole row would collapse to one failure sentence -- in
+    /// the default build, to `Unavailable`, which tests nothing at all.
+    fn the_test_row_reports_the_latency_against_the_deadline(dir: &std::path::Path) {
+        let dir = dir.join("reword-test-row");
+        std::fs::create_dir_all(&dir).expect("a config directory of its own");
+        // Long, because a row that ellipsised instead of wrapping would be
+        // cutting off the one thing the row is for -- and with an `&` in it,
+        // because `AdwPreferencesRow:use-markup` defaults to `true` and a
+        // title it cannot parse renders *blank*. This is the one row in the
+        // window whose title a provider writes, so it is the one where that
+        // character cannot be ruled out.
+        let answer = "Alice & Bob are asking whereabouts you would like to go for dinner";
+        let (model, engine) = model_answering(&dir, answer, Duration::from_millis(300));
+        model
+            .edit(|c| {
+                // An endpoint key nothing else in this binary uses. Whether a
+                // request is the *first* against an endpoint is process-wide
+                // state keyed `base_url|model`, and this test asserts on the
+                // caveat that fact produces.
+                c.reword.model = "window-test-latency".into();
+                // Under the stub's own delay, so the first answers are
+                // `Slower` -- the row this whole task exists for.
+                c.reword.timeout_ms = 200;
+            })
+            .expect("edit");
+        let ui = build(model.clone(), engine.clone());
+        ui.window.present();
+        spin_until(Duration::from_secs(2), || ui.window.is_mapped());
+
+        let group = find_group(ui.window.upcast_ref(), "Reword").expect("a Reword group");
+        let test = find_row::<adw::EntryRow>(group.upcast_ref(), "Test").expect("a Test row");
+        assert_eq!(
+            test.text(),
+            REWORD_TEST_DEFAULT,
+            "pressing Test once without typing anything must already be a \
+             meaningful test"
+        );
+        let run = find_button(group.upcast_ref(), "Test").expect("a Test button");
+        let result = find_result_row(ui.window.upcast_ref()).expect("a result row");
+        assert!(
+            !result.is_visible(),
+            "the result row is hidden until the first test"
+        );
+
+        // The main thread does not wait. The stub sleeps 300 ms on the
+        // model's own thread; a handler that waited for it would show up
+        // here, and so would one that had put the request on this thread.
+        let started = std::time::Instant::now();
+        run.emit_clicked();
+        let handler_took = started.elapsed();
+        assert!(
+            handler_took < Duration::from_millis(100),
+            "the button handler blocked the main thread for {handler_took:?}"
+        );
+        assert!(result.is_visible(), "a test in flight has to be visible");
+        assert_eq!(result.title(), "Testing…");
+        assert!(
+            !run.is_sensitive(),
+            "a test in flight disables its own button"
+        );
+
+        await_answer(&run, &result);
+        assert!(
+            run.is_sensitive(),
+            "the button has to come back, or the row works once per window"
+        );
+
+        // The rewritten text is the title, because it is the point.
+        assert_eq!(result.title(), answer);
+        let subtitle = subtitle_of(&result);
+        assert!(
+            subtitle.starts_with("Rewritten in "),
+            "the measured latency is the first thing the sentence says: {subtitle:?}"
+        );
+        assert!(
+            subtitle.contains(
+                "longer than the 0.2 s deadline, so a real notification would \
+                 have been spoken as written"
+            ),
+            "the number has to be compared against the *configured* deadline, \
+             in the same sentence: {subtitle:?}"
+        );
+        assert!(
+            subtitle.ends_with("(first request — includes connection setup)"),
+            "a first request pays for connection setup and has to say so, or \
+             the row condemns a provider on a number that will not happen \
+             again: {subtitle:?}"
+        );
+
+        // ...and it reached the screen. Both labels carry a string this
+        // window did not write -- the model's answer and a sentence built
+        // around a provider's own numbers -- and a label GTK refused to set
+        // because the markup did not parse is empty, which is the failure
+        // `use_markup(false)` exists for and the one an assertion on the
+        // outcome would sail straight past.
+        let rendered = label_texts(result.upcast_ref());
+        assert!(
+            rendered.iter().any(|l| l == answer),
+            "the rewritten text must render: {rendered:?}"
+        );
+        assert!(
+            rendered.contains(&subtitle),
+            "the latency sentence must render: {rendered:?}"
+        );
+
+        // Wrapped, not ellipsised. The text is the point of the row, and a
+        // provider's answer and a transport error are both longer than one
+        // line at this window's 520 px.
+        for wanted in [answer.to_string(), subtitle.clone()] {
+            let label = labels(result.upcast_ref())
+                .into_iter()
+                .find(|l| l.text() == wanted)
+                .expect("the label that carries it");
+            assert!(label.wraps(), "{wanted:?} must wrap");
+            assert_eq!(
+                label.ellipsize(),
+                gtk::pango::EllipsizeMode::None,
+                "{wanted:?} must not be ellipsised"
+            );
+            // `GtkLabel:lines` only truncates when it is positive:
+            // libadwaita passes `title-lines` through unchanged, so 0 here is
+            // what "no limit" looks like coming from a `title_lines(0)` row,
+            // and -1 is what it looks like on a label nobody set. Both are
+            // unlimited; anything above 0 is a line count this row must not
+            // have.
+            assert!(
+                label.lines() <= 0,
+                "{wanted:?} must not be cut off at a line count, but lines is {}",
+                label.lines()
+            );
+        }
+
+        // A second press against the same endpoint: the same sentence,
+        // without the caveat. Saying "first request" every time would be
+        // exactly as useless as saying it never.
+        press_test(&run, &result);
+        let warm = subtitle_of(&result);
+        assert!(
+            warm.starts_with("Rewritten in ") && !warm.contains("first request"),
+            "a warm endpoint's latency is reported without the caveat: {warm:?}"
+        );
+
+        // Widen the deadline past the stub's delay: the comparison must
+        // follow the number the user configured, not a constant.
+        model.edit(|c| c.reword.timeout_ms = 1500).expect("edit");
+        press_test(&run, &result);
+        let inside = subtitle_of(&result);
+        assert!(
+            inside.contains("inside the 1.5 s deadline"),
+            "the deadline named is the one the Deadline row holds: {inside:?}"
+        );
+
+        // Enter in the field is the same action as the button.
+        result.set_title("cleared");
+        test.emit_by_name::<()>("entry-activated", &[]);
+        assert_eq!(
+            result.title(),
+            "Testing…",
+            "pressing Enter in the field runs the test too"
+        );
+        await_answer(&run, &result);
+
+        // Speak submits the *row's title*, not the Test field's text. Proved
+        // by making them disagree: a field that trims to nothing submits
+        // nothing at all, so anything reaching the engine came from the row.
+        assert_eq!(result.title(), answer);
+        test.set_text("   ");
+        let speak = find_button(result.upcast_ref(), "Speak").expect("a Speak button");
+        speak.emit_clicked();
+        spin_until(Duration::from_secs(5), || {
+            engine.snapshot().current_text == answer
+        });
+        assert_eq!(
+            engine.snapshot().current_text,
+            answer,
+            "Speak must audition what came back, not what is in the Test field"
+        );
+
+        ui.window.destroy();
+        drop(ui);
+        engine.shutdown();
+    }
+
+    /// Closing the window with a request still in flight frees it anyway.
+    ///
+    /// The one lifetime the Test row adds: a `glib::spawn_future_local` that
+    /// outlives the click, holding what it needs to report into. Held
+    /// strongly, that future is a widget tree that cannot be freed until a
+    /// provider answers -- up to `REWORD_HTTP_CEILING`, ten seconds, per
+    /// opening, on a daemon whose whole arrangement is to carry no GTK
+    /// resources between openings.
+    fn the_window_is_freed_while_a_test_is_in_flight(dir: &std::path::Path) {
+        let dir = dir.join("reword-inflight-leak");
+        std::fs::create_dir_all(&dir).expect("a config directory of its own");
+        // Long enough that the request is *still pending* when the count is
+        // taken, which is the whole point: a future that held the row
+        // strongly would release it the moment it completed, so a
+        // measurement taken after the answer arrived would report zero
+        // whether the capture was weak or not. Measured -- a deliberately
+        // strong capture is invisible to a 5 s spin against a 1.5 s stub and
+        // holds all 861 widgets against this one.
+        let (model, engine) = model_answering(&dir, "answered", Duration::from_secs(4));
+        model
+            .edit(|c| c.reword.model = "window-test-inflight".into())
+            .expect("edit");
+
+        let mut widgets = Vec::new();
+        let window = {
+            let ui = build(model, engine.clone());
+            let group = find_group(ui.window.upcast_ref(), "Reword").expect("a Reword group");
+            let run = find_button(group.upcast_ref(), "Test").expect("a Test button");
+            let result = find_result_row(ui.window.upcast_ref()).expect("a result row");
+            run.emit_clicked();
+            assert_eq!(result.title(), "Testing…", "the test is in flight");
+
+            weak_widgets(ui.window.upcast_ref(), &mut widgets);
+            let window = ui.window.downgrade();
+            ui.window.destroy();
+            window
+        };
+        let total = widgets.len();
+        // Comfortably inside the stub's delay: finalisation happens on a turn
+        // of the main loop and takes milliseconds, so two seconds is slack
+        // against a slow machine rather than time for the request to land.
+        let started = std::time::Instant::now();
+        spin_until(Duration::from_secs(2), || {
+            window.upgrade().is_none() && widgets.iter().all(|w| w.upgrade().is_none())
+        });
+        let alive = widgets.iter().filter(|w| w.upgrade().is_some()).count();
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the premise: the request must still be pending when the count is \
+             taken, and it is not after {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            alive, 0,
+            "{alive} of {total} widgets survived a close with a test in flight; \
+             the future is holding the row rather than a weak reference to it"
+        );
+        engine.shutdown();
+    }
+
     /// The leak M5 paid for, guarded at the two places a new one would
     /// appear: the entry rows' focus controllers and the preset popover's
     /// buttons, both of which refer to widgets that refer back.
@@ -2405,6 +2996,8 @@ mod tests {
         adw::init().expect("libadwaita initialises once GTK has");
         a_newly_seen_application_appears_while_the_window_is_open(dir.path());
         the_reword_entry_rows_commit_on_apply_and_never_clobber_typing(dir.path());
+        the_test_row_reports_the_latency_against_the_deadline(dir.path());
         the_window_is_freed_after_the_reword_group_has_been_built(dir.path());
+        the_window_is_freed_while_a_test_is_in_flight(dir.path());
     }
 }
