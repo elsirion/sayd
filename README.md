@@ -453,9 +453,22 @@ through a paid or slow endpoint is a cost and a delay the caller did not ask
 for.
 
 A coalesced follow-up -- `Signal: 3 more notifications` -- is never
-reworded, whatever `enabled` says: it is already a sentence, and rewriting
-it would let it overtake the announcement that opened the coalescing
-window.
+reworded, whatever `enabled` says. Three reasons, all about the line
+itself: `sayd` composed it from a template, so it is already a sentence
+written for the ear and a rewrite can only make it worse; it would cost a
+provider round trip for text you did not write; and its whole job is to
+arrive the moment the coalescing window closes, which a rewrite would
+delay by up to `timeout_ms`.
+
+Not, as an earlier version of this file said, because rewriting it would
+let it overtake the announcement that opened the window. That is backwards
+-- *excluding* the follow-up is what makes it instant, and rewriting it
+would push it later, never earlier. The inversion is real but arrives from
+the other side: the **opener** is what a rewrite delays, and a window that
+closes before its opener has been submitted lets the follow-up be spoken
+first. That is bounded where it lives, by the floor `cooldown_secs` is
+clamped to, which keeps every non-zero cooldown clear of the rewrite
+ceiling.
 
 ### Endpoints
 
@@ -521,8 +534,25 @@ application name (if `speak_app_name`), the summary, and the body (if
 `speak_body`) -- or, on the explicit path, the cleaned submission text.
 Nothing else. No application identity beyond the name it announces itself
 as, no timestamps, no queue state, no other utterances. Cleanup runs first,
-so code fences are already gone and URLs are already reduced to the word
-`link`.
+so code fences are already gone, markdown and terminal escapes are stripped,
+and URLs are already reduced to the word `link` -- which is what keeps a
+reset link, a token in a query string or a secret quoted inside a fenced
+block out of the request. Measured against a fake provider, a notification
+reading
+
+    Alice sent a link. reset here https://example.com/reset?token=SECRET123
+    ```
+    export AWS_SECRET=hunter2
+    ```
+    **bold** _em_
+
+is sent as `Signal: Alice. Alice sent a link. reset here link bold em`.
+
+The request goes to `base_url` **and nowhere else**. `sayd` does not read
+`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`, and it does not follow redirects: a
+provider that answers with a `Location` gets no second request, to any host.
+If you must egress through a proxy, put it in `base_url`, where the log line
+below can name it.
 
 Pressing **Test** in the settings window sends whatever is in the Test
 field. It is the one send that happens with `enabled = false`: it is a
@@ -584,11 +614,21 @@ appears to do nothing. Two specific cases worth knowing:
   per run, even though `enabled` was never asked about: an explicit request
   that cannot be honoured still owes the caller a reason.
 
+"Every failure ends in the original being spoken" includes the failure that
+happens *after* the rewrite worked. A rewrite may be up to about 1.5x the
+length of what it replaced, and `max_chars` is a separate limit, so a long
+announcement can come back as a valid rewrite the engine will not take. The
+announcement is then spoken as written, with one `warning:` line saying so,
+rather than lost. An over-long *notification* never puts the daemon itself
+into an error state either: its text was chosen by the application that sent
+it, not by you.
+
 The daemon also protects itself: a rejected key stops further attempts
-until the configuration changes, three consecutive transport failures stop
-them for a minute, and a `429` is honoured (its `Retry-After`, when the
-provider sends one). At most two rewrites are ever in flight; a third is
-spoken as written immediately rather than queued.
+until the configuration changes -- per endpoint, and each one says so once --
+three consecutive transport failures stop them for a minute, and a `429` is
+honoured (its `Retry-After`, when the provider sends one) and logged with
+whatever the provider said. At most two rewrites are ever in flight; a third
+is spoken as written immediately rather than queued.
 
 ### The limitation worth knowing about
 
