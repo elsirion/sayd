@@ -428,6 +428,14 @@ any of this at all needs `sayd` built with `--features reword` (see
 no TLS stack, so `enabled = true` in that build is a no-op -- see
 [What can go wrong](#what-can-go-wrong) below.
 
+The prompt also asks for English, translating if the text is in another
+language. There is one voice and it speaks English, so a message that
+arrives in German is more useful spoken as English than read aloud in an
+accent that belongs to neither. This is a request, not a guarantee: nothing
+checks what language comes back, because the only instrument that could is a
+detector running on text even shorter than the input. A model that ignores
+the instruction produces a bad announcement, not a broken one.
+
     [reword]
     enabled = false                          # rewrite notification announcements
     base_url = "http://localhost:11434/v1"   # any OpenAI-compatible endpoint

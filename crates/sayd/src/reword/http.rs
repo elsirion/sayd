@@ -75,8 +75,20 @@ use serde::{Deserialize, Serialize};
 
 use super::{http_ceiling, RewordError, Rewriter};
 
-/// §3's prompt, verbatim. One request, one system prompt, one user message
-/// containing the text. No history, no tools, no schema.
+/// §3's prompt, with one rule since changed. One request, one system prompt,
+/// one user message containing the text. No history, no tools, no schema.
+///
+/// §3 told the model to leave non-English text unchanged, which was right
+/// while the only voice was English: a rewrite it could not speak was worse
+/// than the original. That is no longer the shape of the problem. Text
+/// arrives in another language from the people who write to this daemon's
+/// user in one, and returning it verbatim means the English voice reads
+/// German aloud -- so the rule now asks for a translation instead, which is
+/// the one thing the model on the other end is unambiguously good at.
+///
+/// The "reply with it unchanged" escape survives for the case it was
+/// actually protecting: text that is already a natural spoken English
+/// sentence, where a rewrite can only make it worse.
 const SYSTEM_PROMPT: &str = "\
 You rewrite short desktop notifications so a speech synthesiser can
 read them aloud. Notifications are written to be read at a glance, so
@@ -91,8 +103,9 @@ Rules:
   becomes \"Alice is asking where you want to go for dinner\".
 - One or two sentences at most, and no longer than the original needs.
 - Do not expand abbreviations, identifiers or names you are unsure of.
-- If the text is already a natural spoken sentence, is not English, or you
-  cannot improve it, reply with it unchanged.";
+- Always reply in English, translating if the text is in another language.
+- If the text is already a natural spoken English sentence, or you cannot
+  improve it, reply with it unchanged.";
 
 /// `f64` rather than `f32`, because this is serialised into JSON and JSON
 /// numbers are `f64`. As an `f32` the literal `0.2` widens to
