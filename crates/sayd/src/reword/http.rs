@@ -89,6 +89,29 @@ use super::{http_ceiling, RewordError, Rewriter};
 /// The "reply with it unchanged" escape survives for the case it was
 /// actually protecting: text that is already a natural spoken English
 /// sentence, where a rewrite can only make it worse.
+///
+/// The label rule is worded the way it is because of what a measurement
+/// against a real 24B local model showed, not because it reads well.
+/// "Turn labels into sentences" was never the broken part -- `Mutti:
+/// Kommst du am Sonntag zum Essen?` already produced *"Mutti is asking if
+/// you are coming for dinner on Sunday"*. What kept `Mutti` was the *other*
+/// rule: "Names ... stay exactly as written" protects a relationship word
+/// exactly as hard as it protects a person's name, and the conservative
+/// reading wins. Scoping that to **proper** names, and saying outright that
+/// a role word is translated like any other, is what turns it into "Mum",
+/// `Papa:` into "Dad", and `Familie Müller:` into "the Müller family".
+///
+/// The false-friend clause earns its place separately: without it `Chef:`
+/// survived as "Chef" through every other wording tried, which in English
+/// is a cook rather than a boss -- a wrong announcement, not merely a
+/// clumsy one.
+///
+/// One measured side effect, judged an improvement and left alone: the old
+/// wording preserved pleasantries, so `Anna: Bis später, ich bin um 20 Uhr
+/// da.` became *"Anna says she will see you later and will be there at 8
+/// PM"* in 3 of 3 samples, where this one drops the farewell and keeps the
+/// time. Substantive clauses are not dropped -- `Ich habe angerufen, ruf
+/// bitte zurück` keeps both halves.
 const SYSTEM_PROMPT: &str = "\
 You rewrite short desktop notifications so a speech synthesiser can
 read them aloud. Notifications are written to be read at a glance, so
@@ -97,10 +120,16 @@ they are terse and often not sentences.
 Rules:
 - Reply with the rewritten text and nothing else: no preamble, no quotes, no
   explanation, no markdown.
-- Keep every fact. Names, numbers, times and places stay exactly as written.
-  Add nothing.
-- Turn labels into sentences. \"Alice: where do you want to go for dinner\"
-  becomes \"Alice is asking where you want to go for dinner\".
+- Keep every fact. Proper names, numbers, times and places stay exactly as
+  written. Add nothing and drop nothing.
+- The text before a colon is who sent it: a name, a nickname, or what they
+  are to the listener. Make them the subject of a sentence and say what they
+  are doing. \"Alice: where do you want to go for dinner\" becomes \"Alice is
+  asking where you want to go for dinner\". \"Mutti: kommst du Sonntag?\"
+  becomes \"Mum is asking whether you are coming on Sunday\".
+- A word for someone's role or relationship is translated like any other
+  word, including when the same spelling exists in English with a different
+  meaning -- German \"Chef\" is a boss, not a cook.
 - One or two sentences at most, and no longer than the original needs.
 - Do not expand abbreviations, identifiers or names you are unsure of.
 - Always reply in English, translating if the text is in another language.
