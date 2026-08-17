@@ -221,16 +221,7 @@ fn build_menu(s: &Snapshot, config_problem: Option<&str>) -> Vec<MenuItem<SaydTr
         CheckmarkItem {
             label: "Mute".into(),
             checked: s.muted,
-            // CRITICAL 1: through the store, not `Command::SetMuted`. A
-            // mute set here has to survive the next config apply and the
-            // next restart -- spec §6 -- and an engine-only mute did
-            // neither: nudging Speed in the settings window, or any tool
-            // rewriting `~/.config/sayd`, unmuted the daemon and flipped
-            // this checkbox back on its own.
-            activate: Box::new(|t: &mut SaydTray| {
-                let muted = !t.snapshot.muted;
-                persist_in_background(t.store.clone(), move |s| s.set_muted(muted));
-            }),
+            activate: Box::new(toggle_mute),
             ..Default::default()
         }
         .into(),
@@ -275,6 +266,32 @@ fn build_menu(s: &Snapshot, config_problem: Option<&str>) -> Vec<MenuItem<SaydTr
 /// helpers): nothing in the running daemon needs the menu as bare strings,
 /// only its own D-Bus tree, which `Tray::menu` already produces straight
 /// from `build_menu`.
+/// Flip mute and persist it. The one place that happens, reached from both
+/// the **Mute** menu item and a primary click on the icon
+/// ([`SaydTray::activate`]).
+///
+/// Shared rather than written twice on purpose: the two entry points must
+/// agree about *how* mute is set, and the how is not obvious.
+///
+/// CRITICAL 1: through the store, not `Command::SetMuted`. A mute set here
+/// has to survive the next config apply and the next restart -- spec §6 --
+/// and an engine-only mute did neither: nudging Speed in the settings
+/// window, or any tool rewriting `~/.config/sayd`, unmuted the daemon and
+/// flipped the checkbox back on its own. A second copy of this in an
+/// `activate` handler would be one `Command::SetMuted` away from bringing
+/// that back for clicks only, where it would look like the tray
+/// occasionally forgetting rather than like a bug with a shape.
+///
+/// The flip reads `t.snapshot.muted`, which is the last published state
+/// rather than the file's. Two clicks faster than the publish loop
+/// therefore write the same value twice instead of toggling twice -- the
+/// same behaviour the menu item has always had, and preferable to the
+/// alternative of reading the file on the ksni dispatch thread.
+fn toggle_mute(t: &mut SaydTray) {
+    let muted = !t.snapshot.muted;
+    persist_in_background(t.store.clone(), move |s| s.set_muted(muted));
+}
+
 #[cfg(test)]
 pub fn menu_labels(s: &Snapshot, config_problem: Option<&str>) -> Vec<String> {
     build_menu(s, config_problem)
@@ -383,6 +400,25 @@ impl Tray for SaydTray {
     fn menu(&self) -> Vec<MenuItem<Self>> {
         build_menu(&self.snapshot, self.config_status.get().as_deref())
     }
+
+    /// Primary click on the icon toggles mute.
+    ///
+    /// Mute is the one control worth reaching without opening a menu: it is
+    /// the thing you want when the daemon is already talking and you would
+    /// rather it stopped, and the icon already shows the state you are
+    /// toggling ([`icon_for`] returns the muted glyph whatever the engine
+    /// is doing), so the click has visible feedback without a menu.
+    ///
+    /// `ksni` only routes a primary click here when `MENU_ON_ACTIVATE` is
+    /// `false`, which is its default and which this tray leaves alone --
+    /// setting it would make the host open the menu instead and this
+    /// method would never run. Whether a primary click *arrives* is still
+    /// the host's choice: waybar sends `Activate`, but a host that treats
+    /// the item as menu-only (`ItemIsMenu`) will show the menu, and the
+    /// Mute item is still there for exactly that case.
+    fn activate(&mut self, _x: i32, _y: i32) {
+        toggle_mute(self);
+    }
 }
 
 /// Register the tray with whatever StatusNotifierWatcher is running.
@@ -405,7 +441,79 @@ pub async fn spawn(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sayd_core::config::Config;
     use sayd_core::engine::{Snapshot, State};
+
+    /// A primary click on the icon has to actually reach the store.
+    ///
+    /// Driven through [`Tray::activate`] rather than through
+    /// [`toggle_mute`], because the only thing that can break here is the
+    /// wiring: `toggle_mute` is shared with the menu item and is covered by
+    /// the same behaviour there, while `activate` is a trait method with a
+    /// default empty body -- delete this override and every other test in
+    /// this file still passes while a click does nothing at all. `ksni`'s
+    /// `MENU_ON_ACTIVATE` is the other half of that: leave it at its `false`
+    /// default and this method runs, set it and the host opens the menu
+    /// instead.
+    ///
+    /// Asserts on the file rather than on `store.current()`, because
+    /// surviving a restart is the whole point of routing this through the
+    /// store (see [`toggle_mute`]) and only the file shows that.
+    #[tokio::test]
+    async fn a_primary_click_toggles_mute_and_writes_it_to_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let engine = sayd_core::handle::EngineHandle::spawn(
+            Config::default(),
+            Box::new(sayd_core::synth::StubSynthesizer::new()),
+            Box::new(sayd_core::audio::VecSink::new(24_000)),
+        );
+        let store = Arc::new(ConfigStore::new(
+            path.clone(),
+            engine.clone(),
+            Config::default(),
+        ));
+        let mut tray = SaydTray::new(engine.clone(), store.clone(), Arc::new(ConfigStatus::default()));
+
+        assert!(!tray.snapshot.muted, "the daemon starts unmuted");
+        Tray::activate(&mut tray, 0, 0);
+        await_muted(&path, true, "a primary click must mute, and must persist it").await;
+
+        // ...and back. The flip reads the snapshot, so give the tray the
+        // state a publish would have handed it before clicking again.
+        tray.snapshot.muted = true;
+        Tray::activate(&mut tray, 0, 0);
+        await_muted(
+            &path,
+            false,
+            "a second click must unmute rather than write muted twice",
+        )
+        .await;
+
+        engine.send(Command::Shutdown);
+    }
+
+    /// Wait for the file to hold `expect`.
+    ///
+    /// `persist_in_background` spawns and returns nothing to await, so this
+    /// polls -- but it waits for the *value*, not merely for a `muted` key
+    /// to appear. Returning on the first key found passes the second half of
+    /// the test above against the first half's write, which is how this
+    /// helper was written the first time.
+    async fn await_muted(path: &std::path::Path, expect: bool, why: &str) {
+        for _ in 0..200 {
+            let seen = std::fs::read_to_string(path).ok().and_then(|t| {
+                t.lines()
+                    .find(|l| l.trim_start().starts_with("muted"))
+                    .map(|l| l.contains("true"))
+            });
+            if seen == Some(expect) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("{why}: `muted = {expect}` never reached {}", path.display());
+    }
 
     fn snap(state: State) -> Snapshot {
         Snapshot {
