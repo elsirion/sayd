@@ -2240,10 +2240,22 @@ fn theme_has(name: &str) -> bool {
 /// thread and a compositor:
 ///
 /// ```text
-/// WLR_BACKENDS=headless WLR_RENDERER=pixman sway &
-/// WAYLAND_DISPLAY=wayland-1 cargo test -p sayd --bin sayd \
+/// scripts/headless.sh cargo test -p sayd --bin sayd \
 ///     settings::window -- --test-threads=1
 /// ```
+///
+/// **Do not start a headless `sway` and point `WAYLAND_DISPLAY` at
+/// `wayland-1` by hand**, which is what this comment used to say. A nested
+/// compositor takes the next free `wayland-N` in the session's
+/// `XDG_RUNTIME_DIR`, so on any machine that is already running a desktop,
+/// `wayland-1` is *that* desktop: the tests present real windows onto the
+/// developer's screen while the headless compositor they just started sits
+/// idle beside them. It is a silent wrong answer -- the tests pass either
+/// way -- and it was noticed only because someone watched windows appear
+/// while a suite ran. `scripts/headless.sh` gives the nested compositor a
+/// runtime directory of its own, where `wayland-1` can only mean the one it
+/// started, and unsets `DISPLAY` so a GTK4 build with X11 support cannot
+/// reach the session that way instead.
 #[cfg(test)]
 mod tests {
     use super::*;
