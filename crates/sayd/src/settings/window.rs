@@ -1439,14 +1439,14 @@ fn reword_group(ui: &Ui, cfg: &Config, engine: EngineHandle) -> adw::Preferences
         .title("Rewrite notifications")
         .subtitle("Send each announcement to the endpoint below and speak what comes back")
         .use_markup(false)
-        .active(cfg.reword.enabled)
+        .active(cfg.reword.notifications)
         .build();
     let r = enabled.clone();
-    ui.row(move |_, cfg| r.set_active(cfg.reword.enabled));
+    ui.row(move |_, cfg| r.set_active(cfg.reword.notifications));
     let u = ui.downgrade();
     enabled.connect_active_notify(move |row| {
         let on = row.is_active();
-        u.on_user_change(|u| u.apply(|c| c.reword.enabled = on));
+        u.on_user_change(|u| u.apply(|c| c.reword.notifications = on));
     });
     group.add(&enabled);
 

@@ -900,15 +900,20 @@ async fn run_daemon() -> std::process::ExitCode {
         cfg,
     ));
     store.status().set(cfg_problem);
-    // §8: `enabled = true` in a build with no client in it is not an error
-    // -- everything is spoken as written, exactly as it was before this
-    // feature existed -- but it must not be silent, or a user who set the
-    // switch would have no way at all to discover why nothing changed.
+    // §8: asking for rewording in a build with no client in it is not an
+    // error -- everything is spoken as written, exactly as it was before
+    // this feature existed -- but it must not be silent, or a user who set
+    // the switch would have no way at all to discover why nothing changed.
+    //
+    // Keyed on `notifications`, not on the `enabled` master: the master
+    // defaults to true and the 2026-08-24 migration turns it on for every
+    // existing config, so keying there would print this at every start on
+    // every machine that has never asked for rewording at all.
     #[cfg(not(feature = "reword"))]
-    if store.current().reword.enabled {
+    if store.current().reword.notifications {
         eprintln!(
-            "info: [reword] enabled = true, but this build has no rewording client \
-             (rebuild with --features reword); text will be spoken as written"
+            "info: [reword] notifications = true, but this build has no rewording \
+             client (rebuild with --features reword); text will be spoken as written"
         );
     }
     // The settings window is built and destroyed on demand, so the model it

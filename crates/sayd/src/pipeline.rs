@@ -229,6 +229,52 @@ mod tests {
         }
     }
 
+    /// The master refuses both asks, and keeps the endpoint settings.
+    ///
+    /// "Off for now", not "forget my provider": the fields are still there
+    /// afterwards, which is what makes the switch usable as a switch. The
+    /// refusal is checked before `reword::context` is consulted, so a
+    /// config nobody is using never builds a client and never records a
+    /// cached failure against itself.
+    #[test]
+    fn the_master_switch_refuses_every_ask_without_clearing_anything() {
+        let mut cfg = configured();
+        cfg.reword.notifications = true;
+        cfg.reword.enabled = false;
+
+        for ask in [Ask::Automatic(&cfg), Ask::Requested(&cfg)] {
+            let prepared = prepare(Written("Alice: dinner tonight?".into()), ask)
+                .expect("well under the limit");
+            assert!(
+                matches!(prepared, Prepared::Ready(_)),
+                "with the master off nothing is admitted, whoever asks"
+            );
+        }
+
+        assert_eq!(cfg.reword.provider.as_deref(), Some("generic"));
+        assert_eq!(cfg.reword.base_url, "http://127.0.0.1:1/v1");
+    }
+
+    /// Cleanup off reaches the provider too: the copy on the wire is the
+    /// one `clean` produced, and with the master off `clean` produces the
+    /// text as written.
+    ///
+    /// Worth pinning here rather than only in `cleanup`: this is the call
+    /// site the user cannot see, and "cleanup off" quietly not applying to
+    /// it would mean the text sent somewhere is cleaned while the text
+    /// spoken at home is not.
+    #[test]
+    fn the_cleanup_master_reaches_the_copy_that_would_be_sent() {
+        let mut cfg = configured();
+        cfg.cleanup.enabled = false;
+        let raw = "**bold** and a link https://example.com/x";
+        assert_eq!(
+            sayd_core::cleanup::clean(raw, &cfg.cleanup),
+            raw,
+            "the pass `RewordPlan::admit_with` makes is the identity now"
+        );
+    }
+
     /// Provenance survives `prepare`: the origin is passed *through* to
     /// `RewordPlan::automatic` rather than unwrapped into a bare string, so
     /// this daemon's own composed follow-ups still cannot reach a provider.

@@ -1393,14 +1393,14 @@ pub struct RewordPlan {
 }
 
 impl RewordPlan {
-    /// The configuration's standing ask: `[reword] enabled = true`, which
-    /// means "rewrite my notifications without being asked".
+    /// The configuration's standing ask: `[reword] notifications = true`,
+    /// which means "rewrite my notifications without being asked".
     ///
     /// Every step is synchronous and cheap -- a pass over a short string and
     /// one mutex -- so text that is not going to be rewritten costs no
     /// allocation, no clone of the config, and above all no `tokio::spawn`.
     /// That is what keeps the feature-off path exactly what it was: with
-    /// `enabled = false` this returns on the second line, and in a build
+    /// `notifications = false` this returns on the second line, and in a build
     /// without the `reword` feature [`build_rewriter`] cannot make a client
     /// at all, so `context` returns `None` and `admit` returns on its first.
     ///
@@ -1424,7 +1424,7 @@ impl RewordPlan {
             // be added without this rule being re-decided for it.
             Provenance::Composed(text) => return Err(text),
         };
-        if !cfg.enabled {
+        if !cfg.notifications {
             return Err(text);
         }
         RewordPlan::admit(text, cfg, cleanup)
@@ -1433,10 +1433,12 @@ impl RewordPlan {
     /// This caller's explicit ask: `say --reword`, or `reword` in the D-Bus
     /// `opts` map.
     ///
-    /// Deliberately does **not** consult `enabled`. That switch means
+    /// Deliberately does **not** consult `notifications`. That switch means
     /// "rewrite my notifications without being asked", and `--reword` *is*
     /// being asked; refusing an explicit request because a different,
-    /// automatic behaviour is switched off would be surprising. Everything
+    /// automatic behaviour is switched off would be surprising. It does
+    /// consult the `enabled` master, in [`RewordPlan::admit`] -- that one
+    /// says whether rewording happens at all. Everything
     /// else -- a usable endpoint, the eligibility rule, all three breakers --
     /// applies identically, because `admit` below is shared.
     ///
@@ -1492,6 +1494,13 @@ impl RewordPlan {
         cfg: &RewordConfig,
         cleanup: &CleanupConfig,
     ) -> Result<RewordPlan, String> {
+        // The master, and the first thing tested because it is the cheapest
+        // and the broadest: with rewording switched off neither ask admits,
+        // and `context` is not even consulted -- so no client is built and
+        // no cached failure is recorded for a config nobody is using.
+        if !cfg.enabled {
+            return Err(text);
+        }
         let Some((rewriter, state)) = context(cfg) else {
             return Err(text);
         };
@@ -1777,6 +1786,7 @@ mod tests {
     fn cfg() -> RewordConfig {
         RewordConfig {
             enabled: true,
+            notifications: true,
             timeout_ms: 100,
             provider: Some("generic".into()),
             ..RewordConfig::default()
@@ -2802,7 +2812,8 @@ mod tests {
     /// without being asked" is what that switch says, and `--reword` is
     /// being asked -- refusing an explicit request because a different,
     /// automatic behaviour is off would be surprising. Everything else is
-    /// the same code, because both constructors share `admit`.
+    /// the same code, because both constructors share `admit` -- including
+    /// the `enabled` master, which refuses both and is checked at the end.
     ///
     /// `is_ok()` is compared against `cfg!(feature = "reword")` rather than
     /// asserted outright: without the feature there is no client to build, so
@@ -2813,25 +2824,41 @@ mod tests {
     /// written, so each rejection is checked to be that text and not some
     /// other string.
     #[test]
-    fn only_the_automatic_ask_consults_enabled() {
+    fn only_the_automatic_ask_consults_notifications() {
         let text = "Alice: where do you want to go for dinner";
         let mut off = cfg();
-        off.enabled = false;
+        off.notifications = false;
 
         assert_eq!(
             RewordPlan::automatic(Written(text.into()), &off, &CleanupConfig::default()).err(),
             Some(text.to_string()),
-            "`enabled = false` must not even look for a client, and the text \
-             comes straight back"
+            "`notifications = false` must not even look for a client, and the \
+             text comes straight back"
         );
         assert_eq!(
             RewordPlan::requested(text.into(), &off, &CleanupConfig::default()).is_ok(),
             cfg!(feature = "reword"),
-            "an explicit --reword does not need `enabled`"
+            "an explicit --reword does not need `notifications`"
         );
         assert_eq!(
             RewordPlan::automatic(Written(text.into()), &cfg(), &CleanupConfig::default()).is_ok(),
             cfg!(feature = "reword")
+        );
+
+        // The master is the other switch, and it is not this one: it refuses
+        // both asks. Without this the pair above would pass just as well if
+        // `notifications` had been left as the only switch there is.
+        let mut master_off = cfg();
+        master_off.enabled = false;
+        assert_eq!(
+            RewordPlan::automatic(Written(text.into()), &master_off, &CleanupConfig::default())
+                .err(),
+            Some(text.to_string()),
+        );
+        assert_eq!(
+            RewordPlan::requested(text.into(), &master_off, &CleanupConfig::default()).err(),
+            Some(text.to_string()),
+            "rewording off means off, however explicitly it is asked for"
         );
     }
 

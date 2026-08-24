@@ -1104,16 +1104,21 @@ fn validate(cfg: &mut Config) -> Result<(), String> {
             known_speed_modes()
         ));
     }
-    // Gated on `enabled`, exactly as `reword_startup_refusal` is: turning
+    // Gated on the same pair `reword_startup_refusal` is gated on, and it
+    // has to be the same pair: this exists to keep the window from ever
+    // writing a file that function would then refuse to boot from. Turning
     // Rewrite notifications *off* with no provider set is fine and must
     // stay fine, since nothing reads `provider` while it is off. With it
-    // on, an unset or unrecognised provider is the file
-    // `reword_startup_refusal` would then refuse to boot from -- refusing
-    // the edit here is what keeps the window from ever writing one, which
-    // is the whole point: the settings window is reached through the
-    // running daemon's tray, so a daemon that will not start has taken the
-    // GUI away along with it.
-    if cfg.reword.enabled && cfg.reword.resolved_provider().is_none() {
+    // on, an unset or unrecognised provider is exactly that unbootable
+    // file -- and the settings window is reached through the running
+    // daemon's tray, so a daemon that will not start has taken the GUI away
+    // along with it.
+    //
+    // `notifications` and not the `enabled` master. The master defaults to
+    // true and the 2026-08-24 migration turns it on for every existing
+    // config, so gating here on `enabled` alone would refuse every edit to
+    // every unrelated row on any machine without a provider configured.
+    if cfg.reword.enabled && cfg.reword.notifications && cfg.reword.resolved_provider().is_none() {
         return Err(format!(
             "reword.provider ({}) is not a provider this build knows; expected one of {}",
             cfg.reword.provider.as_deref().unwrap_or("unset"),
@@ -2981,6 +2986,7 @@ mod tests {
         let mut unset = Config {
             reword: Box::new(RewordConfig {
                 enabled: true,
+                notifications: true,
                 provider: None,
                 ..RewordConfig::default()
             }),
@@ -3001,6 +3007,7 @@ mod tests {
         let mut bad = Config {
             reword: Box::new(RewordConfig {
                 enabled: true,
+                notifications: true,
                 provider: Some("azure-nonsense".into()),
                 ..RewordConfig::default()
             }),
@@ -3028,6 +3035,7 @@ mod tests {
             let mut cfg = Config {
                 reword: Box::new(RewordConfig {
                     enabled: true,
+                    notifications: true,
                     provider: Some(name.to_string()),
                     ..RewordConfig::default()
                 }),
@@ -3044,14 +3052,17 @@ mod tests {
     /// the window side: flipping Rewrite notifications *off* must stay fine
     /// regardless of what `provider` says, including nonsense left over
     /// from before the switch was turned off and no provider at all. The
-    /// daemon never reads `provider` while `enabled` is false, so there is
-    /// nothing here to refuse.
+    /// daemon never reads `provider` while `notifications` is false, so
+    /// there is nothing here to refuse. Pinned with the `enabled` master
+    /// *on*, so it is the notification switch doing the work here and not
+    /// rewording being off wholesale.
     #[test]
     fn validate_accepts_reword_disabled_regardless_of_provider() {
         for provider in [None, Some("nonsense".to_string())] {
             let mut cfg = Config {
                 reword: Box::new(RewordConfig {
-                    enabled: false,
+                    enabled: true,
+                    notifications: false,
                     provider,
                     ..RewordConfig::default()
                 }),
@@ -3059,7 +3070,7 @@ mod tests {
             };
             assert!(
                 validate(&mut cfg).is_ok(),
-                "reword.enabled = false must accept any provider value: {:?}",
+                "reword.notifications = false must accept any provider value: {:?}",
                 cfg.reword.provider
             );
         }
@@ -4788,7 +4799,10 @@ mod tests {
         const SLOW_MODEL_MS: u64 = 20_000;
 
         let mut cfg = Config::default();
+        // Both: the floor follows the deadline only while notifications are
+        // actually being rewritten, and that needs the master as well.
         cfg.reword.enabled = true;
+        cfg.reword.notifications = true;
         cfg.reword.timeout_ms = SLOW_MODEL_MS;
         cfg.notifications.cooldown_secs = 2;
         let warnings = clamp_ranges(&mut cfg);
@@ -4810,7 +4824,7 @@ mod tests {
         // config cannot have.
         let mut quiet = Config::default();
         quiet.notifications.cooldown_secs = 2;
-        assert!(!quiet.reword.enabled);
+        assert!(!quiet.reword.notifications);
         assert!(clamp_ranges(&mut quiet).is_empty());
         assert_eq!(quiet.notifications.cooldown_secs, 2);
 
@@ -4818,6 +4832,7 @@ mod tests {
         // ever opens, so the ordering the floor protects does not exist.
         let mut off = Config::default();
         off.reword.enabled = true;
+        off.reword.notifications = true;
         off.reword.timeout_ms = SLOW_MODEL_MS;
         off.notifications.cooldown_secs = 0;
         assert!(clamp_ranges(&mut off).is_empty());
@@ -4827,6 +4842,7 @@ mod tests {
         // what the window writes is what a load of that file produces.
         let mut written = Config::default();
         written.reword.enabled = true;
+        written.reword.notifications = true;
         written.reword.timeout_ms = SLOW_MODEL_MS;
         written.reword.provider = Some("generic".into());
         written.notifications.cooldown_secs = 2;

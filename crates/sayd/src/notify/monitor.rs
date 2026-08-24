@@ -1070,6 +1070,7 @@ mod tests {
         Config {
             reword: Box::new(RewordConfig {
                 enabled: true,
+                notifications: true,
                 provider: Some("generic".into()),
                 ..RewordConfig::default()
             }),
@@ -1088,10 +1089,13 @@ mod tests {
     fn nothing_is_admitted_with_rewording_off() {
         let text = "Alice: where do you want to go for dinner";
         let off = Config::default();
-        assert!(!off.reword.enabled, "the shipped default is off");
+        assert!(
+            !off.reword.notifications,
+            "the shipped default does not rewrite notifications"
+        );
         assert!(
             RewordPlan::automatic(Written(text.into()), &off.reword, &off.cleanup).is_err(),
-            "`enabled = false` must not even look for a client"
+            "`notifications = false` must not even look for a client"
         );
         // And in a build with no client in it, not even `enabled = true`
         // can produce a plan.
@@ -1123,7 +1127,10 @@ mod tests {
     async fn an_announcement_with_rewording_off_is_submitted_without_detaching() {
         let (engine, spoken) = engine_allowing("Signal");
         let cfg = Config::default();
-        assert!(!cfg.reword.enabled, "the shipped default is off");
+        assert!(
+            !cfg.reword.notifications,
+            "the shipped default does not rewrite notifications"
+        );
 
         let text = "Alice: where do you want to go for dinner".to_string();
         let logged = Arc::new(AtomicBool::new(false));
@@ -1836,6 +1843,7 @@ mod tests {
         let (base_url, provider) = crate::reword::silent_provider(Duration::from_millis(500));
         let reword = RewordConfig {
             enabled: true,
+            notifications: true,
             base_url,
             timeout_ms: 400,
             provider: Some("generic".into()),

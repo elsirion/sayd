@@ -128,6 +128,13 @@ static ACRONYM: LazyLock<Regex> =
 static WHITESPACE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").expect("static regex"));
 
 pub fn clean(text: &str, cfg: &CleanupConfig) -> String {
+    // The master, tested here rather than at either call site, so both
+    // honour it and neither has to remember to. Returns the input verbatim:
+    // "cleanup off" means the text reaches the synthesiser as it was
+    // written, which is the whole of what the switch promises.
+    if !cfg.enabled {
+        return text.to_string();
+    }
     let mut s = text.to_string();
 
     if cfg.drop_code_blocks {
@@ -406,6 +413,10 @@ mod tests {
     #[test]
     fn every_transform_can_be_disabled() {
         let c = CleanupConfig {
+            // On, deliberately: this test is about the individual switches
+            // covering everything between them, and a master short-circuit
+            // would pass it without any of them being consulted.
+            enabled: true,
             collapse_whitespace: false,
             rejoin_hyphenation: false,
             urls: UrlPolicy::Keep,
@@ -415,6 +426,30 @@ mod tests {
         };
         let input = "**x**  https://a.b\nHTLC";
         assert_eq!(clean(input, &c), input);
+    }
+
+    /// The master switches the whole pass off, with every transform still
+    /// set to on -- so this cannot pass by the switches happening to be
+    /// off, which is the way `every_transform_can_be_disabled` above
+    /// reaches the same output.
+    #[test]
+    fn the_master_switch_makes_clean_the_identity() {
+        let off = CleanupConfig {
+            enabled: false,
+            ..CleanupConfig::default()
+        };
+        assert!(
+            CleanupConfig::default().spell_acronyms,
+            "the premise: these transforms are on and would otherwise fire"
+        );
+        for input in [
+            "**x**  https://a.b\nHTLC",
+            "```\nsecret\n```",
+            "inter-\nnational   cooperation",
+            "| 1. | 2,5 EUR |",
+        ] {
+            assert_eq!(clean(input, &off), input, "untouched with cleanup off");
+        }
     }
 
     #[test]

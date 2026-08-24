@@ -22,6 +22,14 @@ pub enum UrlPolicy {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CleanupConfig {
+    /// The whole of text cleanup, on or off. When false, [`crate::cleanup::clean`]
+    /// returns its input untouched and every switch below is inert -- kept,
+    /// not cleared, so turning it back on restores the arrangement rather
+    /// than a default one.
+    ///
+    /// Short-circuited inside `clean` rather than at its call sites, so both
+    /// of them honour it without either one testing it.
+    pub enabled: bool,
     pub collapse_whitespace: bool,
     pub rejoin_hyphenation: bool,
     pub urls: UrlPolicy,
@@ -33,6 +41,7 @@ pub struct CleanupConfig {
 impl Default for CleanupConfig {
     fn default() -> Self {
         CleanupConfig {
+            enabled: true,
             collapse_whitespace: true,
             rejoin_hyphenation: true,
             urls: UrlPolicy::Link,
@@ -174,7 +183,11 @@ pub const REWORD_TIMEOUT_MIN_MS: u64 = 200;
 ///   (`Config::load_str` and `settings::model::clamp_ranges`), which is
 ///   where the `!= 0` test can be read next to the `max` it guards.
 pub fn notify_cooldown_min_secs(reword: &RewordConfig) -> u64 {
-    if !reword.enabled {
+    // `notifications`, not the `enabled` master: the ordering this floor
+    // protects is the notification coalescing window's, and nothing opens
+    // one unless notifications are being rewritten automatically. An
+    // explicit `say --reword` is not a notification and opens no window.
+    if !(reword.enabled && reword.notifications) {
         return 1;
     }
     reword.timeout_ms.div_ceil(1000) + 1
@@ -252,10 +265,31 @@ impl Provider {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RewordConfig {
-    /// Rewrite notification announcements without being asked. `--reword`
-    /// on a submission does not require this: `enabled` means "rewrite my
-    /// notifications automatically", `--reword` is being asked.
+    /// Rewording at all, on or off. The master.
+    ///
+    /// When false nothing is reworded -- not notifications, not an explicit
+    /// `say --reword` -- and the endpoint settings below are kept rather
+    /// than cleared, so this is "off for now" and not "forget my provider".
+    ///
+    /// **Defaults to `true`, and that is not the feature being on by
+    /// default.** [`RewordConfig::provider`] defaults to `None`, so
+    /// `HttpRewriter::new` refuses, `build_rewriter` returns `Unavailable`
+    /// and `reword::context` yields no client: a config that has never
+    /// mentioned rewording rewrites nothing, exactly as before. What the
+    /// default buys is that switching the master off is a deliberate act
+    /// recorded in the file, rather than the state everyone starts in --
+    /// which in turn is what keeps the migration below from having to guess.
+    ///
+    /// This field held [`RewordConfig::notifications`]'s meaning until
+    /// 2026-08-24; see [`Config::load_str`] for the migration that moves an
+    /// old file's value across.
     pub enabled: bool,
+    /// Rewrite notification announcements without being asked.
+    ///
+    /// `--reword` on a submission does not require this: `notifications`
+    /// means "rewrite my notifications automatically", `--reword` is being
+    /// asked. Both require [`RewordConfig::enabled`].
+    pub notifications: bool,
     /// Any OpenAI-compatible endpoint. PPQ, Ollama, llama.cpp's `server`,
     /// LM Studio and vLLM all speak the same request, which is why `base_url`
     /// alone once said everything. What they do not agree on is how a thinking
@@ -308,7 +342,8 @@ pub struct RewordConfig {
 impl Default for RewordConfig {
     fn default() -> Self {
         RewordConfig {
-            enabled: false,
+            enabled: true,
+            notifications: false,
             base_url: "http://localhost:11434/v1".into(),
             model: "llama3.2:3b".into(),
             provider: None,
@@ -409,18 +444,25 @@ pub fn resolve_api_key(cfg: &RewordConfig) -> Option<String> {
 /// the sentence rather than printing it, so the rule is testable without
 /// `main()` and without a process that exits.
 pub fn reword_startup_refusal(cfg: &RewordConfig) -> Option<String> {
-    if !cfg.enabled || cfg.resolved_provider().is_some() {
+    // Keyed on `notifications` rather than on the `enabled` master, and the
+    // difference is a boot the daemon must not refuse: `enabled` defaults to
+    // true and the migration below turns it on for every existing config, so
+    // a refusal keyed there would stop an unconfigured daemon from starting.
+    // The contradiction this exists for is narrower than that -- the user
+    // asked for notifications to be rewritten automatically and there is no
+    // dialect to ask a provider in. Everything else degrades.
+    if !(cfg.enabled && cfg.notifications) || cfg.resolved_provider().is_some() {
         return None;
     }
     let names = Provider::NAMES.join(", ");
     Some(match cfg.provider.as_deref() {
         None => format!(
-            "reword.enabled = true but reword.provider is unset. \
+            "reword.notifications = true but reword.provider is unset. \
              Set reword.provider to one of: {names}"
         ),
         Some(bad) => format!(
-            "reword.enabled = true but reword.provider = {bad:?} is not a \
-             provider this build knows. Set reword.provider to one of: {names}"
+            "reword.notifications = true but reword.provider = {bad:?} is not \
+             a provider this build knows. Set reword.provider to one of: {names}"
         ),
     })
 }
@@ -525,8 +567,37 @@ impl Config {
     /// parse error -- can parse the bytes it already has instead of paying
     /// for, and racing, a second read.
     pub fn load_str(txt: &str) -> (Config, Option<String>) {
+        // Which `[reword]` keys the document actually spells, read before
+        // deserialising because `serde(default)` erases the difference
+        // between "absent" and "set to the default".
+        //
+        // MIGRATION (2026-08-24). `[reword] enabled` used to mean what
+        // `notifications` means now: "rewrite my notifications without being
+        // asked". A document that spells `enabled` but not `notifications`
+        // is therefore an old one, and its value belongs to the new field.
+        // The master is set true, which is what makes the migration
+        // behaviour-preserving in both directions: a user who had automatic
+        // rewriting on keeps it, and a user who had it off but a provider
+        // configured keeps `say --reword` working.
+        //
+        // One-shot in practice rather than an inference that runs forever:
+        // `Config::save_to` writes the whole struct, so the first write from
+        // the settings window -- or from anything else -- leaves both keys
+        // present and this arm is never taken again.
+        let spelled = |key: &str| {
+            toml::from_str::<toml::Value>(txt)
+                .ok()
+                .and_then(|v| v.get("reword").and_then(|r| r.get(key)).map(|_| ()))
+                .is_some()
+        };
+        let migrate = spelled("enabled") && !spelled("notifications");
+
         match toml::from_str::<Config>(txt) {
             Ok(mut c) => {
+                if migrate {
+                    c.reword.notifications = c.reword.enabled;
+                    c.reword.enabled = true;
+                }
                 // The one range this layer enforces itself, and only its
                 // floor. Everything else out of range is a degradation the
                 // daemon can report and carry on with
@@ -742,13 +813,20 @@ mod tests {
         assert!(leftovers.is_empty(), "unexpected files: {leftovers:?}");
     }
 
-    /// The defaults are a promise: rewording is off, and the endpoint a user
-    /// first sees is a local one. Pointing sayd at a remote endpoint should
-    /// be an act, not something they inherit.
+    /// The defaults are a promise: nothing is rewritten, and the endpoint a
+    /// user first sees is a local one. Pointing sayd at a remote endpoint
+    /// should be an act, not something they inherit.
+    ///
+    /// The master is `true` and that is not the promise being broken: with
+    /// `provider` unset nothing can be rewritten anyway, and `notifications`
+    /// -- the switch that actually asks for a rewrite -- is off. See
+    /// `RewordConfig::enabled`.
     #[test]
     fn reword_defaults_are_off_and_local() {
         let c = Config::default();
-        assert!(!c.reword.enabled);
+        assert!(!c.reword.notifications, "nothing is rewritten by default");
+        assert!(c.reword.provider.is_none(), "and there is nothing to rewrite with");
+        assert!(c.reword.enabled, "the master is on; the two above are why that is safe");
         assert_eq!(c.reword.base_url, "http://localhost:11434/v1");
         assert_eq!(c.reword.model, "llama3.2:3b");
         assert_eq!(c.reword.api_key, "");
@@ -760,6 +838,96 @@ mod tests {
         assert_eq!(c.reword.max_chars, 400);
     }
 
+    /// MIGRATION (2026-08-24): `[reword] enabled` used to mean what
+    /// `notifications` means now, so an old document's value moves across
+    /// and the master goes on.
+    ///
+    /// Behaviour-preserving in both directions is the whole requirement,
+    /// and the two directions fail differently. A user who had automatic
+    /// rewriting on must keep it -- mapping to `notifications = false`
+    /// would silently switch off a feature they configured. A user who had
+    /// it *off* with a provider set must keep `say --reword` working --
+    /// mapping to `enabled = false` would silently break a keybind that
+    /// worked yesterday, since `--reword` never consulted the old switch.
+    #[test]
+    fn an_old_file_moves_reword_enabled_to_notifications() {
+        let (c, err) =
+            Config::load_str("[reword]\nenabled = true\nprovider = \"llama-cpp\"\n");
+        assert_eq!(err, None);
+        assert!(
+            c.reword.notifications,
+            "the old key carried the automatic-rewrite meaning"
+        );
+        assert!(c.reword.enabled, "and the master goes on, so nothing changes");
+    }
+
+    #[test]
+    fn an_old_file_with_automatic_rewriting_off_keeps_reword_available() {
+        // This user configured a provider and turned automatic rewriting
+        // off. `say --reword` worked for them and must keep working.
+        let (c, err) =
+            Config::load_str("[reword]\nenabled = false\nprovider = \"llama-cpp\"\n");
+        assert_eq!(err, None);
+        assert!(!c.reword.notifications);
+        assert!(
+            c.reword.enabled,
+            "--reword never consulted the old switch, so the master must not \
+             inherit its `false`"
+        );
+    }
+
+    /// A document that spells both keys is a new one, and says what it
+    /// means. Nothing is inferred from it -- which is what stops the
+    /// migration from being an inference that runs forever: the settings
+    /// window writes the whole struct, so the first save makes every later
+    /// load take this path.
+    #[test]
+    fn a_new_file_carrying_both_keys_is_left_exactly_as_written() {
+        for (toml, enabled, notifications) in [
+            ("[reword]\nenabled = false\nnotifications = true\n", false, true),
+            ("[reword]\nenabled = true\nnotifications = false\n", true, false),
+            ("[reword]\nenabled = false\nnotifications = false\n", false, false),
+        ] {
+            let (c, err) = Config::load_str(toml);
+            assert_eq!(err, None, "{toml:?}");
+            assert_eq!(c.reword.enabled, enabled, "{toml:?}");
+            assert_eq!(c.reword.notifications, notifications, "{toml:?}");
+        }
+    }
+
+    /// `notifications` alone is also a new document: there is no old value
+    /// to move, so the master keeps its default rather than being derived
+    /// from a key that is not there.
+    #[test]
+    fn a_file_spelling_only_notifications_is_not_migrated() {
+        let (c, err) = Config::load_str("[reword]\nnotifications = true\n");
+        assert_eq!(err, None);
+        assert!(c.reword.notifications);
+        assert!(c.reword.enabled);
+    }
+
+    /// The migration runs before the cooldown floor is derived, because the
+    /// floor reads the flag the migration moves. Out of order, an old file
+    /// asking for automatic rewriting would load with a 1-second floor --
+    /// the "rewording off" exemption -- and the ordering that floor exists
+    /// to protect would be lost on exactly the configs that had it.
+    #[test]
+    fn the_migration_runs_before_the_cooldown_floor_is_derived() {
+        let (c, err) = Config::load_str(
+            "[notifications]\ncooldown_secs = 1\n\
+             [reword]\nenabled = true\ntimeout_ms = 20000\n",
+        );
+        assert_eq!(err, None);
+        assert!(c.reword.notifications, "the premise: the migration fired");
+        assert_eq!(
+            c.notifications.cooldown_secs,
+            notify_cooldown_min_secs(&c.reword),
+            "the floor must be the one the migrated flag implies, not the \
+             1-second exemption an unmigrated read would have given"
+        );
+        assert_eq!(c.notifications.cooldown_secs, 21);
+    }
+
     /// A config written before this milestone has no `[reword]` table at
     /// all, and must keep loading.
     #[test]
@@ -767,7 +935,7 @@ mod tests {
         let (c, err) = Config::load_str("voice = \"am_fenrir\"\n");
         assert_eq!(err, None);
         assert_eq!(c.voice, "am_fenrir");
-        assert!(!c.reword.enabled);
+        assert!(!c.reword.notifications);
         assert_eq!(c.reword.timeout_ms, 1500);
     }
 
@@ -847,7 +1015,7 @@ mod tests {
         // inflated over an interaction this config cannot have.
         let (c, err) = Config::load_str("[notifications]\ncooldown_secs = 1\n");
         assert_eq!(err, None);
-        assert!(!c.reword.enabled);
+        assert!(!c.reword.notifications);
         assert_eq!(c.notifications.cooldown_secs, 1);
 
         let (c, _) = Config::load_str("[notifications]\ncooldown_secs = 0\n");
@@ -951,13 +1119,18 @@ mod tests {
         assert_eq!(Provider::NAMES.len(), 2);
     }
 
-    /// The only combination that refuses. `enabled = true` is the user asking
-    /// for automatic rewording; without a provider it cannot be delivered, and
-    /// a daemon that starts anyway is one that silently does nothing.
+    /// The only combination that refuses. `notifications = true` is the user
+    /// asking for automatic rewording; without a provider it cannot be
+    /// delivered, and a daemon that starts anyway is one that silently does
+    /// nothing.
+    ///
+    /// The `enabled` master is held *on* throughout, so what is under test
+    /// is the notification switch and not rewording being off wholesale.
     #[test]
     fn only_enabled_without_a_usable_provider_refuses_to_start() {
         let mut c = RewordConfig {
-            enabled: false,
+            enabled: true,
+            notifications: false,
             provider: None,
             ..RewordConfig::default()
         };
@@ -971,7 +1144,7 @@ mod tests {
         c.provider = Some("nonsense".into());
         assert_eq!(reword_startup_refusal(&c), None, "still disabled");
 
-        c.enabled = true;
+        c.notifications = true;
         c.provider = Some("llama-cpp".into());
         assert_eq!(reword_startup_refusal(&c), None);
 
@@ -996,6 +1169,7 @@ mod tests {
     fn the_refusal_names_the_field_and_every_value_it_accepts() {
         let c = RewordConfig {
             enabled: true,
+            notifications: true,
             provider: None,
             ..RewordConfig::default()
         };

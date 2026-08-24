@@ -848,8 +848,9 @@ mod tests {
              impose -- that ceiling is what this milestone removed"
         );
         assert!(
-            !cfg.reword.enabled,
-            "and `enabled` stays off: an explicit --reword must not need it"
+            !cfg.reword.notifications,
+            "and automatic rewording stays off: an explicit --reword must not \
+             need it -- only the `enabled` master, which is on by default"
         );
 
         let engine = sayd_core::handle::EngineHandle::spawn(
