@@ -38,20 +38,18 @@ use std::time::Duration;
 
 use adw::prelude::*;
 use gtk4 as gtk;
-use sayd_core::config::{CleanupConfig, Config, NotificationConfig, Provider, UrlPolicy};
+use sayd_core::config::{Config, Provider, UrlPolicy};
 use sayd_core::engine::SayOpts;
 use sayd_core::handle::EngineHandle;
 use sayd_core::queue::{Policy, Source as QueueSource};
 
+use super::schema;
 use super::model::{
     allow_add, allow_contains, allow_remove, icon_file_size_within_limit, icon_pixels_within_limit,
-    reword_key_row_applies, IconSource, SettingsModel, Suggestion, SuggestionKind, COOLDOWN_MAX,
-    COOLDOWN_MIN, COOLDOWN_STEP, ENDPOINT_PRESETS, IDLE_UNLOAD_MAX, IDLE_UNLOAD_MIN,
-    IDLE_UNLOAD_STEP, MAX_CHARS_MAX, MAX_CHARS_MIN, MAX_CHARS_STEP, MODELS, REWORD_MAX_CHARS_MAX,
-    REWORD_MAX_CHARS_MIN, REWORD_MAX_CHARS_STEP, REWORD_TEST_DEFAULT, REWORD_TIMEOUT_MAX,
-    REWORD_TIMEOUT_MIN, REWORD_TIMEOUT_PAGE, REWORD_TIMEOUT_STEP, REWORD_TIMEOUT_SUBTITLE,
-    SPEED_MAX, SPEED_MIN, SPEED_MODES, SPEED_STEP, TEST_INCOMPLETE_TITLE, TEST_IN_PROGRESS_TITLE,
-    THREADS_MAX, THREADS_MIN, THREADS_STEP,
+    reword_key_row_applies, IconSource, SettingsModel, Suggestion, SuggestionKind, ENDPOINT_PRESETS,
+    REWORD_MAX_CHARS_MAX, REWORD_MAX_CHARS_MIN, REWORD_MAX_CHARS_STEP, REWORD_TEST_DEFAULT,
+    REWORD_TIMEOUT_MAX, REWORD_TIMEOUT_MIN, REWORD_TIMEOUT_PAGE, REWORD_TIMEOUT_STEP,
+    REWORD_TIMEOUT_SUBTITLE, TEST_INCOMPLETE_TITLE, TEST_IN_PROGRESS_TITLE,
 };
 use crate::notify::seen;
 
@@ -74,19 +72,6 @@ thread_local! {
 ///
 /// A table rather than three `if`s so the index the widget reports maps back
 /// to a policy by position, with no second list to keep in step.
-const URL_POLICIES: [(UrlPolicy, &str); 3] = [
-    (UrlPolicy::Link, "Say “link”"),
-    (UrlPolicy::Domain, "Say the domain"),
-    (UrlPolicy::Keep, "Read the whole URL"),
-];
-
-/// Read and write one cleanup flag. Function pointers rather than a macro or
-/// six hand-written rows: `CleanupConfig`'s fields are plain `bool`s with no
-/// common accessor, and a pair of one-line closures per field is the least
-/// machinery that still lets the six rows share one handler.
-type CleanupGet = fn(&CleanupConfig) -> bool;
-type CleanupSet = fn(&mut CleanupConfig, bool);
-
 /// One row's "draw yourself from this config" closure; see [`UiState::rows`].
 /// Boxed because they have as many different types as there are rows,
 /// `RefCell` because a handler reached through a shared [`Ui`] may call
@@ -100,74 +85,6 @@ type CleanupSet = fn(&mut CleanupConfig, bool);
 /// ever break. Passing it as an argument makes that unrepresentable rather
 /// than merely discouraged.
 type Redraws = RefCell<Vec<Box<dyn Fn(&Ui, &Config)>>>;
-
-/// The Text cleanup group, in the order spec §8 lists the transforms.
-const CLEANUP_SWITCHES: [(&str, &str, CleanupGet, CleanupSet); 5] = [
-    (
-        "Collapse whitespace",
-        "Runs of spaces and blank lines become a single space",
-        |c| c.collapse_whitespace,
-        |c, v| c.collapse_whitespace = v,
-    ),
-    (
-        "Rejoin hyphenation",
-        "Reunite words a line break split with a hyphen",
-        |c| c.rejoin_hyphenation,
-        |c, v| c.rejoin_hyphenation = v,
-    ),
-    (
-        "Strip Markdown",
-        "Drop emphasis, heading and link syntax instead of reading it out",
-        |c| c.strip_markdown,
-        |c, v| c.strip_markdown = v,
-    ),
-    (
-        "Drop code blocks",
-        "Skip fenced and indented code rather than speaking it",
-        |c| c.drop_code_blocks,
-        |c, v| c.drop_code_blocks = v,
-    ),
-    (
-        "Spell out acronyms",
-        "Read TTS as T-T-S rather than as a word",
-        |c| c.spell_acronyms,
-        |c, v| c.spell_acronyms = v,
-    ),
-];
-
-/// The same arrangement as [`CleanupGet`]/[`CleanupSet`], for the same
-/// reason: `NotificationConfig`'s three flags are plain `bool`s with no
-/// common accessor, so one handler serves all three only if each row can say
-/// which field it is.
-type NotifyGet = fn(&NotificationConfig) -> bool;
-type NotifySet = fn(&mut NotificationConfig, bool);
-
-/// The Notifications group's switches, in the order spec §6 lists them.
-///
-/// `enabled` leads because the other two are refinements of it -- and
-/// because it is the one that starts and stops the bus monitor, rather than
-/// changing the wording of an announcement that was going to happen anyway.
-const NOTIFICATION_SWITCHES: [(&str, &str, NotifyGet, NotifySet); 3] = [
-    (
-        "Speak notifications",
-        "Announce desktop notifications from the applications listed below; \
-         they are still shown as usual",
-        |c| c.enabled,
-        |c, v| c.enabled = v,
-    ),
-    (
-        "Say the application name",
-        "Announce “Signal: Ada: dinner?” rather than the summary on its own",
-        |c| c.speak_app_name,
-        |c, v| c.speak_app_name = v,
-    ),
-    (
-        "Say the body",
-        "Read the body after the summary; many applications only restate the summary there",
-        |c| c.speak_body,
-        |c, v| c.speak_body = v,
-    ),
-];
 
 /// What a suggestion whose icon cannot be drawn shows instead.
 ///
@@ -343,7 +260,19 @@ pub fn open() {
 /// clearing it on close is what drops the window reference, the redraw
 /// closures, and the widget references those carry.
 #[derive(Clone)]
-struct Ui(Rc<UiState>);
+pub struct Ui(Rc<UiState>);
+
+/// What a hand-built section or row is handed.
+///
+/// A struct rather than three parameters because `schema::Section::Custom`
+/// and `schema::Row::Custom` are `fn` pointers: every custom builder has to
+/// have one signature, and the Reword and Voice groups need an
+/// `EngineHandle` that the described rows never touch.
+pub struct Build<'a> {
+    pub ui: &'a Ui,
+    pub cfg: &'a Config,
+    pub engine: &'a EngineHandle,
+}
 
 /// A handler's reference to the [`Ui`] it belongs to.
 ///
@@ -365,7 +294,7 @@ struct Ui(Rc<UiState>);
 struct WeakUi(Weak<UiState>);
 
 /// The state a [`Ui`] shares. Never held by a handler; see [`WeakUi`].
-struct UiState {
+pub struct UiState {
     model: Arc<SettingsModel>,
     window: adw::PreferencesWindow,
     /// Raised while *this code* is setting a widget's value.
@@ -482,6 +411,11 @@ impl Ui {
     }
 
     /// Register a row's redraw closure. Called once per row, at build time.
+    /// The installed voice packs, for `schema::Options::Discovered`.
+    pub fn voices(&self) -> Vec<String> {
+        self.model.voices().to_vec()
+    }
+
     fn row(&self, draw: impl Fn(&Ui, &Config) + 'static) {
         self.rows.borrow_mut().push(Box::new(draw));
     }
@@ -587,6 +521,147 @@ impl Ui {
     }
 }
 
+
+/// Build one described row, doing the five steps exactly once each.
+///
+/// Those five -- build the widget, show the config's value, register the
+/// redraw closure, connect the handler, hand the widget back -- were
+/// repeated about thirty times in this file, which is thirty chances for one
+/// of them to be missing. See `schema` for what replaced that.
+///
+/// **Populate before connecting**, in every arm. A handler connected first
+/// fires on the initial `show` and writes the config back to itself, which
+/// is what opening the window used to cost nine times over; `Ui::quietly`
+/// covers the redraw path, and this ordering covers the build path.
+fn render_row(b: &Build, row: &'static schema::Row) -> gtk::Widget {
+    match row {
+        schema::Row::Custom(build) => build(b),
+
+        schema::Row::Bool {
+            title,
+            subtitle,
+            get,
+            set,
+        } => {
+            let (get, set) = (*get, *set);
+            let widget = adw::SwitchRow::builder()
+                .title(*title)
+                .subtitle(*subtitle)
+                .use_markup(false)
+                .active(get(b.cfg))
+                .build();
+            let r = widget.clone();
+            b.ui.row(move |_, cfg| r.set_active(get(cfg)));
+            let u = b.ui.downgrade();
+            widget.connect_active_notify(move |row| {
+                let on = row.is_active();
+                u.on_user_change(|u| u.apply(|c| set(c, on)));
+            });
+            widget.upcast()
+        }
+
+        schema::Row::Int {
+            title,
+            subtitle,
+            min,
+            max,
+            step,
+            page,
+            digits,
+            get,
+            set,
+        } => {
+            let (get, set) = (*get, *set);
+            let spin = Spin::paged(title, subtitle, *min, *max, *step, *page, *digits);
+            spin.row.set_use_markup(false);
+            spin.show(get(b.cfg));
+            let s = spin.clone();
+            b.ui.row(move |_, cfg| s.show(get(cfg)));
+            let u = b.ui.downgrade();
+            spin.row.connect_value_notify(move |row| {
+                let value = row.value();
+                u.on_user_change(|u| u.apply(|c| set(c, value)));
+            });
+            spin.row.clone().upcast()
+        }
+
+        schema::Row::Choice {
+            title,
+            options,
+            unknown,
+            get,
+            set,
+        } => {
+            let (get, set) = (*get, *set);
+            // Resolved once and captured, not re-read per redraw: a voice
+            // pack appearing mid-session would change the *entries*, and a
+            // row whose entries move under a selection is a row that
+            // reports a choice the user did not make. The window is built on
+            // demand, so reopening it is what picks up a new pack.
+            let entries = options.resolve(b.ui);
+            let labels: Vec<&str> = entries.iter().map(|(_, l)| l.as_str()).collect();
+            let combo = Combo::new(title, &labels, *unknown);
+
+            let known = entries.clone();
+            let position = move |value: &str| known.iter().position(|(v, _)| v == value);
+            combo.show(&get(b.cfg), position(&get(b.cfg)));
+
+            let c = combo.clone();
+            let position_for_redraw = position.clone();
+            b.ui.row(move |_, cfg| {
+                let value = get(cfg);
+                c.show(&value, position_for_redraw(&value));
+            });
+
+            let u = b.ui.downgrade();
+            let synthetic = combo.synthetic.clone();
+            let known = entries;
+            combo.row.connect_selected_notify(move |row| {
+                u.on_user_change(|u| {
+                    match Combo::choice(row, &synthetic).and_then(|i| known.get(i)) {
+                        Some((value, _)) => {
+                            let value = value.clone();
+                            u.apply(|c| set(c, &value));
+                        }
+                        // The synthetic entry, or an empty list: there is
+                        // nothing to write. Redrawing rather than merely
+                        // returning is what stops the row sitting on a
+                        // selection nothing agrees with.
+                        None => u.redraw(&u.model.current()),
+                    }
+                });
+            });
+            combo.row.clone().upcast()
+        }
+    }
+}
+
+/// Build one described group.
+fn render_group(b: &Build, group: &'static schema::Group) -> adw::PreferencesGroup {
+    let mut builder = adw::PreferencesGroup::builder().title(group.title);
+    if let Some(description) = group.description {
+        builder = builder.description(description);
+    }
+    let widget = builder.build();
+    for row in group.rows {
+        widget.add(&render_row(b, row));
+    }
+    widget
+}
+
+/// The URL policy a `schema::Row::Choice` value names.
+///
+/// The inverse of the `format!("{:?}").to_lowercase()` that row's `get`
+/// uses, kept next to nothing else so the two stay one fact.
+pub fn url_policy_named(value: &str) -> Option<UrlPolicy> {
+    match value {
+        "link" => Some(UrlPolicy::Link),
+        "domain" => Some(UrlPolicy::Domain),
+        "keep" => Some(UrlPolicy::Keep),
+        _ => None,
+    }
+}
+
 fn build(model: Arc<SettingsModel>, engine: EngineHandle) -> Ui {
     // Draw from the file, not from whatever this model last wrote itself: a
     // hand edit the watcher picked up while no window was open would
@@ -613,17 +688,16 @@ fn build(model: Arc<SettingsModel>, engine: EngineHandle) -> Ui {
     ui.refresh_suggestions();
 
     let page = adw::PreferencesPage::new();
-    page.add(&voice_group(&ui, &cfg, engine.clone()));
-    page.add(&engine_group(&ui, &cfg));
-    page.add(&cleanup_group(&ui, &cfg));
-    page.add(&notification_group(&ui, &cfg));
-    // The Reword group needs one too: its result row speaks what came back.
-    page.add(&reword_group(&ui, &cfg, engine));
-    // The allowlist and its two suggestion groups belong together at the
-    // bottom of the page, so the Reword group goes above them.
-    page.add(&allowlist_group(&ui, &cfg));
-    for (kind, title, description) in SUGGESTION_GROUPS {
-        page.add(&suggestions_group(&ui, &cfg, kind, title, description));
+    let b = Build {
+        ui: &ui,
+        cfg: &cfg,
+        engine: &engine,
+    };
+    for section in schema::ROOT {
+        page.add(&match section {
+            schema::Section::Described(group) => render_group(&b, group),
+            schema::Section::Custom(build) => build(&b),
+        });
     }
     window.add(&page);
 
@@ -898,95 +972,13 @@ impl Spin {
     }
 }
 
-fn voice_group(ui: &Ui, cfg: &Config, engine: EngineHandle) -> adw::PreferencesGroup {
-    let group = adw::PreferencesGroup::builder()
-        .title("Voice and speed")
-        .build();
-
-    // --- Voice ----------------------------------------------------------
-    let voices: Vec<String> = ui.model.voices().to_vec();
-    // `sayd` already warns about a configured voice with no pack at startup;
-    // saying it again here is what keeps the row from silently showing some
-    // other voice as if it were the configured one.
-    let voice = Combo::new("Voice", &voices, |v| {
-        format!("‘{v}’ — no voice pack installed")
-    });
-    // Populated *before* the handler is connected, which is what keeps
-    // opening the window from writing the config nine times -- see `quiet`
-    // for the other half of the same hazard.
-    voice.show(&cfg.voice, voices.iter().position(|v| *v == cfg.voice));
-    let c = voice.clone();
-    let known = voices.clone();
-    ui.row(move |_, cfg| c.show(&cfg.voice, known.iter().position(|v| *v == cfg.voice)));
-    let u = ui.downgrade();
-    let synthetic = voice.synthetic.clone();
-    let known = voices.clone();
-    voice.row.connect_selected_notify(move |row| {
-        u.on_user_change(|u| {
-            match Combo::choice(row, &synthetic).and_then(|i| known.get(i).cloned()) {
-                Some(name) => u.apply(|cfg| cfg.voice = name),
-                // The synthetic entry, or an empty models directory: there
-                // is no voice to write. Redrawing rather than merely
-                // returning is what stops the row sitting on a selection
-                // nothing agrees with.
-                None => u.redraw(&u.model.current()),
-            }
-        });
-    });
-    group.add(&voice.row);
-
-    // --- Speed ----------------------------------------------------------
-    let speed = Spin::new(
-        "Speed",
-        "Playback rate for every utterance",
-        SPEED_MIN as f64,
-        SPEED_MAX as f64,
-        SPEED_STEP,
-        2,
-    );
-    speed.show(cfg.speed as f64);
-    let s = speed.clone();
-    ui.row(move |_, cfg| s.show(cfg.speed as f64));
-    let u = ui.downgrade();
-    speed.row.connect_value_notify(move |row| {
-        u.on_user_change(|u| {
-            let value = row.value() as f32;
-            u.apply(|c| c.speed = value);
-        });
-    });
-    group.add(&speed.row);
-
-    // --- Speed mode -------------------------------------------------------
-    // Same reasoning as the Model row below: the measured trade-off goes in
-    // the item text itself, visible while the dropdown is open and the user
-    // is choosing, not tucked into a subtitle they have already looked past.
-    let speed_mode_labels: Vec<String> = SPEED_MODES
-        .iter()
-        .map(|(name, note)| format!("{name} — {note}"))
-        .collect();
-    let speed_mode_row = Combo::new("Speed mode", &speed_mode_labels, |m| {
-        format!("‘{m}’ — not a speed mode this build knows")
-    });
-    let speed_mode_position = |name: &str| SPEED_MODES.iter().position(|(n, _)| *n == name);
-    speed_mode_row.show(&cfg.speed_mode, speed_mode_position(&cfg.speed_mode));
-    let c = speed_mode_row.clone();
-    ui.row(move |_, cfg| c.show(&cfg.speed_mode, speed_mode_position(&cfg.speed_mode)));
-    let u = ui.downgrade();
-    let synthetic = speed_mode_row.synthetic.clone();
-    speed_mode_row.row.connect_selected_notify(move |row| {
-        u.on_user_change(|u| {
-            match Combo::choice(row, &synthetic).and_then(|i| SPEED_MODES.get(i)) {
-                Some((name, _)) => {
-                    let name = (*name).to_string();
-                    u.apply(|c| c.speed_mode = name);
-                }
-                None => u.redraw(&u.model.current()),
-            }
-        });
-    });
-    group.add(&speed_mode_row.row);
-
-    // --- Test -----------------------------------------------------------
+/// The Voice group's Test row: an entry and a Speak button.
+///
+/// `schema::Row::Custom` because it is the one control in that group that is
+/// not a view of the config. It is deliberately *not* registered with
+/// `Ui::row`: there is nothing to redraw it from, and clobbering what the
+/// user typed on every edit elsewhere would be its own bug.
+pub fn voice_test_row(b: &Build) -> gtk::Widget {
     let test = adw::EntryRow::builder()
         .title("Test")
         .text("The quick brown fox jumps over the lazy dog.")
@@ -996,29 +988,38 @@ fn voice_group(ui: &Ui, cfg: &Config, engine: EngineHandle) -> adw::PreferencesG
         .valign(gtk::Align::Center)
         .build();
     test.add_suffix(&speak);
-    // Not registered with `Ui::row`: this is the one control in the window
-    // that is not a view of the config, so there is nothing to redraw it
-    // from -- and clobbering what the user typed on every edit elsewhere
-    // would be its own bug.
-    let u = ui.downgrade();
-    let e = engine.clone();
+
+    let u = b.ui.downgrade();
+    let e = b.engine.clone();
     // Weak, because `speak` is a suffix *of* `test`: a strong clone here
     // would be the row holding a button holding the row, which outlives the
-    // window that used to contain it. The same shape `Combo::choice` avoids,
-    // one widget further apart.
+    // window that used to contain it.
     let field = test.downgrade();
     speak.connect_clicked(move |_| {
         let Some(field) = field.upgrade() else { return };
         u.with(|ui| audition(ui, &e, &field.text()));
     });
-    let u = ui.downgrade();
+    let u = b.ui.downgrade();
+    let e = b.engine.clone();
     // Pressing Enter in the field is the same action as pressing the button;
     // a test row you have to reach for the mouse to use is a test row nobody
     // uses twice.
-    test.connect_entry_activated(move |row| u.with(|ui| audition(ui, &engine, &row.text())));
-    group.add(&test);
+    test.connect_entry_activated(move |row| u.with(|ui| audition(ui, &e, &row.text())));
+    test.upcast()
+}
 
-    group
+/// The two suggestion groups, as the two `fn` pointers `schema` can name.
+///
+/// `suggestions_group` takes a kind, a title and a description, and a `fn`
+/// pointer cannot carry them; these are the thinnest thing that can.
+pub fn seen_suggestions_group(b: &Build) -> adw::PreferencesGroup {
+    let (kind, title, description) = SUGGESTION_GROUPS[0];
+    suggestions_group(b.ui, b.cfg, kind, title, description)
+}
+
+pub fn curated_suggestions_group(b: &Build) -> adw::PreferencesGroup {
+    let (kind, title, description) = SUGGESTION_GROUPS[1];
+    suggestions_group(b.ui, b.cfg, kind, title, description)
 }
 
 /// Speak `text` through the engine.
@@ -1054,236 +1055,6 @@ fn audition(ui: &Ui, engine: &EngineHandle, text: &str) {
     if let Err(e) = engine.submit(text, opts) {
         ui.toast(&e);
     }
-}
-
-fn engine_group(ui: &Ui, cfg: &Config) -> adw::PreferencesGroup {
-    let group = adw::PreferencesGroup::builder()
-        .title("Engine")
-        .description(
-            "Changes take effect on the next utterance; switching model reloads the session",
-        )
-        .build();
-
-    // --- Model ----------------------------------------------------------
-    // The measured trade-off goes in the item text itself rather than in the
-    // row's subtitle: it is what the user needs while the dropdown is *open*
-    // and they are choosing between the three, not afterwards.
-    let labels: Vec<String> = MODELS
-        .iter()
-        .map(|(name, note)| format!("{name} — {note}"))
-        .collect();
-    let model_row = Combo::new("Model", &labels, |m| {
-        format!("‘{m}’ — not a model this build knows")
-    });
-    let position = |name: &str| MODELS.iter().position(|(n, _)| *n == name);
-    model_row.show(&cfg.model, position(&cfg.model));
-    let c = model_row.clone();
-    ui.row(move |_, cfg| c.show(&cfg.model, position(&cfg.model)));
-    let u = ui.downgrade();
-    let synthetic = model_row.synthetic.clone();
-    model_row.row.connect_selected_notify(move |row| {
-        u.on_user_change(
-            |u| match Combo::choice(row, &synthetic).and_then(|i| MODELS.get(i)) {
-                Some((name, _)) => {
-                    let name = (*name).to_string();
-                    u.apply(|c| c.model = name);
-                }
-                None => u.redraw(&u.model.current()),
-            },
-        );
-    });
-    group.add(&model_row.row);
-
-    // --- Threads --------------------------------------------------------
-    let threads = Spin::new(
-        "Threads",
-        "ONNX Runtime intra-op threads; measured peak at 8",
-        THREADS_MIN,
-        THREADS_MAX,
-        THREADS_STEP,
-        0,
-    );
-    threads.show(cfg.threads as f64);
-    let s = threads.clone();
-    ui.row(move |_, cfg| s.show(cfg.threads as f64));
-    let u = ui.downgrade();
-    threads.row.connect_value_notify(move |row| {
-        u.on_user_change(|u| {
-            let value = row.value() as usize;
-            u.apply(|c| c.threads = value);
-        });
-    });
-    group.add(&threads.row);
-
-    // --- Idle unload ----------------------------------------------------
-    let idle = Spin::new(
-        "Idle unload",
-        "Seconds of silence before the ~1.27 GB session is dropped; 0 never unloads",
-        IDLE_UNLOAD_MIN,
-        IDLE_UNLOAD_MAX,
-        IDLE_UNLOAD_STEP,
-        0,
-    );
-    idle.show(cfg.idle_unload_secs as f64);
-    let s = idle.clone();
-    ui.row(move |_, cfg| s.show(cfg.idle_unload_secs as f64));
-    let u = ui.downgrade();
-    idle.row.connect_value_notify(move |row| {
-        u.on_user_change(|u| {
-            let value = row.value() as u64;
-            u.apply(|c| c.idle_unload_secs = value);
-        });
-    });
-    group.add(&idle.row);
-
-    // --- Long-text guard ------------------------------------------------
-    let max_chars = Spin::new(
-        "Long-text guard",
-        "Refuse submissions longer than this many characters",
-        MAX_CHARS_MIN,
-        MAX_CHARS_MAX,
-        MAX_CHARS_STEP,
-        0,
-    );
-    max_chars.show(cfg.max_chars as f64);
-    let s = max_chars.clone();
-    ui.row(move |_, cfg| s.show(cfg.max_chars as f64));
-    let u = ui.downgrade();
-    max_chars.row.connect_value_notify(move |row| {
-        u.on_user_change(|u| {
-            let value = row.value() as usize;
-            u.apply(|c| c.max_chars = value);
-        });
-    });
-    group.add(&max_chars.row);
-
-    group
-}
-
-fn cleanup_group(ui: &Ui, cfg: &Config) -> adw::PreferencesGroup {
-    let group = adw::PreferencesGroup::builder()
-        .title("Text cleanup")
-        .description("Applied to every submission before it is spoken")
-        .build();
-
-    for (title, subtitle, get, set) in CLEANUP_SWITCHES {
-        let row = adw::SwitchRow::builder()
-            .title(title)
-            .subtitle(subtitle)
-            .active(get(&cfg.cleanup))
-            .build();
-        let r = row.clone();
-        ui.row(move |_, cfg| r.set_active(get(&cfg.cleanup)));
-        let u = ui.downgrade();
-        row.connect_active_notify(move |row| {
-            u.on_user_change(|u| {
-                let on = row.is_active();
-                u.apply(|c| set(&mut c.cleanup, on));
-            });
-        });
-        group.add(&row);
-    }
-
-    let labels: Vec<&str> = URL_POLICIES.iter().map(|(_, label)| *label).collect();
-    // Unreachable in practice -- `UrlPolicy` is an enum, so the table below
-    // covers every value it can take -- but `Combo` has no way to know that,
-    // and a wording that reads as nonsense would be worse than one that
-    // never appears.
-    let urls = Combo::new("URLs", &labels, |p| {
-        format!("‘{p}’ — not a URL setting this build knows")
-    });
-    let position = |p: UrlPolicy| URL_POLICIES.iter().position(|(q, _)| *q == p);
-    let describe = |p: UrlPolicy| format!("{p:?}").to_lowercase();
-    urls.show(&describe(cfg.cleanup.urls), position(cfg.cleanup.urls));
-    let c = urls.clone();
-    ui.row(move |_, cfg| c.show(&describe(cfg.cleanup.urls), position(cfg.cleanup.urls)));
-    let u = ui.downgrade();
-    let synthetic = urls.synthetic.clone();
-    urls.row.connect_selected_notify(move |row| {
-        u.on_user_change(|u| {
-            match Combo::choice(row, &synthetic).and_then(|i| URL_POLICIES.get(i)) {
-                Some((policy, _)) => {
-                    let policy = *policy;
-                    u.apply(|c| c.cleanup.urls = policy);
-                }
-                None => u.redraw(&u.model.current()),
-            }
-        });
-    });
-    group.add(&urls.row);
-
-    group
-}
-
-fn notification_group(ui: &Ui, cfg: &Config) -> adw::PreferencesGroup {
-    let group = adw::PreferencesGroup::builder()
-        .title("Notifications")
-        .description("Takes effect at once: turning this on starts watching the session bus")
-        .build();
-
-    // The other rows here, and the allowlist below, stay *sensitive* when
-    // "Speak notifications" is off. Deliberately, and not an oversight:
-    //
-    // - Those values are not meaningless while announcements are off, they
-    //   are merely not in effect. The file keeps every one of them, and they
-    //   apply the instant the switch goes back on. A dimmed row says
-    //   "unset", which would be a lie about what the config holds -- the one
-    //   thing this file promises never to do.
-    // - Curating the list with announcements off is a real way to use this:
-    //   turn it off for an hour, tidy up, turn it back on.
-    // - It would be a rule, and rules do not live in this layer. There is no
-    //   config field that says these four depend on that one, so `model.rs`
-    //   has nothing to hang it on and the window would be deciding something
-    //   on its own.
-    //
-    // Cheap to revisit if it reads wrong on hardware; nothing else depends
-    // on it.
-
-    for (title, subtitle, get, set) in NOTIFICATION_SWITCHES {
-        let row = adw::SwitchRow::builder()
-            .title(title)
-            .subtitle(subtitle)
-            .active(get(&cfg.notifications))
-            .build();
-        let r = row.clone();
-        ui.row(move |_, cfg| r.set_active(get(&cfg.notifications)));
-        let u = ui.downgrade();
-        row.connect_active_notify(move |row| {
-            u.on_user_change(|u| {
-                let on = row.is_active();
-                u.apply(|c| set(&mut c.notifications, on));
-            });
-        });
-        group.add(&row);
-    }
-
-    // The subtitle has to spend its words on `0`, which is the one value here
-    // that does not mean what a "seconds between X" row usually means: it is
-    // not "no wait", it turns rate limiting off entirely, so every single
-    // notification from an allowed application is spoken (`Limiter::decide`'s
-    // `cooldown_secs == 0` arm, and the test that pins it). Left unsaid, `0`
-    // reads like the *least* chatty setting rather than the most.
-    let cooldown = Spin::new(
-        "Cooldown",
-        "Seconds before the same application is announced again; 0 speaks every notification",
-        COOLDOWN_MIN,
-        COOLDOWN_MAX,
-        COOLDOWN_STEP,
-        0,
-    );
-    cooldown.show(cfg.notifications.cooldown_secs as f64);
-    let s = cooldown.clone();
-    ui.row(move |_, cfg| s.show(cfg.notifications.cooldown_secs as f64));
-    let u = ui.downgrade();
-    cooldown.row.connect_value_notify(move |row| {
-        u.on_user_change(|u| {
-            let value = row.value() as u64;
-            u.apply(|c| c.notifications.cooldown_secs = value);
-        });
-    });
-    group.add(&cooldown.row);
-
-    group
 }
 
 /// A two-way text row bound to one `String` field of the config.
@@ -1413,7 +1184,8 @@ fn group_description(text: &str) -> String {
 /// `true` and governs the subtitle as well as the title, and a row left on
 /// the default renders **both blank** for a value containing `&` -- which is
 /// exactly the character a URL with a query string carries.
-fn reword_group(ui: &Ui, cfg: &Config, engine: EngineHandle) -> adw::PreferencesGroup {
+pub fn reword_group(b: &Build) -> adw::PreferencesGroup {
+    let (ui, cfg, engine) = (b.ui, b.cfg, b.engine.clone());
     // The description names the destination host and says where the key is
     // coming from -- a user who exports SAYD_REWORD_API_KEY and then sees no
     // key in the window would otherwise conclude the feature is
@@ -1887,7 +1659,8 @@ fn reword_group(ui: &Ui, cfg: &Config, engine: EngineHandle) -> adw::Preferences
 /// the window's 520px it reads as a list: libadwaita draws each group as its
 /// own rounded card, so a dozen one-line rows sit under their own heading
 /// instead of turning the Notifications card into a wall.
-fn allowlist_group(ui: &Ui, cfg: &Config) -> adw::PreferencesGroup {
+pub fn allowlist_group(b: &Build) -> adw::PreferencesGroup {
+    let (ui, cfg) = (b.ui, b.cfg);
     let group = adw::PreferencesGroup::builder()
         .title("Applications to announce")
         .description(
@@ -2504,6 +2277,127 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// Every described row draws itself from the config it is handed.
+    ///
+    /// One scenario for all of them, which is the whole point of the schema:
+    /// before it, this was thirty hand-written `ui.row(..)` registrations and
+    /// a test would have had to name each one. Measured on the renderer --
+    /// deleting the `b.ui.row(..)` line from `render_row`'s `Bool` arm passed
+    /// the entire suite, so nothing anywhere pinned that every switch in this
+    /// window redraws.
+    ///
+    /// `redraw` rather than an `edit`: what is under test is the row's view
+    /// of a `Config`, not the model's write path, and a config that arrived
+    /// from the *file* (a hand edit the watcher picked up) reaches the rows
+    /// exactly this way.
+    fn every_described_row_redraws_from_the_config(dir: &std::path::Path) {
+        let (model, engine) = model_in(dir);
+        let ui = build(model, engine);
+        let w = ui.window.clone().upcast::<gtk::Widget>();
+
+        // A config that differs from the default in every described field,
+        // so no assertion below can pass by the value happening to match
+        // what the row was built with.
+        let mut cfg = Config::default();
+        for section in schema::ROOT {
+            let schema::Section::Described(group) = section else {
+                continue;
+            };
+            for row in group.rows {
+                match row {
+                    schema::Row::Bool { get, set, .. } => {
+                        let flipped = !get(&cfg);
+                        set(&mut cfg, flipped);
+                    }
+                    schema::Row::Int {
+                        min, max, digits, set, ..
+                    } => {
+                        let mut want = (min + max) / 2.0;
+                        if *digits == 0 {
+                            want = want.round();
+                        }
+                        set(&mut cfg, want);
+                    }
+                    schema::Row::Choice { options, set, .. } => {
+                        let entries = options.resolve(&ui);
+                        // The *last* entry: the first is what several of
+                        // these default to.
+                        if let Some((value, _)) = entries.last() {
+                            set(&mut cfg, value);
+                        }
+                    }
+                    schema::Row::Custom(_) => {}
+                }
+            }
+        }
+
+        ui.redraw(&cfg);
+
+        for section in schema::ROOT {
+            let schema::Section::Described(group) = section else {
+                continue;
+            };
+            for row in group.rows {
+                match row {
+                    schema::Row::Bool { title, get, .. } => {
+                        let widget = find_row::<adw::SwitchRow>(&w, title)
+                            .unwrap_or_else(|| panic!("{}/{title} is in the window", group.title));
+                        assert_eq!(
+                            widget.is_active(),
+                            get(&cfg),
+                            "{}/{title} did not redraw",
+                            group.title
+                        );
+                    }
+                    schema::Row::Int { title, get, .. } => {
+                        let widget = find_row::<adw::SpinRow>(&w, title)
+                            .unwrap_or_else(|| panic!("{}/{title} is in the window", group.title));
+                        assert!(
+                            (widget.value() - get(&cfg)).abs() < 0.01,
+                            "{}/{title} shows {} and the config holds {}",
+                            group.title,
+                            widget.value(),
+                            get(&cfg)
+                        );
+                    }
+                    schema::Row::Choice {
+                        title,
+                        options,
+                        get,
+                        ..
+                    } => {
+                        let entries = options.resolve(&ui);
+                        // An empty models directory leaves the Voice row
+                        // with nothing to select; there is no value to
+                        // assert and the row says so itself.
+                        let Some((_, want)) = entries.iter().find(|(v, _)| *v == get(&cfg)) else {
+                            continue;
+                        };
+                        let widget = find_row::<adw::ComboRow>(&w, title)
+                            .unwrap_or_else(|| panic!("{}/{title} is in the window", group.title));
+                        // The selected *label*, not the index: `Combo` shifts
+                        // everything up by one when it grows its synthetic
+                        // entry, and an index assertion would be asserting
+                        // that shift rather than the value.
+                        let shown = widget
+                            .selected_item()
+                            .and_then(|o| o.downcast::<gtk::StringObject>().ok())
+                            .map(|o| o.string().to_string());
+                        assert_eq!(
+                            shown.as_deref(),
+                            Some(want.as_str()),
+                            "{}/{title} did not redraw",
+                            group.title
+                        );
+                    }
+                    schema::Row::Custom(_) => {}
+                }
+            }
+        }
+
+        ui.window.close();
     }
 
     /// IMPORTANT 7: an application that notifies while the window is open
@@ -3431,6 +3325,7 @@ mod tests {
         // The rest of what needs a real window, run from here rather than
         // from a `#[test]` of its own for the same one-init reason.
         adw::init().expect("libadwaita initialises once GTK has");
+        every_described_row_redraws_from_the_config(dir.path());
         a_newly_seen_application_appears_while_the_window_is_open(dir.path());
         the_reword_entry_rows_commit_on_apply_and_never_clobber_typing(dir.path());
         the_key_row_visibility_follows_the_clicked_preset(dir.path());

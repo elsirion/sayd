@@ -6,6 +6,7 @@
 //! a display, so anything that lives in it cannot be tested here.
 
 pub mod model;
+pub mod schema;
 pub mod window;
 
 use std::sync::{Arc, OnceLock};
