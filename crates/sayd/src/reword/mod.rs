@@ -1286,6 +1286,20 @@ impl Origin {
             Provenance::Written(t) | Provenance::Composed(t) => t,
         }
     }
+
+    /// The text itself, consumed.
+    ///
+    /// Safe to expose for the same reason [`Origin::text`] is: taking the
+    /// string out says nothing about where it came from and cannot be used
+    /// to build another `Origin`. `pipeline::prepare` needs it for the two
+    /// asks that do not consult provenance -- `Ask::Never`, which speaks the
+    /// text as written, and `Ask::Requested`, where the caller asking is the
+    /// whole of the authority.
+    pub fn into_text(self) -> String {
+        match self.0 {
+            Provenance::Written(t) | Provenance::Composed(t) => t,
+        }
+    }
 }
 
 /// A rewrite the breakers have already cleared, and the only way anything in

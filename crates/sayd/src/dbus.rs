@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use sayd_core::config::Config;
 use sayd_core::engine::{Command, SayOpts, State, Submitted};
 use sayd_core::handle::EngineHandle;
 use sayd_core::queue::{Policy, Source as QueueSource};
@@ -16,7 +17,8 @@ use zbus::interface;
 use zbus::zvariant::{OwnedValue, Str};
 
 use crate::config_watch::{persist_in_background, ConfigStore};
-use crate::reword::Spoken;
+use crate::pipeline::{self, Ask};
+use crate::reword::{Spoken, Written};
 use crate::selection;
 
 pub struct SaydIface {
@@ -90,98 +92,22 @@ impl SaydIface {
         SaydIface { engine, store }
     }
 
-    /// Rewrite `text` if the caller asked for it, or hand it straight back.
+    /// Which [`Ask`] this submission carries.
     ///
-    /// **Awaited inline**, unlike `notify::monitor::speak`, which detaches.
-    /// The asymmetry is forced: `Say` returns an utterance id,
-    /// `Engine::submit` is what allocates that id, and there is no way to
-    /// allocate one ahead of the text -- `Queue` exposes no `iter_mut`,
-    /// `Utterance::text` is never reassigned anywhere in `sayd-core`, and
-    /// `Current`'s fields are private. Returning an id and rewriting
-    /// afterwards would need a text-replacement hook inside the engine, a
-    /// far larger change for a caller that is already blocked on a
-    /// synchronous method call. So `say --reword "..."` can take up to
-    /// `reword.timeout_ms` to return, and `reword.timeout_ms` has no ceiling
-    /// -- someone running a local model may have set it to thirty seconds.
-    /// That is why `sayd-cli` does not bound a submission carrying `reword`
-    /// at all (see its `call_submission`): this deadline is the one that
-    /// ends the wait, and the daemon is the only party that knows it. What
-    /// this method owes in exchange is that the wait really is bounded by
-    /// that number -- every path out of `RewordPlan::resolve` is, including
-    /// the transport's own ceiling, which is derived from it rather than
-    /// fixed (`reword::http_ceiling`).
-    ///
-    /// Every way this can fail ends in the original text being returned and
-    /// therefore spoken -- no configured endpoint, no client in this build, a
-    /// latched breaker, a provider that never answers. A `--reword` on a
-    /// keybind must not stop speaking because an optional enhancement is
-    /// misconfigured; the diagnosis is in the log, once per run.
-    ///
-    /// That sentence was false for one case until CRITICAL 2, and it is the
-    /// case where the rewrite *worked*: the guard admits a candidate up to
-    /// `original * 3 / 2 + 32` characters and `Engine::submit` refuses
-    /// anything over `max_chars`, so a valid rewrite of a long submission can
-    /// be refused after the original would have been accepted. Hence
-    /// [`Spoken`] rather than a `String` -- the refusal is retried with the
-    /// text the rewrite replaced, in [`SaydIface::submit_spoken`].
-    ///
-    /// **The config comes from the [`ConfigStore`], not from
-    /// `EngineHandle::config()`.** IMPORTANT 1, and it was measured: that
-    /// round trip is bounded by `CONFIG_REPLY_TIMEOUT` at 250 ms, and an
-    /// engine thread that is mid-chunk simply does not answer inside it. The
-    /// `None` that came back was read as "no rewrite" and the original was
-    /// handed straight to `submit` -- no log line, no D-Bus error, nothing
-    /// the caller could see. With six long utterances queued, 3 of 3
-    /// `say --reword` runs were dropped after ~250 ms. That is not an exotic
-    /// state: the normal use of `say --reword selection` on a keybind is to
-    /// press it while the daemon is already speaking, so the feature worked
-    /// on an idle daemon and quietly stopped under exactly the load it exists
-    /// for. The store is the daemon's own last-known config and needs no
-    /// engine at all -- which is what `EngineHandle::config`'s own doc tells
-    /// a caller that needs *some* answer rather than none to fall back to.
-    /// The two agree on `[reword]` because every change to it reaches the
-    /// engine through this same store's `ApplyConfig`.
-    ///
-    /// **[`ConfigStore::published`], not `current`, and not on the blocking
-    /// pool.** IMPORTANT 3 of the final review. `current` takes the stamp
-    /// mutex, and `ConfigStore::write_locked` holds that across an unbounded
-    /// disk write: measured, a wedged write blocked this read for 1.500 s.
-    /// The `spawn_blocking` hop kept that off a runtime worker but did
-    /// nothing about the 1.500 s itself. It is time spent before the
-    /// deadline this call promises even starts, on a path whose whole
-    /// contract is that it answers inside `timeout_ms`: a stall here is
-    /// delay the caller was never told about and cannot attribute, and with
-    /// an ordinary `Say` it is delay before an utterance that asked for no
-    /// rewrite at all.
-    ///
-    /// `published` is the same value behind a lock that is never held across
-    /// I/O, so the read is an `Arc` clone and needs no hop at all. The
-    /// `spawn_blocking` that used to wrap it is gone with it, along with the
-    /// `JoinError` arm that existed only because of it.
-    ///
-    /// The config is read only *after* the opt has been seen, so an ordinary
-    /// `Say` pays nothing at all for this -- not even the mutex.
-    async fn maybe_reword(&self, text: String, opts: &HashMap<String, OwnedValue>) -> Spoken {
+    /// The config is reached only through the ask that needs it, so an
+    /// ordinary `Say` still pays nothing at all for a feature it did not
+    /// ask for -- not even the mutex `ConfigStore::published` takes. That
+    /// promise is pinned by `published_reads` in the tests below, and
+    /// `Ask`'s own shape is what keeps it from being broken by accident.
+    fn ask<'a>(
+        cfg: &'a mut Option<Arc<Config>>,
+        store: &ConfigStore,
+        opts: &HashMap<String, OwnedValue>,
+    ) -> Ask<'a> {
         if !wants_reword(opts) {
-            return Spoken::as_written(text);
+            return Ask::Never;
         }
-        let cfg = self.store.published();
-        // `requested`, never `automatic`: `[reword] enabled` means "rewrite
-        // my notifications without being asked", and this caller is asking.
-        // Everything else -- endpoint, eligibility, all three breakers -- is
-        // the same code, because both constructors share `admit`.
-        //
-        // `cleanup` goes with it: the plan cleans the text before it sends
-        // it, so an explicit `say --reword` puts the same spoken form on the
-        // wire that a notification does, and no code fence or URL from the
-        // caller's own submission leaves the machine (CRITICAL 1).
-        match crate::reword::RewordPlan::requested(text, &cfg.reword, &cfg.cleanup) {
-            // The plan owns the text it was admitted for, so what is sent is
-            // what `will_reword` judged; `Err` hands the original straight
-            // back.
-            Ok(plan) => plan.resolve().await,
-            Err(text) => Spoken::as_written(text),
-        }
+        Ask::Requested(cfg.insert(store.published()))
     }
 
     /// Shared body of `SaySelection` and `SayClipboard`: read, rewrite if the
@@ -209,7 +135,11 @@ impl SaydIface {
             .await
             .map_err(|e| fdo::Error::Failed(format!("{what} read panicked: {e}")))?
             .map_err(fdo::Error::Failed)?;
-        let spoken = self.maybe_reword(text, opts).await;
+        let mut held = None;
+        let spoken = pipeline::prepare(Written(text), Self::ask(&mut held, &self.store, opts))
+            .map_err(|too_long| fdo::Error::Failed(too_long.message()))?
+            .resolve()
+            .await;
         self.submit_spoken(spoken, say_opts_from(opts, QueueSource::Hotkey))
             .await
     }
@@ -323,7 +253,11 @@ impl SaydIface {
     /// `submit`'s doc comment) -- also safe, since the queue does not reach
     /// that id in practice either.
     async fn say(&self, text: String, opts: HashMap<String, OwnedValue>) -> fdo::Result<u32> {
-        let spoken = self.maybe_reword(text, &opts).await;
+        let mut held = None;
+        let spoken = pipeline::prepare(Written(text), Self::ask(&mut held, &self.store, &opts))
+            .map_err(|too_long| fdo::Error::Failed(too_long.message()))?
+            .resolve()
+            .await;
         self.submit_spoken(spoken, say_opts_from(&opts, QueueSource::DBus))
             .await
     }
@@ -770,9 +704,15 @@ mod tests {
         let stamp_before = i.store.stamp_reads();
         let published_before = i.store.published_reads();
         let text = "Alice: where do you want to go for dinner".to_string();
-        let spoken = i
-            .maybe_reword(text.clone(), &opts_with("reword", OwnedValue::from(true)))
-            .await;
+        let mut held = None;
+        let opts = opts_with("reword", OwnedValue::from(true));
+        let spoken = pipeline::prepare(
+            Written(text.clone()),
+            SaydIface::ask(&mut held, &i.store, &opts),
+        )
+        .expect("well under the limit")
+        .resolve()
+        .await;
 
         assert_eq!(
             i.store.stamp_reads(),

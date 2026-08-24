@@ -484,11 +484,7 @@ impl Engine {
             }
         }
         if text.chars().count() > self.cfg.max_chars {
-            let msg = format!(
-                "text is {} characters, limit is {}",
-                text.chars().count(),
-                self.cfg.max_chars
-            );
+            let msg = crate::config::too_long(text.chars().count(), self.cfg.max_chars);
             // Something unrelated is genuinely still playing (or paused):
             // this rejection must not stomp on it and report a global Error
             // when nothing about A is actually wrong. The caller still

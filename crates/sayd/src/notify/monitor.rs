@@ -45,7 +45,8 @@ use zbus::export::futures_core::Stream;
 use zbus::message::Type;
 use zbus::{MatchRule, MessageStream};
 
-use crate::reword::{Origin, RewordPlan, Spoken};
+use crate::pipeline::{self, Ask, Prepared};
+use crate::reword::{Origin, Spoken};
 
 use super::decode::{decode, Decoded};
 use super::policy::{Decision, Limiter};
@@ -675,27 +676,24 @@ async fn speak(
     cfg: &Config,
     failure_logged: &Arc<AtomicBool>,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    let text = text.into();
-    let len = text.text().chars().count();
-    if len > cfg.max_chars {
-        eprintln!(
-            "warning: a notification's announcement is {len} characters, over the \
-             {max_chars}-character limit; skipping it rather than submitting it",
-            max_chars = cfg.max_chars
-        );
-        return None;
-    }
-
-    // `automatic`, never `requested`: this path is the standing ask that
+    // `Ask::Automatic`, never `Requested`: this path is the standing ask that
     // `[reword] enabled` governs. `--reword` is the other one, in `dbus.rs`.
-    let plan = match RewordPlan::automatic(text, &cfg.reword, &cfg.cleanup) {
-        Ok(plan) => plan,
-        // Not being reworded, and here is the text back. Today's path
-        // exactly, awaited: nothing was spawned, so two announcements
-        // arriving back to back are still submitted in the order they
-        // arrived.
-        Err(text) => {
-            submit_announcement(engine, Spoken::as_written(text), failure_logged).await;
+    let plan = match pipeline::prepare(text, Ask::Automatic(cfg)) {
+        Ok(Prepared::Pending(plan)) => plan,
+        // Not being reworded, and here is the text back. Awaited rather than
+        // spawned, so two announcements arriving back to back are still
+        // submitted in the order they arrived.
+        Ok(Prepared::Ready(spoken)) => {
+            submit_announcement(engine, spoken, failure_logged).await;
+            return None;
+        }
+        Err(too_long) => {
+            eprintln!(
+                "warning: a notification's announcement is {chars} characters, over \
+                 the {limit}-character limit; skipping it rather than submitting it",
+                chars = too_long.chars,
+                limit = too_long.limit
+            );
             return None;
         }
     };
@@ -846,7 +844,7 @@ fn log_discovery(app_name: &str, announced: &mut Announced) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reword::{Composed, Written};
+    use crate::reword::{Composed, RewordPlan, Written};
     use std::collections::HashMap;
     use std::io::{BufRead, BufReader};
     use std::process::{Child, Command, Stdio};

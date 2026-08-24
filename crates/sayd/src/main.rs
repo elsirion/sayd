@@ -10,6 +10,7 @@ mod dbus;
 mod kokoro_synth;
 mod mpris;
 mod notify;
+mod pipeline;
 mod resample;
 mod reword;
 mod ring;

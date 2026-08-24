@@ -180,6 +180,19 @@ pub fn notify_cooldown_min_secs(reword: &RewordConfig) -> u64 {
     reword.timeout_ms.div_ceil(1000) + 1
 }
 
+/// What a submission over `max_chars` is refused with.
+///
+/// One function rather than one `format!` because two gates produce it:
+/// `Engine::submit`, which is the engine's guarantee about its own queue,
+/// and `sayd::pipeline::prepare`, which catches the same text earlier so an
+/// over-long submission never costs a provider round trip first. A caller
+/// must not be able to tell which one caught it -- the text is over the
+/// limit either way, and two wordings for one refusal is a difference
+/// that means nothing.
+pub fn too_long(chars: usize, limit: usize) -> String {
+    format!("text is {chars} characters, limit is {limit}")
+}
+
 /// Which dialect a provider is told to stop reasoning in.
 ///
 /// The one thing `base_url` cannot say. Every endpoint in §6's table speaks
