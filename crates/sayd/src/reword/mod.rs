@@ -98,9 +98,12 @@
 //! §4's eligibility ceiling now measures the cleaned string, which is
 //! shorter -- so a notification whose raw form was over `reword.max_chars`
 //! but whose spoken form is not becomes eligible, which is what §2 asked
-//! for. And `Engine::submit` cleans again, so `clean` runs twice over the
-//! same string; that is sound because it is idempotent, pinned by
-//! `sayd_core::cleanup::tests::clean_is_idempotent`.
+//! for. And the cleaned copy stays *inside* the plan: it is what the guard
+//! measured and what goes on the wire, and it is never what this module
+//! hands back. Everything handed back is the original, because
+//! `Engine::submit` cleans whatever it is given and `clean` is not
+//! idempotent -- see `RewordPlan::original` and
+//! `sayd_core::cleanup::tests::clean_is_not_idempotent_and_callers_must_not_assume_it_is`.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -1155,7 +1158,8 @@ impl Spoken {
 /// daemon, which is what makes "reached only through a plan" a fact about
 /// the module boundary rather than a convention two files agree to keep.
 async fn reword_or_original(
-    text: String,
+    sent: String,
+    original: String,
     cfg: &RewordConfig,
     rewriter: Arc<dyn Rewriter>,
     state: Arc<RewordState>,
@@ -1164,17 +1168,21 @@ async fn reword_or_original(
     // No `record` here: `attempt` owns it end to end, because the outcome
     // of an attempt that outlived its deadline is only reachable from
     // inside the job. Recording here as well would count it twice.
-    let (outcome, _elapsed) = attempt(rewriter, state, cfg, text.clone(), budget).await;
+    let (outcome, _elapsed) = attempt(rewriter, state, cfg, sent.clone(), budget).await;
     let Attempt::Answered(Ok(candidate)) = outcome else {
-        return Spoken::as_written(text);
+        return Spoken::as_written(original);
     };
-    match check(&text, &candidate) {
+    // The guard compares like with like -- the candidate against the string
+    // the provider was actually given -- while everything handed *back* is
+    // the original, because `Engine::submit` is what cleans it. See
+    // [`RewordPlan::original`].
+    match check(&sent, &candidate) {
         // The one branch that carries a fallback: past here the engine is
         // the only thing left that can refuse this string, and if it does
         // the announcement must not be lost. See [`Spoken`].
         Ok(rewritten) => Spoken {
             text: rewritten,
-            fallback: Some(text),
+            fallback: Some(original),
         },
         Err(reason) => {
             debug(format_args!(
@@ -1182,7 +1190,7 @@ async fn reword_or_original(
                 reason.phrase(),
                 sayd_core::reword::truncate_for_debug(&candidate, DEBUG_SNIPPET_CHARS)
             ));
-            Spoken::as_written(text)
+            Spoken::as_written(original)
         }
     }
 }
@@ -1348,6 +1356,19 @@ pub struct RewordPlan {
     /// forget. See this module's doc for what was measured leaving the
     /// machine before it did.
     text: String,
+    /// The text exactly as the source handed it over, before any cleanup.
+    ///
+    /// This is what [`Spoken`] carries back whenever the rewrite does not
+    /// happen or does not survive -- never [`RewordPlan::text`]. Everything
+    /// this plan hands back goes to `Engine::submit`, which cleans, and
+    /// `clean` is **not** idempotent: cleaning a cleaned string can drop
+    /// content (`sayd_core::cleanup`'s
+    /// `clean_is_not_idempotent_and_callers_must_not_assume_it_is` has the
+    /// measured case -- a markdown table whose leading `1.` becomes a list
+    /// marker on the second pass and is eaten). Handing back the cleaned
+    /// copy made a notification nobody reworded quieter than the same
+    /// notification with the feature switched off.
+    original: String,
     /// The exact config the decision was taken under, cloned once here
     /// rather than read again later: `notify::monitor` refreshes its cached
     /// `Config` on every tick, and text judged eligible under one
@@ -1474,10 +1495,14 @@ impl RewordPlan {
     /// promise that what leaves the machine is cleaned, in both builds.
     ///
     /// Order is load-bearing. Cleanup comes first, so [`will_reword`] judges
-    /// the string that will actually be spoken (§4) rather than one that may
-    /// be twice as long before its code block is dropped, and so the `Err`
-    /// hands back that same string: `Engine::submit` cleans it again to the
-    /// same value, because `clean` is idempotent.
+    /// the string that will actually be sent (§4) rather than one that may be
+    /// twice as long before its code block is dropped, and so that CRITICAL
+    /// 1 holds: the copy on the wire has had its fences and URLs removed.
+    ///
+    /// What goes back on refusal is the **original**, untouched. Every string
+    /// this module hands back is submitted through `Engine::submit`, which
+    /// cleans it -- so the cleaned copy must not escape, or it is cleaned
+    /// twice. See [`RewordPlan::original`] for what that cost.
     fn admit_with(
         text: String,
         cfg: &RewordConfig,
@@ -1485,14 +1510,15 @@ impl RewordPlan {
         rewriter: Arc<dyn Rewriter>,
         state: Arc<RewordState>,
     ) -> Result<RewordPlan, String> {
-        let text = clean(&text, cleanup);
-        if !will_reword(&text, cfg, &state) {
+        let cleaned = clean(&text, cleanup);
+        if !will_reword(&cleaned, cfg, &state) {
             return Err(text);
         }
         Ok(RewordPlan {
             rewriter,
             state,
-            text,
+            text: cleaned,
+            original: text,
             cfg: cfg.clone(),
         })
     }
@@ -1506,7 +1532,14 @@ impl RewordPlan {
     /// so a rewrite that lands past the deadline is dropped rather than
     /// spoken second. Do not add a submit callback to this signature.
     pub async fn resolve(self) -> Spoken {
-        reword_or_original(self.text, &self.cfg, self.rewriter, self.state).await
+        reword_or_original(
+            self.text,
+            self.original,
+            &self.cfg,
+            self.rewriter,
+            self.state,
+        )
+        .await
     }
 }
 
@@ -1773,6 +1806,7 @@ mod tests {
         let original = "Alice: where do you want to go for dinner".to_string();
 
         let spoken = reword_or_original(
+            original.clone(),
             original.clone(),
             &cfg(),
             stub.clone() as Arc<dyn Rewriter>,
@@ -2611,14 +2645,109 @@ mod tests {
             "the URL is reduced to the word `link`, not deleted: {sent:?}"
         );
 
-        // The same string is what the fallback speaks, and what §4 and §3
-        // measure: `Engine::submit` cleans it again to itself.
+        // What the fallback carries is the **raw** text, and that is not a
+        // hole in any of the above: it never reaches a socket, only
+        // `Engine::submit`, which cleans it -- to exactly the string that
+        // went on the wire. Asserting that equality rather than asserting
+        // the fallback is already cleaned is what keeps the two halves of
+        // this from drifting apart, and it is the stronger claim: it says
+        // the user hears precisely what the provider was shown.
+        let fallback = spoken.fallback.expect("a rewrite carries one");
         assert_eq!(
-            spoken.fallback.as_deref(),
-            Some(sent.as_str()),
-            "the text a rewrite replaced is the cleaned one, not the raw one"
+            clean(&fallback, &CleanupConfig::default()),
+            sent,
+            "the fallback cleans to the string that was sent"
         );
-        assert_eq!(clean(&sent, &CleanupConfig::default()), sent);
+    }
+
+    /// The refusal path hands back **what it was given**, not a cleaned copy.
+    ///
+    /// `Engine::submit` cleans whatever it is handed, and `clean` is not
+    /// idempotent -- see
+    /// `sayd_core::cleanup::tests::clean_is_not_idempotent_and_callers_must_not_assume_it_is`
+    /// for the measured counterexample. A cleaned string returned here is
+    /// therefore cleaned a *second* time downstream, and a notification that
+    /// nobody reworded is spoken with less in it than the same notification
+    /// with rewording switched off entirely.
+    #[test]
+    fn a_refused_plan_hands_back_the_original_not_a_cleaned_copy() {
+        const TABLE: &str = "| 1. | 2,5 EUR |\n| 3. | 1.234 |";
+        let mut c = cfg();
+        c.max_chars = 4; // nothing is eligible at this ceiling
+        let back = RewordPlan::admit_with(
+            TABLE.to_string(),
+            &c,
+            &CleanupConfig::default(),
+            Stub::new(vec![]) as Arc<dyn Rewriter>,
+            RewordState::new(),
+        )
+        .err()
+        .expect("over the ceiling, so no plan");
+        assert_eq!(
+            back, TABLE,
+            "the refusal path must hand back what it was given"
+        );
+    }
+
+    /// Whatever happens to a rewrite, the string that reaches the engine
+    /// cleans to the same thing the rewording-off path speaks.
+    ///
+    /// The property the double-clean broke, stated over the three ways a
+    /// submission can end up speaking its original: never admitted, admitted
+    /// and refused by the guard, and rewritten but then refused by the
+    /// engine. All three are byte-identical to switching the feature off.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_path_back_to_the_original_matches_the_rewording_off_path() {
+        const TABLE: &str = "| 1. | 2,5 EUR |\n| 3. | 1.234 |";
+        let cleanup = CleanupConfig::default();
+        let spoken_when_off = clean(TABLE, &cleanup);
+
+        // 1. The reference: rewording off, so `automatic` returns on its
+        //    second line and nothing has touched the text.
+        let mut off = cfg();
+        off.enabled = false;
+        let back = RewordPlan::automatic(Written(TABLE.into()), &off, &cleanup)
+            .err()
+            .expect("off, so no plan");
+        assert_eq!(clean(&back, &cleanup), spoken_when_off, "rewording off");
+
+        // 2. Admitted nowhere: `will_reword` refuses this text.
+        let mut small = cfg();
+        small.max_chars = 4;
+        let back = RewordPlan::admit_with(
+            TABLE.to_string(),
+            &small,
+            &cleanup,
+            Stub::new(vec![]) as Arc<dyn Rewriter>,
+            RewordState::new(),
+        )
+        .err()
+        .expect("over the ceiling");
+        assert_eq!(
+            clean(&back, &cleanup),
+            spoken_when_off,
+            "refused by the guard"
+        );
+
+        // 3. Rewritten, and then refused by the engine: the fallback is what
+        //    gets submitted, and it goes through `Engine::submit` too.
+        let stub = Stub::new(vec![Ok("Two rows of numbers.".into())]);
+        let spoken = RewordPlan::admit_with(
+            TABLE.to_string(),
+            &cfg(),
+            &cleanup,
+            stub as Arc<dyn Rewriter>,
+            RewordState::new(),
+        )
+        .expect("eligible")
+        .resolve()
+        .await;
+        let fallback = spoken.fallback.expect("a rewrite carries one");
+        assert_eq!(
+            clean(&fallback, &cleanup),
+            spoken_when_off,
+            "the engine refused the rewrite"
+        );
     }
 
     /// The other half of CRITICAL 1: cleaning happens *before* the
@@ -2764,6 +2893,7 @@ mod tests {
         assert_eq!(
             reword_or_original(
                 original.clone(),
+                original.clone(),
                 &cfg(),
                 good as Arc<dyn Rewriter>,
                 state.clone()
@@ -2781,6 +2911,7 @@ mod tests {
         assert_eq!(
             reword_or_original(
                 original.clone(),
+                original.clone(),
                 &cfg(),
                 chatty as Arc<dyn Rewriter>,
                 RewordState::new()
@@ -2793,6 +2924,7 @@ mod tests {
         let dead = Stub::new(vec![Err(RewordError::Unreachable("refused".into()))]);
         assert_eq!(
             reword_or_original(
+                original.clone(),
                 original.clone(),
                 &cfg(),
                 dead as Arc<dyn Rewriter>,
@@ -3120,6 +3252,7 @@ mod tests {
 
         let spoken = reword_or_original(
             original.clone(),
+            original.clone(),
             &cfg(),
             rewriter as Arc<dyn Rewriter>,
             RewordState::new(),
@@ -3157,6 +3290,7 @@ mod tests {
         let state = RewordState::new();
         let original = "Alice: where do you want to go for dinner".to_string();
         let spoken = reword_or_original(
+            original.clone(),
             original.clone(),
             &cfg(),
             Arc::new(Panicky) as Arc<dyn Rewriter>,

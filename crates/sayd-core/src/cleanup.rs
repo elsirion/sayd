@@ -725,44 +725,33 @@ mod tests {
         );
     }
 
-    /// The property the rewording milestone's SS2 depends on: the rewrite
-    /// sits between `clean` and `submit`, and `Engine::submit` cleans
-    /// unconditionally, so `clean` runs twice over the same string. If it
-    /// were not idempotent, a reworded announcement would be transformed
-    /// differently from one that was not, and the SS4 eligibility ceiling
-    /// would be measuring a string other than the one that gets spoken.
+    /// `clean` is **not** idempotent, and no caller may assume it is.
     ///
-    /// Every flag on, and every URL policy, because the acronym pass and
-    /// the URL passes are the two that rewrite their own output.
+    /// This test replaced a `clean_is_idempotent` that asserted the opposite
+    /// over eleven hand-picked strings, none of them table-shaped. Three doc
+    /// comments cited it to justify cleaning an already-cleaned string, and
+    /// on the refusal path that cost content: the first pass turns the
+    /// table's pipes into spaces, which exposes a leading `1.` that the
+    /// second pass reads as an ordered-list marker and drops.
+    ///
+    /// Kept as a characterisation test rather than deleted outright, so that
+    /// anyone who reaches for the old assumption finds the counterexample
+    /// instead of rediscovering it in a notification. See
+    /// `sayd::reword::RewordPlan::original` for the rule that replaced it.
     #[test]
-    fn clean_is_idempotent() {
-        const CORPUS: [&str; 11] = [
-            "the HTLC failed",
-            "I am OK with A and the DKG",
-            "see https://example.com/a_b?q=1#frag for details",
-            "visit http://mysite.example.com and http://other.example.org",
-            "```\nlet x = 1;\n```\nand then some prose",
-            "inter-\nnational cooperation",
-            "machine-\n- learning",
-            "Tom &amp; Jerry went to HTTP land",
-            "a\u{0}b\u{1}c control characters",
-            "- one\n- two\n# heading\ntext",
-            "**bold** and _italic_ and [text](https://example.com)",
-        ];
-        for urls in [UrlPolicy::Link, UrlPolicy::Domain, UrlPolicy::Keep] {
-            let cfg = CleanupConfig {
-                urls,
-                ..CleanupConfig::default()
-            };
-            for input in CORPUS {
-                let once = clean(input, &cfg);
-                let twice = clean(&once, &cfg);
-                assert_eq!(
-                    twice, once,
-                    "clean is not idempotent for {input:?} at {urls:?}: \
-                     {once:?} -> {twice:?}"
-                );
-            }
-        }
+    fn clean_is_not_idempotent_and_callers_must_not_assume_it_is() {
+        let cfg = CleanupConfig::default();
+        let once = clean("| 1. | 2,5 EUR |\n| 3. | 1.234 |", &cfg);
+        let twice = clean(&once, &cfg);
+        assert_eq!(once, "1. 2,5 E U R 3. 1.234");
+        assert_eq!(
+            twice, "2,5 E U R 3. 1.234",
+            "the second pass eats the leading list marker the first one exposed"
+        );
+        assert_ne!(
+            once, twice,
+            "if this ever passes, `clean` may have become idempotent -- that \
+             is a reason to check the callers, not to start relying on it"
+        );
     }
 }

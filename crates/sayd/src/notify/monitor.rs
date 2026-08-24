@@ -649,10 +649,15 @@ fn notification_opts() -> SayOpts {
 /// received before it did), and `Engine::submit` cleans every submission
 /// with the engine's own `cleanup` config before queueing it
 /// (`sayd-core/src/engine.rs`, "let cleaned = clean(&text, &self.cfg.cleanup)").
-/// The rewrite sits between the two, which is sound because `clean` is
-/// idempotent -- pinned by `cleanup::tests::clean_is_idempotent`. Neither
-/// call belongs here: this function would have to do it twice, once for
-/// each arm, and an arm that forgot would be invisible.
+/// Those two are not the same string cleaned twice: `admit_with` keeps its
+/// cleaned copy for the wire and hands the *original* back, so every string
+/// that reaches `Engine::submit` is cleaned exactly once, there. That
+/// distinction is load-bearing rather than tidy -- `clean` is not
+/// idempotent, and the version of this that cleaned twice dropped a leading
+/// list marker from any refused announcement shaped like a table
+/// (`cleanup::tests::clean_is_not_idempotent_and_callers_must_not_assume_it_is`).
+/// Neither call belongs here: this function would have to do it twice, once
+/// for each arm, and an arm that forgot would be invisible.
 ///
 /// `max_chars` is checked here, against the *live* config's own limit,
 /// before the text is ever handed to `submit` (Important 3), and before the

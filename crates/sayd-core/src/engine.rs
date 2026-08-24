@@ -554,6 +554,11 @@ impl Engine {
             return Ok(Submitted::Discarded);
         }
 
+        // The one place a string that will be spoken is cleaned. Callers
+        // hand this raw text -- including `sayd::reword`, whose plans keep
+        // their own cleaned copy for the provider and hand the original
+        // back -- because `clean` is not idempotent and a second pass can
+        // drop content (`cleanup::tests::clean_is_not_idempotent_and_callers_must_not_assume_it_is`).
         let cleaned = clean(&text, &self.cfg.cleanup);
         if cleaned.trim().is_empty() {
             return Ok(Submitted::Discarded);
