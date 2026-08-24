@@ -124,9 +124,33 @@ impl Row {
 }
 
 pub struct Group {
-    pub title: &'static str,
+    /// `None` for a group that carries a page's master switch: libadwaita's
+    /// own pattern for one is an untitled group above the titled ones, and a
+    /// heading over a single switch that repeats the page title reads as a
+    /// second setting.
+    pub title: Option<&'static str>,
     pub description: Option<&'static str>,
     pub rows: &'static [Row],
+}
+
+impl Group {
+    /// A name for assertion messages. `Custom` groups never reach here.
+    #[cfg(test)]
+    pub fn name(&self) -> &'static str {
+        self.title.unwrap_or("(master)")
+    }
+}
+
+/// A sub-page, reached from a navigation row on the root page.
+pub struct Page {
+    pub title: &'static str,
+    pub sections: &'static [Section],
+    /// What the navigation row says underneath the title.
+    ///
+    /// Load-bearing rather than decorative: it is what keeps the root page a
+    /// status view rather than a menu. Without it this trades one long page
+    /// for four short ones plus the clicks to reach them.
+    pub summary: fn(&Config) -> String,
 }
 
 /// One `AdwPreferencesGroup`, described or hand-built.
@@ -134,100 +158,29 @@ pub enum Section {
     Described(Group),
     /// A whole group no descriptor describes. See this module's doc.
     Custom(fn(&Build) -> adw::PreferencesGroup),
+    /// A group of navigation rows, each opening a sub-page.
+    Links {
+        title: &'static str,
+        pages: &'static [&'static Page],
+    },
 }
 
-/// The window's one page, in the order it is drawn.
-///
-/// Unchanged from what `build` assembled by hand, deliberately: this
-/// milestone's first half proves the renderer reproduces the window that was
-/// there, and moves nothing. The hierarchy is the second half.
-pub static ROOT: &[Section] = &[
-    Section::Described(Group {
-        title: "Voice and speed",
-        description: None,
-        rows: &[
-            Row::Choice {
-                title: "Voice",
-                options: Options::Discovered(|ui| ui.voices()),
-                // `sayd` already warns about a configured voice with no pack
-                // at startup; saying it again here is what keeps the row from
-                // silently showing some other voice as if it were the
-                // configured one.
-                unknown: |v| format!("‘{v}’ — no voice pack installed"),
-                get: |c| c.voice.clone(),
-                set: |c, v| c.voice = v.to_string(),
-            },
-            Row::Int {
-                title: "Speed",
-                subtitle: "Playback rate for every utterance",
-                min: SPEED_MIN as f64,
-                max: SPEED_MAX as f64,
-                step: SPEED_STEP,
-                page: SPEED_STEP,
-                digits: 2,
-                get: |c| c.speed as f64,
-                set: |c, v| c.speed = v as f32,
-            },
-            Row::Choice {
-                title: "Speed mode",
-                options: Options::Annotated(&SPEED_MODES),
-                unknown: |m| format!("‘{m}’ — not a speed mode this build knows"),
-                get: |c| c.speed_mode.clone(),
-                set: |c, v| c.speed_mode = v.to_string(),
-            },
-            Row::Custom(super::window::voice_test_row),
-        ],
-    }),
-    Section::Described(Group {
-        title: "Engine",
-        description: Some(
-            "Changes take effect on the next utterance; switching model reloads the session",
-        ),
-        rows: &[
-            Row::Choice {
-                title: "Model",
-                options: Options::Annotated(&MODELS),
-                unknown: |m| format!("‘{m}’ — not a model this build knows"),
-                get: |c| c.model.clone(),
-                set: |c, v| c.model = v.to_string(),
-            },
-            Row::Int {
-                title: "Threads",
-                subtitle: "ONNX Runtime intra-op threads; measured peak at 8",
-                min: THREADS_MIN,
-                max: THREADS_MAX,
-                step: THREADS_STEP,
-                page: THREADS_STEP,
-                digits: 0,
-                get: |c| c.threads as f64,
-                set: |c, v| c.threads = v as usize,
-            },
-            Row::Int {
-                title: "Idle unload",
-                subtitle: "Seconds of silence before the ~1.27 GB session is dropped; 0 never unloads",
-                min: IDLE_UNLOAD_MIN,
-                max: IDLE_UNLOAD_MAX,
-                step: IDLE_UNLOAD_STEP,
-                page: IDLE_UNLOAD_STEP,
-                digits: 0,
-                get: |c| c.idle_unload_secs as f64,
-                set: |c, v| c.idle_unload_secs = v as u64,
-            },
-            Row::Int {
-                title: "Long-text guard",
-                subtitle: "Refuse submissions longer than this many characters",
-                min: MAX_CHARS_MIN,
-                max: MAX_CHARS_MAX,
-                step: MAX_CHARS_STEP,
-                page: MAX_CHARS_STEP,
-                digits: 0,
-                get: |c| c.max_chars as f64,
-                set: |c, v| c.max_chars = v as usize,
-            },
-        ],
-    }),
-    Section::Described(Group {
-        title: "Text cleanup",
+/// The Cleanup sub-page: the master, then the transforms it governs.
+pub static CLEANUP: Page = Page {
+    title: "Cleanup",
+    sections: &[
+        Section::Described(Group {
+            title: None,
+            description: None,
+            rows: &[Row::Bool {
+                title: "Clean up text",
+                subtitle: "Tidy every submission before it is spoken",
+                get: |c| c.cleanup.enabled,
+                set: |c, v| c.cleanup.enabled = v,
+            }],
+        }),
+        Section::Described(Group {
+        title: Some("Text cleanup"),
         description: Some("Applied to every submission before it is spoken"),
         // In the order spec §8 lists the transforms.
         rows: &[
@@ -282,8 +235,101 @@ pub static ROOT: &[Section] = &[
             },
         ],
     }),
-    Section::Described(Group {
-        title: "Notifications",
+    ],
+    summary: |c| {
+        if !c.cleanup.enabled {
+            return "Off".into();
+        }
+        let on = [
+            c.cleanup.collapse_whitespace,
+            c.cleanup.rejoin_hyphenation,
+            c.cleanup.strip_markdown,
+            c.cleanup.drop_code_blocks,
+            c.cleanup.spell_acronyms,
+        ]
+        .iter()
+        .filter(|b| **b)
+        .count();
+        let urls = match c.cleanup.urls {
+            sayd_core::config::UrlPolicy::Link => "say \u{201c}link\u{201d}",
+            sayd_core::config::UrlPolicy::Domain => "say the domain",
+            sayd_core::config::UrlPolicy::Keep => "read the whole URL",
+        };
+        format!("{on} of 5 transforms on \u{b7} URLs: {urls}")
+    },
+};
+
+/// The Rewording sub-page.
+///
+/// The master is described; everything under it is the hand-built Reword
+/// group, whose endpoint presets, key-visibility rule and asynchronous Test
+/// result are not values bound to config fields.
+pub static REWORDING: Page = Page {
+    title: "Rewording",
+    sections: &[
+        Section::Described(Group {
+            title: None,
+            description: None,
+            rows: &[Row::Bool {
+                title: "Reword text",
+                subtitle: "Off keeps the endpoint below; nothing is rewritten, \
+                           not even an explicit --reword",
+                get: |c| c.reword.enabled,
+                set: |c, v| c.reword.enabled = v,
+            }],
+        }),
+        Section::Custom(super::window::reword_group),
+    ],
+    summary: |c| {
+        if !c.reword.enabled {
+            return "Off".into();
+        }
+        // The provider as the file spells it: `Provider` has no display
+        // name of its own, and the string the user typed is the one they
+        // will recognise.
+        match (c.reword.resolved_provider(), c.reword.provider.as_deref()) {
+            (Some(_), Some(name)) => format!("{} via {name}", c.reword.model),
+            _ => "No provider set".into(),
+        }
+    },
+};
+
+/// The `say` sub-page: the submission limit that belongs to it.
+///
+/// **No master switch.** It was in the first sketch of this hierarchy and it
+/// does not earn its keep: notifications arrive uninvited, so a switch for
+/// them is worth having, but `say` only runs when the user runs it.
+/// Switching it off would mean `Say` returning a D-Bus error naming a
+/// setting -- a new failure mode in exchange for nothing.
+pub static SAY: Page = Page {
+    title: "say command",
+    sections: &[Section::Described(Group {
+        title: None,
+        description: Some("Text submitted with the `say` command, a hotkey, or over D-Bus"),
+        rows: &[
+            Row::Int {
+                title: "Long-text guard",
+                subtitle: "Refuse submissions longer than this many characters",
+                min: MAX_CHARS_MIN,
+                max: MAX_CHARS_MAX,
+                step: MAX_CHARS_STEP,
+                page: MAX_CHARS_STEP,
+                digits: 0,
+                get: |c| c.max_chars as f64,
+                set: |c, v| c.max_chars = v as usize,
+            },
+        ],
+    })],
+    summary: |c| format!("Up to {} characters", c.max_chars),
+};
+
+/// The Notifications sub-page: the switches, then the allowlist and the two
+/// pickers that feed it.
+pub static NOTIFICATIONS: Page = Page {
+    title: "Notifications",
+    sections: &[
+        Section::Described(Group {
+        title: Some("Notifications"),
         description: Some(
             "Takes effect at once: turning this on starts watching the session bus",
         ),
@@ -335,24 +381,231 @@ pub static ROOT: &[Section] = &[
             },
         ],
     }),
-    // The Reword group needs the engine: its result row speaks what came
-    // back. The allowlist and its two suggestion groups belong together at
-    // the bottom, so Reword goes above them.
-    Section::Custom(super::window::reword_group),
-    Section::Custom(super::window::allowlist_group),
-    Section::Custom(super::window::seen_suggestions_group),
-    Section::Custom(super::window::curated_suggestions_group),
+        Section::Custom(super::window::allowlist_group),
+        Section::Custom(super::window::seen_suggestions_group),
+        Section::Custom(super::window::curated_suggestions_group),
+    ],
+    summary: |c| {
+        if !c.notifications.enabled {
+            return "Off".into();
+        }
+        let apps = c.notifications.allow.len();
+        let apps = match apps {
+            0 => "no applications yet".to_string(),
+            1 => "1 application".to_string(),
+            n => format!("{n} applications"),
+        };
+        match c.notifications.cooldown_secs {
+            0 => format!("On \u{b7} {apps} \u{b7} every notification"),
+            n => format!("On \u{b7} {apps} \u{b7} {n} s cooldown"),
+        }
+    },
+};
+
+/// The root page: what is worth seeing without navigating, and the way in to
+/// everything else.
+///
+/// The navigation rows sit directly here under a group heading rather than
+/// behind an intermediate page each: a page whose entire content is two more
+/// navigation rows is a click that shows nothing.
+pub static ROOT: &[Section] = &[
+    Section::Described(Group {
+        title: Some("Voice and speed"),
+        description: None,
+        rows: &[
+            Row::Choice {
+                title: "Voice",
+                options: Options::Discovered(|ui| ui.voices()),
+                // `sayd` already warns about a configured voice with no pack
+                // at startup; saying it again here is what keeps the row from
+                // silently showing some other voice as if it were the
+                // configured one.
+                unknown: |v| format!("‘{v}’ — no voice pack installed"),
+                get: |c| c.voice.clone(),
+                set: |c, v| c.voice = v.to_string(),
+            },
+            Row::Int {
+                title: "Speed",
+                subtitle: "Playback rate for every utterance",
+                min: SPEED_MIN as f64,
+                max: SPEED_MAX as f64,
+                step: SPEED_STEP,
+                page: SPEED_STEP,
+                digits: 2,
+                get: |c| c.speed as f64,
+                set: |c, v| c.speed = v as f32,
+            },
+            Row::Choice {
+                title: "Speed mode",
+                options: Options::Annotated(&SPEED_MODES),
+                unknown: |m| format!("‘{m}’ — not a speed mode this build knows"),
+                get: |c| c.speed_mode.clone(),
+                set: |c, v| c.speed_mode = v.to_string(),
+            },
+            Row::Custom(super::window::voice_test_row),
+        ],
+    }),
+    Section::Described(Group {
+        title: Some("Engine"),
+        description: Some(
+            "Changes take effect on the next utterance; switching model reloads the session",
+        ),
+        rows: &[
+            Row::Choice {
+                title: "Model",
+                options: Options::Annotated(&MODELS),
+                unknown: |m| format!("‘{m}’ — not a model this build knows"),
+                get: |c| c.model.clone(),
+                set: |c, v| c.model = v.to_string(),
+            },
+            Row::Int {
+                title: "Threads",
+                subtitle: "ONNX Runtime intra-op threads; measured peak at 8",
+                min: THREADS_MIN,
+                max: THREADS_MAX,
+                step: THREADS_STEP,
+                page: THREADS_STEP,
+                digits: 0,
+                get: |c| c.threads as f64,
+                set: |c, v| c.threads = v as usize,
+            },
+            Row::Int {
+                title: "Idle unload",
+                subtitle: "Seconds of silence before the ~1.27 GB session is dropped; 0 never unloads",
+                min: IDLE_UNLOAD_MIN,
+                max: IDLE_UNLOAD_MAX,
+                step: IDLE_UNLOAD_STEP,
+                page: IDLE_UNLOAD_STEP,
+                digits: 0,
+                get: |c| c.idle_unload_secs as f64,
+                set: |c, v| c.idle_unload_secs = v as u64,
+            },
+        ],
+    }),
+    Section::Links {
+        title: "Text",
+        pages: &[&CLEANUP, &REWORDING],
+    },
+    Section::Links {
+        title: "Sources",
+        pages: &[&SAY, &NOTIFICATIONS],
+    },
 ];
+
+/// Every sub-page, for the tests that check the tree is whole.
+/// Every described group in the whole tree, root page and sub-pages alike.
+///
+/// Shared by this module's tests and by `window`'s, so a group that moves to
+/// a sub-page does not quietly fall out of either one's coverage.
+#[cfg(test)]
+pub fn described_groups() -> impl Iterator<Item = &'static Group> {
+    fn from(sections: &'static [Section]) -> impl Iterator<Item = &'static Group> {
+        sections.iter().filter_map(|s| match s {
+            Section::Described(g) => Some(g),
+            Section::Custom(_) | Section::Links { .. } => None,
+        })
+    }
+    from(ROOT).chain(PAGES.iter().flat_map(|p| from(p.sections)))
+}
+
+#[cfg(test)]
+pub static PAGES: &[&Page] = &[&CLEANUP, &REWORDING, &SAY, &NOTIFICATIONS];
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn described() -> impl Iterator<Item = &'static Group> {
-        ROOT.iter().filter_map(|s| match s {
-            Section::Described(g) => Some(g),
-            Section::Custom(_) => None,
-        })
+    /// Every sub-page is reachable from the root, and every navigation row
+    /// names a page that exists.
+    ///
+    /// A `Page` declared and never linked is a page nobody can open, which
+    /// nothing else in this file would notice: it compiles, it has rows, and
+    /// its rows even redraw.
+    #[test]
+    fn every_page_is_linked_from_the_root_exactly_once() {
+        let mut linked: Vec<&'static str> = Vec::new();
+        for section in ROOT {
+            if let Section::Links { pages, .. } = section {
+                for page in *pages {
+                    assert!(
+                        !linked.contains(&page.title),
+                        "{} is linked twice",
+                        page.title
+                    );
+                    linked.push(page.title);
+                }
+            }
+        }
+        let declared: Vec<&str> = PAGES.iter().map(|p| p.title).collect();
+        for title in &declared {
+            assert!(linked.contains(title), "{title} is declared but not linked");
+        }
+        for title in &linked {
+            assert!(
+                declared.contains(title),
+                "{title} is linked but not in PAGES, so the tests below skip it"
+            );
+        }
+    }
+
+    /// Each summary renders from a known config to a known string.
+    ///
+    /// These are what make the root page a status view rather than a menu,
+    /// so they are pinned as text rather than merely as "not empty".
+    #[test]
+    fn each_summary_says_what_its_page_holds() {
+        let mut cfg = Config::default();
+
+        assert_eq!(
+            (CLEANUP.summary)(&cfg),
+            "5 of 5 transforms on \u{b7} URLs: say \u{201c}link\u{201d}"
+        );
+        cfg.cleanup.strip_markdown = false;
+        assert_eq!(
+            (CLEANUP.summary)(&cfg),
+            "4 of 5 transforms on \u{b7} URLs: say \u{201c}link\u{201d}"
+        );
+        cfg.cleanup.enabled = false;
+        assert_eq!((CLEANUP.summary)(&cfg), "Off");
+
+        // The shipped default: the master is on, and there is no provider.
+        assert_eq!((REWORDING.summary)(&cfg), "No provider set");
+        cfg.reword.provider = Some("llama-cpp".into());
+        cfg.reword.model = "qwen3:32b".into();
+        assert_eq!((REWORDING.summary)(&cfg), "qwen3:32b via llama-cpp");
+        // A provider the file names but this build does not know is not one:
+        // `resolved_provider` is what the daemon will actually use.
+        cfg.reword.provider = Some("llama.cpp".into());
+        assert_eq!((REWORDING.summary)(&cfg), "No provider set");
+        cfg.reword.enabled = false;
+        assert_eq!((REWORDING.summary)(&cfg), "Off");
+
+        assert_eq!(
+            (SAY.summary)(&cfg),
+            format!("Up to {} characters", Config::default().max_chars)
+        );
+
+        assert_eq!((NOTIFICATIONS.summary)(&cfg), "Off");
+        cfg.notifications.enabled = true;
+        // `0` is the off switch for rate limiting, not a short window, and
+        // the summary has to say so in words for the same reason the
+        // Cooldown row's subtitle does.
+        cfg.notifications.cooldown_secs = 0;
+        assert_eq!(
+            (NOTIFICATIONS.summary)(&cfg),
+            "On \u{b7} no applications yet \u{b7} every notification"
+        );
+        cfg.notifications.allow = vec!["Signal".into()];
+        cfg.notifications.cooldown_secs = 5;
+        assert_eq!(
+            (NOTIFICATIONS.summary)(&cfg),
+            "On \u{b7} 1 application \u{b7} 5 s cooldown"
+        );
+        cfg.notifications.allow.push("Element".into());
+        assert_eq!(
+            (NOTIFICATIONS.summary)(&cfg),
+            "On \u{b7} 2 applications \u{b7} 5 s cooldown"
+        );
     }
 
     /// No two rows in a group share a title.
@@ -362,13 +615,13 @@ mod tests {
     /// cannot be referred to.
     #[test]
     fn every_row_title_in_a_group_is_distinct() {
-        for group in described() {
+        for group in described_groups() {
             let mut seen: Vec<&str> = Vec::new();
             for title in group.rows.iter().filter_map(Row::title) {
                 assert!(
                     !seen.contains(&title),
                     "{}: two rows titled {title:?}",
-                    group.title
+                    group.name()
                 );
                 seen.push(title);
             }
@@ -385,7 +638,7 @@ mod tests {
     #[test]
     fn a_static_choice_offers_the_shipped_default() {
         let cfg = Config::default();
-        for group in described() {
+        for group in described_groups() {
             for row in group.rows {
                 let Row::Choice {
                     title,
@@ -400,7 +653,7 @@ mod tests {
                 assert!(
                     table.iter().any(|(v, _)| *v == value),
                     "{}/{title}: the default {value:?} is not one of {:?}",
-                    group.title,
+                    group.name(),
                     table.iter().map(|(v, _)| *v).collect::<Vec<_>>()
                 );
             }
@@ -415,7 +668,7 @@ mod tests {
     /// which no compiler catches, since both fields have the same type.
     #[test]
     fn every_row_reads_back_what_it_writes() {
-        for group in described() {
+        for group in described_groups() {
             for row in group.rows {
                 let mut cfg = Config::default();
                 match row {
@@ -424,7 +677,7 @@ mod tests {
                     } => {
                         let flipped = !get(&cfg);
                         set(&mut cfg, flipped);
-                        assert_eq!(get(&cfg), flipped, "{}/{title}", group.title);
+                        assert_eq!(get(&cfg), flipped, "{}/{title}", group.name());
                     }
                     Row::Int {
                         title,
@@ -446,7 +699,7 @@ mod tests {
                         assert!(
                             (got - want).abs() < 0.01,
                             "{}/{title}: wrote {want}, read {got}",
-                            group.title
+                            group.name()
                         );
                     }
                     Row::Choice {
@@ -458,7 +711,7 @@ mod tests {
                     } => {
                         for (value, _) in table.iter() {
                             set(&mut cfg, value);
-                            assert_eq!(&get(&cfg), value, "{}/{title}", group.title);
+                            assert_eq!(&get(&cfg), value, "{}/{title}", group.name());
                         }
                     }
                     // Voices need a models directory; `Custom` has no

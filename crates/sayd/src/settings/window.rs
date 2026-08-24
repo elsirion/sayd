@@ -638,7 +638,10 @@ fn render_row(b: &Build, row: &'static schema::Row) -> gtk::Widget {
 
 /// Build one described group.
 fn render_group(b: &Build, group: &'static schema::Group) -> adw::PreferencesGroup {
-    let mut builder = adw::PreferencesGroup::builder().title(group.title);
+    let mut builder = adw::PreferencesGroup::builder();
+    if let Some(title) = group.title {
+        builder = builder.title(title);
+    }
     if let Some(description) = group.description {
         builder = builder.description(description);
     }
@@ -647,6 +650,68 @@ fn render_group(b: &Build, group: &'static schema::Group) -> adw::PreferencesGro
         widget.add(&render_row(b, row));
     }
     widget
+}
+
+/// Build one section, whichever kind it is.
+fn render_section(b: &Build, section: &'static schema::Section) -> adw::PreferencesGroup {
+    match section {
+        schema::Section::Described(group) => render_group(b, group),
+        schema::Section::Custom(build) => build(b),
+        schema::Section::Links { title, pages } => {
+            let group = adw::PreferencesGroup::builder().title(*title).build();
+            for page in *pages {
+                group.add(&render_link(b, page));
+            }
+            group
+        }
+    }
+}
+
+/// A navigation row, and the sub-page it opens.
+///
+/// **The sub-page is built here, not when the row is clicked.** Its rows
+/// register redraw closures with `Ui::row` on the way, and a row on a page
+/// nobody has opened yet must still redraw -- otherwise opening the page
+/// later shows whatever the config held when the window was built. Building
+/// eagerly is also what makes `Ui::redraw` a single pass over one list
+/// rather than something that has to know which pages exist.
+///
+/// The row holds the `NavigationPage` through its activate handler, which is
+/// what keeps it alive; the handler reaches the window through a `WeakUi`,
+/// so this adds no strong reference back and the window is still freed on
+/// close (see [`Ui`]).
+fn render_link(b: &Build, page: &'static schema::Page) -> adw::ActionRow {
+    let content = adw::PreferencesPage::new();
+    for section in page.sections {
+        content.add(&render_section(b, section));
+    }
+    let nav = adw::NavigationPage::builder()
+        .title(page.title)
+        .child(&content)
+        .build();
+
+    let row = adw::ActionRow::builder()
+        .title(page.title)
+        // The subtitle is built from config values -- an endpoint, a model
+        // name, an application count -- so the same rule the allowlist rows
+        // follow applies: `AdwPreferencesRow:use-markup` governs the
+        // subtitle too, and a `&` in a model name would blank the line.
+        .use_markup(false)
+        .subtitle((page.summary)(b.cfg))
+        .activatable(true)
+        .build();
+    row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+
+    let summary = page.summary;
+    let r = row.clone();
+    b.ui.row(move |_, cfg| r.set_subtitle(&summary(cfg)));
+
+    let u = b.ui.downgrade();
+    row.connect_activated(move |_| {
+        let nav = nav.clone();
+        u.with(move |ui| ui.window.push_subpage(&nav));
+    });
+    row
 }
 
 /// The URL policy a `schema::Row::Choice` value names.
@@ -694,10 +759,7 @@ fn build(model: Arc<SettingsModel>, engine: EngineHandle) -> Ui {
         engine: &engine,
     };
     for section in schema::ROOT {
-        page.add(&match section {
-            schema::Section::Described(group) => render_group(&b, group),
-            schema::Section::Custom(build) => build(&b),
-        });
+        page.add(&render_section(&b, section));
     }
     window.add(&page);
 
@@ -1395,6 +1457,38 @@ pub fn reword_group(b: &Build) -> adw::PreferencesGroup {
         |cfg, v| cfg.reword.api_key = v,
     );
     group.add(&key);
+
+    // --- API key variable -------------------------------------------------
+    // `api_key_env`'s own doc comment says to prefer it over `api_key`: a key
+    // in a shell profile or a systemd `EnvironmentFile` can be rotated
+    // without touching a file this window rewrites wholesale, and it keeps
+    // the key out of that file entirely. Until this row existed the
+    // recommended path was the one you could not reach from the GUI, which
+    // is the only way most people will ever touch this config.
+    //
+    // Shown under the same rule as the key itself: where no credential is
+    // used, naming the variable one would come from says nothing.
+    let key_env = adw::EntryRow::builder()
+        .title("API key variable")
+        .use_markup(false)
+        .show_apply_button(true)
+        .text(&*cfg.reword.api_key_env)
+        .build();
+    key_env.set_tooltip_text(Some(
+        "The environment variable to read the key from. If it names a variable \
+         that is set and non-empty, that value is used and the key above is \
+         ignored -- and nothing secret is written to config.toml.",
+    ));
+    key_env.set_visible(reword_key_row_applies(&cfg.reword));
+    let r = key_env.clone();
+    ui.row(move |_, cfg| r.set_visible(reword_key_row_applies(&cfg.reword)));
+    bind_entry(
+        ui,
+        &key_env,
+        |cfg| cfg.reword.api_key_env.clone(),
+        |cfg, v| cfg.reword.api_key_env = v,
+    );
+    group.add(&key_env);
 
     // --- Deadline ---------------------------------------------------------
     let deadline = Spin::paged(
@@ -2279,6 +2373,21 @@ mod tests {
         }
     }
 
+    /// Open every sub-page, so `find_row` can reach the rows on them.
+    ///
+    /// A `NavigationPage` that has not been pushed is built -- and its rows
+    /// are already registered for redraw -- but it is not under
+    /// `ui.window`, so nothing that walks down from there can see it.
+    /// Activating the navigation row is the same path a click takes.
+    fn push_every_subpage(ui: &Ui) {
+        for page in schema::PAGES {
+            let w = ui.window.clone().upcast::<gtk::Widget>();
+            let row = find_row::<adw::ActionRow>(&w, page.title)
+                .unwrap_or_else(|| panic!("a navigation row titled {:?}", page.title));
+            gtk::prelude::WidgetExt::activate(&row);
+        }
+    }
+
     /// Every described row draws itself from the config it is handed.
     ///
     /// One scenario for all of them, which is the whole point of the schema:
@@ -2301,10 +2410,7 @@ mod tests {
         // so no assertion below can pass by the value happening to match
         // what the row was built with.
         let mut cfg = Config::default();
-        for section in schema::ROOT {
-            let schema::Section::Described(group) = section else {
-                continue;
-            };
+        for group in schema::described_groups() {
             for row in group.rows {
                 match row {
                     schema::Row::Bool { get, set, .. } => {
@@ -2333,31 +2439,34 @@ mod tests {
             }
         }
 
+        // Redrawn *before* any sub-page is opened, and asserted after: a row
+        // on a page nobody has visited must still have been registered, or
+        // opening that page later shows whatever the config held when the
+        // window was built. That is the one thing the eager build in
+        // `render_link` buys, so it is the one thing worth pinning about it.
         ui.redraw(&cfg);
+        push_every_subpage(&ui);
 
-        for section in schema::ROOT {
-            let schema::Section::Described(group) = section else {
-                continue;
-            };
+        for group in schema::described_groups() {
             for row in group.rows {
                 match row {
                     schema::Row::Bool { title, get, .. } => {
                         let widget = find_row::<adw::SwitchRow>(&w, title)
-                            .unwrap_or_else(|| panic!("{}/{title} is in the window", group.title));
+                            .unwrap_or_else(|| panic!("{}/{title} is in the window", group.name()));
                         assert_eq!(
                             widget.is_active(),
                             get(&cfg),
                             "{}/{title} did not redraw",
-                            group.title
+                            group.name()
                         );
                     }
                     schema::Row::Int { title, get, .. } => {
                         let widget = find_row::<adw::SpinRow>(&w, title)
-                            .unwrap_or_else(|| panic!("{}/{title} is in the window", group.title));
+                            .unwrap_or_else(|| panic!("{}/{title} is in the window", group.name()));
                         assert!(
                             (widget.value() - get(&cfg)).abs() < 0.01,
                             "{}/{title} shows {} and the config holds {}",
-                            group.title,
+                            group.name(),
                             widget.value(),
                             get(&cfg)
                         );
@@ -2376,7 +2485,7 @@ mod tests {
                             continue;
                         };
                         let widget = find_row::<adw::ComboRow>(&w, title)
-                            .unwrap_or_else(|| panic!("{}/{title} is in the window", group.title));
+                            .unwrap_or_else(|| panic!("{}/{title} is in the window", group.name()));
                         // The selected *label*, not the index: `Combo` shifts
                         // everything up by one when it grows its synthetic
                         // entry, and an index assertion would be asserting
@@ -2389,7 +2498,7 @@ mod tests {
                             shown.as_deref(),
                             Some(want.as_str()),
                             "{}/{title} did not redraw",
-                            group.title
+                            group.name()
                         );
                     }
                     schema::Row::Custom(_) => {}
@@ -2421,6 +2530,9 @@ mod tests {
     fn a_newly_seen_application_appears_while_the_window_is_open(dir: &std::path::Path) {
         let (model, engine) = model_in(dir);
         let ui = build(model, engine.clone());
+        // The allowlist and both suggestion groups live on the Notifications
+        // sub-page now, so this walks nothing until that page is open.
+        push_every_subpage(&ui);
 
         let before = row_titles(ui.window.upcast_ref());
         assert!(
@@ -2483,6 +2595,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("a config directory of its own");
         let (model, engine) = model_in(&dir);
         let ui = build(model.clone(), engine.clone());
+        push_every_subpage(&ui);
         // Presented, because half of this drives focus and an unmapped
         // window has none to give.
         ui.window.present();
@@ -2672,6 +2785,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("a config directory of its own");
         let (model, engine) = model_in(&dir);
         let ui = build(model.clone(), engine.clone());
+        push_every_subpage(&ui);
         // Presented, like `the_reword_entry_rows_commit_on_apply_and_never_
         // clobber_typing` -- a row's own `visible` property is set
         // synchronously by `set_visible`, but reading it back through an
@@ -2718,6 +2832,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("a config directory of its own");
         let (model, engine) = model_in(&dir);
         let ui = build(model.clone(), engine.clone());
+        push_every_subpage(&ui);
         ui.window.present();
         spin_until(Duration::from_secs(2), || ui.window.is_mapped());
 
@@ -2753,6 +2868,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("a config directory of its own");
         let (model, engine) = model_in(&dir);
         let ui = build(model.clone(), engine.clone());
+        push_every_subpage(&ui);
         ui.window.present();
         spin_until(Duration::from_secs(2), || ui.window.is_mapped());
 
@@ -2878,6 +2994,7 @@ mod tests {
             })
             .expect("edit");
         let ui = build(model.clone(), engine.clone());
+        push_every_subpage(&ui);
         ui.window.present();
         spin_until(Duration::from_secs(2), || ui.window.is_mapped());
 
@@ -3091,6 +3208,7 @@ mod tests {
             .edit(|c| c.reword.model = "window-test-enter-guard".into())
             .expect("edit");
         let ui = build(model, engine.clone());
+        push_every_subpage(&ui);
         ui.window.present();
         spin_until(Duration::from_secs(2), || ui.window.is_mapped());
 
@@ -3155,6 +3273,7 @@ mod tests {
         let mut widgets = Vec::new();
         let window = {
             let ui = build(model, engine.clone());
+            push_every_subpage(&ui);
             let group = find_group(ui.window.upcast_ref(), "Reword").expect("a Reword group");
             let run = find_button(group.upcast_ref(), "Test").expect("a Test button");
             let result = find_result_row(ui.window.upcast_ref()).expect("a result row");
@@ -3210,6 +3329,7 @@ mod tests {
         let mut widgets = Vec::new();
         let window = {
             let ui = build(model, engine.clone());
+            push_every_subpage(&ui);
             weak_widgets(ui.window.upcast_ref(), &mut widgets);
             let window = ui.window.downgrade();
             ui.window.destroy();
