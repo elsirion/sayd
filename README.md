@@ -3,7 +3,7 @@
 Local text-to-speech for sway/Wayland. Select text, press a key, hear it.
 Kokoro-82M runs locally via ONNX Runtime with the misaki-en G2P frontend.
 Speech synthesis never touches the network and nothing about it leaves your
-machine. The optional rewording feature ([`[reword]`](#rewording), off by
+machine. The optional rewording feature ([`[reword]`](#rewording), inert by
 default, and absent from the binary entirely unless built with
 `--features reword`) is the one exception: it sends the text about to be
 spoken to whatever endpoint you configure. Point it at a model server on
@@ -162,6 +162,21 @@ hand-edit a config file for everyday changes -- open it from the tray's
 destroyed when closed, so the daemon carries no window, and no GTK
 resources, for the vast majority of its life.
 
+The first page holds what is worth seeing without navigating -- voice, speed
+and engine -- and links to four sub-pages, each with a line underneath saying
+what it currently holds:
+
+    sayd Settings
+    ├─ Voice and speed
+    ├─ Engine
+    ├─ Text      → Cleanup        "5 of 5 transforms on · URLs: say “link”"
+    │            → Rewording      "qwen3:32b via llama-cpp"
+    └─ Sources   → say command    "Up to 20000 characters"
+                 → Notifications  "On · 2 applications · 5 s cooldown"
+
+Cleanup, Rewording and Notifications each open with their own on/off switch.
+There is no switch for `say`: it only runs when you run it.
+
 The window is a view over one file, `$XDG_CONFIG_HOME/sayd/config.toml`
 (falling back to `~/.config/sayd/config.toml`), never a second copy of the
 settings. Every change the window makes writes through to that file
@@ -216,6 +231,7 @@ muted = false
 max_chars = 20000       # submissions longer than this are refused
 
 [cleanup]
+enabled = true          # off leaves every submission exactly as written
 collapse_whitespace = true
 rejoin_hyphenation = true
 urls = "link"           # link | domain | keep
@@ -425,7 +441,7 @@ that, and nothing else. It is off by default, it requires an endpoint, and
 when anything at all goes wrong the original text is spoken instead. Doing
 any of this at all needs `sayd` built with `--features reword` (see
 [Build](#build) above); a default build has no rewriter, no HTTP client, and
-no TLS stack, so `enabled = true` in that build is a no-op -- see
+no TLS stack, so asking for a rewrite in that build is a no-op -- see
 [What can go wrong](#what-can-go-wrong) below.
 
 The prompt also asks for English, translating if the text is in another
@@ -437,10 +453,11 @@ detector running on text even shorter than the input. A model that ignores
 the instruction produces a bad announcement, not a broken one.
 
     [reword]
-    enabled = false                          # rewrite notification announcements
+    enabled = true                           # the master: off rewrites nothing, --reword included
+    notifications = false                    # rewrite notification announcements
     base_url = "http://localhost:11434/v1"   # any OpenAI-compatible endpoint
     model = "llama3.2:3b"
-    provider = "generic"                     # "llama-cpp" | "generic"; required when enabled -- Ollama, above, is "generic"
+    provider = "generic"                     # "llama-cpp" | "generic"; required when notifications = true -- Ollama, above, is "generic"
     api_key = ""                             # local servers ignore it; see api_key_env
     api_key_env = "SAYD_REWORD_API_KEY"      # this variable wins over api_key
     timeout_ms = 1500                        # at least 200; no upper bound
@@ -456,15 +473,28 @@ is compiled in.
 
 Two entry points, and only two:
 
-- **Notification announcements**, when `enabled = true`.
+- **Notification announcements**, when `notifications = true`.
 - **Any submission that asks for it** -- `say --reword "..."`, and
   `"reword": true` in the D-Bus `opts` map. Selection and clipboard reads go
   through the same submission path, so `say --reword selection` works.
 
-`--reword` does *not* require `enabled = true`. `enabled` means "rewrite my
-notifications without being asked"; `--reword` is being asked. Both need a
-configured endpoint, and both are absent from a build without
-`--features reword`.
+`--reword` does *not* require `notifications = true`. That switch means
+"rewrite my notifications without being asked"; `--reword` is being asked.
+Both need `enabled = true` -- the master, which says whether rewording
+happens at all -- and a configured endpoint, and both are absent from a build
+without `--features reword`.
+
+`enabled` defaults to `true`, which is not the feature being on by default:
+`provider` has no default, so nothing is rewritten until you set one. What
+the master buys is a way to switch rewording off for a while without losing
+the endpoint you configured.
+
+**Upgrading.** `enabled` used to mean what `notifications` means now. A
+config file that spells `enabled` but not `notifications` is read as the old
+one: the value moves to `notifications` and the master is set on, so
+behaviour does not change either way -- automatic rewording stays on if it
+was on, and `say --reword` keeps working for anyone who had a provider
+configured with automatic rewording off.
 
 There is no switch to rewrite everything by default. Every submission
 through a paid or slow endpoint is a cost and a delay the caller did not ask
@@ -513,7 +543,7 @@ none has been tested here, and a dialect guessed wrong is a rejected request
 on a path designed to fail quietly. Use `generic` for those; if the model
 reasons, the Test row will say so in as many words.
 
-`provider` is **required when `enabled = true`** -- automatic rewording that
+`provider` is **required when `notifications = true`** -- automatic rewording that
 cannot name its provider is a request the daemon cannot fill, so it refuses to
 start and says which values it accepts. Everywhere else a missing provider
 degrades like any other unusable endpoint: `say --reword` speaks the text as
@@ -690,14 +720,14 @@ lost. Rewrites are never retried -- by the time a retry could finish, the
 utterance has already been spoken.
 
 One exception, and it is a startup refusal rather than a reword failure:
-`reword.enabled = true` with `reword.provider` unset or unrecognised is a
+`reword.notifications = true` with `reword.provider` unset or unrecognised is a
 contradiction the daemon cannot fill -- automatic rewording was asked for
 and there is no dialect left to tell the provider not to reason in -- so
 it refuses to start at all, taking every keybind and all of TTS down with
 it, rather than silently ignoring the field it was told to act on. The
 message, printed to stderr and so visible in
 `journalctl --user -u sh.sayd.Sayd`, names the values `reword.provider`
-accepts; set it to one of them, or set `reword.enabled = false`. The
+accepts; set it to one of them, or set `reword.notifications = false`. The
 settings window can no longer write this combination -- every endpoint
 preset it offers now commits a provider alongside the URL -- so this is
 reachable only by hand-editing `config.toml`. Everywhere else --
@@ -711,7 +741,7 @@ they are told apart**, and it is the first place to look when rewording
 appears to do nothing. Two specific cases worth knowing:
 
 - **No endpoint configured** (empty or unparseable `base_url`), and
-  **built without the `reword` feature** with `enabled = true`, both speak
+  **built without the `reword` feature** with rewording asked for, both speak
   the original and log once -- the first naming the field, the second
   telling you to rebuild with `--features reword`.
 - **`--reword` with no provider available** logs the same diagnosis, once
