@@ -1,7 +1,7 @@
 # One owner for the text pipeline, and a settings window that renders a schema
 
 Date: 2026-08-24
-Status: approved, not yet implemented
+Status: implemented (branch settings-schema-and-pipeline-owner)
 
 Two changes, in this order. The first fixes a defect and gives the text
 pipeline a single owner. The second turns the settings window from 3,444
