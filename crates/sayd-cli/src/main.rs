@@ -114,6 +114,9 @@ struct Cli {
     /// configured endpoint; without either, the text is spoken as written.
     /// Does *not* require `[reword] notifications`, which only governs
     /// whether notifications are rewritten without being asked.
+    /// Measured against `[reword] request_max_chars` and
+    /// `[reword] request_timeout_ms` rather than `max_chars`/`timeout_ms`,
+    /// which are the notification path's.
     /// Meaningless outside a submission; ignored elsewhere. Must come
     /// before the text/subcommand it applies to.
     ///
