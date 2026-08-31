@@ -1,5 +1,5 @@
-//! The OpenAI-compatible client. The one file behind
-//! `#[cfg(feature = "reword")]`.
+//! The OpenAI-compatible client: the one implementation of [`super::Rewriter`]
+//! that reaches the network.
 //!
 //! Small on purpose: two `Serialize` structs for the request, four
 //! all-optional `Deserialize` structs for the response and its error object,

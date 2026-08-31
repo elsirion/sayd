@@ -3,11 +3,11 @@
 Local text-to-speech for sway/Wayland. Select text, press a key, hear it.
 Kokoro-82M runs locally via ONNX Runtime with the misaki-en G2P frontend.
 Speech synthesis never touches the network and nothing about it leaves your
-machine. The optional rewording feature ([`[reword]`](#rewording), inert by
-default, and absent from the binary entirely unless built with
-`--features reword`) is the one exception: it sends the text about to be
-spoken to whatever endpoint you configure. Point it at a model server on
-localhost -- the default -- and the original promise holds unchanged.
+machine. The optional rewording feature ([`[reword]`](#rewording), inert
+until you configure a `provider`) is the one exception: it sends the text
+about to be spoken to whatever endpoint you configure. Point it at a model
+server on localhost -- the default -- and the original promise holds
+unchanged.
 
 `sayd` is the resident daemon: it owns the speech engine and the audio
 device, and serves the `sh.sayd.Sayd1` interface on the session bus. `say`
@@ -21,14 +21,10 @@ skip, ask for status.
 
 Put `target/release/sayd` and `target/release/say` on `$PATH`.
 
-To include the optional [rewording](#rewording) feature -- the one thing in
-`sayd` that makes a network request -- build it in explicitly:
-
-    cargo build --release --features reword
-
-A default build has no HTTP client and no TLS stack in it at all, which is
-what makes "nothing leaves your machine" a property of the binary rather
-than a property of the configuration.
+[Rewording](#rewording) -- the one thing in `sayd` that makes a network
+request -- is built in. It stays inert until you set a `reword.provider`, so
+"nothing leaves your machine" holds for any configuration that has not asked
+for it.
 
 ### Native dependencies
 
@@ -438,10 +434,7 @@ asking where you want to go for dinner`.
 
 `sayd` can put a small language model in front of the speaker to do exactly
 that, and nothing else. It is off by default, it requires an endpoint, and
-when anything at all goes wrong the original text is spoken instead. Doing
-any of this at all needs `sayd` built with `--features reword` (see
-[Build](#build) above); a default build has no rewriter, no HTTP client, and
-no TLS stack, so asking for a rewrite in that build is a no-op -- see
+when anything at all goes wrong the original text is spoken instead -- see
 [What can go wrong](#what-can-go-wrong) below.
 
 The prompt also asks for English, translating if the text is in another
@@ -460,14 +453,39 @@ the instruction produces a bad announcement, not a broken one.
     provider = "generic"                     # "llama-cpp" | "generic"; required when notifications = true -- Ollama, above, is "generic"
     api_key = ""                             # local servers ignore it; see api_key_env
     api_key_env = "SAYD_REWORD_API_KEY"      # this variable wins over api_key
-    timeout_ms = 1500                        # at least 200; no upper bound
-    max_chars = 400                          # 32..=2000; longer text is spoken as written
+    timeout_ms = 1500                        # notification deadline; at least 200, no upper bound
+    request_timeout_ms = 25000               # --reword deadline; same floor, no upper bound
+    max_chars = 400                          # 32..=2000; notification announcements
+    request_max_chars = 8000                 # 32..=20000; every explicit --reword
 
-This table is not gated on the cargo feature -- the settings window
-serialises the whole config on every save, so a gated field would be
-silently deleted the first time a feature-off daemon wrote the file. It is
-always present, always preserved, and only ever acted on when the feature
-is compiled in.
+**Two ceilings, because the two asks are not the same shape.** A
+notification arrives uninvited and is already short, so `max_chars` stops at
+2000 -- past that it is a document rather than a notification, and rewriting
+it was never what the feature was for. An explicit `--reword` is you
+pointing at something and asking, and what you point at is routinely a
+document: a page of prose, a chat log, a long tool output.
+`request_max_chars` covers `say --reword "..."`, `say --reword selection`
+and `say --reword clipboard` alike, and its own ceiling is the engine's
+`max_chars` of 20000, past which the submission is refused anyway.
+
+What comes *back* does not scale with either: `max_tokens` is three times
+`max_chars`, deliberately, because a summary of eight thousand characters is
+a paragraph -- the same size as a summary of four hundred.
+
+**The deadline splits the same way, and it has to.** A notification wants a
+short budget; an explicit `--reword` over a document wants tens of seconds,
+because that is how long a local model takes to read two thousand characters
+and write a paragraph. Sharing one number would also have dragged something
+unrelated with it: the notification coalescing floor
+(`notifications.cooldown_secs`) is derived from `timeout_ms`, so a 25-second
+deadline set for clipboard reads would have silently turned every
+notification window into 26 seconds. With the two split, that floor answers
+only to `timeout_ms`.
+
+One consequence worth knowing: a single HTTP client serves both paths, so
+its ceiling clears the *longer* deadline. The settings window's Test row
+waits that ceiling -- deliberately, since a test that gave up at the
+configured deadline could say "too slow" but never *how* slow.
 
 ### Where it applies
 
@@ -476,13 +494,18 @@ Two entry points, and only two:
 - **Notification announcements**, when `notifications = true`.
 - **Any submission that asks for it** -- `say --reword "..."`, and
   `"reword": true` in the D-Bus `opts` map. Selection and clipboard reads go
-  through the same submission path, so `say --reword selection` works.
+  through the same submission path, so `say --reword selection` and `say
+  --reword clipboard` work.
 
 `--reword` does *not* require `notifications = true`. That switch means
 "rewrite my notifications without being asked"; `--reword` is being asked.
 Both need `enabled = true` -- the master, which says whether rewording
-happens at all -- and a configured endpoint, and both are absent from a build
-without `--features reword`.
+happens at all -- and a configured endpoint.
+
+**The ceiling follows the ask.** Everything reached by `--reword` is
+measured against `request_max_chars`, and notifications against `max_chars`
+-- one number per kind of ask, not per entry point, so the three ways of
+spelling `--reword` all behave the same.
 
 `enabled` defaults to `true`, which is not the feature being on by default:
 `provider` has no default, so nothing is rewritten until you set one. What
@@ -740,11 +763,10 @@ switched off all look identical. **The settings window's Test row is where
 they are told apart**, and it is the first place to look when rewording
 appears to do nothing. Two specific cases worth knowing:
 
-- **No endpoint configured** (empty or unparseable `base_url`), and
-  **built without the `reword` feature** with rewording asked for, both speak
-  the original and log once -- the first naming the field, the second
-  telling you to rebuild with `--features reword`.
-- **`--reword` with no provider available** logs the same diagnosis, once
+- **No endpoint configured** -- an unset or unknown `reword.provider`, or an
+  empty or unparseable `base_url` -- speaks the original and logs once,
+  naming the field at fault.
+- **`--reword` with no provider available** logs that same diagnosis, once
   per run, even though `enabled` was never asked about: an explicit request
   that cannot be honoured still owes the caller a reason.
 
@@ -1083,11 +1105,10 @@ Walk this yourself once, after installing, with `notify-send` available
 The settings window's Reword group is not covered by automated tests
 either (no display in a CI or agent environment, same as the two sections
 above), and neither is the quality of any given model's rewrites, which is
-a judgement no assertion makes. Needs a build with the feature in it and a
-model server you can reach -- the quickest is Ollama:
-`ollama serve` and `ollama pull llama3.2:3b`.
+a judgement no assertion makes. Needs a model server you can reach -- the
+quickest is Ollama: `ollama serve` and `ollama pull llama3.2:3b`.
 
-1. `cargo build --release --features reword`, put `sayd` and `say` on
+1. `cargo build --release`, put `sayd` and `say` on
    `$PATH`, and restart the daemon.
 2. Open the tray menu, click **Settings…**, and find the **Reword** group.
    A fresh install has no `reword.provider`, and the field is required

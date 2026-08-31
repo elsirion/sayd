@@ -52,29 +52,21 @@ glib = "0.22"
 # a settings request. Already in Cargo.lock at 2.5.0 as a transitive
 # dependency of other crates, so naming it directly adds no new code.
 async-channel = "2"
-# The rewording client (`--features reword`). Measured at 16 crates new to
-# sayd at exactly this configuration (`cargo tree -e normal`, 160 -> 176);
-# default features add gzip and five more, and any TLS backend but `rustls`
-# drags in `aws-lc-sys`, which needs `cmake` -- not in this project's
-# devshell. `rustls` here means `ring`, which needs a C compiler and nothing
-# else. Cargo.lock grows by more than 16 because it is feature-agnostic and
-# records ureq's optional dependencies too; those are not built.
-ureq = { version = "3.4", default-features = false, features = ["rustls", "json"], optional = true }
+# The rewording client. Measured at 16 crates new to sayd at exactly this
+# configuration (`cargo tree -e normal`, 160 -> 176); default features add
+# gzip and five more, and any TLS backend but `rustls` drags in
+# `aws-lc-sys`, which needs `cmake` -- not in this project's devshell.
+# `rustls` here means `ring`, which needs a C compiler and nothing else --
+# unconditionally, now that this is not behind a feature.
+ureq = { version = "3.4", default-features = false, features = ["rustls", "json"] }
 # Both already in Cargo.lock (sayd-core and zbus build them), so naming them
 # here adds no new code. Named rather than inherited because `http.rs`
 # derives Serialize/Deserialize and calls serde_json directly.
-serde = { version = "1", features = ["derive"], optional = true }
-serde_json = { version = "1", optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1" }
 
 [dev-dependencies]
 tempfile = "3"
 
 [features]
 models = []
-# Off by default, and the justification is not weight -- at 16 crates that
-# would not carry it. The README promises "no network access at runtime,
-# nothing leaves your machine", and a default build with no HTTP client and
-# no TLS in it makes that a property of the *binary* rather than a property
-# of the configuration. `enabled = false` is a promise sayd keeps;
-# `--features reword` left off is a promise the compiler keeps.
-reword = ["dep:ureq", "dep:serde", "dep:serde_json"]

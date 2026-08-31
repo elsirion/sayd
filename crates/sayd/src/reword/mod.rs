@@ -1,10 +1,10 @@
 //! Rewriting text for the ear before it is spoken.
 //!
-//! Everything in this file is in the **default build**: the trait, the
-//! deadline, the semaphore, the circuit breakers and the orchestration.
-//! Only [`http`] -- the `ureq` client -- is behind `#[cfg(feature =
-//! "reword")]`, which is what lets every rule here be tested with a struct
-//! holding a `Vec` and no network at all.
+//! The trait, the deadline, the semaphore, the circuit breakers and the
+//! orchestration are all independent of the transport: [`http`] -- the
+//! `ureq` client -- is just one implementation of [`Rewriter`], which is
+//! what lets every rule here be tested with a struct holding a `Vec` and
+//! no network at all.
 //!
 //! # The two rules that are load-bearing
 //!
@@ -113,7 +113,6 @@ use sayd_core::cleanup::clean;
 use sayd_core::config::{CleanupConfig, Provider, RewordConfig};
 use sayd_core::reword::{check, eligible, Ineligible};
 
-#[cfg(feature = "reword")]
 pub mod http;
 
 /// How long the client keeps trying *past* the configured deadline before
@@ -153,7 +152,13 @@ pub const REWORD_HTTP_GRACE: Duration = Duration::from_secs(10);
 /// chosen a five-minute worst case, which is the difference between a bound
 /// derived from a setting and a bound with no setting behind it.
 pub fn http_ceiling(cfg: &RewordConfig) -> Duration {
-    Duration::from_millis(cfg.timeout_ms).saturating_add(REWORD_HTTP_GRACE)
+    // The *longer* of the two deadlines, because one client serves both
+    // paths: a ceiling derived from `timeout_ms` alone would have the
+    // transport end an explicit `--reword` seconds before its own deadline
+    // expired, turning a rewrite that was going to land into a refusal no
+    // setting explains.
+    Duration::from_millis(cfg.timeout_ms.max(cfg.request_timeout_ms))
+        .saturating_add(REWORD_HTTP_GRACE)
 }
 
 /// What the settings window's Test button waits, rather than `timeout_ms`.
@@ -309,21 +314,13 @@ pub fn debug(args: std::fmt::Arguments<'_>) {
 /// Why a rewrite did not happen. Every variant ends in "speak the original";
 /// they are distinguished so the settings window's Test row can tell a user
 /// which one they have, because from outside the daemon every one of them
-/// looks identical -- and identical to the feature being switched off.
-// `#[allow(dead_code)]`: in a build without the `reword` feature nothing
-// constructs most of these, which is the whole point of the split -- the
-// classification, the breakers that fold it in and the tests that pin their
-// behaviour all live in the default build, and only the client that produces
-// the variants is gated. `http::parse_response` is what constructs them, and
-// it exists only under `--features reword`.
-#[allow(dead_code)]
+/// looks identical -- and identical to `[reword] enabled` being switched
+/// off.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RewordError {
     /// `base_url` is empty or does not parse. Carries the reason, naming
     /// the field.
     NotConfigured(String),
-    /// Built without the `reword` feature.
-    Unavailable,
     /// 401 or 403. Latches the breaker until the config changes.
     Auth {
         status: u16,
@@ -575,12 +572,6 @@ struct Inner {
     /// standing rate limit is one line rather than one per notification.
     rate_limit_logged: bool,
     model_logged: bool,
-    /// MINOR 5's row: an explicit `--reword` against a build that has no
-    /// client in it. Its own latch rather than one of the others because it
-    /// is the one line whose cause is the *binary*, not the configuration --
-    /// nothing a user edits will clear it, so saying it twice would be
-    /// saying it twice for the life of the process.
-    unavailable_logged: bool,
     /// A1: every other row in [`Inner::fold`]'s match gates its line behind
     /// a latch like this one; `Truncated` did not. Because `Truncated`
     /// deliberately does not open the transport breaker (§8: it is not
@@ -773,55 +764,19 @@ impl RewordState {
 
     /// Has this endpoint been announced this run?
     ///
-    /// Read only by `dbus`'s own tests, which use it to check that a rewrite
-    /// really reached the provider before timing it. Production code that
-    /// wants this asks [`RewordState::note_endpoint`] instead, whose return
-    /// value is the same fact taken from the call that establishes it --
-    /// see `settings::model::run_reword_test`.
-    // `#[allow(dead_code)]`: that caller is behind `--features reword`.
-    #[allow(dead_code)]
+    /// Read only by `dbus`'s and `notify`'s own tests, which use it to check
+    /// that a rewrite really reached the provider (or, there, that a composed
+    /// line never did). Production code that wants this asks
+    /// [`RewordState::note_endpoint`] instead, whose return value is the same
+    /// fact taken from the call that establishes it -- see
+    /// `settings::model::run_reword_test`.
+    #[cfg(test)]
     pub fn endpoint_seen(&self, cfg: &RewordConfig) -> bool {
         lock(&self.inner)
             .announced
             .contains(&format!("{}|{}", cfg.base_url, cfg.model))
     }
 
-    /// Has [`RewordState::note_unavailable`]'s line already been said this
-    /// run? Test-only: reading the latch is how that rule is checked without
-    /// capturing stderr.
-    #[cfg(test)]
-    fn unavailable_logged(&self) -> bool {
-        lock(&self.inner).unavailable_logged
-    }
-
-    /// MINOR 5: say once, per run, that this build cannot rewrite anything.
-    ///
-    /// [`RewordState::record`] swallows [`RewordError::Unavailable`], and
-    /// that is right for the path it was written for: `[reword] enabled` in
-    /// a feature-off build would otherwise owe a line per notification for a
-    /// rewrite nobody asked for. The explicit path *did* ask, and `dbus.rs`
-    /// promises it "the diagnosis is in the log, once per run" -- so
-    /// [`RewordPlan::requested`] says it here instead, where the once-per-run
-    /// latch already lives and where the line is built under the lock and
-    /// printed outside it like every other one ([`Journal`]).
-    ///
-    /// Returns whether it printed, which is what makes the latch testable
-    /// without capturing stderr.
-    pub fn note_unavailable(&self) -> bool {
-        let mut i = lock(&self.inner);
-        if i.unavailable_logged {
-            return false;
-        }
-        i.unavailable_logged = true;
-        drop(i);
-        self.emit([Journal::Line(
-            "warning: reword: this build of sayd has no rewriting client, so an \
-             explicit --reword speaks the text as written; rebuild with \
-             `--features reword` (said once per run)"
-                .to_string(),
-        )]);
-        true
-    }
 
     /// §4's logging rule: over-long text is worth one line per run, short
     /// text is worth none at all.
@@ -995,7 +950,6 @@ impl Inner {
                         i.not_configured_logged = true;
                     }
                 }
-                RewordError::Unavailable => {}
                 RewordError::Malformed(detail) => {
                     journal = Some(Journal::Debug(format!(
                         "reword: unusable response: {detail}"
@@ -1084,6 +1038,46 @@ impl Inner {
     }
 }
 
+/// Which of `RewordConfig`'s two length ceilings a submission is measured
+/// against.
+///
+/// An enum rather than the `usize` it selects, for the reason `Origin` is an
+/// enum rather than a `bool`: the two numbers are interchangeable as values
+/// and are not interchangeable as meanings, and a call site that passed the
+/// wrong one would be measuring a document against a notification's ceiling
+/// with nothing to say so. Matched rather than defaulted, so a third path
+/// cannot be added without deciding which ceiling it answers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ceiling {
+    /// [`RewordConfig::max_chars`]: the notification path. Text that
+    /// arrived uninvited and is already short.
+    Notification,
+    /// [`RewordConfig::request_max_chars`]: every explicit `--reword`,
+    /// whether on text, the selection or the clipboard. Text a user pointed
+    /// at, which is routinely a document.
+    Requested,
+}
+
+impl Ceiling {
+    fn chars(self, cfg: &RewordConfig) -> usize {
+        match self {
+            Ceiling::Notification => cfg.max_chars,
+            Ceiling::Requested => cfg.request_max_chars,
+        }
+    }
+
+    /// The deadline this ask answers to. Selected here rather than read at
+    /// use so the two halves of "which ask is this" cannot drift apart: a
+    /// path measured against `request_max_chars` is by construction also
+    /// given `request_timeout_ms`.
+    fn budget(self, cfg: &RewordConfig) -> Duration {
+        Duration::from_millis(match self {
+            Ceiling::Notification => cfg.timeout_ms,
+            Ceiling::Requested => cfg.request_timeout_ms,
+        })
+    }
+}
+
 /// Will this text be reworded at all? Decided synchronously and cheaply,
 /// *before* anything is spawned, so an ineligible submission costs one pass
 /// over a short string and a mutex.
@@ -1095,8 +1089,13 @@ impl Inner {
 /// why this is private and [`RewordPlan::admit`] is its only caller: one
 /// constructor, one ask, one attempt, and no way for a call site to hold the
 /// answer and then decide something else with it.
-fn will_reword(text: &str, cfg: &RewordConfig, state: &RewordState) -> bool {
-    if let Err(why) = eligible(text, cfg.max_chars) {
+fn will_reword(
+    text: &str,
+    cfg: &RewordConfig,
+    ceiling: Ceiling,
+    state: &RewordState,
+) -> bool {
+    if let Err(why) = eligible(text, ceiling.chars(cfg)) {
         state.note_ineligible(why);
         return false;
     }
@@ -1161,10 +1160,10 @@ async fn reword_or_original(
     sent: String,
     original: String,
     cfg: &RewordConfig,
+    budget: Duration,
     rewriter: Arc<dyn Rewriter>,
     state: Arc<RewordState>,
 ) -> Spoken {
-    let budget = Duration::from_millis(cfg.timeout_ms);
     // No `record` here: `attempt` owns it end to end, because the outcome
     // of an attempt that outlived its deadline is only reachable from
     // inside the job. Recording here as well would count it twice.
@@ -1390,6 +1389,16 @@ pub struct RewordPlan {
     /// what lets a caller detach the resolve -- [`attempt`] borrows its
     /// config, and a detached task has nothing to borrow from.
     cfg: RewordConfig,
+    /// The deadline this plan was admitted under, resolved from its
+    /// [`Ceiling`] at admission.
+    ///
+    /// Stored rather than read from `cfg` at `resolve` for the reason the
+    /// config itself is cloned: the plan has to answer to the ask that
+    /// minted it. Reading `cfg.timeout_ms` in `resolve` -- which is what it
+    /// used to do -- would give every explicit `--reword` the notification
+    /// deadline, silently undoing the split the moment the two numbers
+    /// differ.
+    budget: Duration,
 }
 
 impl RewordPlan {
@@ -1399,10 +1408,10 @@ impl RewordPlan {
     /// Every step is synchronous and cheap -- a pass over a short string and
     /// one mutex -- so text that is not going to be rewritten costs no
     /// allocation, no clone of the config, and above all no `tokio::spawn`.
-    /// That is what keeps the feature-off path exactly what it was: with
-    /// `notifications = false` this returns on the second line, and in a build
-    /// without the `reword` feature [`build_rewriter`] cannot make a client
-    /// at all, so `context` returns `None` and `admit` returns on its first.
+    /// That is what keeps the not-rewriting path free: with
+    /// `notifications = false` this returns on the second line, and with no
+    /// usable `provider` [`build_rewriter`] cannot make a client at all, so
+    /// `context` returns `None` and `admit` returns on its first.
     ///
     /// Takes the text by value and hands it back in the `Err`, which is what
     /// makes "the plan owns what it admitted" free for the caller: every
@@ -1427,7 +1436,7 @@ impl RewordPlan {
         if !cfg.notifications {
             return Err(text);
         }
-        RewordPlan::admit(text, cfg, cleanup)
+        RewordPlan::admit(text, cfg, cleanup, Ceiling::Notification)
     }
 
     /// This caller's explicit ask: `say --reword`, or `reword` in the D-Bus
@@ -1447,37 +1456,12 @@ impl RewordPlan {
     /// composed one here would put back the wrong value that [`Written`]
     /// exists to make unspellable.
     ///
-    /// MINOR 5: this is also the one path that owes a line when the build
-    /// itself cannot rewrite. [`RewordState::record`] deliberately swallows
-    /// [`RewordError::Unavailable`] -- right for the automatic path, which
-    /// never asked for anything -- but `dbus.rs` promises an explicit
-    /// `--reword` that "the diagnosis is in the log, once per run", and a
-    /// feature-off daemon used to log nothing at all. The condition is
-    /// exact rather than a guess at the reason: in a build without the
-    /// feature `context` can never return a client, so it is the *first*
-    /// thing `admit` fails on and `Unavailable` is the only reason there is.
     pub fn requested(
         text: String,
         cfg: &RewordConfig,
         cleanup: &CleanupConfig,
     ) -> Result<RewordPlan, String> {
-        RewordPlan::requested_in(text, cfg, cleanup, &state())
-    }
-
-    /// [`RewordPlan::requested`] with its process-wide state handed in, so
-    /// the once-per-run line above can be tested against a state no other
-    /// test has already latched.
-    fn requested_in(
-        text: String,
-        cfg: &RewordConfig,
-        cleanup: &CleanupConfig,
-        state: &RewordState,
-    ) -> Result<RewordPlan, String> {
-        let plan = RewordPlan::admit(text, cfg, cleanup);
-        if plan.is_err() && !cfg!(feature = "reword") {
-            state.note_unavailable();
-        }
-        plan
+        RewordPlan::admit(text, cfg, cleanup, Ceiling::Requested)
     }
 
     /// The shared body: resolve a client for `cfg`, then judge the text.
@@ -1485,14 +1469,15 @@ impl RewordPlan {
     /// `Err` is not a failure: it is "this text is not being reworded, here
     /// it is back", and every caller speaks it as written.
     ///
-    /// The client is resolved *before* anything touches the text, so a build
-    /// without the `reword` feature -- where `context` can never return one
-    /// -- still pays nothing at all: no cleanup pass, no clone of the config,
-    /// no mutex.
+    /// The client is resolved *before* anything touches the text, so a
+    /// config with no usable `provider` -- where `context` can never return
+    /// one -- still pays nothing at all: no cleanup pass, no clone of the
+    /// config, no mutex.
     fn admit(
         text: String,
         cfg: &RewordConfig,
         cleanup: &CleanupConfig,
+        ceiling: Ceiling,
     ) -> Result<RewordPlan, String> {
         // The master, and the first thing tested because it is the cheapest
         // and the broadest: with rewording switched off neither ask admits,
@@ -1504,7 +1489,7 @@ impl RewordPlan {
         let Some((rewriter, state)) = context(cfg) else {
             return Err(text);
         };
-        RewordPlan::admit_with(text, cfg, cleanup, rewriter, state)
+        RewordPlan::admit_with(text, cfg, cleanup, ceiling, rewriter, state)
     }
 
     /// [`RewordPlan::admit`] with its client handed in, and **the one place
@@ -1530,11 +1515,12 @@ impl RewordPlan {
         text: String,
         cfg: &RewordConfig,
         cleanup: &CleanupConfig,
+        ceiling: Ceiling,
         rewriter: Arc<dyn Rewriter>,
         state: Arc<RewordState>,
     ) -> Result<RewordPlan, String> {
         let cleaned = clean(&text, cleanup);
-        if !will_reword(&cleaned, cfg, &state) {
+        if !will_reword(&cleaned, cfg, ceiling, &state) {
             return Err(text);
         }
         Ok(RewordPlan {
@@ -1542,6 +1528,7 @@ impl RewordPlan {
             state,
             text: cleaned,
             original: text,
+            budget: ceiling.budget(cfg),
             cfg: cfg.clone(),
         })
     }
@@ -1559,6 +1546,7 @@ impl RewordPlan {
             self.text,
             self.original,
             &self.cfg,
+            self.budget,
             self.rewriter,
             self.state,
         )
@@ -1583,15 +1571,14 @@ pub fn state() -> Arc<RewordState> {
 /// changes" checkable in one comparison.
 ///
 /// `None` in the second slot -- a cached failure -- is the half that used to
-/// be missing, and the case it costs is not exotic: `enabled = true` in a
-/// build without the `reword` feature, where `build_rewriter` can never
-/// succeed. Every announcement re-entered it and took two global mutexes
+/// be missing, and the case it costs is not exotic: `enabled = true` with no
+/// usable `provider`, where `build_rewriter` can never succeed. Every
+/// announcement re-entered it and took two global mutexes
 /// (this one, then `RewordState::inner` inside `record`), on the very
 /// `select!` arm the `Journal` split above exists to keep clear.
 type Cache = Mutex<Option<(RewordConfig, Option<Arc<dyn Rewriter>>)>>;
 
-/// The rewriter for `cfg`, or `None` when this build cannot make one or the
-/// configuration cannot be used.
+/// The rewriter for `cfg`, or `None` when the configuration cannot be used.
 ///
 /// Cached and rebuilt only when the config changes. The underlying `ureq`
 /// agent is cached separately and outlives config changes entirely --
@@ -1687,16 +1674,15 @@ pub fn silent_provider(hold: Duration) -> (String, std::thread::JoinHandle<()>) 
     (format!("http://127.0.0.1:{port}/v1"), handle)
 }
 
-/// Build a client for `cfg`. The one function whose body differs between
-/// the two builds.
-#[cfg(feature = "reword")]
+/// Build a client for `cfg`.
+///
+/// The `Err` is always a [`RewordError::NotConfigured`] describing the
+/// field at fault: an unset or unknown `provider`, a `base_url` that does
+/// not parse, an API key that cannot go in a header. There is no longer a
+/// "this build cannot rewrite" answer -- the client is always compiled in,
+/// so every refusal names something the user can fix in the config.
 pub fn build_rewriter(cfg: &RewordConfig) -> Result<Arc<dyn Rewriter>, RewordError> {
     http::HttpRewriter::new(cfg).map(|r| Arc::new(r) as Arc<dyn Rewriter>)
-}
-
-#[cfg(not(feature = "reword"))]
-pub fn build_rewriter(_cfg: &RewordConfig) -> Result<Arc<dyn Rewriter>, RewordError> {
-    Err(RewordError::Unavailable)
 }
 
 #[cfg(test)]
@@ -1833,6 +1819,7 @@ mod tests {
             original.clone(),
             original.clone(),
             &cfg(),
+            Duration::from_millis(cfg().timeout_ms),
             stub.clone() as Arc<dyn Rewriter>,
             state.clone(),
         )
@@ -2591,10 +2578,11 @@ mod tests {
         assert!(will_reword(
             "Alice: where do you want to go for dinner",
             &cfg,
+            Ceiling::Notification,
             &state
         ));
-        assert!(!will_reword("Ping", &cfg, &state));
-        assert!(!will_reword(&"x".repeat(401), &cfg, &state));
+        assert!(!will_reword("Ping", &cfg, Ceiling::Notification, &state));
+        assert!(!will_reword(&"x".repeat(401), &cfg, Ceiling::Notification, &state));
 
         state.record(
             &cfg,
@@ -2608,6 +2596,7 @@ mod tests {
         assert!(!will_reword(
             "Alice: where do you want to go for dinner",
             &cfg,
+            Ceiling::Notification,
             &state
         ));
     }
@@ -2622,9 +2611,9 @@ mod tests {
     /// out verbatim; the README told the user the opposite. Every assertion
     /// below fails if the `clean` in `admit_with` is deleted.
     ///
-    /// Not gated on the `reword` feature: the plan, the cleanup and the guard
-    /// are all in the default build, and only the client that would carry the
-    /// string to a socket is not.
+    /// Driven through a `Stub` rather than the real client: the plan, the
+    /// cleanup and the guard are what is under test, and none of them need a
+    /// socket.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn what_leaves_the_machine_is_cleaned_before_it_leaves() {
         let raw = "Alice sent a link. reset here \
@@ -2637,6 +2626,7 @@ mod tests {
             raw.to_string(),
             &cfg(),
             &CleanupConfig::default(),
+            Ceiling::Notification,
             stub.clone() as Arc<dyn Rewriter>,
             state,
         )
@@ -2702,6 +2692,7 @@ mod tests {
             TABLE.to_string(),
             &c,
             &CleanupConfig::default(),
+            Ceiling::Notification,
             Stub::new(vec![]) as Arc<dyn Rewriter>,
             RewordState::new(),
         )
@@ -2742,6 +2733,7 @@ mod tests {
             TABLE.to_string(),
             &small,
             &cleanup,
+            Ceiling::Notification,
             Stub::new(vec![]) as Arc<dyn Rewriter>,
             RewordState::new(),
         )
@@ -2760,6 +2752,7 @@ mod tests {
             TABLE.to_string(),
             &cfg(),
             &cleanup,
+            Ceiling::Notification,
             stub as Arc<dyn Rewriter>,
             RewordState::new(),
         )
@@ -2799,6 +2792,7 @@ mod tests {
                 raw,
                 &c,
                 &CleanupConfig::default(),
+                Ceiling::Notification,
                 stub as Arc<dyn Rewriter>,
                 RewordState::new(),
             )
@@ -2815,11 +2809,6 @@ mod tests {
     /// the same code, because both constructors share `admit` -- including
     /// the `enabled` master, which refuses both and is checked at the end.
     ///
-    /// `is_ok()` is compared against `cfg!(feature = "reword")` rather than
-    /// asserted outright: without the feature there is no client to build, so
-    /// `context` returns `None` and *nothing* is ever admitted -- which is
-    /// the compiler's half of the promise and is worth pinning here too.
-    ///
     /// The `Err` is the text itself, handed back for the caller to speak as
     /// written, so each rejection is checked to be that text and not some
     /// other string.
@@ -2835,14 +2824,12 @@ mod tests {
             "`notifications = false` must not even look for a client, and the \
              text comes straight back"
         );
-        assert_eq!(
+        assert!(
             RewordPlan::requested(text.into(), &off, &CleanupConfig::default()).is_ok(),
-            cfg!(feature = "reword"),
             "an explicit --reword does not need `notifications`"
         );
-        assert_eq!(
-            RewordPlan::automatic(Written(text.into()), &cfg(), &CleanupConfig::default()).is_ok(),
-            cfg!(feature = "reword")
+        assert!(
+            RewordPlan::automatic(Written(text.into()), &cfg(), &CleanupConfig::default()).is_ok()
         );
 
         // The master is the other switch, and it is not this one: it refuses
@@ -2859,6 +2846,109 @@ mod tests {
             RewordPlan::requested(text.into(), &master_off, &CleanupConfig::default()).err(),
             Some(text.to_string()),
             "rewording off means off, however explicitly it is asked for"
+        );
+    }
+
+    /// **The ceiling follows the ask, not the text.**
+    ///
+    /// This is the reason `request_max_chars` exists and the reason
+    /// `Ceiling` is an enum. A string longer than `max_chars` but inside
+    /// `request_max_chars` is exactly the case the second number was added
+    /// for -- a long tool output, summarised down to what it means -- and it
+    /// must be admitted for an explicit `--reword` and refused for a
+    /// notification, which is a different kind of text arriving a different
+    /// way.
+    #[test]
+    fn an_explicit_ask_is_measured_against_its_own_ceiling() {
+        let mut c = cfg();
+        c.max_chars = 400;
+        c.request_max_chars = 8000;
+
+        // Comfortably past the notification ceiling, comfortably inside the
+        // request one. Words rather than one long run of `x`, so the text
+        // also clears `eligible`'s floor for the right reason.
+        let long = "the quick brown fox jumps over the lazy dog. ".repeat(30);
+        assert!(
+            long.chars().count() > c.max_chars && long.chars().count() < c.request_max_chars,
+            "the fixture has to straddle the two ceilings or it proves nothing"
+        );
+
+        assert!(
+            RewordPlan::requested(long.clone(), &c, &CleanupConfig::default()).is_ok(),
+            "an explicit --reword is measured against request_max_chars"
+        );
+        assert_eq!(
+            RewordPlan::automatic(Written(long.clone()), &c, &CleanupConfig::default()).err(),
+            Some(long.clone()),
+            "a notification still answers to max_chars"
+        );
+
+        // The request ceiling is a ceiling and not merely a bigger number:
+        // past it, an explicit ask is refused like anything else.
+        c.request_max_chars = 100;
+        assert_eq!(
+            RewordPlan::requested(long.clone(), &c, &CleanupConfig::default()).err(),
+            Some(long),
+            "over request_max_chars, --reword speaks the text as written too"
+        );
+    }
+
+    /// The deadline follows the ask too, and the cooldown floor does not
+    /// follow it.
+    ///
+    /// Two separate promises. The plan must carry the budget its own ask
+    /// answers to -- `resolve` reading `cfg.timeout_ms` would hand every
+    /// explicit `--reword` the notification deadline and undo the split
+    /// silently. And `notify_cooldown_min_secs` must stay keyed on
+    /// `timeout_ms` alone, or setting a long `--reword` deadline would drag
+    /// notification coalescing out with it, which is the concrete harm the
+    /// split exists to prevent.
+    #[test]
+    fn the_deadline_follows_the_ask_and_does_not_move_the_cooldown() {
+        use sayd_core::config::notify_cooldown_min_secs;
+
+        let mut c = cfg();
+        c.timeout_ms = 1500;
+        c.request_timeout_ms = 25_000;
+        let text = "Alice: where do you want to go for dinner";
+
+        let asked = RewordPlan::requested(text.into(), &c, &CleanupConfig::default())
+            .expect("an explicit ask is admitted");
+        assert_eq!(
+            asked.budget,
+            Duration::from_millis(25_000),
+            "an explicit --reword must get the request deadline"
+        );
+
+        let auto = RewordPlan::automatic(Written(text.into()), &c, &CleanupConfig::default())
+            .expect("a notification is admitted");
+        assert_eq!(
+            auto.budget,
+            Duration::from_millis(1500),
+            "a notification must keep the short one"
+        );
+
+        // The floor answers to the notification deadline only. Measured
+        // against the shape that made this worth splitting: at 25 s shared,
+        // every notification window would have become 26 seconds.
+        c.notifications = true;
+        assert_eq!(
+            notify_cooldown_min_secs(&c),
+            1500u64.div_ceil(1000) + 1,
+            "the cooldown floor derives from timeout_ms"
+        );
+        assert_eq!(
+            notify_cooldown_min_secs(&c),
+            3,
+            "...and concretely that is 3 seconds, not the 26 a shared 25 s \
+             deadline would have forced on every notification window"
+        );
+
+        // And the transport ceiling clears the *longer* of the two, or an
+        // asked-for rewrite would be cut off before its own deadline.
+        assert!(
+            http_ceiling(&c) > Duration::from_millis(c.request_timeout_ms),
+            "the client ceiling must outlast the longest deadline it serves"
         );
     }
 
@@ -2879,46 +2969,12 @@ mod tests {
             "a follow-up is refused, and gets its own text back to speak"
         );
         // ...and not because it was ineligible on its own account: the same
-        // string with the other origin is admitted wherever there is a client.
-        assert_eq!(
+        // string with the other origin is admitted.
+        assert!(
             RewordPlan::automatic(Written(followup.into()), &cfg(), &CleanupConfig::default())
                 .is_ok(),
-            cfg!(feature = "reword"),
             "the exclusion must be the origin, not the length"
         );
-    }
-
-    /// MINOR 5: an explicit `--reword` that this *build* cannot honour says
-    /// so, once per run.
-    ///
-    /// `dbus.rs` promises every `--reword` failure that "the diagnosis is in
-    /// the log, once per run", and a feature-off daemon used to print nothing
-    /// at all: `RewordState::record` swallows `RewordError::Unavailable`,
-    /// which is right for the automatic path (it would owe a line per
-    /// notification for a rewrite nobody asked for) and wrong for the path
-    /// that asked.
-    ///
-    /// Both directions are asserted, and the `cfg!` is what makes this one
-    /// test rather than two: a build *with* a client must not print the line,
-    /// because in that build `Unavailable` is not the reason for anything.
-    #[test]
-    fn an_explicit_reword_says_so_when_the_build_cannot_rewrite() {
-        let state = RewordState::new();
-        let text = "Alice: where do you want to go for dinner";
-        let plan = RewordPlan::requested_in(text.into(), &cfg(), &CleanupConfig::default(), &state);
-        assert_eq!(plan.is_ok(), cfg!(feature = "reword"));
-        assert_eq!(
-            state.unavailable_logged(),
-            !cfg!(feature = "reword"),
-            "a build with no rewriting client in it owes an explicit --reword a \
-             line; one that has a client owes it nothing"
-        );
-
-        // ...and only ever one line, whichever build this is: the latch is
-        // per run, not per `--reword`.
-        let fresh = RewordState::new();
-        assert!(fresh.note_unavailable(), "the first ask is worth a line");
-        assert!(!fresh.note_unavailable(), "and the thousandth is not");
     }
 
     /// The guard is applied to whatever comes back, and a rejection means
@@ -2936,6 +2992,7 @@ mod tests {
                 original.clone(),
                 original.clone(),
                 &cfg(),
+                Duration::from_millis(cfg().timeout_ms),
                 good as Arc<dyn Rewriter>,
                 state.clone()
             )
@@ -2954,6 +3011,7 @@ mod tests {
                 original.clone(),
                 original.clone(),
                 &cfg(),
+                Duration::from_millis(cfg().timeout_ms),
                 chatty as Arc<dyn Rewriter>,
                 RewordState::new()
             )
@@ -2968,6 +3026,7 @@ mod tests {
                 original.clone(),
                 original.clone(),
                 &cfg(),
+                Duration::from_millis(cfg().timeout_ms),
                 dead as Arc<dyn Rewriter>,
                 RewordState::new()
             )
@@ -3295,6 +3354,7 @@ mod tests {
             original.clone(),
             original.clone(),
             &cfg(),
+            Duration::from_millis(cfg().timeout_ms),
             rewriter as Arc<dyn Rewriter>,
             RewordState::new(),
         )
@@ -3334,6 +3394,7 @@ mod tests {
             original.clone(),
             original.clone(),
             &cfg(),
+            Duration::from_millis(cfg().timeout_ms),
             Arc::new(Panicky) as Arc<dyn Rewriter>,
             state.clone(),
         )
@@ -3370,17 +3431,17 @@ mod tests {
         }
         // `will_reword` reads the real clock, and by it barely any time has
         // passed: the window is open.
-        assert!(!will_reword(text, &cfg, &state));
+        assert!(!will_reword(text, &cfg, Ceiling::Notification, &state));
         // The injected clock is a minute later, so the same state lets one
         // through -- no wall-clock second has elapsed to make that true.
         let past = t0 + TRANSPORT_BREAKER_COOLDOWN + Duration::from_secs(1);
         assert_eq!(state.allow(&cfg, past), Ok(()));
         // That was the probe, and the probe is one: a real-clock caller
         // behind it is still refused until the probe comes back.
-        assert!(!will_reword(text, &cfg, &state));
+        assert!(!will_reword(text, &cfg, Ceiling::Notification, &state));
         state.record(&cfg, &Attempt::Answered(Ok("a rewrite".into())), past);
         assert!(
-            will_reword(text, &cfg, &state),
+            will_reword(text, &cfg, Ceiling::Notification, &state),
             "and the breaker the injected clock closed is closed for the \
              real clock too"
         );
@@ -3395,7 +3456,7 @@ mod tests {
             })),
             t0,
         );
-        assert!(!will_reword(text, &cfg, &state));
+        assert!(!will_reword(text, &cfg, Ceiling::Notification, &state));
         assert_eq!(
             state.allow(&cfg, t0 + Duration::from_secs(1799)),
             Err(Blocked::RateLimited)
@@ -3435,9 +3496,9 @@ mod tests {
     }
 
     /// A build *failure* is remembered exactly like a success. It used not to
-    /// be, and the case that costs is not exotic: `enabled = true` in a build
-    /// without the `reword` feature, where `build_rewriter` can never
-    /// succeed. Every announcement then re-entered it and took two global
+    /// be, and the case that costs is not exotic: `enabled = true` with no
+    /// usable `provider`, where `build_rewriter` can never succeed. Every
+    /// announcement then re-entered it and took two global
     /// mutexes -- the cache, then `RewordState::inner` inside `record` --
     /// on the `select!` arm `Journal` exists to keep clear.
     #[test]
@@ -3490,14 +3551,18 @@ mod tests {
         assert!(Arc::ptr_eq(&state(), &state()));
     }
 
-    /// Without the `reword` feature there is no client to build, and the
-    /// orchestration says so in a variant rather than by being absent.
-    #[cfg(not(feature = "reword"))]
+    /// A config with no `provider` has no client to build, and the refusal
+    /// names the field rather than blaming the build.
     #[test]
-    fn a_default_build_has_no_client_to_build() {
-        assert!(matches!(
-            build_rewriter(&cfg()),
-            Err(RewordError::Unavailable)
-        ));
+    fn a_config_without_a_provider_has_no_client_to_build() {
+        let mut no_provider = cfg();
+        no_provider.provider = None;
+        let Err(RewordError::NotConfigured(reason)) = build_rewriter(&no_provider) else {
+            panic!("an unset provider must refuse with NotConfigured");
+        };
+        assert!(
+            reason.contains("reword.provider"),
+            "the refusal must name the field to set, got {reason:?}"
+        );
     }
 }

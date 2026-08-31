@@ -834,11 +834,8 @@ async fn run_daemon() -> std::process::ExitCode {
 
     // A contradiction rather than a degradation, so it is the one reword
     // misconfiguration that stops a boot: automatic rewriting was asked for
-    // and cannot be delivered. Gated, because in a build without the feature
-    // `enabled = true` is already an inert no-op with its own diagnostic, and
-    // refusing to start over a table that build never reads would be a
-    // failure invented out of nothing.
-    #[cfg(feature = "reword")]
+    // and cannot be delivered. Unconditional -- every build has the client
+    // in it, so there is no longer a build for which this table is inert.
     if let Some(refusal) = sayd_core::config::reword_startup_refusal(&cfg.reword) {
         eprintln!("error: {}: {refusal}", Config::path().display());
         return std::process::ExitCode::FAILURE;
@@ -900,22 +897,6 @@ async fn run_daemon() -> std::process::ExitCode {
         cfg,
     ));
     store.status().set(cfg_problem);
-    // §8: asking for rewording in a build with no client in it is not an
-    // error -- everything is spoken as written, exactly as it was before
-    // this feature existed -- but it must not be silent, or a user who set
-    // the switch would have no way at all to discover why nothing changed.
-    //
-    // Keyed on `notifications`, not on the `enabled` master: the master
-    // defaults to true and the 2026-08-24 migration turns it on for every
-    // existing config, so keying there would print this at every start on
-    // every machine that has never asked for rewording at all.
-    #[cfg(not(feature = "reword"))]
-    if store.current().reword.notifications {
-        eprintln!(
-            "info: [reword] notifications = true, but this build has no rewording \
-             client (rebuild with --features reword); text will be spoken as written"
-        );
-    }
     // The settings window is built and destroyed on demand, so the model it
     // edits has to outlive every window: it lives behind `settings`'s own
     // `OnceLock` from here on.

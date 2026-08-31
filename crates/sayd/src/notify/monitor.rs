@@ -1080,11 +1080,9 @@ mod tests {
 
     /// With rewording off the announcement path is what it always was:
     /// `admit` returns `None`, so `speak` is the awaited submission it has
-    /// always been and nothing at all is spawned. The two halves of "off"
-    /// are separate rows on purpose -- `enabled = false` is a promise the
-    /// *configuration* keeps, and a build without the `reword` feature is
-    /// one the *compiler* keeps, and the second must not depend on the
-    /// first.
+    /// always been and nothing at all is spawned. "Off" is a promise the
+    /// *configuration* keeps: `enabled = false`, or no usable `provider` for
+    /// `build_rewriter` to make a client from.
     #[test]
     fn nothing_is_admitted_with_rewording_off() {
         let text = "Alice: where do you want to go for dinner";
@@ -1097,17 +1095,21 @@ mod tests {
             RewordPlan::automatic(Written(text.into()), &off.reword, &off.cleanup).is_err(),
             "`notifications = false` must not even look for a client"
         );
-        // And in a build with no client in it, not even `enabled = true`
-        // can produce a plan.
-        #[cfg(not(feature = "reword"))]
+
+        // The other half, and the one that used to be the compiler's: fully
+        // switched on, but with no provider for `build_rewriter` to make a
+        // client from. It must not depend on the first -- a `notifications`
+        // check that also happened to cover this would hide the day it stops.
+        let mut no_provider = rewording_on();
+        no_provider.reword.provider = None;
         assert!(
             RewordPlan::automatic(
                 Written(text.into()),
-                &rewording_on().reword,
-                &rewording_on().cleanup
+                &no_provider.reword,
+                &no_provider.cleanup
             )
             .is_err(),
-            "a build without the `reword` feature has nothing to rewrite with"
+            "with no provider there is no client, so nothing can be admitted"
         );
     }
 
@@ -1189,14 +1191,11 @@ mod tests {
             "a follow-up must never be admitted to a rewrite"
         );
         // The positive control: the same text under the same config *is*
-        // admitted as a `Written`, in a build that has a client to
-        // admit it to. Without this the assertion above would also pass
-        // against a config that could never rewrite anything.
-        assert_eq!(
+        // admitted as a `Written`. Without this the assertion above would
+        // also pass against a config that could never rewrite anything.
+        assert!(
             RewordPlan::automatic(Written(followup.clone()), &cfg.reword, &cfg.cleanup).is_ok(),
-            cfg!(feature = "reword"),
-            "only the origin should decide this, and only a build with a client \
-             can say yes at all"
+            "only the origin should decide this"
         );
         let logged = Arc::new(AtomicBool::new(false));
         let detached = speak(&engine, Composed(followup.clone()), &cfg, &logged).await;
@@ -1224,11 +1223,6 @@ mod tests {
     /// that *is* being reworded returns from `speak` immediately, so the
     /// `MessageStream` keeps being polled and `ticker.tick()` keeps firing.
     ///
-    /// Without the `reword` feature `context` returns `None` (there is no
-    /// client to build), so this takes the non-detached path and still
-    /// passes -- which is itself the point in that build: the announcement
-    /// never goes near the provider and costs nothing. `--features reword`
-    /// is the configuration where it can actually fail.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn speak_returns_at_once_when_a_rewrite_is_in_flight() {
         let (engine, _spoken) = engine_allowing("Signal");
@@ -1238,11 +1232,10 @@ mod tests {
         cfg.reword.timeout_ms = 800;
 
         let text = "Alice: where do you want to go for dinner".to_string();
-        assert_eq!(
+        assert!(
             RewordPlan::automatic(Written(text.clone()), &cfg.reword, &cfg.cleanup).is_ok(),
-            cfg!(feature = "reword"),
-            "the case under test is the detaching one; in a build with a client \
-             this announcement must be admitted, or the timing below proves nothing"
+            "the case under test is the detaching one; this announcement must be \
+             admitted, or the timing below proves nothing"
         );
 
         let logged = Arc::new(AtomicBool::new(false));
@@ -1250,12 +1243,9 @@ mod tests {
         let detached = speak(&engine, Written(text), &cfg, &logged).await;
         let elapsed = started.elapsed();
 
-        assert_eq!(
+        assert!(
             detached.is_some(),
-            cfg!(feature = "reword"),
-            "an announcement that is being reworded is the one case that \
-             detaches, and in a build with no client there is nothing to wait \
-             for and nothing to detach"
+            "an announcement that is being reworded is the one case that detaches"
         );
 
         provider.join().expect("the silent provider thread ends");
@@ -1921,11 +1911,7 @@ mod tests {
             spoke_followup,
             "the coalesced follow-up never arrived; the ticker's `Limiter::due` wiring is not working"
         );
-        // And it got there without asking a provider first. In a build with
-        // no client `context` returns `None` and nothing could have reached
-        // one anyway, so the assertion is only meaningful -- and is only made
-        // -- where it can fail.
-        #[cfg(feature = "reword")]
+        // And it got there without asking a provider first.
         assert!(
             !crate::reword::state().endpoint_seen(&reword),
             "a line this daemon composed itself was sent to a provider; the \

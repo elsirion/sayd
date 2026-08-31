@@ -110,10 +110,10 @@ struct Cli {
 
     /// Rewrite this submission into something written for the ear before
     /// speaking it -- "Alice: dinner?" becomes "Alice is asking about
-    /// dinner". Needs a configured `[reword]` endpoint and a daemon built
-    /// with `--features reword`; without either, the text is spoken as
-    /// written. Does *not* require `[reword] enabled = true`, which only
-    /// governs whether notifications are rewritten automatically.
+    /// dinner". Needs `[reword] enabled = true` -- the master -- and a
+    /// configured endpoint; without either, the text is spoken as written.
+    /// Does *not* require `[reword] notifications`, which only governs
+    /// whether notifications are rewritten without being asked.
     /// Meaningless outside a submission; ignored elsewhere. Must come
     /// before the text/subcommand it applies to.
     ///

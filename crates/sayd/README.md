@@ -4,10 +4,9 @@ Local text-to-speech for Wayland. Select text, press a key, hear it.
 
 Kokoro-82M runs locally through ONNX Runtime with a misaki-derived English
 frontend. Speech synthesis never touches the network and nothing about it
-leaves your machine. The optional rewording feature (`[reword]`, off by
-default, and absent from the binary entirely unless built with
-`--features reword`) is the one exception: it sends the text about to be
-spoken to whatever endpoint you configure. Point it at a model server on
+leaves your machine. The optional rewording feature (`[reword]`, inert
+until you configure a `provider`) is the one exception: it sends the text
+about to be spoken to whatever endpoint you configure. Point it at a model server on
 localhost -- the default -- and the original promise holds unchanged. See
 the workspace README's Rewording section for what is sent, what is logged,
 and what can go wrong.

@@ -279,14 +279,12 @@ mod tests {
     /// `RewordPlan::automatic` rather than unwrapped into a bare string, so
     /// this daemon's own composed follow-ups still cannot reach a provider.
     ///
-    /// The control is build-dependent, and worth being explicit about: in a
-    /// build without the `reword` feature there is no client to admit to, so
-    /// `Ready` here proves nothing. In a build with one -- where the config
-    /// above names a provider -- `Ready` is true only because the origin was
-    /// consulted. A `prepare` that called `into_text()` first and asked for
-    /// a `Requested` would return `Pending` and fail this there. The
-    /// positive control lives in `notify::monitor`'s own tests, which drive
-    /// `RewordPlan::automatic` directly.
+    /// The config above names a provider, so there is a client to admit to
+    /// and `Ready` is true only because the origin was consulted. A
+    /// `prepare` that called `into_text()` first and asked for a `Requested`
+    /// would return `Pending` and fail this. The positive control lives in
+    /// `notify::monitor`'s own tests, which drive `RewordPlan::automatic`
+    /// directly.
     #[test]
     fn a_composed_follow_up_is_never_admitted() {
         let cfg = configured();

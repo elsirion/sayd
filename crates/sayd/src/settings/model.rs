@@ -125,6 +125,15 @@ pub const REWORD_TIMEOUT_MAX: f64 = 60_000.0;
 /// One arrow click. Small, because the interesting range is one to three
 /// seconds and that is where a deadline is actually tuned.
 pub const REWORD_TIMEOUT_STEP: f64 = 100.0;
+
+/// The explicit ask's deadline. The same floor -- a budget below it cannot
+/// be met by any provider -- and a much higher visible ceiling, because a
+/// local model summarising a document legitimately takes tens of seconds.
+/// Like `REWORD_TIMEOUT_MAX` this bounds the *row*, not the setting: a
+/// longer deadline set in `config.toml` is kept.
+pub const REWORD_REQUEST_TIMEOUT_MIN: f64 = sayd_core::config::REWORD_TIMEOUT_MIN_MS as f64;
+pub const REWORD_REQUEST_TIMEOUT_MAX: f64 = 180_000.0;
+pub const REWORD_REQUEST_TIMEOUT_STEP: f64 = 1000.0;
 /// One PageUp, and the reason the row has one at all: 100 ms steps across a
 /// minute is 598 clicks. Five seconds crosses the whole range in twelve.
 pub const REWORD_TIMEOUT_PAGE: f64 = 5_000.0;
@@ -142,6 +151,15 @@ pub const REWORD_TIMEOUT_SUBTITLE: &str =
 pub const REWORD_MAX_CHARS_MIN: f64 = 32.0;
 pub const REWORD_MAX_CHARS_MAX: f64 = 2000.0;
 pub const REWORD_MAX_CHARS_STEP: f64 = 32.0;
+
+/// The explicit ask's own ceiling, and a much wider range: what it measures
+/// is text a user pointed at, which is routinely a document rather than a
+/// notification. The top is `Config::max_chars`'s default, past which the
+/// engine refuses the submission anyway -- see
+/// [`sayd_core::config::RewordConfig::request_max_chars`].
+pub const REWORD_REQUEST_MAX_CHARS_MIN: f64 = 32.0;
+pub const REWORD_REQUEST_MAX_CHARS_MAX: f64 = 20000.0;
+pub const REWORD_REQUEST_MAX_CHARS_STEP: f64 = 500.0;
 
 /// What the Test row starts with: the example this whole feature exists
 /// for, so pressing Test once without typing anything is already a
@@ -1033,6 +1051,17 @@ fn clamp_ranges(cfg: &mut Config) -> Vec<String> {
     // window write a value the very next load would change. See
     // `REWORD_TIMEOUT_MIN`'s doc comment.
     let timeout = cfg.reword.timeout_ms.max(REWORD_TIMEOUT_MIN as u64);
+    let request_timeout = cfg
+        .reword
+        .request_timeout_ms
+        .max(REWORD_REQUEST_TIMEOUT_MIN as u64);
+    if request_timeout != cfg.reword.request_timeout_ms {
+        warnings.push(format!(
+            "reword.request_timeout_ms {} is below {}; using {request_timeout}",
+            cfg.reword.request_timeout_ms, REWORD_REQUEST_TIMEOUT_MIN as u64
+        ));
+        cfg.reword.request_timeout_ms = request_timeout;
+    }
     if timeout != cfg.reword.timeout_ms {
         warnings.push(format!(
             "reword.timeout_ms {} is shorter than any provider can answer in; using {timeout}",
@@ -1072,6 +1101,19 @@ fn clamp_ranges(cfg: &mut Config) -> Vec<String> {
             cfg.reword.max_chars, REWORD_MAX_CHARS_MIN as usize, REWORD_MAX_CHARS_MAX as usize
         ));
         cfg.reword.max_chars = max_chars;
+    }
+    let request_max_chars = cfg.reword.request_max_chars.clamp(
+        REWORD_REQUEST_MAX_CHARS_MIN as usize,
+        REWORD_REQUEST_MAX_CHARS_MAX as usize,
+    );
+    if request_max_chars != cfg.reword.request_max_chars {
+        warnings.push(format!(
+            "reword.request_max_chars {} is outside {}-{}; using {request_max_chars}",
+            cfg.reword.request_max_chars,
+            REWORD_REQUEST_MAX_CHARS_MIN as usize,
+            REWORD_REQUEST_MAX_CHARS_MAX as usize
+        ));
+        cfg.reword.request_max_chars = request_max_chars;
     }
     warnings
 }
@@ -1270,8 +1312,6 @@ pub enum TestOutcome {
     NotConfigured {
         reason: String,
     },
-    /// Built without the `reword` feature.
-    Unavailable,
     /// Both permits were in use. Rare, and only reachable by hammering the
     /// button while notifications are being rewritten.
     Busy,
@@ -1403,7 +1443,6 @@ impl TestOutcome {
                 format!("No answer after {}", human_elapsed(*ceiling))
             }
             TestOutcome::NotConfigured { .. } => "The endpoint is not usable".into(),
-            TestOutcome::Unavailable => "This build has no rewording client".into(),
             TestOutcome::Busy => "Another rewrite is still running".into(),
         }
     }
@@ -1483,7 +1522,6 @@ impl TestOutcome {
                 human_deadline(*deadline)
             ),
             TestOutcome::NotConfigured { reason } => reason.clone(),
-            TestOutcome::Unavailable => "Rebuild with --features reword to use this".to_string(),
             TestOutcome::Busy => "Both rewrite slots are in use; try again in a moment".to_string(),
         }
     }
@@ -1517,7 +1555,6 @@ impl TestOutcome {
             | TestOutcome::RateLimited { .. }
             | TestOutcome::NoAnswer { .. }
             | TestOutcome::NotConfigured { .. }
-            | TestOutcome::Unavailable
             | TestOutcome::Busy => None,
         }
     }
@@ -1742,7 +1779,6 @@ fn outcome_for_error(e: RewordError, cfg: &RewordConfig) -> TestOutcome {
             deadline: Duration::from_millis(cfg.timeout_ms),
         },
         RewordError::NotConfigured(reason) => TestOutcome::NotConfigured { reason },
-        RewordError::Unavailable => TestOutcome::Unavailable,
         // `Unusable` rather than a row of its own: the endpoint answered and
         // the answer could not be used, which is exactly what that row says
         // and exactly the investigation the user needs. The detail is what
@@ -2847,6 +2883,33 @@ mod tests {
         assert_eq!(cfg.reword.timeout_ms, REWORD_TIMEOUT_MIN as u64);
         assert_eq!(cfg.reword.max_chars, 32);
         assert_eq!(warnings.len(), 2, "both clamps must say so: {warnings:?}");
+
+        // The explicit ask's ceiling is a separate range and clamps
+        // separately. Its top is well above `max_chars`'s, which is the
+        // point of it: a value that is out of range for one is ordinary for
+        // the other.
+        let mut cfg = Config::default();
+        cfg.reword.request_max_chars = 1;
+        let warnings = normalize(&mut cfg);
+        assert_eq!(cfg.reword.request_max_chars, REWORD_REQUEST_MAX_CHARS_MIN as usize);
+        assert_eq!(warnings.len(), 1, "the request clamp must say so: {warnings:?}");
+
+        let mut cfg = Config::default();
+        cfg.reword.request_max_chars = 999_999;
+        let warnings = normalize(&mut cfg);
+        assert_eq!(cfg.reword.request_max_chars, REWORD_REQUEST_MAX_CHARS_MAX as usize);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+
+        // 8000 is inside the request range and outside `max_chars`'s: the
+        // two numbers are not interchangeable and nothing may clamp one to
+        // the other's bounds.
+        let mut cfg = Config::default();
+        cfg.reword.request_max_chars = 8000;
+        assert!(
+            normalize(&mut cfg).is_empty(),
+            "the default request ceiling must not trip its own clamp"
+        );
+        assert_eq!(cfg.reword.request_max_chars, 8000);
 
         let mut cfg = Config::default();
         cfg.reword.timeout_ms = 50;
@@ -3953,14 +4016,22 @@ mod tests {
         engine.shutdown();
 
         // The client's own ceiling: reported as the ceiling that was
-        // actually waited, next to the deadline that was not. 11.5 s is the
-        // 1.5 s deadline plus `REWORD_HTTP_GRACE` -- the number this row
-        // prints has to be the one the transport was really given, or the
-        // row is telling the user how long it waited and being wrong.
+        // actually waited, next to the deadline that was not. The number
+        // this row prints has to be the one the transport was really given,
+        // or the row is telling the user how long it waited and being wrong.
+        //
+        // 35 s rather than the 11.5 s this asserted before the deadline was
+        // split: one cached client serves both paths, so `http_ceiling`
+        // clears the *longer* of the two deadlines (25 s) plus
+        // `REWORD_HTTP_GRACE`. Waiting the longer one is also what this row
+        // wants -- see `test_ceiling`, which exists precisely so a slow
+        // provider can be told *how* slow rather than merely "too slow".
+        // The subtitle still names the notification deadline, which is the
+        // one the announcement path will actually enforce.
         let dir = tempfile::tempdir().expect("tempdir");
         let (model, engine) = model_with(dir.path(), Canned::new(Err(RewordError::Ceiling)));
         let out = outcome_of(&model, REWORD_TEST_DEFAULT);
-        assert_eq!(out.title(), "No answer after 11.5 s");
+        assert_eq!(out.title(), "No answer after 35.0 s");
         assert_eq!(
             out.subtitle(),
             "The deadline is 1.5 s, so this provider is not usable for notifications"
@@ -4070,15 +4141,6 @@ mod tests {
              ceiling, which is derived from the input text: {:?}",
             out.subtitle()
         );
-        drop(model);
-        engine.shutdown();
-
-        // A build with no client in it.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let (model, engine) = model_from(dir.path(), |_| Err(RewordError::Unavailable));
-        let out = outcome_of(&model, REWORD_TEST_DEFAULT);
-        assert_eq!(out.title(), "This build has no rewording client");
-        assert_eq!(out.subtitle(), "Rebuild with --features reword to use this");
         drop(model);
         engine.shutdown();
 
@@ -4326,7 +4388,6 @@ mod tests {
                 deadline: Duration::from_secs(1),
             },
             TestOutcome::NotConfigured { reason: "r".into() },
-            TestOutcome::Unavailable,
             TestOutcome::Busy,
         ];
         for status in nothing_to_speak {

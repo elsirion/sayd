@@ -273,7 +273,7 @@ pub struct RewordConfig {
     ///
     /// **Defaults to `true`, and that is not the feature being on by
     /// default.** [`RewordConfig::provider`] defaults to `None`, so
-    /// `HttpRewriter::new` refuses, `build_rewriter` returns `Unavailable`
+    /// `HttpRewriter::new` refuses, `build_rewriter` returns `NotConfigured`
     /// and `reword::context` yields no client: a config that has never
     /// mentioned rewording rewrites nothing, exactly as before. What the
     /// default buys is that switching the master off is a deliberate act
@@ -332,11 +332,67 @@ pub struct RewordConfig {
     /// carrying `reword` unbounded precisely because it cannot know this
     /// number.
     pub timeout_ms: u64,
+    /// The same deadline for every explicit `--reword`, and much longer.
+    /// Raised to [`REWORD_TIMEOUT_MIN_MS`] on load; no upper bound, for the
+    /// reason `timeout_ms` has none.
+    ///
+    /// The deadline has to be split for the same reason the character
+    /// ceiling does, and the consequence of *not* splitting it is worse than
+    /// a bad number. A notification wants a short budget: it arrives
+    /// uninvited, it is one sentence, and a rewrite that has not landed in a
+    /// second and a half should get out of the way. An explicit `--reword`
+    /// over a document wants tens of seconds, because that is simply how
+    /// long a local model takes to read two thousand characters and write a
+    /// paragraph.
+    ///
+    /// One shared number could not serve both, and raising it to suit the
+    /// document would have dragged something unrelated with it:
+    /// [`notify_cooldown_min_secs`] derives the notification coalescing
+    /// floor from `timeout_ms`, so a 25-second deadline set for clipboard
+    /// reads would have silently turned every notification window into 26
+    /// seconds. That floor still reads `timeout_ms`, and now `timeout_ms`
+    /// means only what the notification path asked for.
+    pub request_timeout_ms: u64,
     /// Longer text is spoken as written. Clamped to 32..=2000. The default
     /// is the chunker's `target_chars`: one synthesis chunk, which is the
     /// natural unit here, and above it the submission is a document rather
     /// than a notification.
+    ///
+    /// **The notification ceiling only.** Every explicit `--reword` is
+    /// measured against [`RewordConfig::request_max_chars`] instead; see
+    /// that field for why one number could not serve both.
     pub max_chars: usize,
+    /// The same ceiling for every explicit `--reword`, and much larger.
+    /// Clamped to 32..=20000.
+    ///
+    /// `max_chars` cannot serve both, because the two asks are not the same
+    /// shape. A notification arrives uninvited and is already short, so its
+    /// ceiling stops at 2000: past that it is a document rather than a
+    /// notification, and rewriting it was never what the feature was for. An
+    /// explicit `--reword` is a user pointing at something and asking for
+    /// it, and what they point at is routinely a document -- a page of
+    /// prose, a chat log, a long tool output. Sharing one number would mean
+    /// choosing which of the two to break.
+    ///
+    /// Applies to `say --reword "..."`, `say --reword selection` and `say
+    /// --reword clipboard` alike: they are one ask made three ways, and a
+    /// limit that varied between them would be a rule nobody could hold in
+    /// their head.
+    ///
+    /// The upper clamp is [`Config::max_chars`]'s own default of 20000: past
+    /// that the engine refuses the submission outright, so a rewrite ceiling
+    /// above it would admit text that is never going to be spoken however
+    /// the rewrite turns out.
+    ///
+    /// **The response bound does not scale with this.** `max_tokens` is
+    /// still derived from `max_chars`, and deliberately: this number bounds
+    /// how much text may be *sent*, while `max_tokens` bounds how much comes
+    /// *back*, and what comes back is a spoken summary. A summary of eight
+    /// thousand characters is not eight thousand characters long -- it is a
+    /// paragraph, the same size as a summary of four hundred. Scaling the
+    /// response with the input would buy nothing and would ask a local model
+    /// for a generation far longer than anything worth listening to.
+    pub request_max_chars: usize,
 }
 
 impl Default for RewordConfig {
@@ -359,7 +415,19 @@ impl Default for RewordConfig {
             // measured -- the settings window's Test row is how a user gets
             // their own number on their own setup and sets this against it.
             timeout_ms: 1500,
+            // Measured, unlike the one above: against a local llama.cpp
+            // server on a CPU-only box, summarising ~2000-character
+            // assistant answers, the fastest usable models answered in
+            // 8.6-16.4 s. 25 s clears the slowest of those with room for a
+            // cold model load, and losing the race still only costs the
+            // original being spoken.
+            request_timeout_ms: 25_000,
             max_chars: 400,
+            // A working number rather than a measured one -- room for a
+            // long tool output or a page of chat, comfortably inside the
+            // 20000 the engine would accept, and far enough above
+            // `max_chars` that the two are obviously not the same knob.
+            request_max_chars: 8000,
         }
     }
 }
@@ -611,6 +679,8 @@ impl Config {
                 // at the use because there are four `load_from` callers and
                 // only two of them normalise.
                 c.reword.timeout_ms = c.reword.timeout_ms.max(REWORD_TIMEOUT_MIN_MS);
+                c.reword.request_timeout_ms =
+                    c.reword.request_timeout_ms.max(REWORD_TIMEOUT_MIN_MS);
                 // The same kind of range for the same kind of reason, and
                 // the other half of the same interaction: a window that
                 // closes before the notification that opened it has been
@@ -1162,6 +1232,7 @@ mod tests {
              different sentences"
         );
     }
+
 
     /// A refusal that does not say what to type is a refusal the user has to
     /// go and read source code about.

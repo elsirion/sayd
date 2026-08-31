@@ -47,7 +47,10 @@ use super::schema;
 use super::model::{
     allow_add, allow_contains, allow_remove, icon_file_size_within_limit, icon_pixels_within_limit,
     reword_key_row_applies, IconSource, SettingsModel, Suggestion, SuggestionKind, ENDPOINT_PRESETS,
-    REWORD_MAX_CHARS_MAX, REWORD_MAX_CHARS_MIN, REWORD_MAX_CHARS_STEP, REWORD_TEST_DEFAULT,
+    REWORD_MAX_CHARS_MAX, REWORD_MAX_CHARS_MIN, REWORD_MAX_CHARS_STEP,
+    REWORD_REQUEST_MAX_CHARS_MAX, REWORD_REQUEST_MAX_CHARS_MIN, REWORD_REQUEST_MAX_CHARS_STEP,
+    REWORD_REQUEST_TIMEOUT_MAX, REWORD_REQUEST_TIMEOUT_MIN, REWORD_REQUEST_TIMEOUT_STEP,
+    REWORD_TEST_DEFAULT,
     REWORD_TIMEOUT_MAX, REWORD_TIMEOUT_MIN, REWORD_TIMEOUT_PAGE, REWORD_TIMEOUT_STEP,
     REWORD_TIMEOUT_SUBTITLE, TEST_INCOMPLETE_TITLE, TEST_IN_PROGRESS_TITLE,
 };
@@ -1534,6 +1537,49 @@ pub fn reword_group(b: &Build) -> adw::PreferencesGroup {
     });
     group.add(&ceiling.row);
 
+    // --- Deadline for an explicit --reword --------------------------------
+    let request_deadline = Spin::new(
+        "--reword deadline",
+        "Milliseconds an asked-for rewrite may take; the notification deadline is above",
+        REWORD_REQUEST_TIMEOUT_MIN,
+        REWORD_REQUEST_TIMEOUT_MAX,
+        REWORD_REQUEST_TIMEOUT_STEP,
+        0,
+    );
+    request_deadline.row.set_use_markup(false);
+    request_deadline.show(cfg.reword.request_timeout_ms as f64);
+    let s = request_deadline.clone();
+    ui.row(move |_, cfg| s.show(cfg.reword.request_timeout_ms as f64));
+    let u = ui.downgrade();
+    request_deadline.row.connect_value_notify(move |row| {
+        let value = row.value() as u64;
+        u.on_user_change(|u| u.apply(|c| c.reword.request_timeout_ms = value));
+    });
+    group.add(&request_deadline.row);
+
+    // --- Longest requested text to rewrite -------------------------------
+    // Its own row beside the one above rather than a shared number: the two
+    // ceilings answer different questions and the ranges do not overlap
+    // usefully. See `RewordConfig::request_max_chars`.
+    let request_ceiling = Spin::new(
+        "Longest --reword text",
+        "Characters; applies when you ask with --reword",
+        REWORD_REQUEST_MAX_CHARS_MIN,
+        REWORD_REQUEST_MAX_CHARS_MAX,
+        REWORD_REQUEST_MAX_CHARS_STEP,
+        0,
+    );
+    request_ceiling.row.set_use_markup(false);
+    request_ceiling.show(cfg.reword.request_max_chars as f64);
+    let s = request_ceiling.clone();
+    ui.row(move |_, cfg| s.show(cfg.reword.request_max_chars as f64));
+    let u = ui.downgrade();
+    request_ceiling.row.connect_value_notify(move |row| {
+        let value = row.value() as usize;
+        u.on_user_change(|u| u.apply(|c| c.reword.request_max_chars = value));
+    });
+    group.add(&request_ceiling.row);
+
     // --- Test -------------------------------------------------------------
     // Every failure in the design's §8 degrades to "speak the original",
     // which is correct and indistinguishable from the feature being switched
@@ -2190,9 +2236,7 @@ mod tests {
     /// The Test row's whole contract is a thing that takes time and then
     /// reports a number, and neither half can be driven against a real
     /// endpoint in a committed test. Injecting the client is what makes the
-    /// latency sentence -- this task's deliverable -- assertable at all, and
-    /// makes it assert the same thing with and without `--features reword`
-    /// (where a real endpoint would report `Unavailable` and nothing else).
+    /// latency sentence -- this task's deliverable -- assertable at all.
     ///
     /// The returned counter is how many times `reword` actually ran --
     /// process-wide state a click or an Enter cannot fake past, unlike the
@@ -2968,8 +3012,8 @@ mod tests {
     /// compared against a deadline this test chooses, on both sides of it,
     /// and the first-request caveat has to be seen appearing once and not
     /// twice. None of that is drivable against a real provider, and against a
-    /// dead port the whole row would collapse to one failure sentence -- in
-    /// the default build, to `Unavailable`, which tests nothing at all.
+    /// dead port the whole row would collapse to one failure sentence,
+    /// which tests nothing at all.
     fn the_test_row_reports_the_latency_against_the_deadline(dir: &std::path::Path) {
         let dir = dir.join("reword-test-row");
         std::fs::create_dir_all(&dir).expect("a config directory of its own");

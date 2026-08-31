@@ -820,12 +820,6 @@ mod tests {
     /// End to end through the real loader and against a real socket, because
     /// that is the only way to check it: the deadline is applied by
     /// `RewordPlan::resolve` in one crate, from a value parsed in another.
-    ///
-    /// In a build without the `reword` feature there is no client to make a
-    /// request with, so this returns at once and still passes -- which is the
-    /// other half of the promise: a `--reword` that cannot be honoured is
-    /// spoken as written rather than refused. `--features reword` is the
-    /// configuration where the timing can actually fail.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_reword_against_a_silent_provider_answers_with_a_spoken_utterance() {
         /// Past the ceiling `timeout_ms` used to be clamped to (2000) and
@@ -895,20 +889,17 @@ mod tests {
         // both permits taken, elsewhere in the run would make the timing
         // below prove nothing, and that is worth a loud failure rather than a
         // quiet pass.
-        #[cfg(feature = "reword")]
-        {
-            assert!(
-                crate::reword::state().endpoint_seen(&cfg.reword),
-                "the rewrite never reached the provider, so the timing below \
-                 would prove nothing"
-            );
-            assert!(
-                elapsed >= std::time::Duration::from_millis(cfg.reword.timeout_ms) / 2,
-                "Say returned in {elapsed:?}, far inside the {} ms budget: the \
-                 rewrite was not awaited inline",
-                cfg.reword.timeout_ms
-            );
-        }
+        assert!(
+            crate::reword::state().endpoint_seen(&cfg.reword),
+            "the rewrite never reached the provider, so the timing below \
+             would prove nothing"
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_millis(cfg.reword.timeout_ms) / 2,
+            "Say returned in {elapsed:?}, far inside the {} ms budget: the \
+             rewrite was not awaited inline",
+            cfg.reword.timeout_ms
+        );
 
         i.engine.shutdown();
         provider.join().expect("the silent provider thread ends");
@@ -957,10 +948,8 @@ mod tests {
     /// synthesiser: `config()` cannot answer at all.
     ///
     /// `published_reads` is what is asserted because it is the mechanism
-    /// itself, and it is the same fact in a build with the `reword` feature
-    /// and one without: `maybe_reword` reads `ConfigStore::published` exactly
-    /// once per `--reword` and never otherwise, so 0 is "the request was
-    /// dropped
+    /// itself: `maybe_reword` reads `ConfigStore::published` exactly once per
+    /// `--reword` and never otherwise, so 0 is "the request was dropped
     /// before anything so much as looked at a configuration" and 1 is "it
     /// reached `RewordPlan::requested`". What happens past that point belongs
     /// to `crate::reword` and is pinned there. An `endpoint_seen` assertion
