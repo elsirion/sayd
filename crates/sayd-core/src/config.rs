@@ -353,6 +353,28 @@ pub struct RewordConfig {
     /// seconds. That floor still reads `timeout_ms`, and now `timeout_ms`
     /// means only what the notification path asked for.
     pub request_timeout_ms: u64,
+    /// Speak an explicit `--reword` sentence by sentence, as the model
+    /// writes it, instead of waiting for the whole answer.
+    ///
+    /// **Off by default, and this is the one switch that trades the
+    /// feature's safety property away.** Everything else here degrades to
+    /// "the original is spoken". Streaming cannot: once a sentence is
+    /// audio it cannot be unsaid, so from the moment the first one is
+    /// committed there is no fallback left. `sayd_core::reword::check` --
+    /// which rejects a rewrite that grew past `length_ceiling`, that came
+    /// back as more than one line, or that carries a code fence -- judges a
+    /// whole answer and cannot judge a prefix. A model that follows the
+    /// prompt for three sentences and then explains itself in the fourth is
+    /// caught today and is spoken when this is on.
+    ///
+    /// What it buys is the wait. A local model reading a document takes
+    /// tens of seconds, and all of it is silence today; streamed, the first
+    /// sentence starts at roughly prefill plus one sentence of decode.
+    ///
+    /// Only ever applies to an explicit `--reword`. A notification is one
+    /// sentence, so there is nothing to stream and fragmenting it into
+    /// several utterances would be worse than the wait it saves.
+    pub stream: bool,
     /// Longer text is spoken as written. Clamped to 32..=2000. The default
     /// is the chunker's `target_chars`: one synthesis chunk, which is the
     /// natural unit here, and above it the submission is a document rather
@@ -422,6 +444,7 @@ impl Default for RewordConfig {
             // cold model load, and losing the race still only costs the
             // original being spoken.
             request_timeout_ms: 25_000,
+            stream: false,
             max_chars: 400,
             // A working number rather than a measured one -- room for a
             // long tool output or a page of chat, comfortably inside the

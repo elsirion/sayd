@@ -455,6 +455,7 @@ the instruction produces a bad announcement, not a broken one.
     api_key_env = "SAYD_REWORD_API_KEY"      # this variable wins over api_key
     timeout_ms = 1500                        # notification deadline; at least 200, no upper bound
     request_timeout_ms = 25000               # --reword deadline; same floor, no upper bound
+    stream = false                           # speak --reword sentence by sentence as it arrives
     max_chars = 400                          # 32..=2000; notification announcements
     request_max_chars = 8000                 # 32..=20000; every explicit --reword
 
@@ -481,6 +482,31 @@ unrelated with it: the notification coalescing floor
 deadline set for clipboard reads would have silently turned every
 notification window into 26 seconds. With the two split, that floor answers
 only to `timeout_ms`.
+
+### Streaming
+
+`stream = true` speaks an explicit `--reword` sentence by sentence, as the
+model writes it, instead of waiting for the whole answer. On a local model
+reading a document that turns tens of seconds of silence into roughly one
+prefill plus one sentence of decode -- measured at about three seconds.
+
+**It is off by default because it is the one setting that gives up the
+promise the rest of this section keeps.** Everywhere else, every failure
+ends in the original being spoken. Streaming cannot: a sentence that has
+been spoken cannot be unsaid, so from the moment the first one is committed
+there is no fallback left. Concretely, the guard that rejects a rewrite for
+growing too long or for coming back as more than one line judges a whole
+answer and cannot judge a prefix, so a model that follows the prompt for
+three sentences and then explains itself in the fourth is caught today and
+is spoken when this is on.
+
+What survives: the deadline still applies to the *first* sentence, so
+nothing is committed until one arrives in time; cleanup still runs per
+sentence, so paths and URLs are still scrubbed; a code fence still refuses
+the sentence carrying it; a stalled provider stops the answer after 20
+seconds of silence rather than hanging; and the streamed body is still
+capped. Only an explicit `--reword` ever streams -- a notification is one
+sentence, so there is nothing to stream.
 
 One consequence worth knowing: a single HTTP client serves both paths, so
 its ceiling clears the *longer* deadline. The settings window's Test row

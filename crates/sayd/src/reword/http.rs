@@ -317,6 +317,20 @@ pub struct Request {
 /// environment, so a test can drive both the with-key and without-key
 /// cases without touching process-global state.
 pub fn build_request(cfg: &RewordConfig, key: Option<&str>, text: &str) -> Request {
+    build_request_in(cfg, key, text, false)
+}
+
+/// [`build_request`] with the `stream` flag chosen by the caller.
+///
+/// Split rather than parameterised at the one call site, so the
+/// non-streaming body -- which every existing test asserts on, byte for
+/// byte -- keeps a constructor that cannot accidentally start streaming.
+pub fn build_request_in(
+    cfg: &RewordConfig,
+    key: Option<&str>,
+    text: &str,
+    stream: bool,
+) -> Request {
     let request = ChatRequest {
         model: &cfg.model,
         messages: [
@@ -329,7 +343,7 @@ pub fn build_request(cfg: &RewordConfig, key: Option<&str>, text: &str) -> Reque
                 content: text,
             },
         ],
-        stream: false,
+        stream,
         temperature: TEMPERATURE,
         max_tokens: cfg.max_tokens(),
         chat_template_kwargs: match cfg.resolved_provider() {
@@ -880,6 +894,79 @@ fn send(
     parse_response(status, retry_after.as_deref(), &body, model, host)
 }
 
+/// One `data:` line of an OpenAI-style stream. Every field optional for
+/// the reason [`ChatResponse`]'s are: this is an untrusted body, and a
+/// frame missing what this client wants must be skipped rather than fail
+/// the stream.
+#[derive(Deserialize, Default)]
+struct StreamFrame {
+    #[serde(default)]
+    choices: Vec<StreamChoice>,
+}
+
+#[derive(Deserialize, Default)]
+struct StreamChoice {
+    #[serde(default)]
+    delta: StreamDelta,
+}
+
+#[derive(Deserialize, Default)]
+struct StreamDelta {
+    #[serde(default)]
+    content: Option<String>,
+}
+
+/// Read an SSE body, handing each `delta.content` to `on_delta`.
+///
+/// Stops -- returning `Ok(())` -- as soon as `on_delta` answers `false`,
+/// on `data: [DONE]`, or at [`BODY_LIMIT`] total bytes. The cap is the same
+/// one `send` relies on and matters more here, not less: a server that
+/// never stops streaming would otherwise grow this process without bound
+/// *and* speak without bound.
+fn read_stream(
+    mut reader: impl std::io::Read,
+    on_delta: &mut dyn FnMut(&str) -> bool,
+) -> Result<(), RewordError> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let mut consumed: u64 = 0;
+    loop {
+        let n = match reader.read(&mut chunk) {
+            Ok(0) => return Ok(()),
+            Ok(n) => n,
+            Err(e) => return Err(RewordError::Malformed(format!("reading the stream: {e}"))),
+        };
+        consumed += n as u64;
+        if consumed > BODY_LIMIT {
+            return Err(RewordError::Malformed(format!(
+                "the streamed body exceeded {BODY_LIMIT} bytes"
+            )));
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        // SSE frames are newline-delimited; a partial trailing line stays in
+        // the buffer until the rest of it arrives.
+        while let Some(nl) = buf.iter().position(|b| *b == b'\n') {
+            let line: Vec<u8> = buf.drain(..=nl).collect();
+            let line = String::from_utf8_lossy(&line);
+            let Some(data) = line.trim().strip_prefix("data:") else {
+                continue;
+            };
+            let data = data.trim();
+            if data == "[DONE]" {
+                return Ok(());
+            }
+            let frame: StreamFrame = serde_json::from_str(data).unwrap_or_default();
+            for choice in &frame.choices {
+                if let Some(text) = &choice.delta.content {
+                    if !text.is_empty() && !on_delta(text) {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl Rewriter for HttpRewriter {
     fn reword(&self, text: &str) -> Result<String, RewordError> {
         let request = build_request(&self.cfg, self.key.as_deref(), text);
@@ -894,6 +981,57 @@ impl Rewriter for HttpRewriter {
             &self.cfg.model,
             &self.host,
         )
+    }
+
+    fn reword_stream(
+        &self,
+        text: &str,
+        emit: &mut dyn FnMut(&str) -> bool,
+    ) -> Result<(), RewordError> {
+        let request = build_request_in(&self.cfg, self.key.as_deref(), text, true);
+        let ceiling = http_ceiling(&self.cfg);
+        let mut call = agent()
+            .post(&request.url)
+            .config()
+            .timeout_global(Some(ceiling))
+            .build()
+            .header("content-type", "application/json");
+        if let Some(auth) = &request.authorization {
+            call = call.header("authorization", auth);
+        }
+        let response = match call.send_json(&request.body) {
+            Ok(r) => r,
+            Err(ureq::Error::Timeout(_)) => return Err(RewordError::Ceiling),
+            Err(e) => return Err(unreachable_from(&e.to_string(), &request.url)),
+        };
+        let status = response.status().as_u16();
+        // A non-2xx never streams: it is one ordinary JSON body saying what
+        // went wrong, and `parse_response` is what turns it into the right
+        // variant -- the auth row, the model row, the rate-limit row. Read
+        // it whole and hand it there rather than looking for `data:` lines
+        // that will never come.
+        if !(200..300).contains(&status) {
+            let retry_after = response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            let body = response
+                .into_body()
+                .with_config()
+                .limit(BODY_LIMIT)
+                .read_to_vec()
+                .unwrap_or_default();
+            return parse_response(
+                status,
+                retry_after.as_deref(),
+                &body,
+                &self.cfg.model,
+                &self.host,
+            )
+            .map(|_| ());
+        }
+        read_stream(response.into_body().into_reader(), emit)
     }
 }
 

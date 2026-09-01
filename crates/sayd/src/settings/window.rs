@@ -1557,6 +1557,22 @@ pub fn reword_group(b: &Build) -> adw::PreferencesGroup {
     });
     group.add(&request_deadline.row);
 
+    // --- Stream an explicit --reword --------------------------------------
+    let stream = adw::SwitchRow::builder()
+        .title("Speak --reword as it is written")
+        .subtitle("Starts sooner; the answer can no longer be checked before it is spoken")
+        .use_markup(false)
+        .active(cfg.reword.stream)
+        .build();
+    let r = stream.clone();
+    ui.row(move |_, cfg| r.set_active(cfg.reword.stream));
+    let u = ui.downgrade();
+    stream.connect_active_notify(move |row| {
+        let on = row.is_active();
+        u.on_user_change(|u| u.apply(|c| c.reword.stream = on));
+    });
+    group.add(&stream);
+
     // --- Longest requested text to rewrite -------------------------------
     // Its own row beside the one above rather than a shared number: the two
     // ceilings answer different questions and the ranges do not overlap

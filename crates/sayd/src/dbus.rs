@@ -18,7 +18,7 @@ use zbus::zvariant::{OwnedValue, Str};
 
 use crate::config_watch::{persist_in_background, ConfigStore};
 use crate::pipeline::{self, Ask};
-use crate::reword::{Spoken, Written};
+use crate::reword::{Spoken, Streamed, Written};
 use crate::selection;
 
 pub struct SaydIface {
@@ -136,11 +136,11 @@ impl SaydIface {
             .map_err(|e| fdo::Error::Failed(format!("{what} read panicked: {e}")))?
             .map_err(fdo::Error::Failed)?;
         let mut held = None;
-        let spoken = pipeline::prepare(Written(text), Self::ask(&mut held, &self.store, opts))
+        let streamed = pipeline::prepare(Written(text), Self::ask(&mut held, &self.store, opts))
             .map_err(|too_long| fdo::Error::Failed(too_long.message()))?
-            .resolve()
+            .resolve_streaming()
             .await;
-        self.submit_spoken(spoken, say_opts_from(opts, QueueSource::Hotkey))
+        self.submit_streamed(streamed, say_opts_from(opts, QueueSource::Hotkey))
             .await
     }
 
@@ -172,6 +172,48 @@ impl SaydIface {
             }
             ok => ok,
         }
+    }
+
+    /// Submit a streamed answer: the first sentence inline, the rest behind
+    /// it on a task of its own.
+    ///
+    /// The returned id is the *first* utterance's, which is the one this
+    /// call queued and the only one it can honestly name. That is also what
+    /// makes the method worth having a streaming path at all -- it returns
+    /// as soon as one sentence is queued, rather than after the whole answer
+    /// is written.
+    ///
+    /// Every sentence after the first is `Policy::Enqueue` whatever the
+    /// caller asked for: `Interrupt` or `Replace` applies to *this*
+    /// submission against what was already playing, and repeating it per
+    /// sentence would have the answer continuously interrupt itself.
+    ///
+    /// No fallback is carried. By construction there is none -- `Streamed`
+    /// only reaches this arm once a sentence has been spoken.
+    async fn submit_streamed(&self, streamed: Streamed, opts: SayOpts) -> fdo::Result<u32> {
+        let (first, mut rest) = match streamed {
+            Streamed::AsWritten(spoken) => return self.submit_spoken(spoken, opts).await,
+            Streamed::Committed { first, rest } => (first, rest),
+        };
+        let id = self.submit(first, opts.clone()).await?;
+        let engine = self.engine.clone();
+        let follow = SayOpts {
+            policy: Some(Policy::Enqueue),
+            ..opts
+        };
+        tokio::spawn(async move {
+            while let Some(sentence) = rest.next().await {
+                let engine = engine.clone();
+                let follow = follow.clone();
+                if tokio::task::spawn_blocking(move || engine.submit(sentence, follow))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        Ok(id)
     }
 
     /// Shared body of `Say`, `SaySelection` and `SayClipboard`.
@@ -254,11 +296,11 @@ impl SaydIface {
     /// that id in practice either.
     async fn say(&self, text: String, opts: HashMap<String, OwnedValue>) -> fdo::Result<u32> {
         let mut held = None;
-        let spoken = pipeline::prepare(Written(text), Self::ask(&mut held, &self.store, &opts))
+        let streamed = pipeline::prepare(Written(text), Self::ask(&mut held, &self.store, &opts))
             .map_err(|too_long| fdo::Error::Failed(too_long.message()))?
-            .resolve()
+            .resolve_streaming()
             .await;
-        self.submit_spoken(spoken, say_opts_from(&opts, QueueSource::DBus))
+        self.submit_streamed(streamed, say_opts_from(&opts, QueueSource::DBus))
             .await
     }
 
@@ -711,8 +753,11 @@ mod tests {
             SaydIface::ask(&mut held, &i.store, &opts),
         )
         .expect("well under the limit")
-        .resolve()
+        .resolve_streaming()
         .await;
+        let Streamed::AsWritten(spoken) = spoken else {
+            panic!("an unusable endpoint cannot commit a stream");
+        };
 
         assert_eq!(
             i.store.stamp_reads(),

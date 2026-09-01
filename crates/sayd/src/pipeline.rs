@@ -31,7 +31,7 @@
 
 use sayd_core::config::Config;
 
-use crate::reword::{Origin, RewordPlan, Spoken};
+use crate::reword::{Origin, RewordPlan, Spoken, Streamed};
 
 /// Whether this submission wants a rewrite, and on whose authority.
 ///
@@ -99,16 +99,24 @@ pub enum Prepared {
     /// there is no provider to admit one.
     Ready(Spoken),
     /// Admitted. Resolve it inline, or on a task, as the caller prefers.
-    Pending(RewordPlan),
+    ///
+    /// Boxed because `RewordPlan` owns a whole `RewordConfig`, which would
+    /// otherwise make every `Ready` -- the common case, and the one that
+    /// pays nothing by design -- as large as the rarest one.
+    Pending(Box<RewordPlan>),
 }
 
 impl Prepared {
     /// Resolve inline. The right choice where the caller is already the
     /// thing waiting -- a D-Bus method whose reply is the answer.
-    pub async fn resolve(self) -> Spoken {
+    /// Resolve as a stream. Whether anything actually streams is the plan's
+    /// decision, taken at admission from `[reword] stream` and the ask --
+    /// see `RewordPlan::resolve_streaming`. Text nothing admitted comes back
+    /// as [`Streamed::AsWritten`], exactly as it comes back from `resolve`.
+    pub async fn resolve_streaming(self) -> Streamed {
         match self {
-            Prepared::Ready(spoken) => spoken,
-            Prepared::Pending(plan) => plan.resolve().await,
+            Prepared::Ready(spoken) => Streamed::AsWritten(spoken),
+            Prepared::Pending(plan) => plan.resolve_streaming().await,
         }
     }
 }
@@ -155,7 +163,7 @@ pub fn prepare(text: impl Into<Origin>, ask: Ask<'_>) -> Result<Prepared, TooLon
     };
 
     Ok(match admitted {
-        Ok(plan) => Prepared::Pending(plan),
+        Ok(plan) => Prepared::Pending(Box::new(plan)),
         // Not a failure: "this text is not being reworded, here it is back",
         // untouched, for `Engine::submit` to clean.
         Err(text) => Prepared::Ready(Spoken::as_written(text)),

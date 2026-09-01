@@ -374,6 +374,28 @@ pub enum RewordError {
 /// the announcement is cost it a rewrite.
 pub trait Rewriter: Send + Sync {
     fn reword(&self, text: &str) -> Result<String, RewordError>;
+
+    /// Rewrite `text`, handing back each completed sentence as it arrives.
+    ///
+    /// `emit` returns `false` when the consumer has stopped listening --
+    /// the receiver was dropped, a stall deadline fired, the byte cap was
+    /// reached -- and an implementation must return promptly when it does,
+    /// because that is the only way a streamed request is ever cancelled.
+    ///
+    /// The default implementation is not a stub: it calls [`Rewriter::reword`]
+    /// and emits the answer whole. That is exactly right for any rewriter
+    /// with no wire to stream over -- every test double in this module, and
+    /// the settings window's Test row -- and it means "streaming" degrades
+    /// to today's behaviour rather than to nothing.
+    fn reword_stream(
+        &self,
+        text: &str,
+        emit: &mut dyn FnMut(&str) -> bool,
+    ) -> Result<(), RewordError> {
+        let whole = self.reword(text)?;
+        emit(&whole);
+        Ok(())
+    }
 }
 
 /// What one bounded attempt produced.
@@ -1140,6 +1162,129 @@ impl Spoken {
     }
 }
 
+/// How long a committed stream may go silent before this daemon stops
+/// waiting for the rest of it.
+///
+/// Streaming removes the one deadline that used to catch a provider going
+/// quiet: past the first sentence there is no budget left to fire, so a
+/// server that accepts the request and then stalls would leave speech
+/// stopped mid-answer with nothing timing it. This is that bound put back.
+/// Generous, because between sentences a slow local model legitimately
+/// thinks: measured decode is ~20 tok/s, so a long sentence is a couple of
+/// seconds and this is an order of magnitude above it.
+const REWORD_STREAM_STALL: Duration = Duration::from_secs(20);
+
+/// Cut a growing string into sentences.
+///
+/// Fed each delta as it arrives; hands back every sentence that is
+/// *complete*, keeping the partial tail for the next call. Sentence-final
+/// punctuation followed by whitespace is the boundary, which is the same
+/// rule `sayd_core::chunk` uses -- but that function needs the whole text
+/// and this one cannot have it.
+///
+/// [`SentenceSplitter::MAX_RUN`] is the escape hatch, and it is not
+/// theoretical: a model that answers in one long clause with no full stop
+/// would otherwise buffer its entire answer and stream nothing, which is
+/// the failure this whole path exists to avoid.
+#[derive(Default)]
+struct SentenceSplitter {
+    buf: String,
+}
+
+impl SentenceSplitter {
+    /// Past this many characters with no boundary in sight, break at the
+    /// last space rather than keep buffering.
+    const MAX_RUN: usize = 320;
+
+    fn push(&mut self, delta: &str) -> Vec<String> {
+        self.buf.push_str(delta);
+        let mut out = Vec::new();
+        while let Some(cut) = self.boundary() {
+            let rest = self.buf.split_off(cut);
+            let done = std::mem::replace(&mut self.buf, rest);
+            let done = done.trim().to_string();
+            if !done.is_empty() {
+                out.push(done);
+            }
+        }
+        out
+    }
+
+    /// The byte index just past the end of the first complete sentence.
+    fn boundary(&self) -> Option<usize> {
+        let b = self.buf.as_bytes();
+        for (i, c) in self.buf.char_indices() {
+            if matches!(c, '.' | '!' | '?') {
+                // A boundary only when whitespace follows: `3.5` and
+                // `reword.rs` are not the ends of sentences.
+                let next = i + c.len_utf8();
+                if next < b.len() && (b[next] as char).is_whitespace() {
+                    return Some(next);
+                }
+            }
+        }
+        if self.buf.chars().count() > Self::MAX_RUN {
+            return self.buf.rfind(char::is_whitespace).map(|i| i + 1);
+        }
+        None
+    }
+
+    /// Whatever is left when the stream ends.
+    fn finish(&mut self) -> Option<String> {
+        let tail = std::mem::take(&mut self.buf).trim().to_string();
+        (!tail.is_empty()).then_some(tail)
+    }
+}
+
+/// The rest of a committed stream, with the stall deadline applied.
+///
+/// A type rather than a bare `Receiver` so [`REWORD_STREAM_STALL`] cannot
+/// be forgotten by a call site: there is no way to take the next sentence
+/// without it.
+pub struct SentenceStream {
+    rx: tokio::sync::mpsc::Receiver<String>,
+}
+
+impl SentenceStream {
+    /// The next sentence, or `None` when the answer is complete, the
+    /// provider stalled, or the job failed. All three end the same way --
+    /// nothing more is spoken -- because past the first sentence there is
+    /// no fallback left to take.
+    pub async fn next(&mut self) -> Option<String> {
+        match tokio::time::timeout(REWORD_STREAM_STALL, self.rx.recv()).await {
+            Ok(next) => next,
+            Err(_) => {
+                eprintln!(
+                    "warning: reword: the provider went quiet for {}s mid-answer; \
+                     the rest of it will not be spoken",
+                    REWORD_STREAM_STALL.as_secs()
+                );
+                None
+            }
+        }
+    }
+}
+
+/// What a streamed rewrite produced.
+pub enum Streamed {
+    /// Nothing was committed: speak this. Every pre-commit failure lands
+    /// here -- no permit, the deadline, a refusal, a provider that answered
+    /// nothing at all -- which is what keeps the feature's promise intact
+    /// right up to the first syllable.
+    ///
+    /// Carries a [`Spoken`] rather than a `String` so it keeps
+    /// [`Spoken::fallback`]: a whole-answer rewrite that the guard accepted
+    /// and the engine then refuses must still be spoken as written, and a
+    /// `String` here silently dropped that retry.
+    AsWritten(Spoken),
+    /// The first sentence arrived inside the budget. **From here the
+    /// original is unreachable**: it has been spoken.
+    Committed {
+        first: String,
+        rest: SentenceStream,
+    },
+}
+
 /// The text to speak: the rewrite if one arrived in time and passed the
 /// guard, the original otherwise.
 ///
@@ -1399,6 +1544,10 @@ pub struct RewordPlan {
     /// deadline, silently undoing the split the moment the two numbers
     /// differ.
     budget: Duration,
+    /// Whether [`RewordPlan::resolve_streaming`] will actually stream, decided
+    /// at admission from the config and the ask. `false` makes that method
+    /// behave exactly like [`RewordPlan::resolve`], guard and all.
+    stream: bool,
 }
 
 impl RewordPlan {
@@ -1529,6 +1678,8 @@ impl RewordPlan {
             text: cleaned,
             original: text,
             budget: ceiling.budget(cfg),
+            // Only an explicit ask ever streams; see `RewordConfig::stream`.
+            stream: cfg.stream && ceiling == Ceiling::Requested,
             cfg: cfg.clone(),
         })
     }
@@ -1541,6 +1692,110 @@ impl RewordPlan {
     /// Holds no `EngineHandle` and returns a [`Spoken`]: the caller submits,
     /// so a rewrite that lands past the deadline is dropped rather than
     /// spoken second. Do not add a submit callback to this signature.
+    /// [`RewordPlan::resolve`]'s streaming twin: speak the answer sentence by
+    /// sentence as it is written.
+    ///
+    /// **The deadline is on the first sentence only, and that is the whole
+    /// design.** Until one arrives nothing has been spoken and every failure
+    /// still ends in [`Streamed::AsWritten`] -- the same promise `resolve`
+    /// keeps. Once one has, the original is gone and the rest of the answer
+    /// is spoken unjudged; [`SentenceStream`] carries the only bound left,
+    /// which is the stall deadline.
+    ///
+    /// `sayd_core::reword::check` is **not** applied. It cannot be: it
+    /// measures a whole answer against the text that produced it, and two of
+    /// its three rules -- the length ceiling and the one-line rule -- have no
+    /// meaning for a prefix. The code-fence rule does survive per sentence
+    /// and is applied below, because a fence is the one rejection that is
+    /// still true of a fragment. Everything `Engine::submit` cleans is still
+    /// cleaned, per sentence, so paths and URLs are scrubbed as they always
+    /// were.
+    ///
+    /// Falls back to `resolve` when this plan was not admitted for
+    /// streaming, so a caller may always use this and get whichever
+    /// behaviour the config asked for.
+    pub async fn resolve_streaming(self) -> Streamed {
+        if !self.stream {
+            return Streamed::AsWritten(self.resolve().await);
+        }
+        let RewordPlan {
+            rewriter,
+            state,
+            text,
+            original,
+            cfg,
+            budget,
+            ..
+        } = self;
+
+        let Some(permit) = state.try_permit() else {
+            state.record(&cfg, &Attempt::Busy, Instant::now());
+            return Streamed::AsWritten(Spoken::as_written(original));
+        };
+        state.note_endpoint(&cfg);
+
+        // Bounded, and small on purpose: back-pressure onto the blocking
+        // thread is what stops a fast provider from queueing an entire
+        // answer's worth of utterances ahead of a synthesiser that is still
+        // speaking the first one.
+        let (tx, rx) = tokio::sync::mpsc::channel::<String>(4);
+        let job_state = state.clone();
+        let job_cfg = cfg.clone();
+        std::thread::spawn(move || {
+            let _permit = permit;
+            let mut split = SentenceSplitter::default();
+            let send = |sentence: String| -> bool {
+                // A fence is the one rule from `check` that is still true of
+                // a fragment, so it is the one still enforced. Dropped
+                // rather than refused: refusing means speaking the original,
+                // and by here the original may already be half-spoken.
+                if sentence.contains("```") {
+                    debug(format_args!("reword: dropped a streamed sentence carrying a code fence"));
+                    return true;
+                }
+                tx.blocking_send(sentence).is_ok()
+            };
+            let outcome = rewriter.reword_stream(&text, &mut |delta| {
+                for sentence in split.push(delta) {
+                    if !send(sentence) {
+                        return false;
+                    }
+                }
+                true
+            });
+            if outcome.is_ok() {
+                if let Some(tail) = split.finish() {
+                    send(tail);
+                }
+            }
+            // The breaker still learns what happened, exactly as `attempt`
+            // makes it learn, and from the job rather than the caller: past
+            // the first sentence the caller has already returned.
+            job_state.record(
+                &job_cfg,
+                &Attempt::Answered(outcome.map(|()| String::new())),
+                Instant::now(),
+            );
+        });
+
+        let mut rx = rx;
+        match tokio::time::timeout(budget, rx.recv()).await {
+            Ok(Some(first)) => Streamed::Committed {
+                first,
+                rest: SentenceStream { rx },
+            },
+            // The provider answered nothing usable, or the job failed. Not
+            // committed, so the original is still reachable.
+            Ok(None) => Streamed::AsWritten(Spoken::as_written(original)),
+            // The deadline. `rx` drops here, which is what tells the
+            // blocking thread to stop on its next send.
+            Err(_) => {
+                state.record(&cfg, &Attempt::Deadline, Instant::now());
+                Streamed::AsWritten(Spoken::as_written(original))
+            }
+        }
+    }
+
     pub async fn resolve(self) -> Spoken {
         reword_or_original(
             self.text,
@@ -2949,6 +3204,164 @@ mod tests {
         assert!(
             http_ceiling(&c) > Duration::from_millis(c.request_timeout_ms),
             "the client ceiling must outlast the longest deadline it serves"
+        );
+    }
+
+    /// The splitter cuts on sentence-final punctuation *followed by
+    /// whitespace*, keeps the partial tail, and never treats a decimal
+    /// point or a file extension as the end of a sentence.
+    #[test]
+    fn the_splitter_emits_whole_sentences_and_keeps_the_tail() {
+        let mut sp = SentenceSplitter::default();
+        assert!(sp.push("The bug was ").is_empty(), "no boundary yet");
+        assert_eq!(
+            sp.push("in the reword module. It caused"),
+            vec!["The bug was in the reword module."],
+            "one complete sentence, and the tail is held back"
+        );
+        assert_eq!(sp.finish().as_deref(), Some("It caused"));
+
+        // Deltas arrive mid-word; a boundary must not be invented at one.
+        let mut sp = SentenceSplitter::default();
+        assert!(sp.push("Version 3.5 of reword.rs").is_empty(),
+            "`3.5` and `reword.rs` are not sentence ends");
+        assert_eq!(sp.push(" is fine. Next"), vec!["Version 3.5 of reword.rs is fine."]);
+
+        // Two at once, from a single delta.
+        let mut sp = SentenceSplitter::default();
+        assert_eq!(sp.push("One. Two! Three"), vec!["One.", "Two!"]);
+        assert_eq!(sp.finish().as_deref(), Some("Three"));
+
+        // An answer with no punctuation at all still streams rather than
+        // buffering to the end -- the case MAX_RUN exists for.
+        let mut sp = SentenceSplitter::default();
+        let long = "word ".repeat(100);
+        assert!(!sp.push(&long).is_empty(), "a run past MAX_RUN must break");
+    }
+
+    /// A rewriter that hands its answer over in pieces, so the streaming
+    /// path can be driven without a socket.
+    struct Pieces(Vec<&'static str>);
+    impl Rewriter for Pieces {
+        fn reword(&self, _text: &str) -> Result<String, RewordError> {
+            Ok(self.0.concat())
+        }
+        fn reword_stream(
+            &self,
+            _text: &str,
+            emit: &mut dyn FnMut(&str) -> bool,
+        ) -> Result<(), RewordError> {
+            for p in &self.0 {
+                if !emit(p) {
+                    return Ok(());
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// The whole point, end to end: the first sentence is committed and the
+    /// rest follow, in order.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stream_commits_the_first_sentence_and_then_the_rest() {
+        let mut c = cfg();
+        c.stream = true;
+        let plan = RewordPlan::admit_with(
+            "Alice: where do you want to go for dinner".to_string(),
+            &c,
+            &CleanupConfig::default(),
+            Ceiling::Requested,
+            Arc::new(Pieces(vec!["First one. ", "Second one. ", "Third one."])) as Arc<dyn Rewriter>,
+            RewordState::new(),
+        )
+        .expect("admitted");
+
+        let Streamed::Committed { first, mut rest } = plan.resolve_streaming().await else {
+            panic!("a stream that answers must commit");
+        };
+        assert_eq!(first, "First one.");
+        let mut got = vec![first];
+        while let Some(s) = rest.next().await {
+            got.push(s);
+        }
+        assert_eq!(got, ["First one.", "Second one.", "Third one."]);
+    }
+
+    /// `stream = false` is not a different code path for the caller: the
+    /// same method still answers, with the whole answer, guard and all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn streaming_off_resolves_whole_through_the_same_method() {
+        let plan = RewordPlan::admit_with(
+            "Alice: where do you want to go for dinner".to_string(),
+            &cfg(),
+            &CleanupConfig::default(),
+            Ceiling::Requested,
+            Stub::new(vec![Ok("Alice is asking about dinner".into())]) as Arc<dyn Rewriter>,
+            RewordState::new(),
+        )
+        .expect("admitted");
+        match plan.resolve_streaming().await {
+            Streamed::AsWritten(spoken) => {
+                assert_eq!(spoken.text, "Alice is asking about dinner");
+                assert!(
+                    spoken.fallback.is_some(),
+                    "the whole-answer path must keep its fallback through this method"
+                );
+            }
+            Streamed::Committed { .. } => panic!("`stream = false` must not commit a stream"),
+        }
+    }
+
+    /// A notification never streams, however the config is set: it is one
+    /// sentence, and fragmenting it into several utterances would cost the
+    /// ordering the notification path exists to keep.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_notification_never_streams() {
+        let mut c = cfg();
+        c.stream = true;
+        let plan = RewordPlan::admit_with(
+            "Alice: where do you want to go for dinner".to_string(),
+            &c,
+            &CleanupConfig::default(),
+            Ceiling::Notification,
+            Arc::new(Pieces(vec!["First one. ", "Second one."])) as Arc<dyn Rewriter>,
+            RewordState::new(),
+        )
+        .expect("admitted");
+        assert!(
+            matches!(plan.resolve_streaming().await, Streamed::AsWritten(_)),
+            "the notification ceiling must not stream"
+        );
+    }
+
+    /// A code fence is the one rule from `check` still true of a fragment,
+    /// so it is the one still enforced -- and the sentence carrying it is
+    /// dropped rather than spoken, because by then the original is gone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_streamed_code_fence_is_dropped_not_spoken() {
+        let mut c = cfg();
+        c.stream = true;
+        let plan = RewordPlan::admit_with(
+            "Alice: where do you want to go for dinner".to_string(),
+            &c,
+            &CleanupConfig::default(),
+            Ceiling::Requested,
+            Arc::new(Pieces(vec!["Good one. ", "```rust fn x() {}``` bad. ", "Fine again."]))
+                as Arc<dyn Rewriter>,
+            RewordState::new(),
+        )
+        .expect("admitted");
+        let Streamed::Committed { first, mut rest } = plan.resolve_streaming().await else {
+            panic!("must commit");
+        };
+        let mut got = vec![first];
+        while let Some(s) = rest.next().await {
+            got.push(s);
+        }
+        assert_eq!(
+            got,
+            ["Good one.", "Fine again."],
+            "the fenced sentence must not be spoken"
         );
     }
 
