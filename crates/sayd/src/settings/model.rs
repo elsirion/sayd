@@ -1711,7 +1711,7 @@ fn run_reword_test(cfg: &RewordConfig, text: String, factory: &RewriterFn) -> Te
     // could disagree with a notification landing between them.
     let first = state.note_endpoint(cfg);
     let started = std::time::Instant::now();
-    let answer = rewriter.reword(&text);
+    let answer = rewriter.reword(cfg.notification_prompt(), &text);
     let elapsed = started.elapsed();
 
     let deadline = Duration::from_millis(cfg.timeout_ms);
@@ -3797,7 +3797,7 @@ mod tests {
     }
 
     impl Rewriter for Canned {
-        fn reword(&self, _text: &str) -> Result<String, RewordError> {
+        fn reword(&self, _prompt: &str, _text: &str) -> Result<String, RewordError> {
             if !self.1.is_zero() {
                 std::thread::sleep(self.1);
             }
@@ -4501,7 +4501,7 @@ mod tests {
 
         struct Watching(Arc<Mutex<bool>>);
         impl Rewriter for Watching {
-            fn reword(&self, _text: &str) -> Result<String, RewordError> {
+            fn reword(&self, _prompt: &str, _text: &str) -> Result<String, RewordError> {
                 *lock(&self.0) = true;
                 Ok("Ping".into())
             }

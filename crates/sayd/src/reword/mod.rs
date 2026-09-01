@@ -373,7 +373,11 @@ pub enum RewordError {
 /// [`RewordError::Malformed`], so the worst a provider's response can do to
 /// the announcement is cost it a rewrite.
 pub trait Rewriter: Send + Sync {
-    fn reword(&self, text: &str) -> Result<String, RewordError>;
+    /// `prompt` is the system instruction, resolved by the caller from the
+    /// config and the ask -- see `RewordConfig::notification_prompt`. Passed
+    /// per request rather than held by the rewriter because one cached
+    /// client serves both asks, and they no longer send the same one.
+    fn reword(&self, prompt: &str, text: &str) -> Result<String, RewordError>;
 
     /// Rewrite `text`, handing back each completed sentence as it arrives.
     ///
@@ -389,10 +393,11 @@ pub trait Rewriter: Send + Sync {
     /// to today's behaviour rather than to nothing.
     fn reword_stream(
         &self,
+        prompt: &str,
         text: &str,
         emit: &mut dyn FnMut(&str) -> bool,
     ) -> Result<(), RewordError> {
-        let whole = self.reword(text)?;
+        let whole = self.reword(prompt, text)?;
         emit(&whole);
         Ok(())
     }
@@ -436,6 +441,7 @@ async fn attempt(
     rewriter: Arc<dyn Rewriter>,
     state: Arc<RewordState>,
     cfg: &RewordConfig,
+    prompt: String,
     text: String,
     budget: Duration,
 ) -> (Attempt, Duration) {
@@ -458,7 +464,7 @@ async fn attempt(
         // lives to the end of this closure, so the permit is released when
         // the *job* finishes -- not when the deadline below fires.
         let _permit = permit;
-        let outcome = Attempt::Answered(rewriter.reword(&text));
+        let outcome = Attempt::Answered(rewriter.reword(&prompt, &text));
         // Folded in here rather than by the caller, and this is the whole
         // of the Ceiling fix: past the deadline the caller is gone and this
         // outcome would otherwise die with the abandoned `JoinHandle`. The
@@ -1098,6 +1104,16 @@ impl Ceiling {
             Ceiling::Requested => cfg.request_timeout_ms,
         })
     }
+
+    /// The instruction this ask sends. The third thing that follows the ask
+    /// rather than the text, and the one with the sharpest evidence behind
+    /// it -- see `sayd_core::reword::REQUEST_PROMPT`.
+    fn prompt(self, cfg: &RewordConfig) -> &str {
+        match self {
+            Ceiling::Notification => cfg.notification_prompt(),
+            Ceiling::Requested => cfg.request_prompt(),
+        }
+    }
 }
 
 /// Will this text be reworded at all? Decided synchronously and cheaply,
@@ -1305,6 +1321,7 @@ async fn reword_or_original(
     sent: String,
     original: String,
     cfg: &RewordConfig,
+    prompt: String,
     budget: Duration,
     rewriter: Arc<dyn Rewriter>,
     state: Arc<RewordState>,
@@ -1312,7 +1329,7 @@ async fn reword_or_original(
     // No `record` here: `attempt` owns it end to end, because the outcome
     // of an attempt that outlived its deadline is only reachable from
     // inside the job. Recording here as well would count it twice.
-    let (outcome, _elapsed) = attempt(rewriter, state, cfg, sent.clone(), budget).await;
+    let (outcome, _elapsed) = attempt(rewriter, state, cfg, prompt, sent.clone(), budget).await;
     let Attempt::Answered(Ok(candidate)) = outcome else {
         return Spoken::as_written(original);
     };
@@ -1548,6 +1565,11 @@ pub struct RewordPlan {
     /// at admission from the config and the ask. `false` makes that method
     /// behave exactly like [`RewordPlan::resolve`], guard and all.
     stream: bool,
+    /// The instruction this ask sends, resolved at admission from the config
+    /// and the [`Ceiling`] for the same reason [`RewordPlan::budget`] is:
+    /// the plan answers to the ask that minted it, and one cached client
+    /// serves both.
+    prompt: String,
 }
 
 impl RewordPlan {
@@ -1678,6 +1700,7 @@ impl RewordPlan {
             text: cleaned,
             original: text,
             budget: ceiling.budget(cfg),
+            prompt: ceiling.prompt(cfg).to_string(),
             // Only an explicit ask ever streams; see `RewordConfig::stream`.
             stream: cfg.stream && ceiling == Ceiling::Requested,
             cfg: cfg.clone(),
@@ -1725,6 +1748,7 @@ impl RewordPlan {
             original,
             cfg,
             budget,
+            prompt,
             ..
         } = self;
 
@@ -1755,7 +1779,7 @@ impl RewordPlan {
                 }
                 tx.blocking_send(sentence).is_ok()
             };
-            let outcome = rewriter.reword_stream(&text, &mut |delta| {
+            let outcome = rewriter.reword_stream(&prompt, &text, &mut |delta| {
                 for sentence in split.push(delta) {
                     if !send(sentence) {
                         return false;
@@ -1801,6 +1825,7 @@ impl RewordPlan {
             self.text,
             self.original,
             &self.cfg,
+            self.prompt,
             self.budget,
             self.rewriter,
             self.state,
@@ -1943,6 +1968,7 @@ pub fn build_rewriter(cfg: &RewordConfig) -> Result<Arc<dyn Rewriter>, RewordErr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sayd_core::reword::NOTIFICATION_PROMPT;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// The invariant every other bound in this module now hangs off: **the
@@ -2012,7 +2038,7 @@ mod tests {
     }
 
     impl Rewriter for Stub {
-        fn reword(&self, text: &str) -> Result<String, RewordError> {
+        fn reword(&self, _prompt: &str, text: &str) -> Result<String, RewordError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             lock(&self.seen).push(text.to_string());
             if !self.sleep.is_zero() {
@@ -2042,7 +2068,7 @@ mod tests {
         text: String,
         budget: Duration,
     ) -> tokio::task::JoinHandle<(Attempt, Duration)> {
-        tokio::spawn(async move { attempt(rewriter, state, &cfg(), text, budget).await })
+        tokio::spawn(async move { attempt(rewriter, state, &cfg(), NOTIFICATION_PROMPT.to_string(), text, budget).await })
     }
 
     /// Wait for every permit to come back, which is also the point at which
@@ -2074,6 +2100,7 @@ mod tests {
             original.clone(),
             original.clone(),
             &cfg(),
+            NOTIFICATION_PROMPT.to_string(),
             Duration::from_millis(cfg().timeout_ms),
             stub.clone() as Arc<dyn Rewriter>,
             state.clone(),
@@ -2112,6 +2139,7 @@ mod tests {
             stub as Arc<dyn Rewriter>,
             state.clone(),
             &cfg(),
+            NOTIFICATION_PROMPT.to_string(),
             "Alice: where do you want to go for dinner".into(),
             Duration::from_millis(50),
         )
@@ -2165,6 +2193,7 @@ mod tests {
             stub.clone() as Arc<dyn Rewriter>,
             state.clone(),
             &cfg(),
+            NOTIFICATION_PROMPT.to_string(),
             text.clone(),
             Duration::from_millis(900),
         )
@@ -2215,6 +2244,7 @@ mod tests {
                 stub.clone() as Arc<dyn Rewriter>,
                 state.clone(),
                 &cfg,
+                NOTIFICATION_PROMPT.to_string(),
                 "Alice: where do you want to go for dinner".into(),
                 Duration::from_millis(20),
             )
@@ -3243,11 +3273,12 @@ mod tests {
     /// path can be driven without a socket.
     struct Pieces(Vec<&'static str>);
     impl Rewriter for Pieces {
-        fn reword(&self, _text: &str) -> Result<String, RewordError> {
+        fn reword(&self, _prompt: &str, _text: &str) -> Result<String, RewordError> {
             Ok(self.0.concat())
         }
         fn reword_stream(
             &self,
+            _prompt: &str,
             _text: &str,
             emit: &mut dyn FnMut(&str) -> bool,
         ) -> Result<(), RewordError> {
@@ -3405,6 +3436,7 @@ mod tests {
                 original.clone(),
                 original.clone(),
                 &cfg(),
+                NOTIFICATION_PROMPT.to_string(),
                 Duration::from_millis(cfg().timeout_ms),
                 good as Arc<dyn Rewriter>,
                 state.clone()
@@ -3424,6 +3456,7 @@ mod tests {
                 original.clone(),
                 original.clone(),
                 &cfg(),
+                NOTIFICATION_PROMPT.to_string(),
                 Duration::from_millis(cfg().timeout_ms),
                 chatty as Arc<dyn Rewriter>,
                 RewordState::new()
@@ -3439,6 +3472,7 @@ mod tests {
                 original.clone(),
                 original.clone(),
                 &cfg(),
+                NOTIFICATION_PROMPT.to_string(),
                 Duration::from_millis(cfg().timeout_ms),
                 dead as Arc<dyn Rewriter>,
                 RewordState::new()
@@ -3576,6 +3610,7 @@ mod tests {
             stub.clone() as Arc<dyn Rewriter>,
             state.clone(),
             &unannounced,
+            NOTIFICATION_PROMPT.to_string(),
             text,
             Duration::from_millis(900),
         )
@@ -3598,7 +3633,7 @@ mod tests {
     #[test]
     fn a_stub_is_a_struct_with_a_vec() {
         let stub: Arc<dyn Rewriter> = Stub::new(vec![Ok("hello".into())]);
-        assert_eq!(stub.reword("anything").as_deref(), Ok("hello"));
+        assert_eq!(stub.reword(sayd_core::reword::NOTIFICATION_PROMPT, "anything").as_deref(), Ok("hello"));
     }
 
     /// A stub that watches itself: how many calls are inside `reword` at
@@ -3622,7 +3657,7 @@ mod tests {
     }
 
     impl Rewriter for Counted {
-        fn reword(&self, _text: &str) -> Result<String, RewordError> {
+        fn reword(&self, _prompt: &str, _text: &str) -> Result<String, RewordError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let n = self.inflight.fetch_add(1, Ordering::SeqCst) + 1;
             self.peak.fetch_max(n, Ordering::SeqCst);
@@ -3721,6 +3756,7 @@ mod tests {
                 stub.clone() as Arc<dyn Rewriter>,
                 state.clone(),
                 &cfg(),
+                NOTIFICATION_PROMPT.to_string(),
                 "Alice: where do you want to go for dinner".into(),
                 Duration::from_millis(10),
             )
@@ -3749,7 +3785,7 @@ mod tests {
             produced: Arc<Mutex<Vec<String>>>,
         }
         impl Rewriter for Late {
-            fn reword(&self, _text: &str) -> Result<String, RewordError> {
+            fn reword(&self, _prompt: &str, _text: &str) -> Result<String, RewordError> {
                 std::thread::sleep(Duration::from_millis(400));
                 let answer = "Alice is asking where you want to go for dinner".to_string();
                 lock(&self.produced).push(answer.clone());
@@ -3767,6 +3803,7 @@ mod tests {
             original.clone(),
             original.clone(),
             &cfg(),
+            NOTIFICATION_PROMPT.to_string(),
             Duration::from_millis(cfg().timeout_ms),
             rewriter as Arc<dyn Rewriter>,
             RewordState::new(),
@@ -3796,7 +3833,7 @@ mod tests {
     async fn a_panicking_rewriter_speaks_the_original_and_returns_its_permit() {
         struct Panicky;
         impl Rewriter for Panicky {
-            fn reword(&self, _text: &str) -> Result<String, RewordError> {
+            fn reword(&self, _prompt: &str, _text: &str) -> Result<String, RewordError> {
                 panic!("a client that unwrapped something a provider sent");
             }
         }
@@ -3807,6 +3844,7 @@ mod tests {
             original.clone(),
             original.clone(),
             &cfg(),
+            NOTIFICATION_PROMPT.to_string(),
             Duration::from_millis(cfg().timeout_ms),
             Arc::new(Panicky) as Arc<dyn Rewriter>,
             state.clone(),

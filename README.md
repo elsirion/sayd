@@ -456,6 +456,8 @@ the instruction produces a bad announcement, not a broken one.
     timeout_ms = 1500                        # notification deadline; at least 200, no upper bound
     request_timeout_ms = 25000               # --reword deadline; same floor, no upper bound
     stream = false                           # speak --reword sentence by sentence as it arrives
+    # prompt = "..."                         # what the model is told for a notification; unset = built-in
+    # request_prompt = "..."                 # the same for --reword; unset = built-in
     max_chars = 400                          # 32..=2000; notification announcements
     request_max_chars = 8000                 # 32..=20000; every explicit --reword
 
@@ -482,6 +484,28 @@ unrelated with it: the notification coalescing floor
 deadline set for clipboard reads would have silently turned every
 notification window into 26 seconds. With the two split, that floor answers
 only to `timeout_ms`.
+
+### The prompts
+
+Both instructions are editable, in the settings window or in the file, and
+there are two of them for the reason there are two ceilings: they are asking
+for different things. The notification prompt asks for one or two sentences
+and forbids dropping names -- correct for an announcement, and the reason it
+is wrong for a document. Measured against a 2129-character assistant answer
+it produced a 305-character headline and read a file path aloud; that leak
+is not incidental, since "names and numbers stay exactly as written"
+protects a path as firmly as it protects a person's name.
+
+The `--reword` default is the opposite instruction: name what a file
+contains rather than the file, say what code does rather than quoting it,
+four to seven sentences of flowing prose. It was the best of five wordings
+measured across seven local models -- no path, line number, backtick or
+markdown in any run.
+
+**An unedited prompt is absent from `config.toml` rather than written into
+it**, so a build that improves the shipped wording reaches you. Clearing the
+box, or resetting it, stores nothing and returns you to the default; a blank
+prompt is never sent.
 
 ### Streaming
 

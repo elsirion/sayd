@@ -19,6 +19,73 @@ pub const REWORD_MIN_CHARS: usize = 12;
 /// and is still not a sentence worth a round trip.
 pub const REWORD_MIN_WORDS: usize = 3;
 
+/// The default instruction for the notification path.
+///
+/// Moved here from the HTTP client when it became configurable: it is data
+/// the user may replace, so it belongs beside the other rules about what is
+/// worth rewriting rather than inside the thing that posts it.
+///
+/// The wording is measured, not drafted. §3 told the model to leave
+/// non-English text unchanged, which was right while the only voice was
+/// English; text arrives in another language from the people who write to
+/// this daemon's user in one, so the rule now asks for a translation
+/// instead. The label rule is worded as it is because of what a run against
+/// a real 24B local model showed: "turn labels into sentences" was never
+/// the broken part, and what kept `Mutti` was the *other* rule -- "names
+/// stay exactly as written" protects a relationship word exactly as hard as
+/// a person's name. Scoping that to **proper** names is what turns it into
+/// "Mum". The false-friend clause earns its place separately: without it
+/// `Chef:` survived as "Chef", which in English is a cook rather than a
+/// boss.
+pub const NOTIFICATION_PROMPT: &str = "\
+You rewrite short desktop notifications so a speech synthesiser can
+read them aloud. Notifications are written to be read at a glance, so
+they are terse and often not sentences.
+
+Rules:
+- Reply with the rewritten text and nothing else: no preamble, no quotes, no
+  explanation, no markdown.
+- Keep every fact. Proper names, numbers, times and places stay exactly as
+  written. Add nothing and drop nothing.
+- The text before a colon is who sent it: a name, a nickname, or what they
+  are to the listener. Make them the subject of a sentence and say what they
+  are doing. \"Alice: where do you want to go for dinner\" becomes \"Alice is
+  asking where you want to go for dinner\". \"Mutti: kommst du Sonntag?\"
+  becomes \"Mum is asking whether you are coming on Sunday\".
+- A word for someone's role or relationship is translated like any other
+  word, including when the same spelling exists in English with a different
+  meaning -- German \"Chef\" is a boss, not a cook.
+- One or two sentences at most, and no longer than the original needs.
+- Do not expand abbreviations, identifiers or names you are unsure of.
+- Always reply in English, translating if the text is in another language.
+- If the text is already a natural spoken English sentence, or you cannot
+  improve it, reply with it unchanged.";
+
+/// The default instruction for an explicit `--reword`.
+///
+/// A different job, and the reason the two are separate settings. The
+/// notification prompt asks for one or two sentences, which is right for a
+/// notification and destroys a document: measured against a 2129-character
+/// assistant answer it produced a 305-character headline *and* read a file
+/// path aloud. The path leak was not incidental -- "names and numbers stay
+/// exactly as written" protects `crates/sayd/src/reword/mod.rs` as firmly
+/// as it protects a person's name, so the notification prompt is
+/// structurally unable to drop one.
+///
+/// This wording was the best of five measured across seven local models: no
+/// path, line number, backtick or markdown leaked in any run, against a
+/// 0.30-0.41 length ratio.
+pub const REQUEST_PROMPT: &str = "\
+You turn a coding assistant's written answer into a spoken summary. A speech synthesiser reads your reply aloud to the programmer who asked the question; they are away from the screen and can only listen.
+
+Anything that only makes sense on a screen is worthless to a listener and must not appear. Never write a file path, a directory or file name, a line number, a commit hash, a URL, a shell command, a code snippet, a backtick, an asterisk, a heading, or a bullet list. Name what a file contains rather than the file. Say what a piece of code does rather than quoting it. Turn an identifier into the plain words it stands for, or leave it out if it has no natural spoken form.
+
+Keep the substance: what the problem was, what was done, why it matters, what the result was, and any caveat or open question -- the caveat is often the most useful thing to hear. Keep numbers a listener cares about, such as how many tests passed or how long something took.
+
+Write four to seven sentences of plain flowing prose, between four hundred and nine hundred characters, as one person telling another what happened. No filler openings such as \"so\" or \"basically\". Never longer than the original.
+
+Reply with the spoken summary and nothing else, in English. Do not introduce it, do not label it, do not add anything after it.";
+
 /// Why a text is spoken as written rather than rewritten.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ineligible {

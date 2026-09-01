@@ -1249,6 +1249,131 @@ fn group_description(text: &str) -> String {
 /// `true` and governs the subtitle as well as the title, and a row left on
 /// the default renders **both blank** for a value containing `&` -- which is
 /// exactly the character a URL with a query string carries.
+/// Which config field a prompt editor edits, and how to describe it.
+///
+/// A table rather than two near-identical blocks: the rows differ only in
+/// the field they reach and the words around it, and writing the widget
+/// twice is how the two drift apart.
+#[derive(Clone, Copy)]
+struct PromptSpec {
+    title: &'static str,
+    subtitle: &'static str,
+    get: fn(&Config) -> Option<&String>,
+    set: fn(&mut Config, Option<String>),
+    default: &'static str,
+}
+
+fn prompt_specs() -> [PromptSpec; 2] {
+    [
+        PromptSpec {
+            title: "Notification prompt",
+            subtitle: "What the model is told when rewriting an announcement",
+            get: |c| c.reword.prompt.as_ref(),
+            set: |c, v| c.reword.prompt = v,
+            default: sayd_core::reword::NOTIFICATION_PROMPT,
+        },
+        PromptSpec {
+            title: "--reword prompt",
+            subtitle: "What the model is told when you ask for a rewrite yourself",
+            get: |c| c.reword.request_prompt.as_ref(),
+            set: |c, v| c.reword.request_prompt = v,
+            default: sayd_core::reword::REQUEST_PROMPT,
+        },
+    ]
+}
+
+/// One expandable prompt editor: a text box, and a Reset that puts the
+/// built-in wording back.
+///
+/// Saved on focus-out rather than per keystroke. Every other row in this
+/// window writes the file as it changes, which is right for a switch and
+/// wrong for a paragraph: it would rewrite `config.toml` on every letter
+/// typed, and each write comes back through the inotify watcher.
+///
+/// Clearing the box stores `None`, not `""`. That is what makes Reset and
+/// "select all, delete" mean the same thing, and it is why the field is an
+/// `Option` -- see `RewordConfig::prompt`.
+fn prompt_row(ui: &Ui, cfg: &Config, spec: PromptSpec) -> adw::ExpanderRow {
+    let row = adw::ExpanderRow::builder()
+        .title(spec.title)
+        .subtitle(spec.subtitle)
+        .use_markup(false)
+        .build();
+
+    let view = gtk::TextView::builder()
+        .wrap_mode(gtk::WrapMode::WordChar)
+        .top_margin(8)
+        .bottom_margin(8)
+        .left_margin(8)
+        .right_margin(8)
+        .build();
+    let shown = move |c: &Config| (spec.get)(c).cloned().unwrap_or_else(|| spec.default.to_string());
+    view.buffer().set_text(&shown(cfg));
+
+    let scroll = gtk::ScrolledWindow::builder()
+        .min_content_height(220)
+        .child(&view)
+        .build();
+    scroll.add_css_class("card");
+    let holder = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    holder.set_margin_top(6);
+    holder.set_margin_bottom(6);
+    holder.set_margin_start(12);
+    holder.set_margin_end(12);
+    holder.append(&scroll);
+
+    let reset = gtk::Button::builder()
+        .label("Reset to default")
+        .halign(gtk::Align::End)
+        .build();
+    holder.append(&reset);
+    row.add_row(&holder);
+
+    // Redrawn like any other row, so a hand edit to `config.toml` shows up
+    // here -- but never while the box has focus, or the watcher would yank
+    // text out from under someone mid-sentence.
+    let v = view.clone();
+    ui.row(move |_, cfg| {
+        if !v.has_focus() {
+            let want = shown(cfg);
+            if v.buffer().text(&v.buffer().start_iter(), &v.buffer().end_iter(), false) != want {
+                v.buffer().set_text(&want);
+            }
+        }
+    });
+
+    let store = move |ui: &Ui, text: String| {
+        let trimmed = text.trim().to_string();
+        // Stored as "unset" when it is blank *or* still the shipped
+        // wording: a config that says nothing tracks an improved default,
+        // and someone who has not edited the text has not asked to own it.
+        let value = (!trimmed.is_empty() && trimmed != spec.default.trim()).then_some(trimmed);
+        ui.apply(move |c| (spec.set)(c, value.clone()));
+    };
+
+    let u = ui.downgrade();
+    let controller = gtk::EventControllerFocus::new();
+    // The *buffer*, never the view: this closure is owned by a controller
+    // owned by the view, so capturing the view would close the cycle and
+    // leak both past the window's close. `widgets_survived` in the tests
+    // below is what catches that, and it caught this.
+    let b = view.buffer();
+    controller.connect_leave(move |_| {
+        let text = b.text(&b.start_iter(), &b.end_iter(), false).to_string();
+        u.on_user_change(|ui| store(ui, text.clone()));
+    });
+    view.add_controller(controller);
+
+    let u = ui.downgrade();
+    let b = view.buffer();
+    reset.connect_clicked(move |_| {
+        b.set_text(spec.default);
+        u.on_user_change(|ui| ui.apply(|c| (spec.set)(c, None)));
+    });
+
+    row
+}
+
 pub fn reword_group(b: &Build) -> adw::PreferencesGroup {
     let (ui, cfg, engine) = (b.ui, b.cfg, b.engine.clone());
     // The description names the destination host and says where the key is
@@ -1556,6 +1681,16 @@ pub fn reword_group(b: &Build) -> adw::PreferencesGroup {
         u.on_user_change(|u| u.apply(|c| c.reword.request_timeout_ms = value));
     });
     group.add(&request_deadline.row);
+
+    // --- The two prompts --------------------------------------------------
+    // A `TextView` rather than an `EntryRow`: these are paragraphs, and
+    // libadwaita 1.4 has no multi-line row. Wrapped in an `ExpanderRow` so
+    // the group is not dominated by two text boxes a user may never open --
+    // the defaults are what most people want, and the subtitle says whether
+    // this one is still on them.
+    for spec in prompt_specs() {
+        group.add(&prompt_row(ui, cfg, spec));
+    }
 
     // --- Stream an explicit --reword --------------------------------------
     let stream = adw::SwitchRow::builder()
@@ -2269,7 +2404,7 @@ mod tests {
     ) {
         struct Canned(String, Duration, Arc<std::sync::atomic::AtomicUsize>);
         impl crate::reword::Rewriter for Canned {
-            fn reword(&self, _text: &str) -> Result<String, crate::reword::RewordError> {
+            fn reword(&self, _prompt: &str, _text: &str) -> Result<String, crate::reword::RewordError> {
                 self.2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 // On the model's own thread, never this one -- which is
                 // exactly what the "did not block" assertion below is about.

@@ -375,6 +375,35 @@ pub struct RewordConfig {
     /// sentence, so there is nothing to stream and fragmenting it into
     /// several utterances would be worse than the wait it saves.
     pub stream: bool,
+    /// The instruction sent with a notification rewrite, or `None` for
+    /// [`crate::reword::NOTIFICATION_PROMPT`].
+    ///
+    /// `Option` and `skip_serializing_if` rather than a `String` carrying
+    /// the default, for the reason [`RewordConfig::provider`] is one: the
+    /// settings window rewrites the whole file on every save, so a `String`
+    /// here would stamp today's wording into every config that has never
+    /// touched it and freeze it there. Absent means "whatever this build
+    /// ships", which is what lets an improved default reach a user who
+    /// never asked to own this text.
+    ///
+    /// Blank -- empty or whitespace -- reads as absent rather than as an
+    /// empty instruction. A user who clears the box in the settings window
+    /// means "give me the default back", and a request carrying an empty
+    /// system message is not a thing anyone wants sent on their behalf.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    /// The same for an explicit `--reword`, defaulting to
+    /// [`crate::reword::REQUEST_PROMPT`].
+    ///
+    /// Separate from [`RewordConfig::prompt`] for the reason
+    /// [`RewordConfig::request_max_chars`] is separate from `max_chars`, and
+    /// the evidence is sharper here: the notification prompt asks for one or
+    /// two sentences and forbids dropping names, which turns a document into
+    /// a headline with a file path read aloud in it. One box for both would
+    /// force a choice between announcing a Signal message well and
+    /// summarising a page of output well.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_prompt: Option<String>,
     /// Longer text is spoken as written. Clamped to 32..=2000. The default
     /// is the chunker's `target_chars`: one synthesis chunk, which is the
     /// natural unit here, and above it the submission is a document rather
@@ -445,6 +474,8 @@ impl Default for RewordConfig {
             // original being spoken.
             request_timeout_ms: 25_000,
             stream: false,
+            prompt: None,
+            request_prompt: None,
             max_chars: 400,
             // A working number rather than a measured one -- room for a
             // long tool output or a page of chat, comfortably inside the
@@ -456,6 +487,28 @@ impl Default for RewordConfig {
 }
 
 impl RewordConfig {
+    /// The instruction for a notification rewrite: the configured one, or
+    /// the built-in default when it is unset or blank.
+    ///
+    /// Blank is folded in here rather than refused at the edit, so a config
+    /// hand-edited to `prompt = ""` behaves the same as one the settings
+    /// window cleared -- both mean the default.
+    pub fn notification_prompt(&self) -> &str {
+        Self::or_default(&self.prompt, crate::reword::NOTIFICATION_PROMPT)
+    }
+
+    /// The same for an explicit `--reword`.
+    pub fn request_prompt(&self) -> &str {
+        Self::or_default(&self.request_prompt, crate::reword::REQUEST_PROMPT)
+    }
+
+    fn or_default<'a>(set: &'a Option<String>, fallback: &'a str) -> &'a str {
+        match set {
+            Some(p) if !p.trim().is_empty() => p,
+            _ => fallback,
+        }
+    }
+
     /// The configured provider, or `None` if it is unset or unrecognised.
     ///
     /// Callers may not distinguish the two by the return value on purpose:
@@ -1256,6 +1309,67 @@ mod tests {
         );
     }
 
+
+    /// An unset, blank, or whitespace-only prompt is the built-in one, and
+    /// the two asks resolve to *different* built-ins.
+    ///
+    /// Blank folding is what makes "select all, delete" in the settings
+    /// window mean the same as Reset. Without it a cleared box would send an
+    /// empty system message, which is the one configuration where the model
+    /// has been told nothing at all about what it is for.
+    #[test]
+    fn a_blank_prompt_resolves_to_the_built_in_one_for_that_ask() {
+        use crate::reword::{NOTIFICATION_PROMPT, REQUEST_PROMPT};
+        let mut c = RewordConfig::default();
+        assert_eq!(c.notification_prompt(), NOTIFICATION_PROMPT);
+        assert_eq!(c.request_prompt(), REQUEST_PROMPT);
+        assert_ne!(
+            NOTIFICATION_PROMPT, REQUEST_PROMPT,
+            "the two asks must not share one instruction; that is the point \
+             of having two"
+        );
+
+        for blank in ["", "   ", "\n\t "] {
+            c.prompt = Some(blank.to_string());
+            c.request_prompt = Some(blank.to_string());
+            assert_eq!(c.notification_prompt(), NOTIFICATION_PROMPT, "{blank:?}");
+            assert_eq!(c.request_prompt(), REQUEST_PROMPT, "{blank:?}");
+        }
+
+        c.prompt = Some("say it shorter".into());
+        assert_eq!(c.notification_prompt(), "say it shorter");
+        assert_eq!(
+            c.request_prompt(),
+            REQUEST_PROMPT,
+            "setting one must not move the other"
+        );
+    }
+
+    /// An untouched prompt is absent from the file, so a build that improves
+    /// the shipped wording reaches a user who never asked to own it.
+    #[test]
+    fn an_unset_prompt_is_not_written_to_the_file() {
+        let c = Config::default();
+        let out = toml::to_string_pretty(&c).expect("serialises");
+        assert!(
+            !out.contains("prompt"),
+            "a default config must carry no prompt key: {out}"
+        );
+
+        let mut edited = Config::default();
+        edited.reword.request_prompt = Some("summarise for the ear".into());
+        let out = toml::to_string_pretty(&edited).expect("serialises");
+        assert!(out.contains("request_prompt = \"summarise for the ear\""), "{out}");
+        assert!(
+            !out.contains("\nprompt"),
+            "and the one still on its default stays absent: {out}"
+        );
+
+        let (back, err) = Config::load_str(&out);
+        assert_eq!(err, None, "a config carrying a prompt must round-trip");
+        assert_eq!(back.reword.request_prompt.as_deref(), Some("summarise for the ear"));
+        assert_eq!(back.reword.prompt, None);
+    }
 
     /// A refusal that does not say what to type is a refusal the user has to
     /// go and read source code about.

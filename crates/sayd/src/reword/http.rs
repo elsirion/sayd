@@ -75,66 +75,6 @@ use serde::{Deserialize, Serialize};
 
 use super::{http_ceiling, RewordError, Rewriter};
 
-/// §3's prompt, with one rule since changed. One request, one system prompt,
-/// one user message containing the text. No history, no tools, no schema.
-///
-/// §3 told the model to leave non-English text unchanged, which was right
-/// while the only voice was English: a rewrite it could not speak was worse
-/// than the original. That is no longer the shape of the problem. Text
-/// arrives in another language from the people who write to this daemon's
-/// user in one, and returning it verbatim means the English voice reads
-/// German aloud -- so the rule now asks for a translation instead, which is
-/// the one thing the model on the other end is unambiguously good at.
-///
-/// The "reply with it unchanged" escape survives for the case it was
-/// actually protecting: text that is already a natural spoken English
-/// sentence, where a rewrite can only make it worse.
-///
-/// The label rule is worded the way it is because of what a measurement
-/// against a real 24B local model showed, not because it reads well.
-/// "Turn labels into sentences" was never the broken part -- `Mutti:
-/// Kommst du am Sonntag zum Essen?` already produced *"Mutti is asking if
-/// you are coming for dinner on Sunday"*. What kept `Mutti` was the *other*
-/// rule: "Names ... stay exactly as written" protects a relationship word
-/// exactly as hard as it protects a person's name, and the conservative
-/// reading wins. Scoping that to **proper** names, and saying outright that
-/// a role word is translated like any other, is what turns it into "Mum",
-/// `Papa:` into "Dad", and `Familie Müller:` into "the Müller family".
-///
-/// The false-friend clause earns its place separately: without it `Chef:`
-/// survived as "Chef" through every other wording tried, which in English
-/// is a cook rather than a boss -- a wrong announcement, not merely a
-/// clumsy one.
-///
-/// One measured side effect, judged an improvement and left alone: the old
-/// wording preserved pleasantries, so `Anna: Bis später, ich bin um 20 Uhr
-/// da.` became *"Anna says she will see you later and will be there at 8
-/// PM"* in 3 of 3 samples, where this one drops the farewell and keeps the
-/// time. Substantive clauses are not dropped -- `Ich habe angerufen, ruf
-/// bitte zurück` keeps both halves.
-const SYSTEM_PROMPT: &str = "\
-You rewrite short desktop notifications so a speech synthesiser can
-read them aloud. Notifications are written to be read at a glance, so
-they are terse and often not sentences.
-
-Rules:
-- Reply with the rewritten text and nothing else: no preamble, no quotes, no
-  explanation, no markdown.
-- Keep every fact. Proper names, numbers, times and places stay exactly as
-  written. Add nothing and drop nothing.
-- The text before a colon is who sent it: a name, a nickname, or what they
-  are to the listener. Make them the subject of a sentence and say what they
-  are doing. \"Alice: where do you want to go for dinner\" becomes \"Alice is
-  asking where you want to go for dinner\". \"Mutti: kommst du Sonntag?\"
-  becomes \"Mum is asking whether you are coming on Sunday\".
-- A word for someone's role or relationship is translated like any other
-  word, including when the same spelling exists in English with a different
-  meaning -- German \"Chef\" is a boss, not a cook.
-- One or two sentences at most, and no longer than the original needs.
-- Do not expand abbreviations, identifiers or names you are unsure of.
-- Always reply in English, translating if the text is in another language.
-- If the text is already a natural spoken English sentence, or you cannot
-  improve it, reply with it unchanged.";
 
 /// `f64` rather than `f32`, because this is serialised into JSON and JSON
 /// numbers are `f64`. As an `f32` the literal `0.2` widens to
@@ -316,8 +256,8 @@ pub struct Request {
 /// Pure: takes the already-resolved key rather than reading the
 /// environment, so a test can drive both the with-key and without-key
 /// cases without touching process-global state.
-pub fn build_request(cfg: &RewordConfig, key: Option<&str>, text: &str) -> Request {
-    build_request_in(cfg, key, text, false)
+pub fn build_request(cfg: &RewordConfig, key: Option<&str>, prompt: &str, text: &str) -> Request {
+    build_request_in(cfg, key, prompt, text, false)
 }
 
 /// [`build_request`] with the `stream` flag chosen by the caller.
@@ -328,6 +268,7 @@ pub fn build_request(cfg: &RewordConfig, key: Option<&str>, text: &str) -> Reque
 pub fn build_request_in(
     cfg: &RewordConfig,
     key: Option<&str>,
+    prompt: &str,
     text: &str,
     stream: bool,
 ) -> Request {
@@ -336,7 +277,7 @@ pub fn build_request_in(
         messages: [
             Message {
                 role: "system",
-                content: SYSTEM_PROMPT,
+                content: prompt,
             },
             Message {
                 role: "user",
@@ -968,8 +909,8 @@ fn read_stream(
 }
 
 impl Rewriter for HttpRewriter {
-    fn reword(&self, text: &str) -> Result<String, RewordError> {
-        let request = build_request(&self.cfg, self.key.as_deref(), text);
+    fn reword(&self, prompt: &str, text: &str) -> Result<String, RewordError> {
+        let request = build_request(&self.cfg, self.key.as_deref(), prompt, text);
         // From `self.cfg`, which is the config this rewriter was built for:
         // `reword::context` rebuilds the rewriter whenever the config
         // changes, so this is the deadline the caller is timing this very
@@ -985,10 +926,11 @@ impl Rewriter for HttpRewriter {
 
     fn reword_stream(
         &self,
+        prompt: &str,
         text: &str,
         emit: &mut dyn FnMut(&str) -> bool,
     ) -> Result<(), RewordError> {
-        let request = build_request_in(&self.cfg, self.key.as_deref(), text, true);
+        let request = build_request_in(&self.cfg, self.key.as_deref(), prompt, text, true);
         let ceiling = http_ceiling(&self.cfg);
         let mut call = agent()
             .post(&request.url)
@@ -1038,6 +980,10 @@ impl Rewriter for HttpRewriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The prompt moved to `sayd-core` when it became a config setting;
+    // aliased rather than re-spelled so these assert against the one copy
+    // that is actually sent.
+    use sayd_core::reword::NOTIFICATION_PROMPT as SYSTEM_PROMPT;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
@@ -1062,7 +1008,7 @@ mod tests {
     fn a_request_names_one_url_and_omits_an_absent_key() {
         let mut c = cfg();
         c.base_url = "http://localhost:11434/v1/".into();
-        let r = build_request(&c, None, "Alice: dinner?");
+        let r = build_request(&c, None, SYSTEM_PROMPT, "Alice: dinner?");
         assert_eq!(r.url, "http://localhost:11434/v1/chat/completions");
         assert_eq!(
             r.authorization, None,
@@ -1070,7 +1016,7 @@ mod tests {
              right for a local server"
         );
 
-        let r = build_request(&cfg(), Some("sk-abc"), "Alice: dinner?");
+        let r = build_request(&cfg(), Some("sk-abc"), SYSTEM_PROMPT, "Alice: dinner?");
         assert_eq!(r.url, "https://api.ppq.ai/v1/chat/completions");
         assert_eq!(r.authorization.as_deref(), Some("Bearer sk-abc"));
     }
@@ -1079,7 +1025,7 @@ mod tests {
     /// generation parameters §3 fixes.
     #[test]
     fn the_body_carries_both_messages_in_order_and_never_streams() {
-        let r = build_request(&cfg(), None, "Alice: where do you want to go for dinner");
+        let r = build_request(&cfg(), None, SYSTEM_PROMPT, "Alice: where do you want to go for dinner");
         assert_eq!(r.body["model"], "gpt-4o-mini");
         assert_eq!(r.body["stream"], false);
         assert_eq!(r.body["max_tokens"], 1200);
@@ -1771,7 +1717,7 @@ mod tests {
 
         let rewriter = HttpRewriter::new(&cfg).expect("a usable client");
         assert_eq!(
-            rewriter.reword("Alice: dinner?").as_deref(),
+            rewriter.reword(SYSTEM_PROMPT, "Alice: dinner?").as_deref(),
             Ok("Alice is asking about dinner")
         );
 
@@ -1814,7 +1760,7 @@ mod tests {
         let rewriter = HttpRewriter::new(&cfg).expect("the scheme and host are readable");
         assert!(
             matches!(
-                rewriter.reword("Alice: dinner?"),
+                rewriter.reword(SYSTEM_PROMPT, "Alice: dinner?"),
                 Err(RewordError::NotConfigured(_))
             ),
             "a URL that cannot be requested is not a provider that is down"
@@ -1830,7 +1776,7 @@ mod tests {
         let rewriter = HttpRewriter::new(&cfg).expect("a usable client");
         assert!(
             matches!(
-                rewriter.reword("Alice: dinner?"),
+                rewriter.reword(SYSTEM_PROMPT, "Alice: dinner?"),
                 Err(RewordError::Unreachable(_))
             ),
             "a closed connection is unreachable, not malformed"
@@ -1864,7 +1810,7 @@ mod tests {
             ..RewordConfig::default()
         };
         let rewriter = HttpRewriter::new(&cfg).expect("a usable client");
-        match rewriter.reword("Alice: dinner?") {
+        match rewriter.reword(SYSTEM_PROMPT, "Alice: dinner?") {
             Err(RewordError::Unreachable(detail)) => assert!(
                 detail.contains(&format!("127.0.0.1:{port}")),
                 "`io: Connection refused` names no address, and the line that does \
@@ -1976,7 +1922,7 @@ mod tests {
         });
 
         let rewriter = HttpRewriter::new(&cfg).expect("a usable client");
-        let out = rewriter.reword("Alice: where do you want to go for dinner");
+        let out = rewriter.reword(SYSTEM_PROMPT, "Alice: where do you want to go for dinner");
         server.join().expect("the server thread");
 
         assert!(
@@ -2024,7 +1970,7 @@ mod tests {
         });
 
         let rewriter = HttpRewriter::new(&cfg).expect("a usable client");
-        let out = rewriter.reword("Alice: where do you want to go for dinner");
+        let out = rewriter.reword(SYSTEM_PROMPT, "Alice: where do you want to go for dinner");
         // The server may have been killed mid-write by the client giving up
         // on the response, so its own thread is allowed to have failed.
         let _ = server.join();
@@ -2069,7 +2015,7 @@ mod tests {
         });
 
         let agent = build_agent();
-        let request = build_request(&cfg, None, "Alice: dinner?");
+        let request = build_request(&cfg, None, SYSTEM_PROMPT, "Alice: dinner?");
         let started = std::time::Instant::now();
         let outcome = send(
             &agent,
@@ -2167,7 +2113,7 @@ mod tests {
         });
         let rewriter = HttpRewriter::new(&cfg).expect("a usable client");
         assert_eq!(
-            rewriter.reword("Alice: dinner?"),
+            rewriter.reword(SYSTEM_PROMPT, "Alice: dinner?"),
             Err(RewordError::Auth {
                 status: 401,
                 host: "127.0.0.1".into(),
@@ -2191,7 +2137,7 @@ mod tests {
         });
         let rewriter = HttpRewriter::new(&cfg).expect("a usable client");
         assert_eq!(
-            rewriter.reword("Alice: dinner?"),
+            rewriter.reword(SYSTEM_PROMPT, "Alice: dinner?"),
             Err(RewordError::RateLimited {
                 retry_after: Some(Duration::from_secs(7)),
                 message: Some("slow down".into()),
@@ -2209,7 +2155,7 @@ mod tests {
         let rewriter = HttpRewriter::new(&cfg).expect("a usable client");
         assert!(
             matches!(
-                rewriter.reword("Alice: dinner?"),
+                rewriter.reword(SYSTEM_PROMPT, "Alice: dinner?"),
                 Err(RewordError::NoSuchModel { status: 500, .. })
             ),
             "a server that answers 500 for a missing model must still be diagnosable"
@@ -2236,7 +2182,7 @@ mod tests {
         });
         let rewriter = HttpRewriter::new(&cfg).expect("a usable client");
         assert_eq!(
-            rewriter.reword("Alice: dinner?"),
+            rewriter.reword(SYSTEM_PROMPT, "Alice: dinner?"),
             Err(RewordError::Malformed("HTTP 502".into())),
             "an HTML page is not JSON and 502 is all there is to say about it"
         );
@@ -2251,7 +2197,7 @@ mod tests {
         let (cfg, server) = serve(|_| Some(http(200, "", "")));
         let rewriter = HttpRewriter::new(&cfg).expect("a usable client");
         assert!(matches!(
-            rewriter.reword("Alice: dinner?"),
+            rewriter.reword(SYSTEM_PROMPT, "Alice: dinner?"),
             Err(RewordError::Malformed(_))
         ));
         server.join().expect("the server thread");
@@ -2264,7 +2210,7 @@ mod tests {
     fn llama_cpp_asks_the_model_not_to_think() {
         let mut c = cfg();
         c.provider = Some("llama-cpp".into());
-        let r = build_request(&c, None, "Alice: dinner?");
+        let r = build_request(&c, None, SYSTEM_PROMPT, "Alice: dinner?");
         assert_eq!(
             r.body["chat_template_kwargs"]["enable_thinking"],
             serde_json::json!(false)
@@ -2277,7 +2223,7 @@ mod tests {
     /// about bytes, not about intent.
     #[test]
     fn generic_sends_the_common_request_and_nothing_else() {
-        let r = build_request(&cfg(), None, "Alice: dinner?");
+        let r = build_request(&cfg(), None, SYSTEM_PROMPT, "Alice: dinner?");
         let obj = r.body.as_object().expect("a JSON object");
         assert!(
             !obj.contains_key("chat_template_kwargs"),
@@ -2356,15 +2302,15 @@ mod tests {
         let mut c = cfg();
 
         assert_eq!(
-            build_request(&c, None, "x").body["max_tokens"],
+            build_request(&c, None, SYSTEM_PROMPT, "x").body["max_tokens"],
             1200,
             "the default max_chars of 400"
         );
 
         c.max_chars = 32;
-        assert_eq!(build_request(&c, None, "x").body["max_tokens"], 96);
+        assert_eq!(build_request(&c, None, SYSTEM_PROMPT, "x").body["max_tokens"], 96);
 
         c.max_chars = 2000;
-        assert_eq!(build_request(&c, None, "x").body["max_tokens"], 6000);
+        assert_eq!(build_request(&c, None, SYSTEM_PROMPT, "x").body["max_tokens"], 6000);
     }
 }
