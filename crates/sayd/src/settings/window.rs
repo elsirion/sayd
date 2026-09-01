@@ -780,9 +780,19 @@ fn render_link(b: &Build, page: &'static schema::Page) -> adw::ActionRow {
     for section in page.sections {
         content.add(&render_section(b, section));
     }
+    // `AdwNavigationPage` draws no chrome of its own: the back button and
+    // the page title come from an `AdwHeaderBar` *inside* it, which is what
+    // `AdwToolbarView` is for. Without this wrapper a sub-page opens with no
+    // title bar and no way back except Escape -- which is what it did.
+    //
+    // The header bar needs no back button of its own; one appears because
+    // the page is not the navigation stack's root
+    // (`AdwHeaderBar:show-back-button` defaults true).
+    let bar = adw::ToolbarView::builder().content(&content).build();
+    bar.add_top_bar(&adw::HeaderBar::new());
     let nav = adw::NavigationPage::builder()
         .title(page.title)
-        .child(&content)
+        .child(&bar)
         .build();
 
     let row = adw::ActionRow::builder()
@@ -1555,7 +1565,7 @@ fn prompt_specs() -> [PromptSpec; 2] {
             default: sayd_core::reword::NOTIFICATION_PROMPT,
         },
         PromptSpec {
-            title: "--reword prompt",
+            title: "Prompt when you ask",
             subtitle: "What the model is told when you ask for a rewrite yourself",
             get: |c| c.reword.request_prompt.as_ref(),
             set: |c, v| c.reword.request_prompt = v,
@@ -1946,7 +1956,7 @@ pub fn reword_group(b: &Build) -> adw::PreferencesGroup {
 
     // --- Deadline for an explicit --reword --------------------------------
     let request_deadline = Spin::new(
-        "--reword deadline",
+        "Deadline when you ask",
         "Milliseconds an asked-for rewrite may take; the notification deadline is above",
         REWORD_REQUEST_TIMEOUT_MIN,
         REWORD_REQUEST_TIMEOUT_MAX,
@@ -1976,8 +1986,9 @@ pub fn reword_group(b: &Build) -> adw::PreferencesGroup {
 
     // --- Stream an explicit --reword --------------------------------------
     let stream = adw::SwitchRow::builder()
-        .title("Speak --reword as it is written")
-        .subtitle("Starts sooner; the answer can no longer be checked before it is spoken")
+        .title("Speak as it is written")
+        .subtitle("Speak a --reword answer sentence by sentence; it starts sooner, but \
+         can no longer be checked before it is spoken")
         .use_markup(false)
         .active(cfg.reword.stream)
         .build();
@@ -1995,7 +2006,7 @@ pub fn reword_group(b: &Build) -> adw::PreferencesGroup {
     // ceilings answer different questions and the ranges do not overlap
     // usefully. See `RewordConfig::request_max_chars`.
     let request_ceiling = Spin::new(
-        "Longest --reword text",
+        "Longest text when you ask",
         "Characters; applies when you ask with --reword",
         REWORD_REQUEST_MAX_CHARS_MIN,
         REWORD_REQUEST_MAX_CHARS_MAX,
@@ -2896,6 +2907,80 @@ mod tests {
                 .unwrap_or_else(|| panic!("a navigation row titled {:?}", page.title));
             gtk::prelude::WidgetExt::activate(&row);
         }
+    }
+
+    /// The `NavigationPage` carrying `title`, anywhere below `widget`.
+    fn find_nav(widget: &gtk::Widget, title: &str) -> Option<adw::NavigationPage> {
+        if let Some(nav) = widget.downcast_ref::<adw::NavigationPage>() {
+            if nav.title() == title {
+                return Some(nav.clone());
+            }
+        }
+        let mut child = widget.first_child();
+        while let Some(w) = child {
+            if let Some(found) = find_nav(&w, title) {
+                return Some(found);
+            }
+            child = w.next_sibling();
+        }
+        None
+    }
+
+    /// Find the first descendant of type `T`, whatever its title.
+    fn find_widget<T: IsA<gtk::Widget>>(widget: &gtk::Widget) -> Option<T> {
+        if let Some(found) = widget.downcast_ref::<T>() {
+            return Some(found.clone());
+        }
+        let mut child = widget.first_child();
+        while let Some(w) = child {
+            if let Some(found) = find_widget::<T>(&w) {
+                return Some(found);
+            }
+            child = w.next_sibling();
+        }
+        None
+    }
+
+    /// Every sub-page carries a header bar, and so a title and a way back.
+    ///
+    /// `AdwNavigationPage` draws no chrome of its own, so a page whose child
+    /// is a bare `AdwPreferencesPage` opens with no title bar and no back
+    /// button -- reachable only by Escape, which a pointer user has no way
+    /// to guess. That is what every sub-page did until the `AdwToolbarView`
+    /// wrapper in `render_link`, and nothing failed: the rows were all
+    /// present and findable, because `find_row` walks the widget tree and
+    /// does not care what draws above it.
+    ///
+    /// Asserted per page rather than once, so a page added later that skips
+    /// the wrapper is caught rather than covered by its neighbours.
+    fn every_subpage_has_a_header_bar_to_get_back_from(dir: &std::path::Path) {
+        let dir = dir.join("subpage-chrome");
+        std::fs::create_dir_all(&dir).expect("a config directory of its own");
+        let (model, engine) = model_in(&dir);
+        let ui = build(model, engine.clone());
+
+        for page in schema::PAGES {
+            let w = ui.window.clone().upcast::<gtk::Widget>();
+            let row = find_row::<adw::ActionRow>(&w, page.title)
+                .unwrap_or_else(|| panic!("a navigation row titled {:?}", page.title));
+            gtk::prelude::WidgetExt::activate(&row);
+
+            // By title, not by type: the window's own root page is a
+            // `NavigationPage` too and comes first in the walk, so a
+            // type-only search finds "sayd Settings" and proves nothing
+            // about the page just pushed.
+            let nav = find_nav(&w, page.title)
+                .unwrap_or_else(|| panic!("{:?} must push a NavigationPage", page.title));
+            assert!(
+                find_widget::<adw::HeaderBar>(&nav.clone().upcast::<gtk::Widget>()).is_some(),
+                "sub-page {:?} has no header bar, so it has no back button",
+                page.title
+            );
+            ui.window.pop_subpage();
+        }
+
+        drop(ui);
+        engine.shutdown();
     }
 
     /// Every described row draws itself from the config it is handed.
@@ -4086,6 +4171,7 @@ mod tests {
         // The rest of what needs a real window, run from here rather than
         // from a `#[test]` of its own for the same one-init reason.
         adw::init().expect("libadwaita initialises once GTK has");
+        every_subpage_has_a_header_bar_to_get_back_from(dir.path());
         every_described_row_redraws_from_the_config(dir.path());
         a_newly_seen_application_appears_while_the_window_is_open(dir.path());
         the_reword_entry_rows_commit_on_apply_and_never_clobber_typing(dir.path());
