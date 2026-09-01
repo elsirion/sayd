@@ -72,6 +72,35 @@ fn default_dylib_name() -> PathBuf {
     }
 }
 
+/// Where the weights and voice packs live, by the same rule for everyone
+/// who needs to know.
+///
+/// `SAYD_MODELS_DIR`, then `$XDG_DATA_HOME/sayd/models` (or
+/// `~/.local/share/sayd/models`), then a relative `models` for a build run
+/// out of a source tree.
+///
+/// Here rather than in the daemon because it had four copies that did not
+/// agree: `sayd::models_dir` walked this ladder, and three test helpers
+/// hardcoded `<workspace>/models`, which only resolved because the repo
+/// carried a symlink pointing out of the tree. Anything that resolves this
+/// differently from the running daemon is testing a directory the daemon
+/// will not read.
+pub fn default_models_dir() -> PathBuf {
+    if let Some(d) = std::env::var_os("SAYD_MODELS_DIR") {
+        return PathBuf::from(d);
+    }
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let xdg = base.join("sayd").join("models");
+    if xdg.is_dir() {
+        xdg
+    } else {
+        PathBuf::from("models")
+    }
+}
+
 pub const SAMPLE_RATE: u32 = 24_000;
 /// Style packs have exactly `STYLE_ROWS` rows and are indexed by token count,
 /// so `STYLE_ROWS - 1` is the usable maximum.
@@ -363,13 +392,13 @@ mod tests {
         use super::*;
         use std::path::Path;
 
-        fn models_dir() -> &'static Path {
-            Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../models"))
+        fn models_dir() -> PathBuf {
+            super::super::default_models_dir()
         }
 
         #[test]
         fn synth_on_unloaded_voice_is_an_error_not_a_panic() {
-            let mut k = Kokoro::new(models_dir(), "model.onnx", 1).expect("model loads");
+            let mut k = Kokoro::new(&models_dir(), "model.onnx", 1).expect("model loads");
             let err = k
                 .synth("kˈOkəɹO", "am_fenrir", 1.0)
                 .expect_err("unloaded voice must error");
@@ -381,7 +410,7 @@ mod tests {
 
         #[test]
         fn synth_with_a_loaded_voice_produces_non_empty_audio() {
-            let mut k = Kokoro::new(models_dir(), "model.onnx", 1).expect("model loads");
+            let mut k = Kokoro::new(&models_dir(), "model.onnx", 1).expect("model loads");
             k.load_voice("af_heart").expect("af_heart.bin loads");
             let audio = k
                 .synth("kˈOkəɹO", "af_heart", 1.0)

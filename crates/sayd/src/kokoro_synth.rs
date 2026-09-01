@@ -174,8 +174,8 @@ mod models_tests {
     use super::*;
     use std::path::Path;
 
-    fn models_dir() -> &'static Path {
-        Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../models"))
+    fn models_dir() -> std::path::PathBuf {
+        sayd_kokoro::default_models_dir()
     }
 
     /// The real end-to-end proof available without an audio device: text in,
@@ -183,7 +183,7 @@ mod models_tests {
     #[test]
     fn synth_produces_plausible_length_audio_from_real_text() {
         let cfg = Config::default();
-        let mut s = KokoroSynthesizer::new(models_dir(), &cfg).expect("synthesizer constructs");
+        let mut s = KokoroSynthesizer::new(&models_dir(), &cfg).expect("synthesizer constructs");
 
         let text = "Hello there. This is sayd speaking from the engine.";
         let phonemes = s.phonemize(text, "af_heart");
@@ -213,7 +213,7 @@ mod models_tests {
     #[test]
     fn voice_exists_matches_the_real_voices_directory() {
         let cfg = Config::default();
-        let s = KokoroSynthesizer::new(models_dir(), &cfg).expect("synthesizer constructs");
+        let s = KokoroSynthesizer::new(&models_dir(), &cfg).expect("synthesizer constructs");
         assert!(
             s.voice_exists("af_heart"),
             "af_heart.bin ships in models/voices"
@@ -229,7 +229,7 @@ mod models_tests {
     #[test]
     fn american_and_british_voices_produce_different_phonemes() {
         let cfg = Config::default();
-        let mut s = KokoroSynthesizer::new(models_dir(), &cfg).expect("synthesizer constructs");
+        let mut s = KokoroSynthesizer::new(&models_dir(), &cfg).expect("synthesizer constructs");
 
         let us = s.phonemize("tomato", "af_heart");
         let gb = s.phonemize("tomato", "bf_emma");
@@ -245,7 +245,7 @@ mod models_tests {
     #[test]
     fn reconfigure_reports_a_reload_only_when_the_model_or_thread_count_moves() {
         let cfg = Config::default();
-        let mut s = KokoroSynthesizer::new(models_dir(), &cfg).expect("synthesizer constructs");
+        let mut s = KokoroSynthesizer::new(&models_dir(), &cfg).expect("synthesizer constructs");
 
         let same = Config {
             voice: "am_fenrir".into(),
@@ -340,7 +340,7 @@ mod models_tests {
     #[test]
     fn stretch_mode_keeps_the_leading_word_as_loud_as_model_mode_drops_it() {
         let cfg = Config::default();
-        let mut s = KokoroSynthesizer::new(models_dir(), &cfg).expect("synthesizer constructs");
+        let mut s = KokoroSynthesizer::new(&models_dir(), &cfg).expect("synthesizer constructs");
         let text = "The quick brown fox jumps over the lazy dog.";
         let phonemes = s.phonemize(text, "af_heart");
 
@@ -406,7 +406,7 @@ mod models_tests {
     #[test]
     fn per_chunk_stretch_seam_on_real_speech_is_measured_not_assumed() {
         let cfg = Config::default();
-        let mut s = KokoroSynthesizer::new(models_dir(), &cfg).expect("synthesizer constructs");
+        let mut s = KokoroSynthesizer::new(&models_dir(), &cfg).expect("synthesizer constructs");
         let stretch_cfg = Config {
             speed_mode: "stretch".into(),
             ..Config::default()
@@ -495,8 +495,8 @@ mod engine_models_tests {
 
     use super::*;
 
-    fn models_dir() -> &'static Path {
-        Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../models"))
+    fn models_dir() -> std::path::PathBuf {
+        sayd_kokoro::default_models_dir()
     }
 
     /// `Engine` keeps its sink behind a private `Box<dyn AudioSink>`, so
@@ -545,7 +545,7 @@ mod engine_models_tests {
     #[test]
     fn engine_produces_non_silent_audio_of_plausible_duration() {
         let cfg = Config::default();
-        let synth = KokoroSynthesizer::new(models_dir(), &cfg).expect("synthesizer constructs");
+        let synth = KokoroSynthesizer::new(&models_dir(), &cfg).expect("synthesizer constructs");
         let sink = Arc::new(Mutex::new(VecSink::new(24_000 * 30)));
         let mut e = Engine::new(cfg, Box::new(synth), Box::new(DrainableSink(sink.clone())));
 

@@ -604,19 +604,7 @@ impl NotifyEnabledWatch {
 }
 
 fn models_dir() -> PathBuf {
-    if let Some(d) = std::env::var_os("SAYD_MODELS_DIR") {
-        return PathBuf::from(d);
-    }
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
-        .unwrap_or_else(|| PathBuf::from("."));
-    let xdg = base.join("sayd").join("models");
-    if xdg.is_dir() {
-        xdg
-    } else {
-        PathBuf::from("models")
-    }
+    sayd_kokoro::default_models_dir()
 }
 
 /// Open the real audio device, unless `SAYD_NO_AUDIO` says to discard audio
@@ -868,10 +856,18 @@ async fn run_daemon() -> std::process::ExitCode {
     // typo'd config *before* every default-voice submission starts failing
     // the same way.
     if !synth.voice_exists(&cfg.voice) {
+        // Points at the settings window whichever of the two shapes this
+        // has. With packs installed, the Voice dropdown lists them and the
+        // fix is picking one; with none installed -- a fresh install, where
+        // this warning fires for the shipped default and there is nothing
+        // to pick -- that same group offers to download them. Naming the
+        // directory as well, because a user who set `SAYD_MODELS_DIR` to
+        // the wrong place needs to see which one is being read.
         eprintln!(
             "warning: configured default voice '{}' has no installed voice pack; \
              every submission that does not override it with its own --voice will \
-             be rejected until this is fixed. Check {}/voices for installed voices.",
+             be rejected until this is fixed. The tray's Settings window lists the \
+             packs in {}/voices, and offers to download them if there are none.",
             cfg.voice,
             models_dir().display()
         );
