@@ -9,6 +9,17 @@
       pkgs = nixpkgs.legacyPackages.${system};
     in
     {
+      packages.${system} = rec {
+        sayd = pkgs.callPackage ./package.nix { };
+        default = sayd;
+      };
+
+      # So a system flake can add `sayd` to `environment.systemPackages`
+      # without threading the package through by hand.
+      overlays.default = final: _prev: {
+        sayd = final.callPackage ./package.nix { };
+      };
+
       devShells.${system}.default = pkgs.mkShell {
         buildInputs = with pkgs; [
           espeak-ng
