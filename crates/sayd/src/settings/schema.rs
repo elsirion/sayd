@@ -11,14 +11,20 @@
 //! `(title, subtitle, get, set)` covering two groups. [`ROOT`] covers all of
 //! them, and `window::render` is the one implementation of the five steps.
 //!
-//! **What is deliberately not described.** Five things in this window are not
+//! **What is deliberately not described.** Six things in this window are not
 //! a value bound to a config field, and pretending otherwise would cost more
-//! than it saves: the Voice group's Test row, the Reword group (its endpoint
-//! presets, its key-visibility rule and its asynchronous Test result), the
-//! allowlist's entry-plus-list, and the two suggestion groups with their
-//! icons. They stay hand-written behind [`Row::Custom`] and
-//! [`Section::Custom`]. If a *sixth* arrives, extend the descriptors --
-//! `Custom` growing is this module failing.
+//! than it saves: the Voice group's Test row and its download row, the Reword
+//! group (its endpoint presets, its key-visibility rule and its asynchronous
+//! Test result), the allowlist's entry-plus-list, and the two suggestion
+//! groups with their icons. They stay hand-written behind [`Row::Custom`] and
+//! [`Section::Custom`].
+//!
+//! The download row is the newest of them and the clearest case for the
+//! escape hatch: it is an *action*, with a progress bar and a cancel, and
+//! there is no config field anywhere it could be a view of. That is the bar.
+//! A row that does read and write a setting and merely looks unusual is not
+//! -- if one of those arrives, extend the descriptors, because `Custom`
+//! growing for that reason is this module failing.
 
 use gtk4 as gtk;
 use sayd_core::config::Config;
@@ -424,6 +430,12 @@ pub static ROOT: &[Section] = &[
                 get: |c| c.voice.clone(),
                 set: |c, v| c.voice = v.to_string(),
             },
+            // Directly under the dropdown it fills, and hidden the moment
+            // that dropdown has anything in it. A fresh install opens this
+            // window to an empty Voice row and a subtitle saying the
+            // configured voice has no pack; the answer to that belongs on
+            // the next line, not on a page the user has to go looking for.
+            Row::Custom(super::window::voice_download_row),
             Row::Int {
                 title: "Speed",
                 subtitle: "Playback rate for every utterance",

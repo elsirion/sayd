@@ -3,11 +3,15 @@
 Local text-to-speech for sway/Wayland. Select text, press a key, hear it.
 Kokoro-82M runs locally via ONNX Runtime with the misaki-en G2P frontend.
 Speech synthesis never touches the network and nothing about it leaves your
-machine. The optional rewording feature ([`[reword]`](#rewording), inert
-until you configure a `provider`) is the one exception: it sends the text
-about to be spoken to whatever endpoint you configure. Point it at a model
-server on localhost -- the default -- and the original promise holds
-unchanged.
+machine. Two things reach out at all, and only when you ask them to. The
+[**Download voices** button](#models) in the settings window fetches the
+model and the voice packs from Hugging Face on a machine that has none: it
+asks for files and sends nothing, once, and a machine with the packs already
+installed never sees it. The optional rewording feature
+([`[reword]`](#rewording), inert until you configure a `provider`) is the
+one that sends anything *out*: the text about to be spoken, to whatever
+endpoint you configure. Point it at a model server on localhost -- the
+default -- and the original promise holds unchanged.
 
 `sayd` is the resident daemon: it owns the speech engine and the audio
 device, and serves the `sh.sayd.Sayd1` interface on the session bus. `say`
@@ -21,10 +25,12 @@ skip, ask for status.
 
 Put `target/release/sayd` and `target/release/say` on `$PATH`.
 
-[Rewording](#rewording) -- the one thing in `sayd` that makes a network
-request -- is built in. It stays inert until you set a `reword.provider`, so
-"nothing leaves your machine" holds for any configuration that has not asked
-for it.
+[Rewording](#rewording) -- the one thing in `sayd` that sends your text
+anywhere -- is built in. It stays inert until you set a `reword.provider`,
+so "nothing leaves your machine" holds for any configuration that has not
+asked for it. The [voice download](#models) is the only other code path that
+opens a socket, and it is a button: it fetches files from a named host,
+sends nothing, and has nothing to do once the packs are on disk.
 
 ### Native dependencies
 
@@ -58,12 +64,44 @@ current distributions ship considerably newer.
 
 ## Models
 
+Kokoro-82M's weights and voice packs are not shipped with `sayd`. They are
+341 MB, and they come from
+[`onnx-community/Kokoro-82M-v1.0-ONNX`](https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX)
+on Hugging Face. There are two ways to get them.
+
+**From the settings window.** On a machine with no voice packs installed,
+the Voice group carries a **Download voices** row that says what it will
+cost -- "341 MB from huggingface.co: the Kokoro-82M weights and 29 voice
+packs" -- before you press anything. Pressing it fetches `config.json`,
+`tokenizer.json`, the fp32 `model.onnx` and all 29 packs, showing the file
+it is on and a progress bar as it goes, and the button becomes **Cancel**
+for as long as it runs.
+
+Each file is written to `<name>.part` and renamed into place only once it is
+complete and flushed, so a cancel, a dropped connection, a full disk or a
+power cut leaves either the whole file or no file -- never a truncated
+`model.onnx`, which would surface much later as an unexplained ONNX parse
+error rather than as a failed download. Pressing Download again after any of
+those resumes: whatever arrived intact is left alone. When it finishes the
+Voice dropdown fills in immediately, with no restart of anything, and the
+row disappears -- it is an offer for a machine that has nothing, not a
+button to refetch 341 MB with.
+
+Only the fp32 model is fetched, which is what `model = "fp32"` (the default)
+loads.
+
+**From the shell.**
+
     ./scripts/fetch-models.sh
 
-Downloads Kokoro-82M ONNX weights and voice packs into `models/`. `sayd`
-looks for them in `$XDG_DATA_HOME/sayd/models` (falling back to
+The same files into `./models`, plus the `fp16` and quantized model variants
+-- 255 MB more, and worth having only if you intend to compare them (see
+**Model** under [Settings](#settings)).
+
+`sayd` looks for models in `$XDG_DATA_HOME/sayd/models` (falling back to
 `~/.local/share/sayd/models`), or in `./models` if neither exists. Set
-`SAYD_MODELS_DIR` to point it somewhere else entirely.
+`SAYD_MODELS_DIR` to point it somewhere else entirely. The settings window
+downloads into whichever of those the daemon is reading.
 
 ## sway setup
 
@@ -172,6 +210,11 @@ what it currently holds:
 
 Cleanup, Rewording and Notifications each open with their own on/off switch.
 There is no switch for `say`: it only runs when you run it.
+
+On a machine with no voice packs installed, the Voice group carries one
+extra row: **Download voices**, which fetches them from Hugging Face. See
+[Models](#models) for what it does and what it costs. It is not there once
+packs are installed.
 
 The window is a view over one file, `$XDG_CONFIG_HOME/sayd/config.toml`
 (falling back to `~/.config/sayd/config.toml`), never a second copy of the
@@ -781,8 +824,10 @@ The settings window's group description and the once-per-run log line above
 are where the destination is stated.
 
 Any OpenAI-compatible server on localhost keeps the original promise
-intact. That is the default, and a default build cannot make a network
-request at all.
+intact. That is the default, and a default build sends your text nowhere.
+(The [voice download](#models) is the one request a default build can make,
+and only when the button is pressed: it asks huggingface.co for files and
+sends nothing of yours.)
 
 ### What can go wrong
 
@@ -1096,12 +1141,25 @@ for looking at it. Walk this yourself once, after installing:
     show up clearly marked as missing (e.g. "'name' — no voice pack
     installed"), not silently render as, or select, some other installed
     voice instead.
-12. At the window's default width, check the **Idle unload** row's
+12. The download offer, on a machine that has the packs already: with an
+    installed models directory, the **Voice** group must show no
+    **Download voices** row at all.
+13. The same offer on a fresh install: start `sayd` with
+    `SAYD_MODELS_DIR` pointing at an empty directory and open the window.
+    The Voice group now carries **Download voices**, and its subtitle says
+    **341 MB** and names `huggingface.co` *before* you press anything.
+    Press it -- a progress bar appears, the subtitle names the file in
+    flight, and the button reads **Cancel**. Press Cancel: it stops within
+    a second or so, and `find "$SAYD_MODELS_DIR" -name '*.part'` prints
+    nothing. Press Download again and let it finish -- the **Voice**
+    dropdown fills with all 29 voices without the window being reopened,
+    and the download row is gone.
+14. At the window's default width, check the **Idle unload** row's
     subtitle -- it is a long sentence ("Seconds of silence before the
     ~1.27 GB session is dropped; 0 never unloads") and should read in full,
     wrapping onto more than one line, rather than being truncated with an
     ellipsis.
-13. Restart `sayd` -- every setting from the steps above survives. This is
+15. Restart `sayd` -- every setting from the steps above survives. This is
     M4's stated done-when.
 
 ## Verify notifications

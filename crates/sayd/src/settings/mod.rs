@@ -5,6 +5,7 @@
 //! and calls it. That split is not stylistic. The window cannot run without
 //! a display, so anything that lives in it cannot be tested here.
 
+pub mod download;
 pub mod model;
 pub mod schema;
 pub mod window;

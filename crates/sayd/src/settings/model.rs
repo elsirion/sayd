@@ -18,6 +18,7 @@ use crate::config_watch::ConfigStore;
 use crate::notify::seen::{self, SeenApp};
 use crate::notify::{truncate_chars, MAX_APP_NAME_LEN};
 use crate::reword::{RewordError, Rewriter};
+use crate::settings::download;
 
 /// The model values, with the measured trade-off shown inline in the
 /// window. Numbers are from the benchmark recorded in the design doc; do
@@ -354,7 +355,21 @@ type RewriterFactory = Arc<RewriterFn>;
 /// - Holding a spin button's +/- auto-repeats; see [`WRITE_DEBOUNCE`].
 pub struct SettingsModel {
     shared: Arc<Shared>,
-    voices: Vec<String>,
+    /// The voice packs installed when this was last asked -- not a
+    /// constant, because [`SettingsModel::download_voices`] can put packs
+    /// there while the window is open, which is the one moment this list is
+    /// *expected* to change under a running window.
+    ///
+    /// A `Mutex` and not a `Vec` for that reason alone: the model is shared
+    /// behind an `Arc` (see `settings::Host`), so there is no `&mut self` to
+    /// rescan through. Poison-tolerant like every other lock here; see
+    /// [`lock`].
+    voices: Mutex<Vec<String>>,
+    /// Where the packs live, kept so a rescan looks in the same place the
+    /// first scan did rather than re-deriving it -- and so the download has
+    /// somewhere to write. One directory, resolved once, by
+    /// `sayd_kokoro::default_models_dir`'s single rule.
+    models_dir: PathBuf,
     /// The writer thread, or `None` if it could not be started at all
     /// (finding 8) -- and, after `Drop` has taken it to join, `None` for
     /// that reason instead.
@@ -435,7 +450,8 @@ impl SettingsModel {
         };
         SettingsModel {
             shared,
-            voices: list_voices(&models_dir),
+            voices: Mutex::new(list_voices(&models_dir)),
+            models_dir,
             writer,
             rewriter_factory,
             runtime: tokio::runtime::Handle::try_current().ok(),
@@ -460,8 +476,87 @@ impl SettingsModel {
     }
 
     /// The dropdown's contents: sorted voice-pack names.
-    pub fn voices(&self) -> &[String] {
-        &self.voices
+    ///
+    /// A clone rather than a borrow, because this is now behind a lock that
+    /// [`SettingsModel::rescan_voices`] takes -- and the window copies the
+    /// list anyway to build a `GtkStringList` out of it.
+    pub fn voices(&self) -> Vec<String> {
+        lock(&self.voices).clone()
+    }
+
+    /// Look at the models directory again, and hand back what is there now.
+    ///
+    /// Only one thing calls this: the end of a successful download. A
+    /// dropdown whose *entries* move on their own is a dropdown that reports
+    /// a choice the user did not make (see `window::render_row`), so this is
+    /// deliberately not a poll -- it is the one moment the user has just
+    /// asked for the list to change and is watching it do so.
+    pub fn rescan_voices(&self) -> Vec<String> {
+        let fresh = list_voices(&self.models_dir);
+        *lock(&self.voices) = fresh.clone();
+        fresh
+    }
+
+    /// Fetch the weights and voice packs, reporting into the window's event
+    /// loop as it goes.
+    ///
+    /// Returns immediately with a receiver, exactly as
+    /// [`SettingsModel::test_reword`] does and for the same reason: the
+    /// transfer is blocking, the glib main thread must never wait on it, and
+    /// a window closed mid-flight simply drops the receiver.
+    ///
+    /// `cancel` is the caller's to set. It carries two different meanings
+    /// that the transfer does not need to tell apart -- the user pressed
+    /// Cancel, or the window that asked for this is gone (a closed channel,
+    /// detected below) -- because the right response to both is to stop and
+    /// tidy up.
+    ///
+    /// Progress is *lossy on purpose*. The queue is bounded and a full one
+    /// means the main loop has not drained since the last report; dropping
+    /// that report costs a slightly staler bar, while blocking the transfer
+    /// on the UI's redraw rate would make a busy desktop slow the download.
+    /// The final outcome is not lossy -- it is the one message the window
+    /// cannot do without, so it is sent blocking.
+    pub fn download_voices(
+        &self,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    ) -> async_channel::Receiver<download::Event> {
+        // Room for a burst of progress reports between two turns of the main
+        // loop, plus the outcome behind them. Larger buys nothing: the
+        // window only ever draws the newest.
+        let (tx, rx) = async_channel::bounded(16);
+        let dir = self.models_dir.clone();
+        let stop = cancel.clone();
+        let run = move || {
+            let fetch = download::UreqFetch::new();
+            let cancelled = || cancel.load(Ordering::Relaxed);
+            let mut report = |p: download::Progress| {
+                if let Err(async_channel::TrySendError::Closed(_)) =
+                    tx.try_send(download::Event::Progress(p))
+                {
+                    // Nobody is listening any more: the window was closed
+                    // with a download running. Leaving it to finish would
+                    // mean a 341 MB transfer with no UI, no progress and no
+                    // way to stop it.
+                    stop.store(true, Ordering::Relaxed);
+                }
+            };
+            let outcome = download::download(&dir, &fetch, &cancelled, &mut report);
+            let _ = tx.send_blocking(download::Event::Finished(outcome));
+        };
+        match &self.runtime {
+            Some(handle) => {
+                handle.spawn_blocking(run);
+            }
+            // Unit tests only; the daemon always has a runtime. Named so a
+            // stuck transfer is identifiable in a backtrace.
+            None => {
+                let _ = std::thread::Builder::new()
+                    .name("voice-download".into())
+                    .spawn(run);
+            }
+        }
+        rx
     }
 
     /// Suggestions for the notification allowlist editor's "add an

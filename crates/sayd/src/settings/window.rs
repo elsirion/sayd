@@ -33,6 +33,7 @@
 use std::cell::{Cell, RefCell};
 use std::path::Path;
 use std::rc::{Rc, Weak};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -43,17 +44,17 @@ use sayd_core::engine::SayOpts;
 use sayd_core::handle::EngineHandle;
 use sayd_core::queue::{Policy, Source as QueueSource};
 
-use super::schema;
+use super::download;
 use super::model::{
     allow_add, allow_contains, allow_remove, icon_file_size_within_limit, icon_pixels_within_limit,
-    reword_key_row_applies, IconSource, SettingsModel, Suggestion, SuggestionKind, ENDPOINT_PRESETS,
-    REWORD_MAX_CHARS_MAX, REWORD_MAX_CHARS_MIN, REWORD_MAX_CHARS_STEP,
+    reword_key_row_applies, IconSource, SettingsModel, Suggestion, SuggestionKind,
+    ENDPOINT_PRESETS, REWORD_MAX_CHARS_MAX, REWORD_MAX_CHARS_MIN, REWORD_MAX_CHARS_STEP,
     REWORD_REQUEST_MAX_CHARS_MAX, REWORD_REQUEST_MAX_CHARS_MIN, REWORD_REQUEST_MAX_CHARS_STEP,
     REWORD_REQUEST_TIMEOUT_MAX, REWORD_REQUEST_TIMEOUT_MIN, REWORD_REQUEST_TIMEOUT_STEP,
-    REWORD_TEST_DEFAULT,
-    REWORD_TIMEOUT_MAX, REWORD_TIMEOUT_MIN, REWORD_TIMEOUT_PAGE, REWORD_TIMEOUT_STEP,
-    REWORD_TIMEOUT_SUBTITLE, TEST_INCOMPLETE_TITLE, TEST_IN_PROGRESS_TITLE,
+    REWORD_TEST_DEFAULT, REWORD_TIMEOUT_MAX, REWORD_TIMEOUT_MIN, REWORD_TIMEOUT_PAGE,
+    REWORD_TIMEOUT_STEP, REWORD_TIMEOUT_SUBTITLE, TEST_INCOMPLETE_TITLE, TEST_IN_PROGRESS_TITLE,
 };
+use super::schema;
 use crate::notify::seen;
 
 thread_local! {
@@ -141,6 +142,33 @@ const SEEN_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// unlimited title lines -- is shared with rows built elsewhere on the page,
 /// so identity is the only thing left to find it by.
 const RESULT_ROW_NAME: &str = "reword-test-result";
+
+/// The download row's widget name, for the same reason [`RESULT_ROW_NAME`]
+/// exists: its title and subtitle are what the tests assert about, so they
+/// cannot also be how the tests find it.
+const DOWNLOAD_ROW_NAME: &str = "voice-download";
+
+/// The three labels the download button cycles through.
+///
+/// Named rather than written inline because the tests assert on them, and a
+/// button whose label a test looks for by a string literal typed twice is a
+/// test that passes while the button says something else.
+const DOWNLOAD_LABEL: &str = "Download";
+const CANCEL_LABEL: &str = "Cancel";
+/// Between the click and the transfer noticing. Its own label, rather than a
+/// disabled "Cancel", because the gap is a chunk's worth of network wait and
+/// a button that simply greys out looks like one that did not take the
+/// press.
+const CANCELLING_LABEL: &str = "Cancelling…";
+
+/// How wide the download's progress bar is drawn, in pixels.
+///
+/// A `GtkProgressBar` in an `AdwActionRow` suffix takes its natural width,
+/// which is a few pixels: the bar has no content to be sized by. 120 is
+/// about a quarter of the window's 520px default, which leaves the
+/// filename-and-size subtitle its full line and still reads as a bar rather
+/// than as a dash.
+const DOWNLOAD_BAR_PX: i32 = 120;
 
 /// The two suggestion groups, in the order the page shows them: what has
 /// actually notified, then the built-in guesses.
@@ -335,6 +363,16 @@ pub struct UiState {
     /// cannot clobber the allowlist entry field the user is halfway through
     /// typing into, or any other row.
     suggestion_rows: Redraws,
+    /// One per row whose *entries* are discovered from the filesystem
+    /// rather than declared in `schema` -- today, exactly the Voice row.
+    ///
+    /// A third list rather than a flag on `rows`, because these run on a
+    /// different trigger and must not run on the ordinary one: a dropdown
+    /// that re-reads the models directory on every redraw is a dropdown
+    /// whose entries can shift under a selection the user is making. The
+    /// one trigger is [`voice_download_row`] finishing a download the user
+    /// asked for and watched -- see [`Ui::rediscover_options`].
+    discovered: Redraws,
     /// What those closures draw: computed once per redraw rather than once
     /// per group.
     ///
@@ -427,6 +465,34 @@ impl Ui {
     /// [`UiState::suggestion_rows`] for why these are a separate list.
     fn suggestion_row(&self, draw: impl Fn(&Ui, &Config) + 'static) {
         self.suggestion_rows.borrow_mut().push(Box::new(draw));
+    }
+
+    /// Register a rebuild for a row whose entries come from the filesystem.
+    /// See [`UiState::discovered`].
+    fn discovered_row(&self, rebuild: impl Fn(&Ui, &Config) + 'static) {
+        self.discovered.borrow_mut().push(Box::new(rebuild));
+    }
+
+    /// Rebuild the entries of every discovered row, then redraw everything.
+    ///
+    /// Called from exactly one place: the moment a voice download finishes,
+    /// which is the moment the models directory has changed *because the
+    /// user asked it to*. `quietly`, because splicing a `GtkStringList`
+    /// under an `AdwComboRow` emits a `selected` notify, and that signal
+    /// would otherwise be indistinguishable from the user having chosen the
+    /// entry that happens to now sit at that index.
+    ///
+    /// The redraw afterwards is not redundant: rebuilding the list is what
+    /// makes the *entries* right, and the redraw is what puts every row --
+    /// including this one, whose selection the splice moved -- back to what
+    /// the config holds.
+    fn rediscover_options(&self, cfg: &Config) {
+        self.quietly(|| {
+            for rebuild in self.discovered.borrow().iter() {
+                rebuild(self, cfg);
+            }
+        });
+        self.redraw(cfg);
     }
 
     /// Put every row back to what `cfg` says.
@@ -596,17 +662,25 @@ fn render_row(b: &Build, row: &'static schema::Row) -> gtk::Widget {
             set,
         } => {
             let (get, set) = (*get, *set);
-            // Resolved once and captured, not re-read per redraw: a voice
-            // pack appearing mid-session would change the *entries*, and a
-            // row whose entries move under a selection is a row that
-            // reports a choice the user did not make. The window is built on
-            // demand, so reopening it is what picks up a new pack.
-            let entries = options.resolve(b.ui);
-            let labels: Vec<&str> = entries.iter().map(|(_, l)| l.as_str()).collect();
+            // Resolved once, and *not* re-resolved per redraw: a voice pack
+            // appearing mid-session would change the *entries*, and a row
+            // whose entries move under a selection is a row that reports a
+            // choice the user did not make.
+            //
+            // Behind a `RefCell` all the same, because there is exactly one
+            // moment where the entries should move: a download the user
+            // started from this very window has just finished putting voice
+            // packs on disk, and they are watching for the list to fill.
+            // That goes through [`Ui::rediscover_options`], never through a
+            // redraw. Anything *else* that changes the directory is picked
+            // up by reopening the window, as before.
+            let entries: Rc<RefCell<Vec<(String, String)>>> =
+                Rc::new(RefCell::new(options.resolve(b.ui)));
+            let labels: Vec<String> = entries.borrow().iter().map(|(_, l)| l.clone()).collect();
             let combo = Combo::new(title, &labels, *unknown);
 
             let known = entries.clone();
-            let position = move |value: &str| known.iter().position(|(v, _)| v == value);
+            let position = move |value: &str| known.borrow().iter().position(|(v, _)| v == value);
             combo.show(&get(b.cfg), position(&get(b.cfg)));
 
             let c = combo.clone();
@@ -616,14 +690,32 @@ fn render_row(b: &Build, row: &'static schema::Row) -> gtk::Widget {
                 c.show(&value, position_for_redraw(&value));
             });
 
+            // Only a discovered list can change while the window is open; a
+            // static table cannot, so registering one would be a rebuild
+            // that can only ever produce what is already there.
+            if matches!(options, schema::Options::Discovered(_)) {
+                let c = combo.clone();
+                let known = entries.clone();
+                b.ui.discovered_row(move |ui, cfg| {
+                    let fresh = options.resolve(ui);
+                    let labels: Vec<String> = fresh.iter().map(|(_, l)| l.clone()).collect();
+                    c.reload(&labels);
+                    *known.borrow_mut() = fresh;
+                    let value = get(cfg);
+                    let at = known.borrow().iter().position(|(v, _)| *v == value);
+                    c.show(&value, at);
+                });
+            }
+
             let u = b.ui.downgrade();
             let synthetic = combo.synthetic.clone();
             let known = entries;
             combo.row.connect_selected_notify(move |row| {
                 u.on_user_change(|u| {
-                    match Combo::choice(row, &synthetic).and_then(|i| known.get(i)) {
+                    let picked =
+                        Combo::choice(row, &synthetic).and_then(|i| known.borrow().get(i).cloned());
+                    match picked {
                         Some((value, _)) => {
-                            let value = value.clone();
                             u.apply(|c| set(c, &value));
                         }
                         // The synthetic entry, or an empty list: there is
@@ -747,6 +839,7 @@ fn build(model: Arc<SettingsModel>, engine: EngineHandle) -> Ui {
         quiet: Cell::new(false),
         rows: RefCell::new(Vec::new()),
         suggestion_rows: RefCell::new(Vec::new()),
+        discovered: RefCell::new(Vec::new()),
         suggestions: RefCell::new(Vec::new()),
         seen_generation: Cell::new(0),
     }));
@@ -945,6 +1038,28 @@ impl Combo {
             .checked_sub(u32::from(synthetic.get()))
             .map(|i| i as usize)
     }
+
+    /// Replace the choices this row offers, leaving any synthetic entry
+    /// where it is.
+    ///
+    /// The only caller is [`Ui::rediscover_options`], which runs when a
+    /// download the user just watched finish has put voice packs on disk.
+    /// It is emphatically *not* something a redraw does -- see the comment
+    /// in [`render_row`]'s `Choice` arm for why a row whose entries move on
+    /// their own is a row that reports a choice nobody made.
+    ///
+    /// The synthetic entry is left in place rather than removed even when
+    /// the new list makes it redundant, for the reason `synthetic`'s own
+    /// doc gives: removing index 0 renumbers the selection and emits a
+    /// `selected` notify. `show` is called straight afterwards and puts the
+    /// selection and the subtitle back to what the config holds, so a stale
+    /// dead entry at the top of the list is all it costs.
+    fn reload(&self, choices: &[String]) {
+        let offset = self.offset();
+        let additions: Vec<&str> = choices.iter().map(String::as_str).collect();
+        self.list
+            .splice(offset, self.list.n_items() - offset, &additions);
+    }
 }
 
 /// A spin row that admits when the config holds a value it cannot show.
@@ -1071,6 +1186,173 @@ pub fn voice_test_row(b: &Build) -> gtk::Widget {
     // uses twice.
     test.connect_entry_activated(move |row| u.with(|ui| audition(ui, &e, &row.text())));
     test.upcast()
+}
+
+/// The Voice group's offer to fetch the model and the voice packs, for a
+/// machine that has none.
+///
+/// **Shown only when nothing is installed.** A fresh install opens this
+/// window to an empty Voice dropdown, a subtitle saying the configured voice
+/// has no pack, and -- until this row -- a daemon log line telling them to
+/// find a shell script in a source tree they may not have. Once packs are
+/// there the row is a 341 MB button that can only do harm, so it hides.
+/// Visibility is decided once, at build time, from the same list the
+/// dropdown was built from; the window is built on demand, so a directory
+/// filled by other means is picked up by reopening it.
+///
+/// `schema::Row::Custom` because there is no config field here at all. It is
+/// not registered with `Ui::row` for the same reason the Test row above is
+/// not: a redraw fires for every accepted edit anywhere in the window, and
+/// there is nothing in the config to draw a running download's progress
+/// from -- redrawing it would erase the very thing the user is watching.
+///
+/// Every string and every number it shows is built in `settings::download`,
+/// which is the layer with tests. What is left here is a subtitle, a
+/// fraction, a button label and a visibility.
+pub fn voice_download_row(b: &Build) -> gtk::Widget {
+    let row = adw::ActionRow::builder()
+        .title("Download voices")
+        // The subtitle is a size and a hostname, neither of which is markup;
+        // the same rule every other row in this file follows.
+        .use_markup(false)
+        .subtitle(download::offer_subtitle())
+        // Long enough to wrap rather than be ellipsised: the size is the
+        // whole point of the sentence, and it is at the end of it.
+        .subtitle_lines(0)
+        .activatable(false)
+        .visible(b.ui.model.voices().is_empty())
+        // Named so the tests can find it by identity. Its title is one of
+        // the things under test, and every other property it has is shared
+        // with rows built elsewhere in this file.
+        .name(DOWNLOAD_ROW_NAME)
+        .build();
+
+    let bar = gtk::ProgressBar::builder()
+        .valign(gtk::Align::Center)
+        // A bar sized by its container would be a hairline beside a button;
+        // this is roughly a quarter of the window's 520px.
+        .width_request(DOWNLOAD_BAR_PX)
+        // Hidden until there is something to show, rather than sitting at
+        // zero: an empty bar next to an offer reads as a download that has
+        // stalled at the start.
+        .visible(false)
+        .build();
+    let button = gtk::Button::builder()
+        .label(DOWNLOAD_LABEL)
+        .valign(gtk::Align::Center)
+        .build();
+    row.add_suffix(&bar);
+    row.add_suffix(&button);
+
+    // The running transfer's stop switch, or `None` when nothing is
+    // running -- which is also how a second click is told from a first.
+    // Cleared by the outcome rather than by the cancelling click, so that a
+    // cancel which has not landed yet cannot be mistaken for "idle" and
+    // start a *second* download alongside the one it is stopping.
+    //
+    // `Rc<RefCell<_>>` and not a widget property because it holds no widget:
+    // it closes no cycle, and nothing a widget owns holds it back.
+    let running: Rc<RefCell<Option<Arc<AtomicBool>>>> = Rc::new(RefCell::new(None));
+
+    let u = b.ui.downgrade();
+    // Weak, all three: `bar` and `row` are the widgets this handler is
+    // attached *underneath* (the button is a suffix of the row, which owns
+    // the bar), so a strong clone here would be a widget holding a handler
+    // holding that widget -- the cycle `widgets_survived` exists to catch.
+    // The button itself is never captured at all: `connect_clicked` hands it
+    // back as an argument.
+    let weak_row = row.downgrade();
+    let weak_bar = bar.downgrade();
+    let flag = running.clone();
+    button.connect_clicked(move |button| {
+        if let Some(stop) = flag.borrow().as_ref() {
+            stop.store(true, Ordering::Relaxed);
+            // The transfer notices between chunks, so the row keeps saying
+            // what it is doing until the outcome lands and puts it back.
+            button.set_sensitive(false);
+            button.set_label(CANCELLING_LABEL);
+            return;
+        }
+        let (Some(row), Some(bar)) = (weak_row.upgrade(), weak_bar.upgrade()) else {
+            return;
+        };
+        u.with(|ui| {
+            let stop = Arc::new(AtomicBool::new(false));
+            *flag.borrow_mut() = Some(stop.clone());
+            let events = ui.model.download_voices(stop);
+
+            row.set_subtitle(&download::starting_subtitle());
+            bar.set_fraction(0.0);
+            bar.set_visible(true);
+            button.set_label(CANCEL_LABEL);
+
+            let u = ui.downgrade();
+            let weak_row = row.downgrade();
+            let weak_bar = bar.downgrade();
+            let weak_button = button.downgrade();
+            let flag = flag.clone();
+            // The main thread does not wait: the transfer is on the
+            // daemon's blocking pool and this future only awaits what it
+            // reports. Closing the window drops the receiver, which the
+            // transfer reads as a cancel (see
+            // `SettingsModel::download_voices`), so nothing is left running
+            // for a window that no longer exists.
+            glib::spawn_future_local(async move {
+                while let Ok(event) = events.recv().await {
+                    let (Some(row), Some(bar)) = (weak_row.upgrade(), weak_bar.upgrade()) else {
+                        return;
+                    };
+                    match event {
+                        download::Event::Progress(p) => {
+                            row.set_subtitle(&p.subtitle());
+                            bar.set_fraction(p.fraction());
+                        }
+                        download::Event::Finished(outcome) => {
+                            *flag.borrow_mut() = None;
+                            bar.set_visible(false);
+                            row.set_subtitle(&outcome.subtitle());
+                            if let Some(button) = weak_button.upgrade() {
+                                button.set_label(DOWNLOAD_LABEL);
+                                button.set_sensitive(true);
+                            }
+                            if outcome == download::Outcome::Complete {
+                                // The offer has been taken; what is left is
+                                // a button that can only refetch 341 MB.
+                                row.set_visible(false);
+                            }
+                            u.with(|ui| finish_download(ui, &outcome));
+                        }
+                    }
+                }
+            });
+        });
+    });
+    row.upcast()
+}
+
+/// What a finished download changes outside its own row.
+///
+/// Split out so the two things it does are visible: the model looks at the
+/// directory again, and every row that reads that directory is rebuilt from
+/// what it now holds. Without the second half the packs are on disk and the
+/// dropdown is still empty until the window is reopened, which is exactly
+/// the "restart to see it" the button exists to avoid.
+///
+/// A failure is toasted as well as written into the row's subtitle: the row
+/// is at the top of one group on one page, and a user who navigated to a
+/// sub-page while 341 MB transferred is not looking at it.
+fn finish_download(ui: &Ui, outcome: &download::Outcome) {
+    match outcome {
+        download::Outcome::Complete => {
+            ui.model.rescan_voices();
+            ui.rediscover_options(&ui.model.current());
+            ui.toast(&outcome.subtitle());
+        }
+        download::Outcome::Failed(_) => ui.toast(&outcome.subtitle()),
+        // Cancelling is something the user just did on purpose; a toast
+        // telling them they did it is noise.
+        download::Outcome::Cancelled => {}
+    }
 }
 
 /// The two suggestion groups, as the two `fn` pointers `schema` can name.
@@ -2480,6 +2762,39 @@ mod tests {
     }
 
     /// The `GtkButton` under `widget` with this label.
+    /// The `AdwActionRow` under `widget` carrying this widget name.
+    ///
+    /// By name and not by title for the reason [`find_result_row`] is: the
+    /// download row's title and subtitle are what the tests assert about,
+    /// so they cannot also be how the tests find it.
+    fn find_named_row(widget: &gtk::Widget, name: &str) -> Option<adw::ActionRow> {
+        if let Some(row) = widget.downcast_ref::<adw::ActionRow>() {
+            if row.widget_name() == name {
+                return Some(row.clone());
+            }
+        }
+        let mut child = widget.first_child();
+        while let Some(w) = child {
+            if let Some(found) = find_named_row(&w, name) {
+                return Some(found);
+            }
+            child = w.next_sibling();
+        }
+        None
+    }
+
+    /// What a `Combo` is offering, in the order the dropdown shows it --
+    /// including any synthetic entry at index 0.
+    fn combo_labels(row: &adw::ComboRow) -> Vec<String> {
+        let list = row
+            .model()
+            .and_then(|m| m.downcast::<gtk::StringList>().ok())
+            .expect("a ComboRow built by `Combo::new` has a StringList model");
+        (0..list.n_items())
+            .map(|i| list.string(i).map(|s| s.to_string()).unwrap_or_default())
+            .collect()
+    }
+
     fn find_button(widget: &gtk::Widget, label: &str) -> Option<gtk::Button> {
         if let Some(button) = widget.downcast_ref::<gtk::Button>() {
             if button.label().is_some_and(|l| l == label) {
@@ -3507,6 +3822,137 @@ mod tests {
         engine.shutdown();
     }
 
+    /// The offer appears exactly when there is nothing installed, and says
+    /// how large it is before the user commits to it.
+    ///
+    /// Both halves matter and they fail in opposite directions. Without the
+    /// first, every user who has already downloaded the packs is shown a
+    /// button whose only possible effect is to refetch 341 MB. Without the
+    /// second, a user on a metered connection presses it once.
+    fn the_download_row_is_offered_only_when_no_voices_are_installed(dir: &std::path::Path) {
+        // A fresh install: no models directory at all, which is the state
+        // `list_voices` reports as an empty list.
+        let empty = dir.join("download-offer-empty");
+        std::fs::create_dir_all(&empty).expect("a config directory of its own");
+        let (model, engine) = model_in(&empty);
+        let ui = build(model, engine.clone());
+        let row = find_named_row(ui.window.upcast_ref(), DOWNLOAD_ROW_NAME)
+            .expect("a download row in the Voice group");
+        assert!(
+            row.get_visible(),
+            "with no voice pack installed the window must offer to fetch them"
+        );
+        assert_eq!(row.title(), "Download voices");
+        let subtitle = row.subtitle().map(|s| s.to_string()).unwrap_or_default();
+        assert!(
+            subtitle.contains("341 MB"),
+            "the size has to be readable before the download starts, not after: \
+             {subtitle:?}"
+        );
+        assert!(
+            subtitle.contains("huggingface.co"),
+            "the offer names the host it fetches from: {subtitle:?}"
+        );
+        assert!(
+            find_button(row.clone().upcast_ref(), DOWNLOAD_LABEL).is_some(),
+            "the offer is a button, not a sentence"
+        );
+        ui.window.destroy();
+        drop(ui);
+        engine.shutdown();
+
+        // One pack installed is enough: the dropdown has something in it, so
+        // the offer has nothing left to offer.
+        let filled = dir.join("download-offer-filled");
+        std::fs::create_dir_all(filled.join("voices")).expect("a voices directory");
+        std::fs::write(filled.join("voices").join("af_heart.bin"), b"x").expect("a voice pack");
+        let (model, engine) = model_in(&filled);
+        let ui = build(model, engine.clone());
+        let row = find_named_row(ui.window.upcast_ref(), DOWNLOAD_ROW_NAME)
+            .expect("a download row in the Voice group");
+        assert!(
+            !row.get_visible(),
+            "with a voice pack installed the download row is a 341 MB button that \
+             can only do harm"
+        );
+        ui.window.destroy();
+        drop(ui);
+        engine.shutdown();
+    }
+
+    /// A finished download fills the Voice dropdown without the window being
+    /// reopened.
+    ///
+    /// The point of the button. A download that leaves the user looking at
+    /// the same empty dropdown it was pressed from has, as far as they can
+    /// tell, done nothing -- and the fix for that ("close the settings and
+    /// open them again") is precisely the instruction this replaces.
+    ///
+    /// Driven through [`finish_download`] rather than through the button,
+    /// because the button reaches the network and this suite does not. What
+    /// is under test is everything downstream of the transfer succeeding:
+    /// the model looking at the directory again, the `GtkStringList` being
+    /// respliced, and the row's selection landing on the configured voice
+    /// rather than wherever the splice left it.
+    fn a_finished_download_fills_the_voice_dropdown(dir: &std::path::Path) {
+        let dir = dir.join("download-refresh");
+        std::fs::create_dir_all(&dir).expect("a config directory of its own");
+        let (model, engine) = model_in(&dir);
+        let ui = build(model, engine.clone());
+
+        let voice =
+            find_row::<adw::ComboRow>(ui.window.upcast_ref(), "Voice").expect("a Voice row");
+        let configured = Config::default().voice;
+        assert_eq!(
+            combo_labels(&voice),
+            vec![format!(
+                "\u{2018}{configured}\u{2019} — no voice pack installed"
+            )],
+            "with nothing installed the row offers only the synthetic entry \
+             explaining that"
+        );
+
+        // What a completed download leaves behind.
+        std::fs::create_dir_all(dir.join("voices")).expect("a voices directory");
+        for name in [configured.as_str(), "am_fenrir"] {
+            std::fs::write(dir.join("voices").join(format!("{name}.bin")), b"x")
+                .expect("a voice pack");
+        }
+        finish_download(&ui, &download::Outcome::Complete);
+
+        let labels = combo_labels(&voice);
+        assert_eq!(
+            labels.len(),
+            3,
+            "the two new packs, behind the synthetic entry the row keeps: {labels:?}"
+        );
+        assert_eq!(
+            &labels[1..],
+            &[configured.clone(), "am_fenrir".to_string()],
+            "the packs on disk are what the dropdown now offers: {labels:?}"
+        );
+        assert_eq!(
+            voice.selected(),
+            1,
+            "the row must land on the configured voice, not on wherever the \
+             splice left the selection"
+        );
+        assert_eq!(
+            voice.subtitle().map(|s| s.to_string()).unwrap_or_default(),
+            "",
+            "the row must stop saying the configured voice has no pack once it has one"
+        );
+        assert_eq!(
+            ui.model.current().voice,
+            configured,
+            "rebuilding the entries must not write a config change nobody asked for"
+        );
+
+        ui.window.destroy();
+        drop(ui);
+        engine.shutdown();
+    }
+
     /// The leak M5 paid for, guarded at the two places a new one would
     /// appear: the entry rows' focus controllers and the preset popover's
     /// buttons, both of which refer to widgets that refer back.
@@ -3646,6 +4092,8 @@ mod tests {
         the_key_row_visibility_follows_the_clicked_preset(dir.path());
         clicking_a_preset_commits_its_provider_too(dir.path());
         the_provider_row_does_not_silently_rewrite_an_unset_or_unrecognised_value(dir.path());
+        the_download_row_is_offered_only_when_no_voices_are_installed(dir.path());
+        a_finished_download_fills_the_voice_dropdown(dir.path());
         the_test_row_reports_the_latency_against_the_deadline(dir.path());
         pressing_enter_while_a_test_runs_does_not_start_a_second_one(dir.path());
         the_window_is_freed_after_the_reword_group_has_been_built(dir.path());
