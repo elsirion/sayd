@@ -1839,6 +1839,124 @@ pub fn reword_group(b: &Build) -> adw::PreferencesGroup {
         |cfg| cfg.reword.model.clone(),
         |cfg, v| cfg.reword.model = v,
     );
+
+    // A menu of what the endpoint says it has, beside the entry rather than
+    // instead of it. `AdwComboRow` would have been less code and the wrong
+    // shape: the listing is optional -- plenty of OpenAI-compatible servers
+    // do not implement `/v1/models`, and a remote one may need a key before
+    // it will answer -- so a dropdown would be the *only* way to name a
+    // model and would be empty exactly when the user most needs to type one.
+    // Free text stays the mechanism; this only saves the typing when it can.
+    //
+    // The same popover-of-buttons as the Endpoint presets above, and for the
+    // same reason: no `GtkApplication`, so no action group to hang a `GMenu`
+    // on.
+    let models = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let models_pop = gtk::Popover::builder().child(&models).build();
+    let models_menu = gtk::MenuButton::builder()
+        .icon_name("view-list-symbolic")
+        .tooltip_text("Models this endpoint offers")
+        .valign(gtk::Align::Center)
+        .popover(&models_pop)
+        .build();
+    models_menu.add_css_class("flat");
+    model_row.add_suffix(&models_menu);
+
+    // Fetched when the menu opens, not when the window is built: it is a
+    // network round trip, and a window that made one on every open would
+    // pay for it whether or not anyone looked. Refetched on every open
+    // rather than cached, because the set changes when the user edits the
+    // endpoint two rows up -- and a stale list of a *different* server's
+    // models is worse than a slow one.
+    let u = ui.downgrade();
+    let list_box = models.clone();
+    let weak_field = model_row.downgrade();
+    let weak_pop = models_pop.downgrade();
+    // On the popover's `show` rather than the button's `active` property:
+    // `show` is the signal that means "the user is looking at this now",
+    // whatever opened it.
+    models_pop.connect_show(move |_| {
+        while let Some(child) = list_box.first_child() {
+            list_box.remove(&child);
+        }
+        list_box.append(&gtk::Label::builder().label("Asking the endpoint…").build());
+
+        // `WeakUi::with` runs a closure and returns nothing, so the
+        // receiver comes back through a cell rather than out of the call.
+        let mut pending = None;
+        u.with(|ui| pending = Some(ui.model.list_models()));
+        let Some(events) = pending else { return };
+        let list_box = list_box.clone();
+        let u = u.clone();
+        let weak_field = weak_field.clone();
+        let weak_pop = weak_pop.clone();
+        glib::spawn_future_local(async move {
+            let Ok(answer) = events.recv().await else {
+                return;
+            };
+            while let Some(child) = list_box.first_child() {
+                list_box.remove(&child);
+            }
+            let names = match answer {
+                Ok(names) if names.is_empty() => {
+                    list_box.append(
+                        &gtk::Label::builder()
+                            .label("This endpoint lists no models")
+                            .build(),
+                    );
+                    return;
+                }
+                Ok(names) => names,
+                Err(why) => {
+                    // The endpoint's own words, wrapped: a model name or a
+                    // URL in a refusal is long, and a popover that grows
+                    // past the window is worse than one that wraps.
+                    list_box.append(
+                        &gtk::Label::builder()
+                            .label(&why)
+                            .wrap(true)
+                            .max_width_chars(40)
+                            .build(),
+                    );
+                    return;
+                }
+            };
+            for name in names {
+                let item = gtk::Button::builder()
+                    .label(&name)
+                    .css_classes(["flat"])
+                    .build();
+                // Left-aligned like a menu item rather than centred like a
+                // button, which is what every other popover list here does.
+                if let Some(label) = item.child().and_then(|c| c.downcast::<gtk::Label>().ok()) {
+                    label.set_xalign(0.0);
+                }
+                let u = u.clone();
+                let weak_field = weak_field.clone();
+                let weak_pop = weak_pop.clone();
+                let chosen = name.clone();
+                item.connect_clicked(move |_| {
+                    if let Some(pop) = weak_pop.upgrade() {
+                        pop.popdown();
+                    }
+                    let Some(field) = weak_field.upgrade() else {
+                        return;
+                    };
+                    let chosen = chosen.clone();
+                    // The visible text *and* the config, for the reason the
+                    // Endpoint presets do both: a menu that filled the field
+                    // and left it waiting for Apply would look applied and
+                    // not be.
+                    u.on_user_change(|ui| {
+                        field.set_text(&chosen);
+                        ui.apply(move |cfg| cfg.reword.model = chosen.clone());
+                    });
+                });
+                list_box.append(&item);
+            }
+        });
+    });
+
     group.add(&model_row);
 
     // --- API key ----------------------------------------------------------
@@ -2978,6 +3096,39 @@ mod tests {
             );
             ui.window.pop_subpage();
         }
+
+        drop(ui);
+        engine.shutdown();
+    }
+
+    /// The Model row keeps free text and gains a menu, rather than becoming
+    /// a dropdown.
+    ///
+    /// The distinction is the whole design: `/v1/models` is optional -- many
+    /// OpenAI-compatible servers do not implement it, and a remote one may
+    /// need a key before it will answer -- so a `AdwComboRow` would be the
+    /// only way to name a model and would be empty exactly when the user
+    /// most needs to type one. Finding it as an `AdwEntryRow` is what pins
+    /// that it was not quietly swapped.
+    ///
+    /// **What this does not cover**: the menu's contents. `list_models`
+    /// reaches `reword::http` directly, with none of the injection seam
+    /// `rewriter_factory` gives the Test row, so a populated popover cannot
+    /// be driven without a socket. The parsing, sorting and failure paths
+    /// are covered in `reword::http`'s own tests instead.
+    fn the_model_row_is_free_text_with_a_menu_beside_it(dir: &std::path::Path) {
+        let dir = dir.join("model-menu");
+        std::fs::create_dir_all(&dir).expect("a config directory of its own");
+        let (model, engine) = model_in(&dir);
+        let ui = build(model, engine.clone());
+        push_every_subpage(&ui);
+
+        let row = find_row::<adw::EntryRow>(ui.window.upcast_ref(), "Model")
+            .expect("the Model row must stay an entry, not become a combo");
+        assert!(
+            find_widget::<gtk::MenuButton>(&row.clone().upcast::<gtk::Widget>()).is_some(),
+            "the Model row must carry the endpoint's model menu"
+        );
 
         drop(ui);
         engine.shutdown();
@@ -4172,6 +4323,7 @@ mod tests {
         // from a `#[test]` of its own for the same one-init reason.
         adw::init().expect("libadwaita initialises once GTK has");
         every_subpage_has_a_header_bar_to_get_back_from(dir.path());
+        the_model_row_is_free_text_with_a_menu_beside_it(dir.path());
         every_described_row_redraws_from_the_config(dir.path());
         a_newly_seen_application_appears_while_the_window_is_open(dir.path());
         the_reword_entry_rows_commit_on_apply_and_never_clobber_typing(dir.path());

@@ -908,6 +908,86 @@ fn read_stream(
     }
 }
 
+/// The shape of `GET /v1/models`. Every field optional for the reason
+/// [`ChatResponse`]'s are: this is an untrusted body, and a server that
+/// answers something unexpected must produce an empty list rather than fail
+/// the parse.
+#[derive(Deserialize, Default)]
+struct ModelList {
+    #[serde(default)]
+    data: Vec<ModelEntry>,
+}
+
+#[derive(Deserialize, Default)]
+struct ModelEntry {
+    #[serde(default)]
+    id: Option<String>,
+}
+
+/// Ask the configured endpoint which models it has.
+///
+/// `GET {base_url}/models`, the OpenAI-compatible listing that llama.cpp's
+/// server, llama-swap, Ollama, LM Studio and vLLM all answer. **Optional by
+/// design**: a server that does not implement it, or answers something
+/// unrecognisable, yields an empty list rather than an error the user has to
+/// dismiss, because the Model row is a free-text entry and a listing that
+/// fails costs nothing but the suggestion.
+///
+/// A short deadline of its own rather than [`http_ceiling`]: this runs
+/// because a user opened a menu and is waiting on it, which is a different
+/// budget from a rewrite that may legitimately take half a minute. Ten
+/// seconds is long enough for a loaded server on a slow link and short
+/// enough that a dead endpoint does not leave the menu spinning.
+///
+/// Sends the same `Authorization` header a rewrite would: a remote endpoint
+/// that needs a key to answer `/chat/completions` needs one to answer this.
+pub fn list_models(cfg: &RewordConfig, key: Option<&str>) -> Result<Vec<String>, RewordError> {
+    let url = sayd_core::reword::models_url(&cfg.base_url);
+    let mut call = agent()
+        .get(&url)
+        .config()
+        .timeout_global(Some(MODEL_LIST_CEILING))
+        .build();
+    if let Some(key) = key {
+        call = call.header("authorization", format!("Bearer {key}"));
+    }
+    let response = match call.call() {
+        Ok(r) => r,
+        Err(ureq::Error::Timeout(_)) => return Err(RewordError::Ceiling),
+        Err(e) => return Err(unreachable_from(&e.to_string(), &url)),
+    };
+    let status = response.status().as_u16();
+    if !(200..300).contains(&status) {
+        return Err(RewordError::NotConfigured(format!(
+            "the endpoint answered {status} when asked for its model list"
+        )));
+    }
+    let body = response
+        .into_body()
+        .with_config()
+        .limit(BODY_LIMIT)
+        .read_to_vec()
+        .map_err(|e| RewordError::Malformed(format!("reading the model list: {e}")))?;
+    let parsed: ModelList = serde_json::from_slice(&body).unwrap_or_default();
+    let mut ids: Vec<String> = parsed
+        .data
+        .into_iter()
+        .filter_map(|m| m.id)
+        .filter(|id| !id.trim().is_empty())
+        .collect();
+    // Sorted and deduplicated because this is a menu: the wire order is
+    // whatever the server felt like, and llama-swap in particular lists in
+    // config-file order, which is not an order a user is looking for a name
+    // in.
+    ids.sort_unstable();
+    ids.dedup();
+    Ok(ids)
+}
+
+/// What [`list_models`] waits. See its doc for why this is not
+/// [`http_ceiling`].
+const MODEL_LIST_CEILING: Duration = Duration::from_secs(10);
+
 impl Rewriter for HttpRewriter {
     fn reword(&self, prompt: &str, text: &str) -> Result<String, RewordError> {
         let request = build_request(&self.cfg, self.key.as_deref(), prompt, text);
@@ -998,6 +1078,67 @@ mod tests {
             // request.
             provider: Some("generic".into()),
             ..RewordConfig::default()
+        }
+    }
+
+    /// A model list is sorted, deduplicated and stripped of blanks.
+    ///
+    /// The wire order is whatever the server felt like -- llama-swap lists
+    /// in config-file order -- and this is a menu someone is looking a name
+    /// up in. Verified against a real llama-swap on this machine before the
+    /// shape was fixed here; that check is not committed because it needs a
+    /// server.
+    #[test]
+    fn a_model_list_is_sorted_and_deduplicated() {
+        let body = br#"{"data":[{"id":"zeta"},{"id":"alpha"},{"id":"zeta"},
+                       {"id":""},{"id":"  "},{"id":"beta"}]}"#;
+        let (cfg, server) = serve(move |_req| {
+            Some(http(200, "", std::str::from_utf8(body).unwrap()))
+        });
+        let got = list_models(&cfg, None).expect("the server answers");
+        assert_eq!(got, ["alpha", "beta", "zeta"]);
+        server.join().expect("server thread ends");
+    }
+
+    /// A server with no listing endpoint, or one that answers something
+    /// unrecognisable, must not produce an error the user has to dismiss --
+    /// the Model row is free text and a failed suggestion costs nothing.
+    #[test]
+    fn an_unusable_model_list_is_empty_rather_than_fatal() {
+        let (cfg, server) = serve(|_req| Some(http(200, "", "not json at all")));
+        assert_eq!(
+            list_models(&cfg, None).expect("a body that is not JSON still parses to empty"),
+            Vec::<String>::new()
+        );
+        server.join().expect("server thread ends");
+
+        let (cfg, server) = serve(|_req| Some(http(200, "", r#"{"object":"list"}"#)));
+        assert_eq!(
+            list_models(&cfg, None).expect("a listing with no data key is empty"),
+            Vec::<String>::new()
+        );
+        server.join().expect("server thread ends");
+    }
+
+    /// A refusal is reported, because it is the one case where the user can
+    /// act: a 404 means this endpoint has no listing, a 401 means the key is
+    /// wrong, and both are worth a line in the menu.
+    #[test]
+    fn a_refused_model_list_says_what_the_server_answered() {
+        let (cfg, server) = serve(|_req| Some(http(404, "", "nope")));
+        let Err(RewordError::NotConfigured(why)) = list_models(&cfg, None) else {
+            panic!("a 404 must be reported, not silently empty");
+        };
+        assert!(why.contains("404"), "the status is the actionable part: {why}");
+        server.join().expect("server thread ends");
+    }
+
+    /// The listing goes to `/models` beside `/chat/completions`, with the
+    /// same trailing-slash handling.
+    #[test]
+    fn the_listing_url_sits_beside_the_completions_url() {
+        for base in ["http://h/v1", "http://h/v1/"] {
+            assert_eq!(sayd_core::reword::models_url(base), "http://h/v1/models");
         }
     }
 

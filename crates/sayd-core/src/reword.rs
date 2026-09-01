@@ -320,6 +320,15 @@ pub fn chat_completions_url(base_url: &str) -> String {
     format!("{}/chat/completions", base_url.trim().trim_end_matches('/'))
 }
 
+/// The model-listing endpoint for the same base URL.
+///
+/// Beside [`chat_completions_url`] so the two agree about what a base URL
+/// is -- the trailing-slash handling in particular, which is the whole
+/// reason that function exists rather than a `format!` at each call site.
+pub fn models_url(base_url: &str) -> String {
+    format!("{}/models", base_url.trim().trim_end_matches('/'))
+}
+
 /// Is `host` this machine? Decides only whether plain HTTP earns a warning.
 ///
 /// Name-based, not resolution-based: resolving would be a DNS lookup at

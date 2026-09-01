@@ -936,6 +936,43 @@ impl SettingsModel {
         rx
     }
 
+    /// Ask the configured endpoint which models it has.
+    ///
+    /// The same `spawn_blocking`-and-channel shape as [`SettingsModel::test_reword`],
+    /// and for the same reason: the call reaches a socket and must not be
+    /// made on the glib thread. `Err` carries a sentence for the menu rather
+    /// than a `RewordError`, because the menu has one line to say it in and
+    /// no row to colour.
+    pub fn list_models(&self) -> async_channel::Receiver<Result<Vec<String>, String>> {
+        // Bounded at one: there is exactly one answer, and the menu is
+        // rebuilt from it.
+        let (tx, rx) = async_channel::bounded(1);
+        let cfg = *self.current().reword;
+        let run = move || {
+            let key = sayd_core::config::resolve_api_key(&cfg);
+            // Through `outcome_for_error` rather than a `to_string`: these
+            // are the same failures the Test row names, and there is no
+            // reason for a dead endpoint to read one way in that row and
+            // another in this menu. `RewordError` has no `Display` on
+            // purpose -- every user-facing string in this window is built
+            // here (see `TestOutcome`).
+            let answer = crate::reword::http::list_models(&cfg, key.as_deref())
+                .map_err(|e| outcome_for_error(e, &cfg).title());
+            let _ = tx.try_send(answer);
+        };
+        match &self.runtime {
+            Some(handle) => {
+                handle.spawn_blocking(run);
+            }
+            None => {
+                let _ = std::thread::Builder::new()
+                    .name("model-list".into())
+                    .spawn(run);
+            }
+        }
+        rx
+    }
+
     /// Block until nothing is owed to the disk. Test-only: production code
     /// on the glib thread must never wait on the writer.
     #[cfg(test)]
