@@ -8,8 +8,7 @@ exec sayd
 
 bindsym $mod+Shift+s exec say selection
 bindsym $mod+Shift+v exec say clipboard
-bindsym $mod+Shift+x exec say stop
-bindsym $mod+Shift+p exec say play-pause
+bindsym $mod+Shift+m exec say stop
 
 # Media keys, via the MPRIS2 interface sayd registers as
 # org.mpris.MediaPlayer2.sayd -- `playerctl -p sayd` addresses it by that

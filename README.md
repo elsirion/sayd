@@ -112,8 +112,7 @@ Add [`docs/sway.conf.example`](docs/sway.conf.example) to
 
     bindsym $mod+Shift+s exec say selection
     bindsym $mod+Shift+v exec say clipboard
-    bindsym $mod+Shift+x exec say stop
-    bindsym $mod+Shift+p exec say play-pause
+    bindsym $mod+Shift+m exec say stop
 
 `sayd` reads the PRIMARY selection itself through `wlr-data-control`, so
 there is no `$(...)` anywhere in the keybinds -- no selected text ever
@@ -1062,7 +1061,7 @@ own test suite -- walk it yourself after installing:
 3. Select text in any window, press `$mod+Shift+s` -- it should speak.
 4. Run `say status` while it speaks -- expect `state: speaking` and a
    non-zero `remaining` figure.
-5. Press `$mod+Shift+x` -- it should stop immediately.
+5. Press `$mod+Shift+m` -- it should stop immediately.
 6. Copy text, press `$mod+Shift+v` -- it should speak the clipboard.
 7. Run `say "hello from the terminal"` -- it should speak.
 8. Reload the sway config again -- `pgrep -c sayd` should still report `1`.
