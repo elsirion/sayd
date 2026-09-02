@@ -1,0 +1,814 @@
+@import url("fonts.css");
+
+/* ---------------------------------------------------------------------------
+   sayd — project site
+
+   Terminal, not editorial. Everything is monospace, every corner is square,
+   every border is a hairline. Two colours carry the argument: steel is text
+   written to be read, phosphor is text made to be heard.
+
+   Dark only, on purpose. Painted explicitly rather than inherited.
+   --------------------------------------------------------------------------- */
+
+:root {
+  --void: #07080a;
+  --surface: #0c0e11;
+  --sunk: #040506;
+  --raised: #11151a;
+
+  --fg: #c6cfc9;
+  --fg-dim: #7c8a84;
+  --fg-faint: #48524e;
+
+  --acid: #2bf08a;
+  --acid-dim: #2bf08a3d;
+  --acid-glow: #2bf08a12;
+
+  --steel: #6b7d8c;
+  --steel-dim: #6b7d8c1f;
+
+  --line: #1a2025;
+  --line-soft: #12171b;
+
+  --display: "JetBrains Mono", ui-monospace, monospace;
+  --mono: "IBM Plex Mono", ui-monospace, "Iosevka NF", monospace;
+
+  --measure: 66ch;
+  --pad: clamp(1.1rem, 5vw, 4rem);
+  --gap: clamp(2rem, 4vw, 3.25rem);
+
+  color-scheme: dark;
+}
+
+*,
+*::before,
+*::after { box-sizing: border-box; }
+
+html { -webkit-text-size-adjust: 100%; scroll-behavior: smooth; }
+
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+body {
+  margin: 0;
+  background: var(--void);
+  color: var(--fg);
+  font-family: var(--mono);
+  font-size: clamp(0.85rem, 0.8rem + 0.24vw, 0.94rem);
+  line-height: 1.7;
+  letter-spacing: -0.005em;
+  -webkit-font-smoothing: antialiased;
+}
+
+main, header, footer { position: relative; z-index: 1; }
+
+a { color: inherit; text-underline-offset: 0.25em; text-decoration-thickness: 1px; }
+a:hover { color: var(--acid); }
+
+::selection { background: var(--acid); color: var(--void); }
+
+h1, h2, h3 {
+  font-family: var(--display);
+  font-weight: 800;
+  letter-spacing: -0.045em;
+  line-height: 1.08;
+  margin: 0;
+  text-transform: lowercase;
+  text-wrap: balance;
+}
+
+.wrap {
+  width: min(100% - calc(var(--pad) * 2), 78rem);
+  margin-inline: auto;
+}
+
+/* --- masthead ------------------------------------------------------------ */
+
+.masthead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1.5rem;
+  padding-block: 1.15rem;
+  border-bottom: 1px solid var(--line);
+}
+
+.wordmark {
+  font-family: var(--display);
+  font-size: 1.15rem;
+  font-weight: 800;
+  letter-spacing: -0.06em;
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.55ch;
+  color: var(--fg);
+}
+
+.wordmark::before { content: "▚"; color: var(--acid); font-size: 0.85em; }
+
+.wordmark::after {
+  content: "_";
+  color: var(--acid);
+  animation: caret 1.15s step-end infinite;
+}
+
+@keyframes caret { 0%, 55% { opacity: 1; } 56%, 100% { opacity: 0; } }
+
+.masthead nav {
+  display: flex;
+  gap: clamp(0.75rem, 2.2vw, 1.7rem);
+  font-size: 0.76rem;
+  color: var(--fg-dim);
+  flex-wrap: wrap;
+}
+
+.masthead nav a { text-decoration: none; }
+.masthead nav a::before { content: "/"; color: var(--fg-faint); margin-right: 0.35ch; }
+.masthead nav a:hover { color: var(--acid); }
+.masthead nav a:hover::before { color: var(--acid-dim); }
+
+@media (max-width: 36rem) {
+  .masthead { flex-direction: column; align-items: flex-start; gap: 0.7rem; }
+}
+
+/* --- hero ---------------------------------------------------------------- */
+
+.hero { padding-block: clamp(2.25rem, 6vw, 4rem) clamp(1.5rem, 4vw, 2.5rem); }
+
+/* Sized so "text to speech" plus the block cursor stays on one line inside the
+   hero's left column at every width the two-column layout is used. */
+.hero h1 {
+  font-size: clamp(1.9rem, 0.37rem + 5.05vw, 4.9rem);
+  max-width: none;
+  text-wrap: initial;
+}
+
+.hero h1 .out {
+  color: var(--acid);
+  text-shadow: 0 0 26px var(--acid-dim);
+}
+
+/* A drawn block rather than the "█" glyph: the glyph sits on its own metrics
+   and rode low against the ascenders. This is pinned to the baseline and cut
+   to the ascender height, so it lines up with the text it follows. */
+.hero h1::after {
+  content: "";
+  display: inline-block;
+  width: 0.55em;
+  height: 0.74em;
+  margin-left: 0.1em;
+  vertical-align: baseline;
+  background: var(--acid);
+  animation: caret 1.15s step-end infinite;
+}
+
+.hero .lede {
+  margin: clamp(1.4rem, 3.4vw, 2.2rem) 0 0;
+  max-width: 54ch;
+  font-size: clamp(0.92rem, 0.86rem + 0.38vw, 1.06rem);
+  color: var(--fg-dim);
+  line-height: 1.7;
+}
+
+.hero .lede strong { color: var(--fg); font-weight: 500; }
+
+.cta { display: flex; flex-wrap: wrap; gap: 0.65rem; margin-top: clamp(1.8rem, 4vw, 2.5rem); }
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.62em 1.05em;
+  border: 1px solid var(--line);
+  border-radius: 0;
+  font-family: var(--mono);
+  font-size: 0.82rem;
+  font-weight: 500;
+  text-decoration: none;
+  color: var(--fg-dim);
+  background: var(--surface);
+  transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease;
+}
+
+.btn::before { content: "["; color: var(--fg-faint); margin-right: 0.6ch; }
+.btn::after { content: "]"; color: var(--fg-faint); margin-left: 0.6ch; }
+
+.btn--solid { border-color: var(--acid-dim); color: var(--acid); background: var(--acid-glow); }
+.btn--solid::before, .btn--solid::after { color: var(--acid-dim); }
+.btn--solid:hover { background: var(--acid); color: var(--void); border-color: var(--acid); }
+.btn--solid:hover::before, .btn--solid:hover::after { color: #0006; }
+
+.btn--ghost:hover { border-color: var(--acid-dim); color: var(--acid); }
+
+.facts {
+  margin-top: clamp(1.6rem, 3.5vw, 2.25rem);
+  padding-top: 1.1rem;
+  border-top: 1px solid var(--line-soft);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1.75rem;
+  font-size: 0.72rem;
+  color: var(--fg-dim);
+}
+
+.facts span { white-space: nowrap; }
+.facts b { color: var(--acid); font-weight: 400; }
+
+/* --- hero layout ------------------------------------------------------------ */
+
+.hero__grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.3fr) minmax(0, 0.7fr);
+  gap: clamp(2rem, 5vw, 4rem);
+  align-items: center;
+}
+
+@media (max-width: 62rem) {
+  .hero__grid { grid-template-columns: 1fr; }
+  .hero__flow { max-width: 30rem; margin: 1rem auto 0; }
+}
+
+/* --- section furniture ----------------------------------------------------- */
+
+section { padding-block: var(--gap); border-top: 1px solid var(--line-soft); }
+
+.eyebrow {
+  font-size: 0.68rem;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--acid);
+  margin: 0 0 1rem;
+  font-family: var(--mono);
+}
+
+.eyebrow::before { content: "// "; color: var(--fg-faint); }
+
+h2 { font-size: clamp(1.5rem, 0.9rem + 2.5vw, 2.7rem); max-width: 22ch; }
+
+.section-lede { margin: 1.2rem 0 0; max-width: 60ch; color: var(--fg-dim); }
+
+/* --- three use cases -------------------------------------------------------- */
+
+.cards {
+  margin-top: clamp(2.5rem, 5vw, 3.75rem);
+  display: grid;
+  gap: 1.1rem;
+  grid-template-columns: 1fr;
+}
+
+/* three across or stacked, never two: two orphans the third card */
+@media (min-width: 58rem) {
+  .cards { grid-template-columns: repeat(3, 1fr); }
+}
+
+/* Each card shares the parent's rows (subgrid), so the step marker, title,
+   prose and snippet each sit on one common row line across all three cards —
+   the snippet tops align however uneven the prose above them runs. */
+.card {
+  background: var(--void);
+  border: 1px solid var(--line-soft);
+  padding: clamp(1.35rem, 3vw, 2rem);
+  display: grid;
+  grid-template-rows: subgrid;
+  grid-row: span 4;
+  row-gap: 0.75rem;
+  position: relative;
+  transition: background 0.18s ease;
+}
+
+.card:hover { background: var(--surface); }
+
+/* the icon sits on the heading's own line and stands in for the ▸ marker
+   the other sections use */
+.card h3 {
+  font-size: 1rem;
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+.card p { margin: 0; color: var(--fg-dim); font-size: 0.82rem; }
+.card .kbd-row { margin-top: auto; padding-top: 0.5rem; }
+
+kbd {
+  font-family: var(--mono);
+  font-size: 0.7rem;
+  padding: 0.24em 0.5em;
+  border: 1px solid var(--line);
+  color: var(--fg-dim);
+  background: var(--surface);
+  white-space: nowrap;
+}
+
+.card-icon { color: var(--acid); width: 19px; height: 19px; flex: none; }
+
+/* the escalating-effort marker on each integration card */
+.card__step {
+  margin: 0;
+  font-size: 0.64rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--acid);
+  opacity: 0.8;
+}
+
+/* snippets sit flush at the bottom of every card, so the three line up
+   however uneven the prose above them is */
+/* `auto` pins the snippet to the card's bottom edge so the three line up; the
+   margin on the prose above guarantees a gap even when the text runs long
+   enough to leave no slack for `auto` to absorb. */
+.card-snip {
+  margin: 0;
+  align-self: start;
+  padding: 0.75rem 0.85rem;
+  font-size: 0.7rem;
+  line-height: 1.65;
+  background: var(--sunk);
+  border: 1px solid var(--line-soft);
+  border-left: 2px solid var(--acid-dim);
+  overflow-x: auto;
+  color: var(--fg-dim);
+  white-space: pre;
+}
+
+/* --- the before / after pairs ----------------------------------------------- */
+
+.pairs { margin-top: clamp(2.25rem, 5vw, 3.5rem); display: grid; gap: 0.9rem; }
+
+.pair {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: stretch;
+  gap: 0.8rem;
+}
+
+.said {
+  border: 1px solid var(--line);
+  padding: 0.9rem 1.05rem 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  background: var(--sunk);
+}
+
+.said p { margin: 0; font-size: 0.85rem; }
+
+.said__tag {
+  font-size: 0.63rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+}
+
+.said--raw { border-left: 2px solid var(--steel); }
+.said--raw p { color: var(--steel); }
+.said--raw .said__tag { color: var(--steel); opacity: 0.8; }
+.said--raw .said__tag::before { content: "< "; }
+
+.said--spoken { border-left: 2px solid var(--acid); background: var(--acid-glow); }
+.said--spoken p { color: var(--fg); }
+.said--spoken .said__tag { color: var(--acid); }
+.said--spoken .said__tag::before { content: "> "; }
+
+.pair__bot { display: grid; place-items: center; padding-inline: 0.15rem; color: var(--acid); }
+
+.bot { width: 42px; height: 42px; overflow: visible; }
+.bot .bot-eye { animation: blink 5.5s steps(1, end) infinite; transform-box: fill-box; transform-origin: center; }
+.bot .bot-ping { animation: ping 2.4s steps(4, end) infinite; }
+.bot .bot-wave { animation: emit 2.4s steps(5, end) infinite; }
+.bot .bot-wave:nth-of-type(2) { animation-delay: 0.3s; }
+
+@keyframes blink { 0%, 92%, 100% { scale: 1 1; } 95% { scale: 1 0.1; } }
+@keyframes ping { 0%, 100% { opacity: 0.3; } 50% { opacity: 1; } }
+@keyframes emit { 0% { opacity: 0; } 40% { opacity: 0.85; } 100% { opacity: 0; } }
+
+@media (max-width: 46rem) {
+  .pair { grid-template-columns: 1fr; gap: 0.45rem; }
+  .pair__bot { padding-block: 0.2rem; }
+  .bot { width: 34px; height: 34px; rotate: 90deg; }
+}
+
+/* --- the long example -------------------------------------------------------- */
+
+.longform {
+  margin-top: clamp(2.5rem, 5vw, 3.5rem);
+  display: grid;
+  gap: 0.9rem;
+  grid-template-columns: 1fr 1fr;
+  align-items: start;
+}
+
+@media (max-width: 52rem) { .longform { grid-template-columns: 1fr; } }
+
+.longform .said { height: 100%; }
+.longform .said p { font-size: 0.79rem; line-height: 1.78; }
+
+mark.drop {
+  background: var(--steel-dim);
+  color: var(--steel);
+  text-decoration: line-through;
+  text-decoration-color: var(--steel);
+  padding: 0.05em 0.25em;
+}
+
+mark.keep {
+  background: none;
+  color: var(--acid);
+  border-bottom: 1px solid var(--acid-dim);
+  padding: 0;
+}
+
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1.4rem;
+  margin-top: 1.3rem;
+  font-size: 0.71rem;
+  color: var(--fg-faint);
+}
+
+.legend span { display: inline-flex; align-items: center; gap: 0.6ch; }
+.legend i { width: 0.65rem; height: 0.65rem; display: inline-block; }
+.legend .i-drop { background: var(--steel-dim); border: 1px solid var(--steel); }
+.legend .i-keep { background: var(--acid); }
+
+/* --- numbered assertions ------------------------------------------------------ */
+
+.plainly {
+  margin-top: clamp(2.25rem, 5vw, 3.25rem);
+  list-style: none;
+  padding: 0;
+  border-top: 1px solid var(--line-soft);
+  max-width: 62ch;
+}
+
+.plainly li {
+  padding: 0.85rem 0;
+  border-bottom: 1px solid var(--line-soft);
+  display: grid;
+  grid-template-columns: 2.6rem 1fr;
+  gap: 0.5rem;
+  align-items: baseline;
+  font-size: 0.83rem;
+  color: var(--fg-dim);
+}
+
+.plainly li::before {
+  content: "[" attr(data-n) "]";
+  color: var(--acid);
+  font-size: 0.68rem;
+  opacity: 0.75;
+}
+
+.plainly b { color: var(--fg); font-weight: 500; }
+
+/* --- the local diagram --------------------------------------------------------- */
+
+.diagram { margin-top: clamp(2.25rem, 5vw, 3rem); width: 100%; height: auto; max-width: 50rem; }
+
+.diagram .d-box { fill: var(--sunk); stroke: var(--line); }
+.diagram .d-machine { fill: none; stroke: var(--acid); stroke-opacity: 0.55; }
+.diagram .d-label { fill: var(--fg); font-family: var(--mono); font-size: 12.5px; }
+.diagram .d-sub { fill: var(--fg-faint); font-family: var(--mono); font-size: 10px; }
+.diagram .d-amber { fill: var(--acid); font-family: var(--mono); font-size: 10px; letter-spacing: 0.14em; }
+.diagram .d-flow { stroke: var(--acid); stroke-width: 1.4; fill: none; }
+.diagram .d-cut { stroke: var(--fg-faint); stroke-dasharray: 3 5; fill: none; }
+.diagram .d-net { fill: none; stroke: var(--fg-faint); opacity: 0.45; }
+.diagram .d-dim { fill: var(--fg-faint); font-family: var(--mono); font-size: 10px; }
+
+.diagram .d-pulse { animation: flow 2s linear infinite; stroke-dasharray: 2 6; }
+
+@keyframes flow { to { stroke-dashoffset: -16; } }
+
+.scroller { overflow-x: auto; overscroll-behavior-x: contain; }
+.scroller > .diagram { min-width: 34rem; }
+.scroller > table { min-width: 22rem; }
+
+
+/* --- the end-to-end pipeline ------------------------------------------------- */
+
+.hero__flow { display: flex; justify-content: center; }
+
+.flow { width: 100%; height: auto; display: block; }
+
+/* Two-column hero: drive the diagram from height so it matches the text block
+   beside it, rather than filling whatever the column happens to be. */
+@media (min-width: 62.01rem) {
+  .flow { width: auto; height: clamp(21rem, 32.3vw, 29rem); max-width: 100%; min-width: 0; }
+}
+
+.scroller > .flow { min-width: 21rem; }
+
+/* Signal's own mark (simple-icons, CC0 code; trademark used nominatively). */
+.flow .f-signal { fill: #3b45fd; }
+
+.flow .f-node { fill: var(--sunk); stroke: var(--line); }
+.flow .f-node--acid { stroke: var(--acid); stroke-opacity: 0.5; }
+
+.flow .f-raw { fill: var(--sunk); stroke: var(--steel); stroke-opacity: 0.65; }
+.flow .f-spoken { fill: var(--acid-glow); stroke: var(--acid); stroke-opacity: 0.65; }
+
+.flow .f-label { fill: var(--fg); font-family: var(--mono); font-size: 14px; }
+.flow .f-label--sm { font-size: 12.5px; }
+.flow .f-sub { fill: var(--fg-faint); font-family: var(--mono); font-size: 10.5px; }
+.flow .f-note { fill: var(--fg-faint); font-family: var(--mono); font-size: 10px; }
+
+.flow .f-tag { font-family: var(--mono); font-size: 9.5px; letter-spacing: 0.14em; }
+.flow .f-tag--steel { fill: var(--steel); opacity: 0.85; }
+.flow .f-tag--acid { fill: var(--acid); }
+
+.flow .f-text-raw { fill: var(--steel); font-family: var(--mono); font-size: 12px; }
+.flow .f-text-spoken { fill: var(--fg); font-family: var(--mono); font-size: 12px; }
+
+.flow .f-wire { stroke-width: 1.3; fill: none; }
+.flow .f-wire--acid { stroke: var(--acid); stroke-opacity: 0.75; }
+.flow .f-wire--steel { stroke: var(--steel); stroke-opacity: 0.8; }
+.flow .f-head--acid { fill: var(--acid); stroke: none; }
+.flow .f-head--steel { fill: var(--steel); stroke: none; }
+
+.flow .f-pulse { stroke-dasharray: 2 5; animation: flow 2s linear infinite; }
+
+/* --- the pipeline as a play button ------------------------------------------ */
+
+.f-trigger { cursor: pointer; }
+.f-trigger:focus { outline: none; }
+
+.flow .f-frame {
+  fill: var(--surface);
+  stroke: var(--line);
+  transition: stroke 0.18s ease, fill 0.18s ease;
+}
+
+.f-trigger:hover .f-frame,
+.f-trigger:focus-visible .f-frame { stroke: var(--acid); fill: var(--acid-glow); }
+
+.flow .f-playicon circle {
+  fill: var(--void);
+  stroke: var(--acid);
+  stroke-opacity: 0.7;
+  transition: stroke-opacity 0.18s ease;
+}
+
+.flow .f-playicon path { fill: var(--acid); }
+
+.f-trigger:hover .f-playicon circle,
+.f-trigger:focus-visible .f-playicon circle { stroke-opacity: 1; }
+
+/* the little "press me" nudge, until it has been pressed */
+.f-trigger .f-playicon { animation: nudge 3.6s ease-in-out infinite; transform-box: view-box; }
+.flow.is-running .f-playicon,
+.flow.is-playing .f-playicon { animation: none; }
+
+@keyframes nudge {
+  0%, 88%, 100% { opacity: 1; }
+  92% { opacity: 0.45; }
+}
+
+/* The gear only turns while the model server has the text. Fade and spin are
+   on separate elements: putting a CSS rotation on the same node that carries
+   the SVG transform attribute left it computing correctly but never painting. */
+.flow .f-gear { fill: var(--acid); opacity: 0; }
+
+.flow.is-running .f-gear { animation: gear-fade 3.4s linear 1; }
+
+.flow .f-gear-spin { transform-box: fill-box; transform-origin: center; }
+
+.flow.is-running .f-gear-spin { animation: gear-spin 3.4s linear 1; }
+
+@keyframes gear-fade {
+  0%, 33% { opacity: 0; }
+  37%, 63% { opacity: 0.95; }
+  66%, 100% { opacity: 0; }
+}
+
+@keyframes gear-spin {
+  0%, 33% { transform: rotate(0deg); }
+  66%, 100% { transform: rotate(315deg); }
+}
+
+/* The desktop notification as the session bus actually surfaces it. Deliberately
+   OS chrome rather than page chrome — rounded, grey, foreign to the palette —
+   so it reads as something that popped up rather than part of the diagram. */
+.flow .f-toast { opacity: 0; transition: opacity 0.45s ease; }
+
+.flow .f-toast-bg { fill: #26282c; stroke: #3b3f46; }
+.flow .f-toast-title { fill: #eceff2; font-family: var(--mono); font-size: 10.5px; font-weight: 600; }
+.flow .f-toast-time { fill: #868c94; font-family: var(--mono); font-size: 9px; }
+.flow .f-toast-body { fill: #b6bcc4; font-family: var(--mono); font-size: 9.5px; }
+
+/* It slides in when the message lands and then stays put: a real notification
+   does not disappear while it is still being read out. `forwards` holds it
+   through the travel phase, the .is-playing rule holds it through the audio,
+   and the transition fades it once the sequence ends. */
+.flow.is-running .f-toast { animation: toast 3.4s ease 1 forwards; }
+
+.flow.is-playing .f-toast { opacity: 1; }
+
+@keyframes toast {
+  0%, 11%   { opacity: 0; transform: translate(9px, -3px); }
+  17%, 100% { opacity: 1; transform: translate(0, 0); }
+}
+
+/* the notification itself, travelling the route */
+.flow .f-packet { fill: var(--steel); opacity: 0; }
+
+.flow.is-running .f-packet { animation: travel 3.4s linear 1; }
+
+@keyframes travel {
+  0%   { transform: translate(130px, 62px); opacity: 0; fill: var(--steel); }
+  4%   { opacity: 1; }
+  14%  { transform: translate(130px, 132px); fill: var(--steel); }
+  27%  { transform: translate(130px, 238px); }
+  36%  { transform: translate(258px, 240px); opacity: 1; fill: var(--steel); }
+  39%  { transform: translate(300px, 244px); opacity: 0; }
+  64%  { transform: translate(300px, 256px); opacity: 0; fill: var(--acid); }
+  67%  { transform: translate(258px, 260px); opacity: 1; fill: var(--acid); }
+  76%  { transform: translate(210px, 260px); fill: var(--acid); }
+  80%  { transform: translate(130px, 276px); }
+  90%  { transform: translate(130px, 340px); }
+  100% { transform: translate(130px, 440px); opacity: 1; fill: var(--acid); }
+}
+
+/* each stage lights as the packet reaches it */
+.flow .f-raw, .flow .f-node, .flow .f-spoken { transition: stroke-opacity 0.25s ease; }
+
+.flow.is-running .f-raw { animation: lit 3.4s linear 1; }
+.flow.is-running .f-node { animation: lit-node 3.4s linear 1; }
+.flow.is-running .f-spoken { animation: lit-spoken 3.4s linear 1; }
+
+@keyframes lit { 0%, 10% { stroke-opacity: .65; } 16%, 30% { stroke-opacity: 1; } 40%, 100% { stroke-opacity: .65; } }
+@keyframes lit-node { 0%, 22% { stroke-opacity: 1; } 28%, 40% { stroke-opacity: 1; } 100% { stroke-opacity: 1; } }
+@keyframes lit-spoken { 0%, 78% { stroke-opacity: .65; } 86%, 100% { stroke-opacity: 1; } }
+
+/* the output bars are still until something is actually being spoken */
+.flow .f-bar {
+  fill: var(--acid);
+  transform-box: fill-box;
+  transform-origin: center bottom;
+  transform: scaleY(0.14);
+  opacity: 0.35;
+}
+
+.flow.is-playing .f-bar { animation: talk-bar 1.4s steps(5, end) infinite alternate; }
+
+@keyframes talk-bar {
+  from { transform: scaleY(0.14); opacity: 0.4; }
+  to { transform: scaleY(1); opacity: 1; }
+}
+
+.flow.is-playing .f-node--acid { stroke-opacity: 1; }
+
+/* --- callout -------------------------------------------------------------------- */
+
+.callout {
+  margin-top: clamp(2.25rem, 5vw, 3rem);
+  border: 1px solid var(--line);
+  border-left: 2px solid var(--acid);
+  padding: clamp(1.1rem, 3vw, 1.6rem);
+  background: var(--sunk);
+  max-width: 60ch;
+  position: relative;
+}
+
+.callout p { margin: 0; color: var(--fg-dim); font-size: 0.83rem; }
+.callout b { color: var(--fg); font-weight: 500; }
+.callout code { color: var(--acid); }
+
+/* --- code ------------------------------------------------------------------------ */
+
+pre {
+  margin: 1.2rem 0 0;
+  padding: 1rem 1.1rem;
+  background: var(--sunk);
+  border: 1px solid var(--line-soft);
+  border-left: 2px solid var(--line);
+  overflow-x: auto;
+  font-size: 0.78rem;
+  line-height: 1.75;
+  color: var(--fg-dim);
+}
+
+pre .c { color: var(--fg-faint); }
+pre .k { color: var(--acid); }
+
+code { font-family: var(--mono); font-size: 0.92em; }
+p code, li code, td code { color: var(--acid); }
+
+/* --- detail grid ------------------------------------------------------------------ */
+
+.detail {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(21rem, 1fr));
+  gap: clamp(1.75rem, 4vw, 3rem);
+  margin-top: clamp(2.25rem, 5vw, 3.25rem);
+  align-items: start;
+}
+
+.detail h3 { font-size: 0.98rem; font-weight: 700; margin-bottom: 0.6rem; letter-spacing: -0.03em; }
+.detail h3::before { content: "▸ "; color: var(--acid); }
+.detail p { color: var(--fg-dim); font-size: 0.82rem; margin: 0; }
+
+.shot {
+  margin-top: 1.2rem;
+  border: 1px solid var(--line);
+  background: var(--sunk);
+  display: block;
+  padding: 5px;
+}
+
+.shot img { width: 100%; height: auto; display: block; }
+
+figure { margin: 0; }
+figcaption { font-size: 0.71rem; color: var(--fg-faint); padding-top: 0.6rem; }
+figcaption::before { content: "// "; }
+
+table { width: 100%; border-collapse: collapse; margin-top: 1.2rem; font-size: 0.77rem; }
+
+th, td {
+  text-align: left;
+  padding: 0.5rem 0.9rem 0.5rem 0;
+  border-bottom: 1px solid var(--line-soft);
+  vertical-align: top;
+}
+
+th { color: var(--fg-faint); font-weight: 400; font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.14em; }
+td { color: var(--fg-dim); }
+td:first-child { color: var(--acid); white-space: nowrap; }
+
+/* the friendly aside under the two real install routes */
+.aside-bot {
+  margin-top: clamp(2rem, 4vw, 2.75rem);
+  padding: 1rem 1.15rem;
+  border: 1px dashed var(--line);
+  display: flex;
+  align-items: flex-start;
+  gap: 0.9rem;
+  background: var(--sunk);
+}
+
+.aside-bot__icon {
+  width: 30px;
+  height: 30px;
+  flex: none;
+  color: var(--acid);
+  overflow: visible;
+  margin-top: 0.1rem;
+}
+
+.aside-bot p {
+  margin: 0;
+  font-size: 0.79rem;
+  color: var(--fg-dim);
+  line-height: 1.7;
+}
+
+.aside-bot b { color: var(--fg); font-weight: 500; }
+
+@media (max-width: 34rem) {
+  .aside-bot { flex-direction: column; gap: 0.6rem; }
+}
+
+.docs-cta {
+  margin: clamp(2.5rem, 5vw, 3.5rem) 0 0;
+  text-align: center;
+}
+
+/* inline-block, not flex: when the label wraps on a phone the brackets stay
+   glued to the first and last word instead of floating at the box edges */
+.btn--big { display: inline-block; font-size: 0.95rem; padding: 0.95em 1.7em; text-align: center; }
+
+/* --- footer ------------------------------------------------------------------------ */
+
+footer {
+  border-top: 1px solid var(--line-soft);
+  padding-block: clamp(2.25rem, 5vw, 3.5rem);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.9rem 2.5rem;
+  justify-content: space-between;
+  align-items: baseline;
+  font-size: 0.73rem;
+  color: var(--fg-faint);
+}
+
+footer a { color: var(--fg-dim); }
+
+/* --- reveal on scroll ---------------------------------------------------------------- */
+
+.js .reveal {
+  opacity: 0;
+  translate: 0 10px;
+  transition: opacity 0.55s ease, translate 0.55s ease;
+}
+
+.js .reveal.seen { opacity: 1; translate: 0 0; }
+
+@media (prefers-reduced-motion: reduce) {
+  .js .reveal { opacity: 1; translate: 0 0; }
+}

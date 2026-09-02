@@ -1,0 +1,312 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sayd docs — install and configure</title>
+<meta name="description" content="How to install sayd and what every setting in config.toml does.">
+<meta name="color-scheme" content="dark light">
+<link rel="stylesheet" href="docs.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%2307080a'/%3E%3Cg fill='%232bf08a'%3E%3Crect x='7' y='13' width='2.5' height='6'/%3E%3Crect x='12' y='9' width='2.5' height='14'/%3E%3Crect x='17' y='11' width='2.5' height='10'/%3E%3Crect x='22' y='14' width='2.5' height='4'/%3E%3C/g%3E%3C/svg%3E">
+</head>
+<body>
+
+<header class="wrap masthead">
+  <a class="wordmark" href="./">sayd</a>
+  <nav>
+    <a href="./">home</a>
+    <a href="https://github.com/elsirion/sayd">github</a>
+  </nav>
+</header>
+
+<div class="wrap docs">
+
+<nav class="toc" aria-label="Contents">
+  <p class="toc__title">Contents</p>
+  <ol>
+    <li><a href="#install">Installation</a></li>
+    <li class="toc--sub"><a href="#install-nix">With Nix</a></li>
+    <li class="toc--sub"><a href="#install-pm">With a package manager</a></li>
+    <li class="toc--sub"><a href="#voices">Voices</a></li>
+    <li><a href="#config-file">The config file</a></li>
+    <li><a href="#general">General settings</a></li>
+    <li><a href="#cleanup">Text cleanup</a></li>
+    <li><a href="#chunking">Chunking</a></li>
+    <li><a href="#notifications">Notifications</a></li>
+    <li><a href="#reword">Rewording</a></li>
+  </ol>
+</nav>
+
+<main class="content">
+
+<h1>Install and configure.</h1>
+<p class="lede">
+  <code>sayd</code> is the daemon. <code>say</code> is the command that drives it.
+  This page shows how to install both, and what every setting does.
+</p>
+
+<!-- ================================================================== -->
+
+<section id="install">
+  <h2>Installation</h2>
+  <p>
+    sayd needs four native libraries: espeak-ng, ONNX Runtime, GTK4 and
+    libadwaita. Nix installs them for you. On other systems you install them
+    first, then build with cargo.
+  </p>
+
+  <h3 id="install-nix">With Nix</h3>
+  <p>The flake carries every dependency. Nothing to install first.</p>
+<pre><span class="c"># run it straight from the repository</span>
+nix run github:elsirion/sayd
+
+<span class="c"># or build from a checkout</span>
+nix build</pre>
+  <p>
+    The flake also exposes an overlay. Use it to add <code>sayd</code> to
+    <code>environment.systemPackages</code> on NixOS.
+  </p>
+
+  <h3 id="install-pm">With a package manager</h3>
+  <p>Install the four libraries with your system's package manager. Then build.</p>
+<pre><span class="c"># Debian/Ubuntu — names differ on other distributions</span>
+apt install libespeak-ng-dev libonnxruntime-dev \
+            libgtk-4-dev libadwaita-1-dev
+
+<span class="k">export</span> ORT_DYLIB_PATH=/usr/lib/x86_64-linux-gnu/libonnxruntime.so
+cargo build --release</pre>
+  <p>
+    <code>ORT_DYLIB_PATH</code> matters: ONNX Runtime is loaded at run time,
+    not linked at build time. Without it the build succeeds but the daemon
+    will not start. Put both binaries — <code>target/release/sayd</code> and
+    <code>target/release/say</code> — on your <code>$PATH</code>.
+  </p>
+
+  <p>Then start the daemon and bind keys in your sway config:</p>
+<pre>exec sayd
+
+bindsym <span class="k">$mod+Shift+s</span> exec say selection
+bindsym <span class="k">$mod+Shift+v</span> exec say clipboard
+bindsym <span class="k">$mod+Shift+x</span> exec say stop
+bindsym <span class="k">$mod+Shift+p</span> exec say play-pause</pre>
+  <p>
+    Reloading sway is safe. sayd is single-instance: a second start hands its
+    arguments to the running daemon and exits.
+  </p>
+
+  <h3 id="voices">Voices</h3>
+  <p>
+    The Kokoro-82M weights and voice packs are not shipped. They are 341&nbsp;MB
+    and come from Hugging Face. Two ways to get them:
+  </p>
+  <ul>
+    <li><b>The settings window.</b> Open Settings from the tray. On a machine
+      with no voices it shows a <b>Download voices</b> button that says what it
+      will fetch before you press it.</li>
+    <li><b>The shell.</b> Run <code>./scripts/fetch-models.sh</code> from a
+      checkout.</li>
+  </ul>
+  <p class="note">
+    This download is one of only two network calls sayd can make. It fetches
+    files and sends nothing. The other is the rewording endpoint, which you
+    configure yourself — see <a href="#reword">Rewording</a>.
+  </p>
+</section>
+
+<!-- ================================================================== -->
+
+<section id="config-file">
+  <h2>The config file</h2>
+  <p>
+    Configuration lives in <code>~/.config/sayd/config.toml</code>
+    (<code>$XDG_CONFIG_HOME</code> is honoured). You rarely edit it by hand:
+    the settings window writes it for you. If you do edit it by hand, sayd
+    picks up the change at once — no restart needed.
+  </p>
+  <p>
+    Every setting has a default. A missing file, or a missing key, is not an
+    error. The tables below list each setting with its default value.
+  </p>
+</section>
+
+<!-- ================================================================== -->
+
+<section id="general">
+  <h2>General settings</h2>
+  <p>Top-level keys, not in any table.</p>
+  <div class="scroller">
+  <table>
+    <tr><th>Setting</th><th>Default</th><th>What it does</th></tr>
+    <tr><td>voice</td><td>"af_heart"</td>
+      <td>The voice to speak with. 29 packs ship with the model download. The settings window lists them all.</td></tr>
+    <tr><td>speed</td><td>1.0</td>
+      <td>Playback speed multiplier for every utterance.</td></tr>
+    <tr><td>speed_mode</td><td>"model"</td>
+      <td><code>"model"</code> or <code>"stretch"</code>. <code>model</code> hands the speed to Kokoro itself. <code>stretch</code> synthesises at 1.0 and time-stretches the audio afterwards. <code>model</code> can swallow the first word at some speeds and does not hit the exact tempo; <code>stretch</code> avoids both but has its own artifacts.</td></tr>
+    <tr><td>model</td><td>"fp32"</td>
+      <td><code>"fp32"</code>, <code>"fp16"</code> or <code>"q8"</code>. fp32 sounds best. q8 is about three times faster and sounds worse. Switching reloads the engine.</td></tr>
+    <tr><td>threads</td><td>8</td>
+      <td>ONNX Runtime threads. Measured peak at 8; more does not help.</td></tr>
+    <tr><td>idle_unload_secs</td><td>600</td>
+      <td>Seconds of silence before the ~1.27&nbsp;GB engine session is dropped from memory. <code>0</code> means never unload.</td></tr>
+    <tr><td>muted</td><td>false</td>
+      <td>While muted, sayd accepts submissions and silently discards them. Nothing piles up to be spoken later.</td></tr>
+    <tr><td>max_chars</td><td>20000</td>
+      <td>Submissions longer than this are refused.</td></tr>
+  </table>
+  </div>
+</section>
+
+<!-- ================================================================== -->
+
+<section id="cleanup">
+  <h2>Text cleanup</h2>
+  <p>
+    The <code>[cleanup]</code> table. Cleanup rewrites text before it is
+    spoken, so screen artifacts do not reach the speaker. It runs before
+    rewording too, so URLs and code never reach the endpoint either.
+  </p>
+  <div class="scroller">
+  <table>
+    <tr><th>Setting</th><th>Default</th><th>What it does</th></tr>
+    <tr><td>enabled</td><td>true</td>
+      <td>Master switch. Off means text is spoken exactly as submitted, and every switch below is ignored (but kept, so turning it back on restores them).</td></tr>
+    <tr><td>collapse_whitespace</td><td>true</td>
+      <td>Fold runs of spaces and newlines into one space.</td></tr>
+    <tr><td>rejoin_hyphenation</td><td>true</td>
+      <td>Rejoin words that were split across lines with a hyphen.</td></tr>
+    <tr><td>urls</td><td>"link"</td>
+      <td><code>"link"</code> speaks a URL as the word "link". <code>"domain"</code> speaks just the host, like "example.com". <code>"keep"</code> leaves it alone.</td></tr>
+    <tr><td>strip_markdown</td><td>true</td>
+      <td>Remove markdown markup — asterisks, backticks, headings — so it is not read aloud.</td></tr>
+    <tr><td>drop_code_blocks</td><td>true</td>
+      <td>Skip fenced code blocks entirely. Code is not worth hearing character by character.</td></tr>
+    <tr><td>spell_acronyms</td><td>true</td>
+      <td>Read all-caps words letter by letter: "URL" becomes "U R L".</td></tr>
+  </table>
+  </div>
+</section>
+
+<!-- ================================================================== -->
+
+<section id="chunking">
+  <h2>Chunking</h2>
+  <p>
+    The <code>[chunking]</code> table. sayd synthesises long text in chunks,
+    so playback starts before the whole text is rendered.
+  </p>
+  <div class="scroller">
+  <table>
+    <tr><th>Setting</th><th>Default</th><th>What it does</th></tr>
+    <tr><td>target_chars</td><td>400</td>
+      <td>How much text goes into one synthesis chunk. Smaller starts sooner; larger flows better.</td></tr>
+    <tr><td>lookahead_chunks</td><td>2</td>
+      <td>How many chunks are synthesised ahead of the one playing.</td></tr>
+  </table>
+  </div>
+</section>
+
+<!-- ================================================================== -->
+
+<section id="notifications">
+  <h2>Notifications</h2>
+  <p>
+    The <code>[notifications]</code> table. sayd can speak desktop
+    notifications. It watches the session bus passively, so it works next to
+    any notification daemon — mako, dunst — without replacing it.
+  </p>
+  <div class="scroller">
+  <table>
+    <tr><th>Setting</th><th>Default</th><th>What it does</th></tr>
+    <tr><td>enabled</td><td>false</td>
+      <td>Off by default. Speaking notifications changes how your desktop behaves, so you have to ask for it.</td></tr>
+    <tr><td>allow</td><td>[]</td>
+      <td>Application names to speak. Matched exactly, ignoring case — no globs. Empty means nothing is spoken. sayd logs every name it declines, once per run, so you can find the right ones; the settings window offers every name it has seen.</td></tr>
+    <tr><td>cooldown_secs</td><td>30</td>
+      <td>At most one utterance per application in this window. Extra notifications are counted and read out as one follow-up ("Signal: 3 more notifications") when the window closes. <code>0</code> turns rate limiting off entirely.</td></tr>
+    <tr><td>speak_app_name</td><td>true</td>
+      <td>Prefix the announcement with the application's name: "Signal: Alice sent a message".</td></tr>
+    <tr><td>speak_body</td><td>false</td>
+      <td>Also read the notification's body after its summary. Off by default — bodies are often long and often repeat the summary.</td></tr>
+  </table>
+  </div>
+  <p class="note">
+    <b>Two switches to hear anything:</b> set <code>enabled = true</code>
+    <em>and</em> put at least one name in <code>allow</code>. With rewording
+    on, a non-zero <code>cooldown_secs</code> is raised to one second past
+    <code>reword.timeout_ms</code>, so a follow-up can never overtake the
+    announcement it counts from.
+  </p>
+</section>
+
+<!-- ================================================================== -->
+
+<section id="reword">
+  <h2>Rewording</h2>
+  <p>
+    The <code>[reword]</code> table. A small language model rewrites text into
+    something written for the ear before it is spoken. Off until you set a
+    provider. When anything goes wrong — a dead, slow or missing endpoint —
+    the original text is spoken instead. No notification is ever lost.
+  </p>
+  <div class="scroller">
+  <table>
+    <tr><th>Setting</th><th>Default</th><th>What it does</th></tr>
+    <tr><td>enabled</td><td>true</td>
+      <td>The master switch. Off means nothing is rewritten, not even an explicit <code>--reword</code>. On means nothing yet — a provider is still needed.</td></tr>
+    <tr><td>notifications</td><td>false</td>
+      <td>Rewrite notification announcements automatically. Requires <code>provider</code> to be set.</td></tr>
+    <tr><td>base_url</td><td>"http://localhost:11434/v1"</td>
+      <td>Where the text goes. Any OpenAI-compatible endpoint. The default is a local Ollama. Text goes here and nowhere else — no proxies, no redirects.</td></tr>
+    <tr><td>model</td><td>"llama3.2:3b"</td>
+      <td>The model name sent with each request.</td></tr>
+    <tr><td>provider</td><td>unset</td>
+      <td><code>"llama-cpp"</code> or <code>"generic"</code>. <code>llama-cpp</code> also tells the server not to "think" — a reasoning model cannot answer inside the deadline. Use <code>generic</code> for Ollama, LM Studio, vLLM and hosted APIs. Required when <code>notifications = true</code>.</td></tr>
+    <tr><td>api_key</td><td>""</td>
+      <td>Sent as a bearer token. Local servers ignore it. If set, the config file is written with mode 0600.</td></tr>
+    <tr><td>api_key_env</td><td>"SAYD_REWORD_API_KEY"</td>
+      <td>Environment variable to read the key from. If it is set and non-empty, it wins over <code>api_key</code>. Prefer it — it keeps the key out of the config file.</td></tr>
+    <tr><td>timeout_ms</td><td>1500</td>
+      <td>Deadline for a notification rewrite, in milliseconds. Past it the original is spoken. Minimum 200, no maximum.</td></tr>
+    <tr><td>request_timeout_ms</td><td>25000</td>
+      <td>Deadline for an explicit <code>--reword</code>. Longer, because you may point it at a whole document and a local model needs time to read it.</td></tr>
+    <tr><td>stream</td><td>false</td>
+      <td>Speak a <code>--reword</code> answer sentence by sentence as it arrives, instead of waiting for the whole thing. Starts much sooner, but a spoken sentence cannot be unsaid, so the whole-answer safety checks cannot run.</td></tr>
+    <tr><td>prompt</td><td>unset</td>
+      <td>The instruction sent with a notification rewrite. Unset means the built-in prompt, which also improves with new releases. An edited prompt is stored; a cleared one returns to the built-in.</td></tr>
+    <tr><td>request_prompt</td><td>unset</td>
+      <td>The same, for explicit <code>--reword</code> requests. A different instruction, because summarising a document is a different job from rephrasing one line.</td></tr>
+    <tr><td>max_chars</td><td>400</td>
+      <td>Longest notification to rewrite (32–2000). Anything longer is spoken as written.</td></tr>
+    <tr><td>request_max_chars</td><td>8000</td>
+      <td>Longest text an explicit <code>--reword</code> will rewrite (32–20000).</td></tr>
+  </table>
+  </div>
+  <p class="note">
+    <b>Privacy:</b> with rewording configured, the text about to be spoken is
+    sent to <code>base_url</code>. Point it at localhost — the default — and
+    nothing leaves your machine. Cleanup runs first, so URLs, code blocks and
+    markdown are already gone from what is sent. The destination is logged
+    once per run.
+  </p>
+
+  <h3>A working local setup</h3>
+  <p>This is a real configuration against a llama.cpp server on the same machine:</p>
+<pre><span class="c">[reword]</span>
+enabled = <span class="k">true</span>
+notifications = <span class="k">true</span>
+base_url = <span class="k">"http://localhost:8080/v1"</span>
+provider = <span class="k">"llama-cpp"</span>
+timeout_ms = 10000</pre>
+</section>
+
+</main>
+</div>
+
+<footer class="wrap">
+  <span>MIT licensed — except the vendored misaki lexicons, which are Apache-2.0.</span>
+  <span><a href="https://github.com/elsirion/sayd">github.com/elsirion/sayd</a></span>
+</footer>
+
+</body>
+</html>
