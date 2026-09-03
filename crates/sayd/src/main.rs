@@ -7,6 +7,7 @@
 
 mod config_watch;
 mod dbus;
+mod icons;
 mod kokoro_synth;
 mod mpris;
 mod notify;

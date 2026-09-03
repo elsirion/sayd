@@ -144,19 +144,19 @@ MPRIS without a tray icon:
     info: could not register the tray: failed to register to the
     StatusNotifierWatcher: ...; continuing without a tray icon
 
-The icon reflects state:
+The icon is the sayd robot, drawn as pixel art and reflecting state:
 
 | State | Icon |
 |---|---|
-| Idle | `audio-speakers-symbolic` |
-| Speaking | `media-playback-start-symbolic` |
-| Paused | `media-playback-pause-symbolic` |
-| Error | `dialog-error-symbolic` |
+| Idle | green robot |
+| Speaking | green robot with speak waves |
+| Paused | green robot, dot mouth |
+| Error | grey robot, x mouth |
 
 **Muted takes precedence over all of the above** -- while muted the icon is
-always `audio-volume-muted-symbolic`, regardless of state. These are stock
-freedesktop icon names, themed by the host, with no install step; `sayd`
-does not ship its own icons into `hicolor` since there is no installer yet.
+always the grey robot with a dot mouth, regardless of state. The icons are
+sent to the host as SNI pixmaps rendered at the common tray sizes, so no
+icon theme entry or install step is involved.
 
 The tooltip shows the current utterance (truncated) and its estimated
 remaining time, or "Nothing playing" when idle.

@@ -50,6 +50,28 @@ rustPlatform.buildRustPackage {
   # letting a -sys crate compile espeak from source.
   ESPEAK_LIB_DIR = "${espeak-ng}/lib";
 
+  # The desktop file exists so hosts can resolve the settings window to an
+  # icon: on Wayland that lookup goes app_id -> `sayd.desktop` -> `Icon=`,
+  # and GTK derives the app_id from the program name. The tray does not use
+  # this -- it sends its state icons over the bus as SNI pixmaps.
+  postInstall = ''
+    install -Dm444 crates/sayd/assets/sayd.svg \
+      $out/share/icons/hicolor/scalable/apps/sayd.svg
+    mkdir -p $out/share/applications
+    cat > $out/share/applications/sayd.desktop <<DESKTOP
+    [Desktop Entry]
+    Type=Application
+    Name=sayd
+    GenericName=Text to speech
+    Comment=Reads notifications, the selection and the clipboard aloud
+    Exec=sayd
+    Icon=sayd
+    Terminal=false
+    Categories=Utility;Accessibility;
+    Keywords=tts;speech;speak;
+    DESKTOP
+  '';
+
   # `ort` is built with `load-dynamic` and no default features, so ONNX
   # Runtime is never linked -- it is `dlopen`ed at run time from
   # `ORT_DYLIB_PATH`, or from the loader path if that is unset. On NixOS it

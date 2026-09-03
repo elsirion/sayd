@@ -39,21 +39,6 @@ fn speak_opts() -> SayOpts {
     }
 }
 
-/// Stock freedesktop icon names, so the tray works with no install step and
-/// the host themes it. Shipping our own into `hicolor` would need an
-/// installer, which does not exist yet.
-pub fn icon_for(state: State, muted: bool) -> &'static str {
-    if muted {
-        return "audio-volume-muted-symbolic";
-    }
-    match state {
-        State::Idle => "audio-speakers-symbolic",
-        State::Speaking => "media-playback-start-symbolic",
-        State::Paused => "media-playback-pause-symbolic",
-        State::Error => "dialog-error-symbolic",
-    }
-}
-
 /// Trim to a menu-sized label on a character boundary.
 fn short(text: &str, limit: usize) -> String {
     let mut out: String = text.chars().take(limit).collect();
@@ -373,8 +358,15 @@ impl Tray for SaydTray {
         "sayd".into()
     }
 
+    /// Deliberately empty: an SNI host prefers `IconName` over
+    /// `IconPixmap` whenever the name resolves in its theme, so any name
+    /// here would shadow the pixel-art pixmaps below.
     fn icon_name(&self) -> String {
-        icon_for(self.snapshot.state, self.snapshot.muted).into()
+        String::new()
+    }
+
+    fn icon_pixmap(&self) -> Vec<ksni::Icon> {
+        crate::icons::pixmaps(self.snapshot.state, self.snapshot.muted)
     }
 
     fn tool_tip(&self) -> ksni::ToolTip {
@@ -390,7 +382,7 @@ impl Tray for SaydTray {
             )
         };
         ksni::ToolTip {
-            icon_name: self.icon_name(),
+            icon_name: String::new(),
             title: "sayd".into(),
             description,
             ..Default::default()
@@ -406,7 +398,7 @@ impl Tray for SaydTray {
     /// Mute is the one control worth reaching without opening a menu: it is
     /// the thing you want when the daemon is already talking and you would
     /// rather it stopped, and the icon already shows the state you are
-    /// toggling ([`icon_for`] returns the muted glyph whatever the engine
+    /// toggling ([`crate::icons::sprite_for`] returns the muted robot whatever the engine
     /// is doing), so the click has visible feedback without a menu.
     ///
     /// `ksni` only routes a primary click here when `MENU_ON_ACTIVATE` is
@@ -530,29 +522,6 @@ mod tests {
             queue_heads: Vec::new(),
             error_kind: None,
         }
-    }
-
-    #[test]
-    fn each_state_has_a_distinct_icon() {
-        let idle = icon_for(State::Idle, false);
-        let speaking = icon_for(State::Speaking, false);
-        let paused = icon_for(State::Paused, false);
-        let error = icon_for(State::Error, false);
-        let muted = icon_for(State::Speaking, true);
-        let all = [idle, speaking, paused, error, muted];
-        for (i, a) in all.iter().enumerate() {
-            assert!(!a.is_empty(), "icon {i} is empty");
-            for (j, b) in all.iter().enumerate() {
-                if i != j {
-                    assert_ne!(a, b, "icons {i} and {j} are the same");
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn muted_overrides_the_state_icon() {
-        assert_eq!(icon_for(State::Idle, true), icon_for(State::Speaking, true));
     }
 
     #[test]
