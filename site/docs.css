@@ -107,7 +107,7 @@ h1, h2, h3 {
   color: var(--fg);
 }
 
-.wordmark::before { content: "▚"; color: var(--accent); font-size: 0.85em; }
+.wordmark__bot { width: 1.15em; height: 1.15em; color: var(--accent); }
 
 .masthead nav { display: flex; gap: 1.4rem; font-size: 0.76rem; color: var(--fg-dim); }
 .masthead nav a { text-decoration: none; }

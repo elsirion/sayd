@@ -111,7 +111,7 @@ h1, h2, h3 {
   color: var(--fg);
 }
 
-.wordmark::before { content: "▚"; color: var(--acid); font-size: 0.85em; }
+.wordmark__bot { width: 1.15em; height: 1.15em; color: var(--acid); }
 
 .wordmark::after {
   content: "_";
