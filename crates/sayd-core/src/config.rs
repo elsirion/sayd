@@ -404,17 +404,17 @@ pub struct RewordConfig {
     /// summarising a page of output well.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_prompt: Option<String>,
-    /// Longer text is spoken as written. Clamped to 32..=2000. The default
-    /// is the chunker's `target_chars`: one synthesis chunk, which is the
-    /// natural unit here, and above it the submission is a document rather
-    /// than a notification.
+    /// Longer text is spoken as written; `0` means no ceiling and is the
+    /// default. A limit here is a tightening a user reaches for after
+    /// watching their own provider choke, not a guess this file makes for
+    /// them first.
     ///
     /// **The notification ceiling only.** Every explicit `--reword` is
     /// measured against [`RewordConfig::request_max_chars`] instead; see
     /// that field for why one number could not serve both.
     pub max_chars: usize,
-    /// The same ceiling for every explicit `--reword`, and much larger.
-    /// Clamped to 32..=20000.
+    /// The same ceiling for every explicit `--reword`; `0` again means no
+    /// ceiling and is the default.
     ///
     /// `max_chars` cannot serve both, because the two asks are not the same
     /// shape. A notification arrives uninvited and is already short, so its
@@ -429,11 +429,6 @@ pub struct RewordConfig {
     /// --reword clipboard` alike: they are one ask made three ways, and a
     /// limit that varied between them would be a rule nobody could hold in
     /// their head.
-    ///
-    /// The upper clamp is [`Config::max_chars`]'s own default of 20000: past
-    /// that the engine refuses the submission outright, so a rewrite ceiling
-    /// above it would admit text that is never going to be spoken however
-    /// the rewrite turns out.
     ///
     /// **The response bound does not scale with this.** `max_tokens` is
     /// still derived from `max_chars`, and deliberately: this number bounds
@@ -476,12 +471,8 @@ impl Default for RewordConfig {
             stream: false,
             prompt: None,
             request_prompt: None,
-            max_chars: 400,
-            // A working number rather than a measured one -- room for a
-            // long tool output or a page of chat, comfortably inside the
-            // 20000 the engine would accept, and far enough above
-            // `max_chars` that the two are obviously not the same knob.
-            request_max_chars: 8000,
+            max_chars: 0,
+            request_max_chars: 0,
         }
     }
 }
@@ -537,11 +528,18 @@ impl RewordConfig {
     /// client's own ceiling is what bounds the request, as it already did
     /// when this was a fixed 256.
     ///
-    /// Saturating rather than wrapping: `max_chars` is clamped to
-    /// 32..=2000 by `settings::model::normalize`, but a hand-edited file
-    /// reaches some callers first, and a wrapped cap of 3 tokens would
-    /// truncate every answer.
+    /// With `max_chars` at `0` -- no input ceiling -- there is nothing to
+    /// multiply, and the answer is a paragraph however long the input was,
+    /// so the bound falls back to a constant: 1200, three times the 400
+    /// that was the ceiling's old default.
+    ///
+    /// Saturating rather than wrapping: a hand-edited file reaches some
+    /// callers before anything normalises it, and a wrapped cap of 3
+    /// tokens would truncate every answer.
     pub fn max_tokens(&self) -> u32 {
+        if self.max_chars == 0 {
+            return 1200;
+        }
         u32::try_from(self.max_chars.saturating_mul(3)).unwrap_or(u32::MAX)
     }
 }
@@ -641,7 +639,8 @@ pub struct Config {
     /// `0` disables idle unloading entirely (spec §8); see `maybe_unload`.
     pub idle_unload_secs: u64,
     pub muted: bool,
-    /// Submissions longer than this are refused.
+    /// Submissions longer than this are refused; `0` -- the default --
+    /// refuses nothing.
     pub max_chars: usize,
     pub cleanup: CleanupConfig,
     pub chunking: ChunkConfig,
@@ -668,7 +667,7 @@ impl Default for Config {
             threads: 8,
             idle_unload_secs: 600,
             muted: false,
-            max_chars: 20_000,
+            max_chars: 0,
             cleanup: CleanupConfig::default(),
             chunking: ChunkConfig::default(),
             notifications: NotificationConfig::default(),
@@ -981,7 +980,7 @@ mod tests {
             c.reword.timeout_ms, 1500,
             "a budget, not a measurement -- see the spec's §10"
         );
-        assert_eq!(c.reword.max_chars, 400);
+        assert_eq!(c.reword.max_chars, 0);
     }
 
     /// MIGRATION (2026-08-24): `[reword] enabled` used to mean what
@@ -1231,14 +1230,13 @@ mod tests {
     }
 
     /// The cap follows the longest text the feature accepts rather than sitting
-    /// at a constant a long notification outgrows. Both ends of `max_chars`'s
-    /// 32..=2000 clamp, so the arithmetic is pinned rather than the default.
+    /// at a constant a long notification outgrows.
     #[test]
     fn the_token_cap_is_three_times_the_longest_text_accepted() {
         let mut c = RewordConfig::default();
 
-        assert_eq!(c.max_chars, 400, "the default this multiplies");
-        assert_eq!(c.max_tokens(), 1200);
+        assert_eq!(c.max_chars, 0, "no ceiling by default");
+        assert_eq!(c.max_tokens(), 1200, "unlimited input still bounds the answer");
 
         c.max_chars = 32;
         assert_eq!(c.max_tokens(), 96);
@@ -1246,10 +1244,9 @@ mod tests {
         c.max_chars = 2000;
         assert_eq!(c.max_tokens(), 6000);
 
-        // Not reachable through the settings window, which clamps, but a
-        // hand-edited file reaches some callers before anything normalises it.
-        // Saturating rather than wrapping: a cap of 3 tokens would truncate
-        // every answer.
+        // A hand-edited file reaches some callers before anything
+        // normalises it. Saturating rather than wrapping: a cap of 3
+        // tokens would truncate every answer.
         c.max_chars = usize::MAX;
         assert_eq!(c.max_tokens(), u32::MAX);
     }

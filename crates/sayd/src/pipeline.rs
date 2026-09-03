@@ -144,7 +144,7 @@ pub fn prepare(text: impl Into<Origin>, ask: Ask<'_>) -> Result<Prepared, TooLon
     };
 
     let chars = origin.text().chars().count();
-    if chars > cfg.max_chars {
+    if cfg.max_chars != 0 && chars > cfg.max_chars {
         return Err(TooLong {
             chars,
             limit: cfg.max_chars,

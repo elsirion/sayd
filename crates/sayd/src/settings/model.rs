@@ -72,7 +72,8 @@ pub const SPEED_STEP: f64 = 0.05;
 pub const IDLE_UNLOAD_MIN: f64 = 0.0;
 pub const IDLE_UNLOAD_MAX: f64 = 3600.0;
 pub const IDLE_UNLOAD_STEP: f64 = 30.0;
-pub const MAX_CHARS_MIN: f64 = 100.0;
+/// `0` means no limit, the default: refusals are opt-in.
+pub const MAX_CHARS_MIN: f64 = 0.0;
 pub const MAX_CHARS_MAX: f64 = 200_000.0;
 pub const MAX_CHARS_STEP: f64 = 500.0;
 /// `0` is the minimum because it means something, and something the row has
@@ -146,20 +147,19 @@ pub const REWORD_TIMEOUT_SUBTITLE: &str =
     "Milliseconds a rewrite may take before the original is spoken instead. \
      This row stops at 60000; a longer deadline can be set in config.toml \
      and is kept.";
-/// The floor is not `0`: there is no magic zero here. `enabled` is the off
-/// switch, and `--reword` on an over-long submission is a no-op rather than
-/// an error.
-pub const REWORD_MAX_CHARS_MIN: f64 = 32.0;
-pub const REWORD_MAX_CHARS_MAX: f64 = 2000.0;
+/// `0` means no ceiling, the default: with streaming a long rewrite is
+/// merely a long rewrite, so a limit is a tightening a user applies after
+/// their own provider disappoints, not a guess made for them.
+pub const REWORD_MAX_CHARS_MIN: f64 = 0.0;
+pub const REWORD_MAX_CHARS_MAX: f64 = 200_000.0;
 pub const REWORD_MAX_CHARS_STEP: f64 = 32.0;
 
-/// The explicit ask's own ceiling, and a much wider range: what it measures
-/// is text a user pointed at, which is routinely a document rather than a
-/// notification. The top is `Config::max_chars`'s default, past which the
-/// engine refuses the submission anyway -- see
-/// [`sayd_core::config::RewordConfig::request_max_chars`].
-pub const REWORD_REQUEST_MAX_CHARS_MIN: f64 = 32.0;
-pub const REWORD_REQUEST_MAX_CHARS_MAX: f64 = 20000.0;
+/// The explicit ask's own ceiling: what it measures is text a user pointed
+/// at, which is routinely a document rather than a notification -- see
+/// [`sayd_core::config::RewordConfig::request_max_chars`]. `0` again means
+/// no ceiling and is the default.
+pub const REWORD_REQUEST_MAX_CHARS_MIN: f64 = 0.0;
+pub const REWORD_REQUEST_MAX_CHARS_MAX: f64 = 200_000.0;
 pub const REWORD_REQUEST_MAX_CHARS_STEP: f64 = 500.0;
 
 /// What the Test row starts with: the example this whole feature exists
@@ -1223,30 +1223,10 @@ fn clamp_ranges(cfg: &mut Config) -> Vec<String> {
         ));
         cfg.notifications.cooldown_secs = floor;
     }
-    let max_chars = cfg
-        .reword
-        .max_chars
-        .clamp(REWORD_MAX_CHARS_MIN as usize, REWORD_MAX_CHARS_MAX as usize);
-    if max_chars != cfg.reword.max_chars {
-        warnings.push(format!(
-            "reword.max_chars {} is outside {}-{}; using {max_chars}",
-            cfg.reword.max_chars, REWORD_MAX_CHARS_MIN as usize, REWORD_MAX_CHARS_MAX as usize
-        ));
-        cfg.reword.max_chars = max_chars;
-    }
-    let request_max_chars = cfg.reword.request_max_chars.clamp(
-        REWORD_REQUEST_MAX_CHARS_MIN as usize,
-        REWORD_REQUEST_MAX_CHARS_MAX as usize,
-    );
-    if request_max_chars != cfg.reword.request_max_chars {
-        warnings.push(format!(
-            "reword.request_max_chars {} is outside {}-{}; using {request_max_chars}",
-            cfg.reword.request_max_chars,
-            REWORD_REQUEST_MAX_CHARS_MIN as usize,
-            REWORD_REQUEST_MAX_CHARS_MAX as usize
-        ));
-        cfg.reword.request_max_chars = request_max_chars;
-    }
+    // The two reword ceilings are deliberately not clamped: `0` is "no
+    // ceiling" and any positive number is a tightening the user chose.
+    // The spin rows bound what the *window* can enter; a hand-edited file
+    // is taken at its word.
     warnings
 }
 
@@ -3003,9 +2983,11 @@ mod tests {
         assert_eq!(cfg, before);
     }
 
-    /// An out-of-range reword field must be clamped and *warned about*, not
-    /// refused -- refusing would lock the user out of every unrelated
+    /// An out-of-range reword *timeout* must be clamped and warned about,
+    /// not refused -- refusing would lock the user out of every unrelated
     /// settings row, which is exactly what `model = "int4"` used to do.
+    /// The char ceilings, by contrast, pass through untouched: `0` is "no
+    /// ceiling" and any hand-edited number is taken at its word.
     #[test]
     fn out_of_range_reword_bounds_are_clamped_and_warned_about_not_rejected() {
         let mut cfg = Config::default();
@@ -3013,35 +2995,24 @@ mod tests {
         cfg.reword.max_chars = 1;
         let warnings = normalize(&mut cfg);
         assert_eq!(cfg.reword.timeout_ms, REWORD_TIMEOUT_MIN as u64);
-        assert_eq!(cfg.reword.max_chars, 32);
-        assert_eq!(warnings.len(), 2, "both clamps must say so: {warnings:?}");
-
-        // The explicit ask's ceiling is a separate range and clamps
-        // separately. Its top is well above `max_chars`'s, which is the
-        // point of it: a value that is out of range for one is ordinary for
-        // the other.
-        let mut cfg = Config::default();
-        cfg.reword.request_max_chars = 1;
-        let warnings = normalize(&mut cfg);
-        assert_eq!(cfg.reword.request_max_chars, REWORD_REQUEST_MAX_CHARS_MIN as usize);
-        assert_eq!(warnings.len(), 1, "the request clamp must say so: {warnings:?}");
+        assert_eq!(cfg.reword.max_chars, 1, "a chosen ceiling is kept as chosen");
+        assert_eq!(warnings.len(), 1, "only the timeout clamps: {warnings:?}");
 
         let mut cfg = Config::default();
         cfg.reword.request_max_chars = 999_999;
-        let warnings = normalize(&mut cfg);
-        assert_eq!(cfg.reword.request_max_chars, REWORD_REQUEST_MAX_CHARS_MAX as usize);
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
-
-        // 8000 is inside the request range and outside `max_chars`'s: the
-        // two numbers are not interchangeable and nothing may clamp one to
-        // the other's bounds.
-        let mut cfg = Config::default();
-        cfg.reword.request_max_chars = 8000;
         assert!(
             normalize(&mut cfg).is_empty(),
-            "the default request ceiling must not trip its own clamp"
+            "no ceiling clamps, however large"
         );
-        assert_eq!(cfg.reword.request_max_chars, 8000);
+        assert_eq!(cfg.reword.request_max_chars, 999_999);
+
+        let mut cfg = Config::default();
+        cfg.reword.max_chars = 0;
+        cfg.reword.request_max_chars = 0;
+        assert!(
+            normalize(&mut cfg).is_empty(),
+            "0 is no ceiling, not an out-of-range value"
+        );
 
         let mut cfg = Config::default();
         cfg.reword.timeout_ms = 50;

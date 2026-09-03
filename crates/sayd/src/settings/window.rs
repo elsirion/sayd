@@ -2055,7 +2055,7 @@ pub fn reword_group(b: &Build) -> adw::PreferencesGroup {
     // --- Longest text to rewrite -----------------------------------------
     let ceiling = Spin::new(
         "Longest text to rewrite",
-        "Characters; anything longer is spoken as written",
+        "Characters; anything longer is spoken as written. 0 means no limit",
         REWORD_MAX_CHARS_MIN,
         REWORD_MAX_CHARS_MAX,
         REWORD_MAX_CHARS_STEP,
@@ -2125,7 +2125,7 @@ pub fn reword_group(b: &Build) -> adw::PreferencesGroup {
     // usefully. See `RewordConfig::request_max_chars`.
     let request_ceiling = Spin::new(
         "Longest text when you ask",
-        "Characters; applies when you ask with --reword",
+        "Characters; applies when you ask with --reword. 0 means no limit",
         REWORD_REQUEST_MAX_CHARS_MIN,
         REWORD_REQUEST_MAX_CHARS_MAX,
         REWORD_REQUEST_MAX_CHARS_STEP,

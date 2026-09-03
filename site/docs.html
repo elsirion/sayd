@@ -150,8 +150,8 @@ bindsym <span class="k">$mod+Shift+m</span> exec say stop</pre>
       <td>Seconds of silence before the ~1.27&nbsp;GB engine session is dropped from memory. <code>0</code> means never unload.</td></tr>
     <tr><td>muted</td><td>false</td>
       <td>While muted, sayd accepts submissions and silently discards them. Nothing piles up to be spoken later.</td></tr>
-    <tr><td>max_chars</td><td>20000</td>
-      <td>Submissions longer than this are refused.</td></tr>
+    <tr><td>max_chars</td><td>0</td>
+      <td>Submissions longer than this are refused. <code>0</code> means no limit.</td></tr>
   </table>
   </div>
 </section>
@@ -275,10 +275,10 @@ bindsym <span class="k">$mod+Shift+m</span> exec say stop</pre>
       <td>The instruction sent with a notification rewrite. Unset means the built-in prompt, which also improves with new releases. An edited prompt is stored; a cleared one returns to the built-in.</td></tr>
     <tr><td>request_prompt</td><td>unset</td>
       <td>The same, for explicit <code>--reword</code> requests. A different instruction, because summarising a document is a different job from rephrasing one line.</td></tr>
-    <tr><td>max_chars</td><td>400</td>
-      <td>Longest notification to rewrite (32–2000). Anything longer is spoken as written.</td></tr>
-    <tr><td>request_max_chars</td><td>8000</td>
-      <td>Longest text an explicit <code>--reword</code> will rewrite (32–20000).</td></tr>
+    <tr><td>max_chars</td><td>0</td>
+      <td>Longest notification to rewrite; anything longer is spoken as written. <code>0</code> means no ceiling.</td></tr>
+    <tr><td>request_max_chars</td><td>0</td>
+      <td>Longest text an explicit <code>--reword</code> will rewrite. <code>0</code> means no ceiling.</td></tr>
   </table>
   </div>
   <p class="note">

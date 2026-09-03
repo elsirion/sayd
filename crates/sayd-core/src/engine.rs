@@ -483,7 +483,7 @@ impl Engine {
                 }
             }
         }
-        if text.chars().count() > self.cfg.max_chars {
+        if self.cfg.max_chars != 0 && text.chars().count() > self.cfg.max_chars {
             let msg = crate::config::too_long(text.chars().count(), self.cfg.max_chars);
             // Something unrelated is genuinely still playing (or paused):
             // this rejection must not stomp on it and report a global Error
@@ -1723,14 +1723,14 @@ mod tests {
                 }),
                 // CRITICAL 2 (rewording final review): the one submission
                 // that is refused and deliberately does *not* enter
-                // `Error`. Every other rejection in this list either
-                // enters it or was never eligible to, so without this the
-                // sweep never checks that *declining* to set the state
-                // leaves both invariants intact -- in particular from
-                // `error`, where the `Rejected` clear above runs first and
-                // then nothing re-enters.
+                // `Error`. With no ceiling by default it is only actually
+                // refused under `build_error`'s explicit 5-char config --
+                // which is the state the original finding was about, the
+                // one where the `Rejected` clear runs first and nothing
+                // must re-enter. Everywhere else it is an ordinary short
+                // notification and the invariants are checked anyway.
                 Command::Say {
-                    text: "x".repeat(Config::default().max_chars + 1),
+                    text: "x".repeat(6),
                     opts: SayOpts {
                         source: Source::Notification,
                         ..SayOpts::default()

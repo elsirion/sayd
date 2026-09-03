@@ -104,9 +104,10 @@ pub enum Ineligible {
 ///
 /// The ceiling is tested before the floor on purpose: `TooLong` is the
 /// variant that earns a log line, so a text that is over the ceiling must
-/// report that rather than whatever else it also happens to be.
+/// report that rather than whatever else it also happens to be. A
+/// `max_chars` of `0` is no ceiling at all.
 pub fn eligible(text: &str, max_chars: usize) -> Result<(), Ineligible> {
-    if text.chars().count() > max_chars {
+    if max_chars != 0 && text.chars().count() > max_chars {
         return Err(Ineligible::TooLong);
     }
     if text.chars().count() < REWORD_MIN_CHARS {

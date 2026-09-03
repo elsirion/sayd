@@ -315,7 +315,7 @@ pub static SAY: Page = Page {
         rows: &[
             Row::Int {
                 title: "Long-text guard",
-                subtitle: "Refuse submissions longer than this many characters",
+                subtitle: "Refuse submissions longer than this many characters. 0 means no limit",
                 min: MAX_CHARS_MIN,
                 max: MAX_CHARS_MAX,
                 step: MAX_CHARS_STEP,
@@ -326,7 +326,10 @@ pub static SAY: Page = Page {
             },
         ],
     })],
-    summary: |c| format!("Up to {} characters", c.max_chars),
+    summary: |c| match c.max_chars {
+        0 => "No limit".into(),
+        n => format!("Up to {n} characters"),
+    },
 };
 
 /// The Notifications sub-page: the switches, then the allowlist and the two
@@ -594,8 +597,12 @@ mod tests {
 
         assert_eq!(
             (SAY.summary)(&cfg),
-            format!("Up to {} characters", Config::default().max_chars)
+            "No limit",
+            "0 is the default and means no guard at all"
         );
+        cfg.max_chars = 20_000;
+        assert_eq!((SAY.summary)(&cfg), "Up to 20000 characters");
+        cfg.max_chars = 0;
 
         assert_eq!((NOTIFICATIONS.summary)(&cfg), "Off");
         cfg.notifications.enabled = true;

@@ -204,7 +204,7 @@ what it currently holds:
     ├─ Engine
     ├─ Text      → Cleanup        "5 of 5 transforms on · URLs: say “link”"
     │            → Rewording      "qwen3:32b via llama-cpp"
-    └─ Sources   → say command    "Up to 20000 characters"
+    └─ Sources   → say command    "No limit"
                  → Notifications  "On · 2 applications · 5 s cooldown"
 
 Cleanup, Rewording and Notifications each open with their own on/off switch.
@@ -266,7 +266,7 @@ model = "fp32"          # fp32 | fp16 | q8; anything else runs fp32, with a warn
 threads = 8             # measured peak; 16 and 24 both regress
 idle_unload_secs = 600  # seconds idle before the session is dropped; 0 = never
 muted = false
-max_chars = 20000       # submissions longer than this are refused
+max_chars = 0           # refuse submissions longer than this; 0 = no limit
 
 [cleanup]
 enabled = true          # off leaves every submission exactly as written
@@ -500,22 +500,22 @@ the instruction produces a bad announcement, not a broken one.
     stream = false                           # speak --reword sentence by sentence as it arrives
     # prompt = "..."                         # what the model is told for a notification; unset = built-in
     # request_prompt = "..."                 # the same for --reword; unset = built-in
-    max_chars = 400                          # 32..=2000; notification announcements
-    request_max_chars = 8000                 # 32..=20000; every explicit --reword
+    max_chars = 0                            # notification announcements; 0 = no ceiling
+    request_max_chars = 0                    # every explicit --reword; 0 = no ceiling
 
 **Two ceilings, because the two asks are not the same shape.** A
-notification arrives uninvited and is already short, so `max_chars` stops at
-2000 -- past that it is a document rather than a notification, and rewriting
-it was never what the feature was for. An explicit `--reword` is you
-pointing at something and asking, and what you point at is routinely a
-document: a page of prose, a chat log, a long tool output.
+notification arrives uninvited and is already short; an explicit `--reword`
+is you pointing at something and asking, and what you point at is routinely
+a document: a page of prose, a chat log, a long tool output.
 `request_max_chars` covers `say --reword "..."`, `say --reword selection`
-and `say --reword clipboard` alike, and its own ceiling is the engine's
-`max_chars` of 20000, past which the submission is refused anyway.
+and `say --reword clipboard` alike. Both default to `0` -- no ceiling: a
+limit is something you tighten after your own provider chokes, not a guess
+made for you in advance.
 
 What comes *back* does not scale with either: `max_tokens` is three times
-`max_chars`, deliberately, because a summary of eight thousand characters is
-a paragraph -- the same size as a summary of four hundred.
+`max_chars` -- or a flat 1200 when `max_chars` is `0` -- deliberately,
+because a summary of eight thousand characters is a paragraph, the same
+size as a summary of four hundred.
 
 **The deadline splits the same way, and it has to.** A notification wants a
 short budget; an explicit `--reword` over a document wants tens of seconds,
@@ -758,9 +758,9 @@ reaches the cap, the original is spoken and the journal says so.
 It is also a cost bound, on any endpoint that meters completion tokens --
 PPQ, OpenAI, and any other paid provider in the table above. A rewrite that
 runs away now bills up to 1200 tokens instead of the fixed 256 this used to
-be capped at, and up to 6000 at `max_chars`'s ceiling of 2000. `max_chars`
-is what bounds it; a lower value lowers the worst case on every failed
-rewrite, not only the successful ones.
+be capped at -- more if you raise `max_chars` above its old 400 default.
+`max_chars` is what bounds it; a lower value lowers the worst case on every
+failed rewrite, not only the successful ones.
 
 ### What is sent, and what is not
 
