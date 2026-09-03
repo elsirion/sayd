@@ -925,6 +925,62 @@ bars:
     {"state":"idle","muted":false,"voice":"af_heart","speed":1,
      "queue_length":0,"remaining_seconds":0.00,"current_text":"","error":""}
 
+## Narrating a Claude Code session
+
+A coding agent ends its turn in a workspace you are not looking at, and its
+closing report -- the paragraph saying what it actually did -- sits unread
+until you switch back. Hearing that report is exactly what a TTS daemon is
+for. Claude Code fires a `Stop` hook when a turn ends, and by that point
+the turn's final assistant message has been flushed to the session
+transcript; a hook can read it back and hand it to `say --reword`, which
+turns a paragraph written for a terminal into one written for the ear.
+
+`~/.claude/hooks/narrate.sh`:
+
+    #!/usr/bin/env bash
+    input=$(cat)
+    transcript=$(jq -r '.transcript_path // empty' <<<"$input")
+    [ -r "$transcript" ] || exit 0
+
+    # Name the instance after its working directory, so two agents in
+    # different repos are told apart by ear.
+    name=$(basename "$(jq -r '.cwd // empty' <<<"$input")")
+
+    # The turn's final assistant message. The tail bound keeps a
+    # multi-megabyte transcript cheap to read on every turn.
+    report=$(tail -n 400 "$transcript" | jq -rs '
+      [ .[]?
+        | select(.type == "assistant")
+        | [.message.content[]? | select(.type == "text") | .text]
+        | join("\n")
+        | select(. != "")
+      ] | last // empty')
+    [ -n "$report" ] || exit 0
+
+    # Detached: a --reword submission is answered inline and takes as
+    # long as the rewording endpoint needs. A hook must not sit on that.
+    (setsid say --reword \
+        "${name:-Claude} finished and reports: ${report:0:2500}" \
+        >/dev/null 2>&1 &)
+
+Registered in `~/.claude/settings.json`:
+
+    "hooks": {
+      "Stop": [
+        { "hooks": [ { "type": "command",
+                       "command": "/home/you/.claude/hooks/narrate.sh" } ] }
+      ]
+    }
+
+`--reword` needs `[reword] enabled = true` and a configured endpoint;
+without them the report is spoken as written, which still works but was
+written for the eye. If a hook also posts desktop notifications under an
+application name on `[notifications] allow`, take that name off the list
+-- otherwise every announcement is spoken twice, once from the hook and
+once off the bus. And the same pattern extends to the `Notification`
+hook: speak what a permission dialog is asking, rather than noticing it
+minutes later.
+
 ## D-Bus interface
 
 Bus name `sh.sayd.Sayd`, object path `/sh/sayd/Sayd`, interface

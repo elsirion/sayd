@@ -34,6 +34,7 @@
     <li><a href="#chunking">Chunking</a></li>
     <li><a href="#notifications">Notifications</a></li>
     <li><a href="#reword">Rewording</a></li>
+    <li><a href="#narration">Agent narration</a></li>
   </ol>
 </nav>
 
@@ -301,6 +302,63 @@ provider = <span class="k">"llama-cpp"</span>
 timeout_ms = 10000</pre>
 </section>
 
+
+<section id="narration">
+  <h2>Agent narration</h2>
+  <p>
+    A coding agent ends its turn in a workspace you are not looking at, and
+    its closing report sits unread until you switch back. Claude Code fires a
+    <code>Stop</code> hook when a turn ends, and by then the turn's final
+    assistant message — the agent's own account of what it did — has been
+    flushed to the session transcript. A hook can read it back and hand it to
+    <code>say --reword</code>, which turns a paragraph written for a terminal
+    into one written for the ear.
+  </p>
+  <p><code>~/.claude/hooks/narrate.sh</code>:</p>
+<pre>#!/usr/bin/env bash
+input=$(cat)
+transcript=$(jq -r '.transcript_path // empty' &lt;&lt;&lt;"$input")
+[ -r "$transcript" ] || exit 0
+
+<span class="c"># Name the instance after its working directory, so two agents in
+# different repos are told apart by ear.</span>
+name=$(basename "$(jq -r '.cwd // empty' &lt;&lt;&lt;"$input")")
+
+<span class="c"># The turn's final assistant message. The tail bound keeps a
+# multi-megabyte transcript cheap to read on every turn.</span>
+report=$(tail -n 400 "$transcript" | jq -rs '
+  [ .[]?
+    | select(.type == "assistant")
+    | [.message.content[]? | select(.type == "text") | .text]
+    | join("\n")
+    | select(. != "")
+  ] | last // empty')
+[ -n "$report" ] || exit 0
+
+<span class="c"># Detached: a --reword submission is answered inline and takes as
+# long as the rewording endpoint needs. A hook must not sit on that.</span>
+(setsid <span class="k">say --reword</span> \
+    "${name:-Claude} finished and reports: ${report:0:2500}" \
+    &gt;/dev/null 2&gt;&amp;1 &amp;)</pre>
+  <p>Registered in <code>~/.claude/settings.json</code>:</p>
+<pre>"hooks": {
+  "Stop": [
+    { "hooks": [ { "type": "command",
+                   "command": "/home/you/.claude/hooks/narrate.sh" } ] }
+  ]
+}</pre>
+  <p>
+    <code>--reword</code> needs <code>enabled = true</code> in
+    <code>[reword]</code> and a configured endpoint; without them the report
+    is spoken as written, which still works but was written for the eye. If a
+    hook also posts desktop notifications under an application name on the
+    <code>[notifications]</code> allow-list, take that name off it — otherwise
+    every announcement is spoken twice, once from the hook and once off the
+    bus. The same pattern extends to the <code>Notification</code> hook:
+    speak what a permission dialog is asking, rather than noticing it minutes
+    later.
+  </p>
+</section>
 </main>
 </div>
 
