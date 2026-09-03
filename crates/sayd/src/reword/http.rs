@@ -155,7 +155,11 @@ struct ChatRequest<'a> {
     messages: [Message<'a>; 2],
     stream: bool,
     temperature: f64,
-    max_tokens: u32,
+    /// Absent -- not `null` -- when the config says "no cap": some
+    /// OpenAI-compatible services reject `"max_tokens": null` while every
+    /// one of them accepts the field simply not being there.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
     /// Absent for every provider but llama.cpp, and absent rather than
     /// `null`: a remote OpenAI-compatible service rejects an unknown
     /// top-level field, so this must not reach one at all.
@@ -2453,5 +2457,18 @@ mod tests {
 
         c.max_chars = 2000;
         assert_eq!(build_request(&c, None, SYSTEM_PROMPT, "x").body["max_tokens"], 6000);
+
+        // `max_tokens = 0` in the file means no cap: the field must be
+        // absent from the wire, not null -- some OpenAI-compatible
+        // services reject an explicit null.
+        c.max_tokens = Some(0);
+        let body = build_request(&c, None, SYSTEM_PROMPT, "x").body;
+        assert!(
+            !body.as_object().expect("a JSON object").contains_key("max_tokens"),
+            "an uncapped request must not carry the key at all: {body}"
+        );
+
+        c.max_tokens = Some(4096);
+        assert_eq!(build_request(&c, None, SYSTEM_PROMPT, "x").body["max_tokens"], 4096);
     }
 }

@@ -993,9 +993,14 @@ impl Inner {
                     // `Inner::truncated_logged`'s doc comment gives.
                     if !i.truncated_logged {
                         journal = Some(Journal::Line(format!(
-                            "warning: reword: the model reached its {cap}-token cap \
+                            "warning: reword: the model reached its {cap} token cap \
                              without finishing{cause}; speaking text as written",
-                            cap = cfg.max_tokens(),
+                            // With `max_tokens = 0` no cap is sent, so a
+                            // truncation here is the server's own ceiling.
+                            cap = match cfg.max_tokens() {
+                                Some(n) => n.to_string(),
+                                None => "provider-side".into(),
+                            },
                             // A2: `HttpRewriter::new` refuses any config whose
                             // provider does not resolve before a request ever
                             // leaves the machine, so a config that reached

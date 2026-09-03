@@ -279,6 +279,8 @@ bindsym <span class="k">$mod+Shift+m</span> exec say stop</pre>
       <td>Longest notification to rewrite; anything longer is spoken as written. <code>0</code> means no ceiling.</td></tr>
     <tr><td>request_max_chars</td><td>0</td>
       <td>Longest text an explicit <code>--reword</code> will rewrite. <code>0</code> means no ceiling.</td></tr>
+    <tr><td>max_tokens</td><td>unset</td>
+      <td>Completion-token cap sent with each request. Unset derives it: three times max_chars, or a flat 1200 when that is 0 &#8212; right for a summarising prompt. <code>0</code> sends no cap at all, for a prompt that rewrites instead of summarising.</td></tr>
   </table>
   </div>
   <p class="note">

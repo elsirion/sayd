@@ -1856,6 +1856,16 @@ fn run_reword_test(cfg: &RewordConfig, text: String, factory: &RewriterFn) -> Te
     }
 }
 
+/// The token budget as the Test row speaks of it: the number when a cap is
+/// sent, "provider-side" when `max_tokens = 0` sends none and whatever cut
+/// the answer short was the server's own ceiling.
+fn token_budget(cfg: &RewordConfig) -> String {
+    match cfg.max_tokens() {
+        Some(n) => n.to_string(),
+        None => "provider-side".into(),
+    }
+}
+
 /// Which row of §6's table a failure is. One variant per failure a user can
 /// actually do something about, because "error" tells them nothing.
 fn outcome_for_error(e: RewordError, cfg: &RewordConfig) -> TestOutcome {
@@ -1907,13 +1917,13 @@ fn outcome_for_error(e: RewordError, cfg: &RewordConfig) -> TestOutcome {
                     "the model spent its whole {} token budget reasoning even \
                      though reword.provider is already llama-cpp; the server did \
                      not honour the request -- try a model that does not reason",
-                    cfg.max_tokens()
+                    token_budget(cfg)
                 ),
                 true => format!(
                     "the model spent its whole {} token budget reasoning instead \
                      of answering; set reword.provider to llama-cpp so it can be \
                      told not to",
-                    cfg.max_tokens()
+                    token_budget(cfg)
                 ),
                 // C2: raising `max_chars` does not move the guard's rejection
                 // ceiling. `sayd_core::reword::length_ceiling` derives it from
@@ -1928,7 +1938,7 @@ fn outcome_for_error(e: RewordError, cfg: &RewordConfig) -> TestOutcome {
                      written far more text than a rewritten notification should \
                      contain; try a different model, or instruct this one to \
                      answer in one short sentence",
-                    cfg.max_tokens()
+                    token_budget(cfg)
                 ),
             },
             endpoint: cfg.base_url.clone(),

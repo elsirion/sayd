@@ -502,6 +502,7 @@ the instruction produces a bad announcement, not a broken one.
     # request_prompt = "..."                 # the same for --reword; unset = built-in
     max_chars = 0                            # notification announcements; 0 = no ceiling
     request_max_chars = 0                    # every explicit --reword; 0 = no ceiling
+    # max_tokens = 4096                      # response cap; unset = derived, 0 = uncapped
 
 **Two ceilings, because the two asks are not the same shape.** A
 notification arrives uninvited and is already short; an explicit `--reword`
@@ -512,10 +513,12 @@ and `say --reword clipboard` alike. Both default to `0` -- no ceiling: a
 limit is something you tighten after your own provider chokes, not a guess
 made for you in advance.
 
-What comes *back* does not scale with either: `max_tokens` is three times
-`max_chars` -- or a flat 1200 when `max_chars` is `0` -- deliberately,
-because a summary of eight thousand characters is a paragraph, the same
-size as a summary of four hundred.
+What comes *back* does not scale with either by default: the derived
+`max_tokens` is three times `max_chars` -- or a flat 1200 when `max_chars`
+is `0` -- because a summary of eight thousand characters is a paragraph,
+the same size as a summary of four hundred. If your `request_prompt`
+rewrites rather than summarises, the answer *does* scale with the input:
+set `max_tokens` yourself, or set it to `0` to send no cap at all.
 
 **The deadline splits the same way, and it has to.** A notification wants a
 short budget; an explicit `--reword` over a document wants tens of seconds,
@@ -746,7 +749,9 @@ is pre-warmed at startup, because that would be a network call you did not
 ask for.
 
 A reasoning model cannot meet this deadline and is not meant to try. The
-token cap is three times `max_chars` -- 1200 by default -- which is generous
+token cap defaults to three times `max_chars` -- a flat 1200 when that is
+`0` -- and can be set directly with `max_tokens` (`0` sends none, for a
+prompt that rewrites rather than summarises). The derived value is generous
 so that an over-long answer arrives whole and is rejected whole, rather than
 arriving truncated mid-sentence and being spoken. It is not a latency bound:
 at the 8 to 19 tokens per second a CPU-only machine sustains, 1200 tokens is

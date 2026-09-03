@@ -413,6 +413,16 @@ pub struct RewordConfig {
     /// measured against [`RewordConfig::request_max_chars`] instead; see
     /// that field for why one number could not serve both.
     pub max_chars: usize,
+    /// The completion-token cap sent with every rewrite request, or unset
+    /// for the derived default ([`RewordConfig::max_tokens`], the method,
+    /// explains the derivation). `0` sends no cap at all, for a
+    /// `request_prompt` that rewrites rather than summarises -- there the
+    /// answer legitimately scales with the input and any constant starves
+    /// it. On a metered endpoint an uncapped runaway bills whatever the
+    /// provider allows; that trade is the user's to make, which is why it
+    /// is a setting and not a formula.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<usize>,
     /// The same ceiling for every explicit `--reword`; `0` again means no
     /// ceiling and is the default.
     ///
@@ -472,6 +482,7 @@ impl Default for RewordConfig {
             prompt: None,
             request_prompt: None,
             max_chars: 0,
+            max_tokens: None,
             request_max_chars: 0,
         }
     }
@@ -529,18 +540,24 @@ impl RewordConfig {
     /// when this was a fixed 256.
     ///
     /// With `max_chars` at `0` -- no input ceiling -- there is nothing to
-    /// multiply, and the answer is a paragraph however long the input was,
-    /// so the bound falls back to a constant: 1200, three times the 400
-    /// that was the ceiling's old default.
+    /// multiply, and a *summary* is a paragraph however long the input
+    /// was, so the derived bound falls back to a constant: 1200, three
+    /// times the 400 that was the ceiling's old default.
+    ///
+    /// The `max_tokens` *setting* overrides the derivation entirely:
+    /// `Some(n)` is that cap, and `Some(0)` is `None` here -- no cap in
+    /// the request at all, the state a rewrite-not-summarise prompt needs.
     ///
     /// Saturating rather than wrapping: a hand-edited file reaches some
     /// callers before anything normalises it, and a wrapped cap of 3
     /// tokens would truncate every answer.
-    pub fn max_tokens(&self) -> u32 {
-        if self.max_chars == 0 {
-            return 1200;
+    pub fn max_tokens(&self) -> Option<u32> {
+        match self.max_tokens {
+            Some(0) => None,
+            Some(n) => Some(u32::try_from(n).unwrap_or(u32::MAX)),
+            None if self.max_chars == 0 => Some(1200),
+            None => Some(u32::try_from(self.max_chars.saturating_mul(3)).unwrap_or(u32::MAX)),
         }
-        u32::try_from(self.max_chars.saturating_mul(3)).unwrap_or(u32::MAX)
     }
 }
 
@@ -1236,19 +1253,31 @@ mod tests {
         let mut c = RewordConfig::default();
 
         assert_eq!(c.max_chars, 0, "no ceiling by default");
-        assert_eq!(c.max_tokens(), 1200, "unlimited input still bounds the answer");
+        assert_eq!(
+            c.max_tokens(),
+            Some(1200),
+            "unlimited input still bounds the answer by default"
+        );
 
         c.max_chars = 32;
-        assert_eq!(c.max_tokens(), 96);
+        assert_eq!(c.max_tokens(), Some(96));
 
         c.max_chars = 2000;
-        assert_eq!(c.max_tokens(), 6000);
+        assert_eq!(c.max_tokens(), Some(6000));
+
+        // The setting overrides the derivation, and its own zero is "no
+        // cap in the request at all".
+        c.max_tokens = Some(4096);
+        assert_eq!(c.max_tokens(), Some(4096));
+        c.max_tokens = Some(0);
+        assert_eq!(c.max_tokens(), None);
+        c.max_tokens = None;
 
         // A hand-edited file reaches some callers before anything
         // normalises it. Saturating rather than wrapping: a cap of 3
         // tokens would truncate every answer.
         c.max_chars = usize::MAX;
-        assert_eq!(c.max_tokens(), u32::MAX);
+        assert_eq!(c.max_tokens(), Some(u32::MAX));
     }
 
     #[test]
