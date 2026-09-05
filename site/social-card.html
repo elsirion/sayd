@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>sayd — social card</title>
+<meta name="color-scheme" content="dark">
+<link rel="stylesheet" href="style.css">
+<style>
+/* ---------------------------------------------------------------------------
+   The og:image, drawn by the landing page's own stylesheet on a fixed
+   1200x630 canvas and screenshotted into social-card.png (see README's
+   Publishing section). Everything sized in px, not clamp(): a card is not
+   responsive, it is a poster.
+
+   No buttons and no play affordance: in a static preview a drawn control is
+   a spot that looks clickable and is not. The card itself is the link; the
+   bare domain says where it goes.
+   --------------------------------------------------------------------------- */
+html, body { margin: 0; width: 1200px; height: 630px; overflow: hidden; }
+
+.card {
+  box-sizing: border-box;
+  width: 1200px;
+  height: 630px;
+  padding: 42px 72px 40px;
+  display: flex;
+  flex-direction: column;
+}
+
+.card .wordmark { font-size: 2.7rem; pointer-events: none; }
+
+.card .hero {
+  flex: 1;
+  padding: 0;
+  border-top: 0;
+  display: grid;
+  grid-template-columns: 660px minmax(0, 1fr);
+  gap: 48px;
+  align-items: center;
+}
+
+.card .hero h1 { font-size: 63px; }
+/* A blinking caret is invisible half the time; a poster's caret is lit. */
+.card .hero h1::after { animation: none; }
+
+.card .lede { font-size: 20px; margin-top: 22px; max-width: 54ch; line-height: 1.6; }
+
+.card .url {
+  margin: 26px 0 0;
+  font-family: var(--display);
+  font-size: 27px;
+  font-weight: 800;
+  letter-spacing: -0.04em;
+  color: var(--acid);
+  text-shadow: 0 0 22px var(--acid-dim);
+}
+
+/* Two rows of three, each fact centred in its equal-width cell. */
+.card .facts {
+  font-size: 15px;
+  margin-top: 24px;
+  padding-top: 16px;
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px 20px;
+  text-align: center;
+}
+
+.card .hero__flow { display: flex; justify-content: center; overflow: visible; }
+.card .flow { height: 480px; width: auto; }
+.card .f-playicon { display: none; }
+</style>
+</head>
+<body>
+<div class="card">
+
+<div class="wordmark">
+<svg class="wordmark__bot" viewBox="0 0 16 16" width="18" height="18" aria-hidden="true" shape-rendering="crispEdges" fill="currentColor"><rect x="5" y="0" width="3" height="1"/><rect x="5" y="1" width="3" height="1"/><rect x="6" y="2" width="1" height="1"/><rect x="6" y="3" width="1" height="1"/><rect x="1" y="4" width="11" height="1"/><rect x="1" y="5" width="1" height="1"/><rect x="11" y="5" width="1" height="1"/><rect x="15" y="5" width="1" height="1"/><rect x="1" y="6" width="1" height="1"/><rect x="11" y="6" width="1" height="1"/><rect x="15" y="6" width="1" height="1"/><rect x="1" y="7" width="1" height="1"/><rect x="3" y="7" width="2" height="1"/><rect x="8" y="7" width="2" height="1"/><rect x="11" y="7" width="1" height="1"/><rect x="13" y="7" width="1" height="1"/><rect x="15" y="7" width="1" height="1"/><rect x="1" y="8" width="1" height="1"/><rect x="3" y="8" width="2" height="1"/><rect x="8" y="8" width="2" height="1"/><rect x="11" y="8" width="1" height="1"/><rect x="13" y="8" width="1" height="1"/><rect x="15" y="8" width="1" height="1"/><rect x="1" y="9" width="1" height="1"/><rect x="11" y="9" width="1" height="1"/><rect x="13" y="9" width="1" height="1"/><rect x="15" y="9" width="1" height="1"/><rect x="1" y="10" width="1" height="1"/><rect x="11" y="10" width="1" height="1"/><rect x="13" y="10" width="1" height="1"/><rect x="15" y="10" width="1" height="1"/><rect x="1" y="11" width="1" height="1"/><rect x="4" y="11" width="5" height="1"/><rect x="11" y="11" width="1" height="1"/><rect x="13" y="11" width="1" height="1"/><rect x="15" y="11" width="1" height="1"/><rect x="1" y="12" width="1" height="1"/><rect x="11" y="12" width="1" height="1"/><rect x="15" y="12" width="1" height="1"/><rect x="1" y="13" width="1" height="1"/><rect x="11" y="13" width="1" height="1"/><rect x="15" y="13" width="1" height="1"/><rect x="1" y="14" width="11" height="1"/></svg>sayd</div>
+
+<section class="hero">
+  <div class="hero__text">
+    <h1><span class="out">Fully local</span><br>Text to Speech</h1>
+    <p class="lede">
+      Notifications, selected text, and your coding agent's answers — spoken on
+      your machine, optionally reworded by <strong>local</strong> LLMs to sound
+      more natural.
+    </p>
+    <p class="url">sayd.sh</p>
+    <div class="facts">
+      <span><b>engine</b>=kokoro-82m</span>
+      <span><b>runtime</b>=onnx</span>
+      <span><b>target</b>=sway/wayland</span>
+      <span><b>voices</b>=29</span>
+      <span><b>telemetry</b>=none</span>
+      <span><b>licence</b>=mit</span>
+    </div>
+  </div>
+  <div class="hero__flow">
+<svg class="flow" viewBox="0 -12 420 540" role="img" aria-label="Pipeline, top to bottom: Signal emits a D-Bus notification reading &quot;Alice: where do you want to go for dinner&quot;. sayd receives it, sends it sideways to a llama.cpp server on localhost and gets back &quot;Alice is asking where you want to go for dinner.&quot;, then hands that to the Kokoro-82M text-to-speech engine, which plays it.">
+
+    <!-- Signal -->
+    <g class="f-trigger" role="button" tabindex="0" aria-label="Play: watch the notification travel through sayd and hear the result">
+      <title>Play the pipeline</title>
+      <rect class="f-frame" x="84" y="-10" width="92" height="88"/>
+      <g class="f-signal" transform="translate(110.8 4.8) scale(1.6)">
+        <path d="M12 0q-.934 0-1.83.139l.17 1.111a11 11 0 0 1 3.32 0l.172-1.111A12 12 0 0 0 12 0M9.152.34A12 12 0 0 0 5.77 1.742l.584.961a10.8 10.8 0 0 1 3.066-1.27zm5.696 0-.268 1.094a10.8 10.8 0 0 1 3.066 1.27l.584-.962A12 12 0 0 0 14.848.34M12 2.25a9.75 9.75 0 0 0-8.539 14.459c.074.134.1.292.064.441l-1.013 4.338 4.338-1.013a.62.62 0 0 1 .441.064A9.7 9.7 0 0 0 12 21.75c5.385 0 9.75-4.365 9.75-9.75S17.385 2.25 12 2.25m-7.092.068a12 12 0 0 0-2.59 2.59l.909.664a11 11 0 0 1 2.345-2.345zm14.184 0-.664.909a11 11 0 0 1 2.345 2.345l.909-.664a12 12 0 0 0-2.59-2.59M1.742 5.77A12 12 0 0 0 .34 9.152l1.094.268a10.8 10.8 0 0 1 1.269-3.066zm20.516 0-.961.584a10.8 10.8 0 0 1 1.27 3.066l1.093-.268a12 12 0 0 0-1.402-3.383M.138 10.168A12 12 0 0 0 0 12q0 .934.139 1.83l1.111-.17A11 11 0 0 1 1.125 12q0-.848.125-1.66zm23.723.002-1.111.17q.125.812.125 1.66c0 .848-.042 1.12-.125 1.66l1.111.172a12.1 12.1 0 0 0 0-3.662M1.434 14.58l-1.094.268a12 12 0 0 0 .96 2.591l-.265 1.14 1.096.255.36-1.539-.188-.365a10.8 10.8 0 0 1-.87-2.35m21.133 0a10.8 10.8 0 0 1-1.27 3.067l.962.584a12 12 0 0 0 1.402-3.383zm-1.793 3.848a11 11 0 0 1-2.345 2.345l.664.909a12 12 0 0 0 2.59-2.59zm-19.959 1.1L.357 21.48a1.8 1.8 0 0 0 2.162 2.161l1.954-.455-.256-1.095-1.953.455a.675.675 0 0 1-.81-.81l.454-1.954zm16.832 1.769a10.8 10.8 0 0 1-3.066 1.27l.268 1.093a12 12 0 0 0 3.382-1.402zm-10.94.213-1.54.36.256 1.095 1.139-.266c.814.415 1.683.74 2.591.961l.268-1.094a10.8 10.8 0 0 1-2.35-.869zm3.634 1.24-.172 1.111a12.1 12.1 0 0 0 3.662 0l-.17-1.111q-.812.125-1.66.125a11 11 0 0 1-1.66-.125"/>
+      </g>
+      <text class="f-sub" x="130" y="60" text-anchor="middle">Signal</text>
+      <g class="f-playicon" transform="translate(162 2)">
+        <circle r="8.5"/>
+        <path d="M-2.6 -4.2L4 0l-6.6 4.2z"/>
+      </g>
+    </g>
+
+    <path class="f-wire f-wire--steel" d="M130 82v14"/>
+    <path class="f-head f-head--steel" d="M130 104l-4.5-9h9z"/>
+
+    <!-- the notification as it arrives -->
+    <rect class="f-raw" x="20" y="110" width="220" height="78"/>
+    <text class="f-tag f-tag--steel" x="36" y="130">&lt; DBUS NOTIFICATION</text>
+    <text class="f-text-raw" x="36" y="154">Alice: where do you want</text>
+    <text class="f-text-raw" x="36" y="172">to go for dinner</text>
+
+    <!-- what the desktop actually shows when the notification lands -->
+    <g class="f-toast">
+      <rect class="f-toast-bg" x="248" y="108" width="170" height="60" rx="5"/>
+      <text class="f-toast-title" x="259" y="127">Alice</text>
+      <text class="f-toast-time" x="407" y="127" text-anchor="end">now</text>
+      <text class="f-toast-body" x="259" y="143">where do you want to go</text>
+      <text class="f-toast-body" x="259" y="156">for dinner</text>
+    </g>
+
+    <path class="f-wire f-wire--steel" d="M130 196v14"/>
+    <path class="f-head f-head--steel" d="M130 218l-4.5-9h9z"/>
+
+    <!-- sayd, with the lateral trip to the model server -->
+    <rect class="f-node" x="55" y="224" width="150" height="52"/>
+    <text class="f-label" x="130" y="256" text-anchor="middle">sayd</text>
+
+    <path class="f-wire f-wire--steel f-pulse" d="M205 240h48"/>
+    <path class="f-head f-head--steel" d="M262 240l-9-4.5v9z"/>
+    <path class="f-wire f-wire--acid f-pulse" d="M262 260h-48"/>
+    <path class="f-head f-head--acid" d="M205 260l9-4.5v9z"/>
+    <text class="f-note" x="233" y="284" text-anchor="middle">reword</text>
+
+    <rect class="f-node" x="262" y="222" width="150" height="56"/>
+    <text class="f-label f-label--sm" x="331" y="245" text-anchor="middle">llama.cpp</text>
+    <text class="f-sub" x="331" y="263" text-anchor="middle">127.0.0.1:8080</text>
+    <g class="f-gear" transform="translate(394 250)">
+      <g class="f-gear-spin"><path fill-rule="evenodd" d="M5.40 0.00 L7.98 0.63 L7.57 2.59 L4.96 2.14 L3.82 3.82 L5.20 6.08 L3.52 7.18 L1.99 5.02 L0.00 5.40 L-0.63 7.98 L-2.59 7.57 L-2.14 4.96 L-3.82 3.82 L-6.08 5.20 L-7.18 3.52 L-5.02 1.99 L-5.40 0.00 L-7.98 -0.63 L-7.57 -2.59 L-4.96 -2.14 L-3.82 -3.82 L-5.20 -6.08 L-3.52 -7.18 L-1.99 -5.02 L-0.00 -5.40 L0.63 -7.98 L2.59 -7.57 L2.14 -4.96 L3.82 -3.82 L6.08 -5.20 L7.18 -3.52 L5.02 -1.99 Z M2.60 0 A2.60 2.60 0 1 0 -2.60 0 A2.60 2.60 0 1 0 2.60 0 Z"/></g>
+    </g>
+
+    <path class="f-wire f-wire--acid" d="M130 276v18"/>
+    <path class="f-head f-head--acid" d="M130 302l-4.5-9h9z"/>
+
+    <!-- what comes back -->
+    <rect class="f-spoken" x="20" y="308" width="220" height="78"/>
+    <text class="f-tag f-tag--acid" x="36" y="328">&gt; REWRITTEN</text>
+    <text class="f-text-spoken" x="36" y="352">Alice is asking where you</text>
+    <text class="f-text-spoken" x="36" y="370">want to go for dinner.</text>
+
+    <path class="f-wire f-wire--acid" d="M130 394v14"/>
+    <path class="f-head f-head--acid" d="M130 416l-4.5-9h9z"/>
+
+    <!-- the engine, and the sound it makes -->
+    <rect class="f-node f-node--acid" x="20" y="422" width="220" height="58"/>
+    <text class="f-label" x="130" y="446" text-anchor="middle">Kokoro-82M</text>
+    <text class="f-sub" x="130" y="464" text-anchor="middle">text to speech, on-device</text>
+
+    <circle class="f-packet" r="3.6"/>
+
+    <g class="f-out">
+      <rect class="f-bar" x="93" y="512" width="3" height="8" style="animation-delay:-.10s"/>
+      <rect class="f-bar" x="99" y="504" width="3" height="16" style="animation-delay:-.55s"/>
+      <rect class="f-bar" x="105" y="498" width="3" height="22" style="animation-delay:-.25s"/>
+      <rect class="f-bar" x="111" y="508" width="3" height="12" style="animation-delay:-.80s"/>
+      <rect class="f-bar" x="117" y="501" width="3" height="19" style="animation-delay:-.40s"/>
+      <rect class="f-bar" x="123" y="513" width="3" height="7" style="animation-delay:-.05s"/>
+      <rect class="f-bar" x="129" y="499" width="3" height="21" style="animation-delay:-.65s"/>
+      <rect class="f-bar" x="135" y="506" width="3" height="14" style="animation-delay:-.30s"/>
+      <rect class="f-bar" x="141" y="510" width="3" height="10" style="animation-delay:-.90s"/>
+      <rect class="f-bar" x="147" y="502" width="3" height="18" style="animation-delay:-.15s"/>
+      <rect class="f-bar" x="153" y="511" width="3" height="9" style="animation-delay:-.70s"/>
+      <rect class="f-bar" x="159" y="505" width="3" height="15" style="animation-delay:-.45s"/>
+      <rect class="f-bar" x="165" y="509" width="3" height="11" style="animation-delay:-.20s"/>
+    </g>
+  </svg>  </div>
+</section>
+
+</div>
+</body>
+</html>
