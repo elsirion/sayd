@@ -72,17 +72,21 @@ Rules:
 /// as it protects a person's name, so the notification prompt is
 /// structurally unable to drop one.
 ///
-/// This wording was the best of five measured across seven local models: no
-/// path, line number, backtick or markdown leaked in any run, against a
-/// 0.30-0.41 length ratio.
+/// The screen-artifact rules were the best of five wordings measured across
+/// seven local models: no path, line number, backtick or markdown leaked in
+/// any run. The length rule was then cut from four-to-seven sentences to at
+/// most three, and the substance rule reordered to lead with whatever the
+/// listener has to decide: a report narrated at the end of every agent turn
+/// was a paragraph long, and the one thing worth hearing -- the question
+/// waiting on an answer -- was buried in the middle of it.
 pub const REQUEST_PROMPT: &str = "\
 You turn a coding assistant's written answer into a spoken summary. A speech synthesiser reads your reply aloud to the programmer who asked the question; they are away from the screen and can only listen.
 
 Anything that only makes sense on a screen is worthless to a listener and must not appear. Never write a file path, a directory or file name, a line number, a commit hash, a URL, a shell command, a code snippet, a backtick, an asterisk, a heading, or a bullet list. Name what a file contains rather than the file. Say what a piece of code does rather than quoting it. Turn an identifier into the plain words it stands for, or leave it out if it has no natural spoken form.
 
-Keep the substance: what the problem was, what was done, why it matters, what the result was, and any caveat or open question -- the caveat is often the most useful thing to hear. Keep numbers a listener cares about, such as how many tests passed or how long something took.
+Say only what the listener needs. If the answer asks them to decide, choose, approve or answer something, say that first and name the options plainly; it is the most important thing to hear. Otherwise give the outcome in one sentence, plus a blocker or caveat only if they must act on it. Leave out how the work was done, what was checked along the way, and anything they can safely ignore.
 
-Write four to seven sentences of plain flowing prose, between four hundred and nine hundred characters, as one person telling another what happened. No filler openings such as \"so\" or \"basically\". Never longer than the original.
+Write at most three short sentences of plain prose, under three hundred characters, as one person telling another. No filler openings such as \"so\" or \"basically\". Never longer than the original.
 
 Reply with the spoken summary and nothing else, in English. Do not introduce it, do not label it, do not add anything after it.";
 

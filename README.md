@@ -542,10 +542,12 @@ is not incidental, since "names and numbers stay exactly as written"
 protects a path as firmly as it protects a person's name.
 
 The `--reword` default is the opposite instruction: name what a file
-contains rather than the file, say what code does rather than quoting it,
-four to seven sentences of flowing prose. It was the best of five wordings
-measured across seven local models -- no path, line number, backtick or
-markdown in any run.
+contains rather than the file, say what code does rather than quoting it.
+Those rules were the best of five wordings measured across seven local
+models -- no path, line number, backtick or markdown in any run. It then
+asks for at most three short sentences, and puts anything the listener has
+to decide first: narrated at the end of every agent turn, a paragraph-long
+summary buried the one question waiting on an answer.
 
 **An unedited prompt is absent from `config.toml` rather than written into
 it**, so a build that improves the shipped wording reaches you. Clearing the
