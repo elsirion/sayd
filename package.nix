@@ -103,6 +103,8 @@ rustPlatform.buildRustPackage {
     "sayd-kokoro"
     "-p"
     "sayd-misaki-en"
+    "-p"
+    "sayd-pocket"
   ];
 
   meta = {

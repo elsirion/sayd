@@ -2034,6 +2034,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sayd-pocket"
+version = "0.2.0"
+dependencies = [
+ "ort",
+ "serde_json",
+]
+
+[[package]]
 name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
