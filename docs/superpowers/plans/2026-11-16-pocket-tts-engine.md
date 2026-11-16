@@ -2,6 +2,18 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **2026-11-17 note:** some steps below changed while they were built. Each
+> change is a ruling (R1 to R21) in the SDD ledger,
+> `.superpowers/sdd/2026-11-16-pocket-tts-engine/progress.md`, which is kept
+> locally and not committed. The ones a reader of this plan would trip over:
+> Task 4's `frames_after_eos` is the package's guess + 2, not "not the wrapper's
+> guess + 2" (R6); the Fenrir clip lives at `crates/sayd-pocket/assets/fenrir.wav`
+> as `FENRIR_WAV`, not under `crates/sayd/assets/pocket/` (R8); there is no
+> `SetVoice` routing, because sayd has no `SetVoice` (R11); "installed" means
+> every int8 file is present (R16); and a missing Pocket model is refused at
+> submission through `Synthesizer::unavailable` rather than accepted and failed
+> (R18). The design doc's own update note lists what was built.
+
 **Goal:** Add Pocket TTS as a second, switchable speech engine in sayd. It runs in Rust on ONNX Runtime and speaks with a voice cloned from a reference clip, Fenrir by default.
 
 **Architecture:** A new crate `sayd-pocket` drives the five ONNX graphs of the `KevinAHM/pocket-tts-onnx` export. It reproduces the official `pocket-tts` 4.0.1 package's text and audio handling. The `sayd` binary wraps it as `PocketSynthesizer` and puts both engines behind one `SwitchingSynthesizer` that implements `sayd_core::synth::Synthesizer`. That way `sayd-core`'s `Engine` keeps owning a single `Box<dyn Synthesizer>`. The switch takes effect at the next `unload`, which the engine already defers until no utterance is in flight.

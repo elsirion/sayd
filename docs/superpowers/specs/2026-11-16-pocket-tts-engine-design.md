@@ -1,7 +1,40 @@
 # A second engine: Pocket TTS, with voices cloned from a clip
 
 Date: 2026-11-16
-Status: approved, not yet implemented
+Status: implemented
+
+> **2026-11-17 update, later commits:** what was built differs from this
+> design in the places below. The text is left as approved, because it is the
+> record of what was reasoned about; read these notes as current behaviour.
+>
+> - `frames_after_eos` is the package's guess + 2, not "not the wrapper's
+>   guess + 2" as "Generation loop" says: the package itself adds the 2
+>   (`tts_model.py`, around line 743), and this bundle's
+>   `model_recommended_frames_after_eos` is null.
+> - sayd has no D-Bus `SetVoice`, so the `SetVoice` routing under "An explicit
+>   voice while Pocket TTS is active" was dropped. `say --voice` and the `Say`
+>   option `voice` behave as described there.
+> - The settings window has a separate **Pocket TTS** group, with a **Voice
+>   clip** dropdown and the **Download Pocket TTS** row, instead of one
+>   **Voice** dropdown whose contents depend on the engine. The Kokoro
+>   **Voice** row is unchanged and stays visible under Pocket TTS.
+> - The Fenrir clip is committed once, at `crates/sayd-pocket/assets/fenrir.wav`,
+>   and exported as `sayd_pocket::FENRIR_WAV`; the download installs it from
+>   there.
+> - Pocket TTS counts as installed (`pocket_synth::bundle_installed`) only when
+>   every file of the downloaded int8 set is present and non-empty, so a
+>   cancelled download is not installed.
+> - The tray does not show the engine; `say status` and the D-Bus `Engine`
+>   property do.
+> - With Pocket TTS chosen and its model missing, `Engine::submit` refuses each
+>   submission with the "Download Pocket TTS" hint, through a new
+>   `Synthesizer::unavailable`. That refusal is not sticky, so the first
+>   submission after the download is taken. The design's "accept, then fail
+>   with a sticky synth error" is gone.
+> - A switch does not replace the synthesizer object. A
+>   `SwitchingSynthesizer` holds both engines, loads only the active one, and
+>   applies a pending switch in `unload`, which the engine already defers
+>   until no utterance is in flight.
 
 ## Why
 
