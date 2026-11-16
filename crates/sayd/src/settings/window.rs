@@ -147,6 +147,9 @@ const RESULT_ROW_NAME: &str = "reword-test-result";
 /// exists: its title and subtitle are what the tests assert about, so they
 /// cannot also be how the tests find it.
 const DOWNLOAD_ROW_NAME: &str = "voice-download";
+/// The Pocket TTS download row's widget name, for the same reason as
+/// [`DOWNLOAD_ROW_NAME`].
+const POCKET_DOWNLOAD_ROW_NAME: &str = "pocket-download";
 
 /// The three labels the download button cycles through.
 ///
@@ -457,6 +460,11 @@ impl Ui {
         self.model.voices().to_vec()
     }
 
+    /// The Pocket voice clips, for `schema::Options::Discovered`.
+    pub fn pocket_voices(&self) -> Vec<String> {
+        self.model.pocket_voices()
+    }
+
     fn row(&self, draw: impl Fn(&Ui, &Config) + 'static) {
         self.rows.borrow_mut().push(Box::new(draw));
     }
@@ -656,6 +664,7 @@ fn render_row(b: &Build, row: &'static schema::Row) -> gtk::Widget {
 
         schema::Row::Choice {
             title,
+            subtitle,
             options,
             unknown,
             get,
@@ -677,7 +686,7 @@ fn render_row(b: &Build, row: &'static schema::Row) -> gtk::Widget {
             let entries: Rc<RefCell<Vec<(String, String)>>> =
                 Rc::new(RefCell::new(options.resolve(b.ui)));
             let labels: Vec<String> = entries.borrow().iter().map(|(_, l)| l.clone()).collect();
-            let combo = Combo::new(title, &labels, *unknown);
+            let combo = Combo::new(title, subtitle, &labels, *unknown);
 
             let known = entries.clone();
             let position = move |value: &str| known.borrow().iter().position(|(v, _)| v == value);
@@ -965,10 +974,17 @@ struct Combo {
     synthetic: Rc<Cell<bool>>,
     /// How to word that entry for this row.
     describe: fn(&str) -> String,
+    /// The row's own subtitle, shown whenever `describe`'s note is not.
+    subtitle: &'static str,
 }
 
 impl Combo {
-    fn new<S: AsRef<str>>(title: &str, choices: &[S], describe: fn(&str) -> String) -> Combo {
+    fn new<S: AsRef<str>>(
+        title: &str,
+        subtitle: &'static str,
+        choices: &[S],
+        describe: fn(&str) -> String,
+    ) -> Combo {
         // `gtk::StringList::new` takes `&[&str]` and every list here is
         // built from owned `String`s, so it is filled by `append` instead.
         let list = gtk::StringList::new(&[]);
@@ -1000,6 +1016,7 @@ impl Combo {
             list,
             synthetic: Rc::new(Cell::new(false)),
             describe,
+            subtitle,
         }
     }
 
@@ -1016,7 +1033,7 @@ impl Combo {
                 // The config no longer holds anything this row cannot
                 // express, so it must stop claiming otherwise -- even if the
                 // synthetic entry it is talking about is still in the list.
-                self.row.set_subtitle("");
+                self.row.set_subtitle(self.subtitle);
             }
             None => {
                 let note = (self.describe)(value);
@@ -1220,21 +1237,69 @@ pub fn voice_test_row(b: &Build) -> gtk::Widget {
 /// which is the layer with tests. What is left here is a subtitle, a
 /// fraction, a button label and a visibility.
 pub fn voice_download_row(b: &Build) -> gtk::Widget {
+    download_row(
+        b,
+        DownloadSpec {
+            name: DOWNLOAD_ROW_NAME,
+            title: "Download voices",
+            offer: download::offer_subtitle(),
+            visible: b.ui.model.voices().is_empty(),
+            start: SettingsModel::download_voices,
+            outcome_subtitle: download::Outcome::subtitle,
+            rescan: |ui| {
+                ui.model.rescan_voices();
+            },
+        },
+    )
+}
+
+/// The Pocket TTS twin of [`voice_download_row`], in the Pocket TTS group.
+/// Shown while the model is not fully on disk; the Fenrir clip arrives with
+/// it, and the Voice clip dropdown is refilled when it finishes.
+pub fn pocket_download_row(b: &Build) -> gtk::Widget {
+    download_row(
+        b,
+        DownloadSpec {
+            name: POCKET_DOWNLOAD_ROW_NAME,
+            title: "Download Pocket TTS",
+            offer: download::pocket_offer_subtitle(),
+            visible: !b.ui.model.pocket_installed(),
+            start: SettingsModel::download_pocket,
+            outcome_subtitle: download::pocket_outcome_subtitle,
+            rescan: |ui| {
+                ui.model.rescan_pocket_voices();
+            },
+        },
+    )
+}
+
+/// What differs between the two download rows.
+struct DownloadSpec {
+    name: &'static str,
+    title: &'static str,
+    offer: String,
+    visible: bool,
+    start: fn(&SettingsModel, Arc<AtomicBool>) -> async_channel::Receiver<download::Event>,
+    outcome_subtitle: fn(&download::Outcome) -> String,
+    rescan: fn(&Ui),
+}
+
+fn download_row(b: &Build, spec: DownloadSpec) -> gtk::Widget {
     let row = adw::ActionRow::builder()
-        .title("Download voices")
+        .title(spec.title)
         // The subtitle is a size and a hostname, neither of which is markup;
         // the same rule every other row in this file follows.
         .use_markup(false)
-        .subtitle(download::offer_subtitle())
+        .subtitle(&spec.offer)
         // Long enough to wrap rather than be ellipsised: the size is the
         // whole point of the sentence, and it is at the end of it.
         .subtitle_lines(0)
         .activatable(false)
-        .visible(b.ui.model.voices().is_empty())
+        .visible(spec.visible)
         // Named so the tests can find it by identity. Its title is one of
         // the things under test, and every other property it has is shared
         // with rows built elsewhere in this file.
-        .name(DOWNLOAD_ROW_NAME)
+        .name(spec.name)
         .build();
 
     let bar = gtk::ProgressBar::builder()
@@ -1263,6 +1328,7 @@ pub fn voice_download_row(b: &Build) -> gtk::Widget {
     // `Rc<RefCell<_>>` and not a widget property because it holds no widget:
     // it closes no cycle, and nothing a widget owns holds it back.
     let running: Rc<RefCell<Option<Arc<AtomicBool>>>> = Rc::new(RefCell::new(None));
+    let (start, outcome_subtitle, rescan) = (spec.start, spec.outcome_subtitle, spec.rescan);
 
     let u = b.ui.downgrade();
     // Weak, all three: `bar` and `row` are the widgets this handler is
@@ -1289,7 +1355,7 @@ pub fn voice_download_row(b: &Build) -> gtk::Widget {
         u.with(|ui| {
             let stop = Arc::new(AtomicBool::new(false));
             *flag.borrow_mut() = Some(stop.clone());
-            let events = ui.model.download_voices(stop);
+            let events = start(&ui.model, stop);
 
             row.set_subtitle(&download::starting_subtitle());
             bar.set_fraction(0.0);
@@ -1320,17 +1386,20 @@ pub fn voice_download_row(b: &Build) -> gtk::Widget {
                         download::Event::Finished(outcome) => {
                             *flag.borrow_mut() = None;
                             bar.set_visible(false);
-                            row.set_subtitle(&outcome.subtitle());
+                            row.set_subtitle(&outcome_subtitle(&outcome));
                             if let Some(button) = weak_button.upgrade() {
                                 button.set_label(DOWNLOAD_LABEL);
                                 button.set_sensitive(true);
                             }
                             if outcome == download::Outcome::Complete {
                                 // The offer has been taken; what is left is
-                                // a button that can only refetch 341 MB.
+                                // a button that can only refetch what is
+                                // already on disk.
                                 row.set_visible(false);
                             }
-                            u.with(|ui| finish_download(ui, &outcome));
+                            u.with(|ui| {
+                                finish_download(ui, &outcome, rescan, &outcome_subtitle(&outcome))
+                            });
                         }
                     }
                 }
@@ -1351,14 +1420,14 @@ pub fn voice_download_row(b: &Build) -> gtk::Widget {
 /// A failure is toasted as well as written into the row's subtitle: the row
 /// is at the top of one group on one page, and a user who navigated to a
 /// sub-page while 341 MB transferred is not looking at it.
-fn finish_download(ui: &Ui, outcome: &download::Outcome) {
+fn finish_download(ui: &Ui, outcome: &download::Outcome, rescan: fn(&Ui), said: &str) {
     match outcome {
         download::Outcome::Complete => {
-            ui.model.rescan_voices();
+            rescan(ui);
             ui.rediscover_options(&ui.model.current());
-            ui.toast(&outcome.subtitle());
+            ui.toast(said);
         }
-        download::Outcome::Failed(_) => ui.toast(&outcome.subtitle()),
+        download::Outcome::Failed(_) => ui.toast(said),
         // Cancelling is something the user just did on purpose; a toast
         // telling them they did it is noise.
         download::Outcome::Cancelled => {}
@@ -1745,7 +1814,7 @@ pub fn reword_group(b: &Build) -> adw::PreferencesGroup {
     // out here: a third provider must be addable without touching this
     // file, per the module doc comment's rule that the window is wiring
     // only.
-    let provider_row = Combo::new("Provider", &Provider::NAMES, |p| {
+    let provider_row = Combo::new("Provider", "", &Provider::NAMES, |p| {
         if p.is_empty() {
             "not set — required while Rewrite notifications is on".to_string()
         } else {
@@ -4154,7 +4223,14 @@ mod tests {
             std::fs::write(dir.join("voices").join(format!("{name}.bin")), b"x")
                 .expect("a voice pack");
         }
-        finish_download(&ui, &download::Outcome::Complete);
+        finish_download(
+            &ui,
+            &download::Outcome::Complete,
+            |ui| {
+                ui.model.rescan_voices();
+            },
+            "done",
+        );
 
         let labels = combo_labels(&voice);
         assert_eq!(

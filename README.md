@@ -4,10 +4,11 @@ Local text-to-speech for sway/Wayland. Select text, press a key, hear it.
 Kokoro-82M runs locally via ONNX Runtime with the misaki-en G2P frontend.
 Speech synthesis never touches the network and nothing about it leaves your
 machine. Two things reach out at all, and only when you ask them to. The
-[**Download voices** button](#models) in the settings window fetches the
-model and the voice packs from Hugging Face on a machine that has none: it
-asks for files and sends nothing, once, and a machine with the packs already
-installed never sees it. The optional rewording feature
+model downloads in the settings window -- [**Download voices**](#models) for
+Kokoro and [**Download Pocket TTS**](#pocket-tts) -- fetch the model and its
+voices from Hugging Face on a machine that has none: each asks for files and
+sends nothing, once, and a machine with the files already installed never
+sees it. The optional rewording feature
 ([`[reword]`](#rewording), inert until you configure a `provider`) is the
 one that sends anything *out*: the text about to be spoken, to whatever
 endpoint you configure. Point it at a model server on localhost -- the
@@ -28,9 +29,10 @@ Put `target/release/sayd` and `target/release/say` on `$PATH`.
 [Rewording](#rewording) -- the one thing in `sayd` that sends your text
 anywhere -- is built in. It stays inert until you set a `reword.provider`,
 so "nothing leaves your machine" holds for any configuration that has not
-asked for it. The [voice download](#models) is the only other code path that
-opens a socket, and it is a button: it fetches files from a named host,
-sends nothing, and has nothing to do once the packs are on disk.
+asked for it. The [voice download](#models) and the [Pocket TTS
+download](#pocket-tts) are the only other code paths that open a socket, and
+they are buttons: each fetches files from a named host (Hugging Face), sends
+nothing, and has nothing to do once the files are on disk.
 
 ### Native dependencies
 
@@ -102,6 +104,71 @@ The same files into `./models`, plus the `fp16` and quantized model variants
 `~/.local/share/sayd/models`), or in `./models` if neither exists. Set
 `SAYD_MODELS_DIR` to point it somewhere else entirely. The settings window
 downloads into whichever of those the daemon is reading.
+
+## Pocket TTS
+
+Kokoro is the default voice. [Pocket TTS](https://huggingface.co/kyutai/pocket-tts)
+(Kyutai, 100M parameters) is a second engine you can switch to: it runs
+in-process on the same ONNX Runtime, and it clones its voice from a short
+`.wav` clip instead of using a fixed voice pack. It has no emotion controls;
+the only knob is `temperature` (0.3 by default).
+
+**Switching.** In the settings window, set **Engine** to **Pocket TTS**. On a
+machine without the model the **Pocket TTS** group shows a **Download Pocket
+TTS** row that states its cost first -- "165 MB from huggingface.co: the
+Pocket TTS model and the Fenrir voice clip" -- and then behaves like the
+Kokoro download above: `.part` files renamed into place, Cancel, resume. The
+change applies to the next utterance with no restart, and your Kokoro `voice`
+is kept for when you switch back. Until the model is on disk, every
+submission is refused with a message saying to press **Download Pocket TTS**;
+nothing is left in an error state, so the first one after the download is
+spoken. The Kokoro **Voice** row (and, with no packs installed, **Download
+voices**) stays visible while Pocket TTS is the engine: it is what Kokoro
+speaks with when you switch back. In `config.toml`:
+
+    engine = "pocket"      # "kokoro" (default) | "pocket"
+
+    [pocket]
+    voice = "fenrir"       # a <name>.wav in <models>/pocket/voices/
+    precision = "int8"     # "int8" (default) | "fp32"
+    temperature = 0.3
+
+The download fetches the int8 files. `precision = "fp32"` needs three fp32
+files that you put in place yourself, in `<models>/pocket/english_2026-04/`:
+`flow_lm_main.onnx`, `flow_lm_flow.onnx` and `mimi_decoder.onnx`, from the
+same Hugging Face repository. The loader does not fall back to int8 for it,
+and the install check still wants the int8 files, so keep both sets there.
+
+**Where things live.** Below the models directory (see [Models](#models)):
+
+    <models>/pocket/english_2026-04/   the model: five ONNX files and their metadata
+    <models>/pocket/voices/*.wav       one reference clip per voice
+
+**Adding your own voice.** Drop a clean recording of one speaker, five to
+fifteen seconds, into `<models>/pocket/voices/` as `<name>.wav` (16-bit PCM or
+32-bit float, any rate, mono or stereo; it is resampled). Reopen the settings
+window and pick it under **Voice clip**, or set `pocket.voice = "<name>"`.
+Each clip is encoded once and cached under `$XDG_CACHE_HOME/sayd/pocket`. A
+clip too long for the model's attention cache (about a minute) cannot be
+used: speaking with it fails with an error that ends "use a shorter clip".
+
+**A voice named for the other engine.** A `--voice` (or D-Bus `voice`) is
+looked up in the engine that will speak it. Under Pocket TTS, any name with
+no clip -- `say --voice am_fenrir` from a hook written for Kokoro, or a typo
+-- is spoken with `pocket.voice` (provided that clip exists), and the
+daemon's log notes it once per name. Under Kokoro, a Pocket clip name is
+accepted the same way and spoken with `voice`, while a name neither engine
+has is refused, exactly as before.
+
+**Licences.** The Pocket TTS weights are CC-BY-4.0, by Kyutai. The ONNX export
+is [`KevinAHM/pocket-tts-onnx`](https://huggingface.co/KevinAHM/pocket-tts-onnx),
+and the download is pinned to commit
+`58a6d00cf13d239b6748cb0769f35c580a8f606c` so it cannot change under you. The
+bundled **Fenrir** clip (`fenrir.wav`, installed into `pocket/voices` when the
+model is downloaded) is Kokoro-82M's `am_fenrir` voice, which is Apache-2.0,
+reading a nine-second sentence; it is never overwritten if you replace it.
+
+**Network.** That download is the only network access Pocket TTS makes.
 
 ## sway setup
 
@@ -196,12 +263,14 @@ destroyed when closed, so the daemon carries no window, and no GTK
 resources, for the vast majority of its life.
 
 The first page holds what is worth seeing without navigating -- voice, speed
-and engine -- and links to four sub-pages, each with a line underneath saying
-what it currently holds:
+and which engine speaks, Pocket TTS's own settings, and performance -- and
+links to four sub-pages, each with a line underneath saying what it currently
+holds:
 
     sayd Settings
     ├─ Voice and speed
-    ├─ Engine
+    ├─ Pocket TTS
+    ├─ Performance
     ├─ Text      → Cleanup        "5 of 5 transforms on · URLs: say “link”"
     │            → Rewording      "qwen3:32b via llama-cpp"
     └─ Sources   → say command    "No limit"
@@ -213,7 +282,8 @@ There is no switch for `say`: it only runs when you run it.
 On a machine with no voice packs installed, the Voice group carries one
 extra row: **Download voices**, which fetches them from Hugging Face. See
 [Models](#models) for what it does and what it costs. It is not there once
-packs are installed.
+packs are installed. The **Pocket TTS** group has its own, **Download Pocket
+TTS**, until that model is on disk (see [Pocket TTS](#pocket-tts)).
 
 The window is a view over one file, `$XDG_CONFIG_HOME/sayd/config.toml`
 (falling back to `~/.config/sayd/config.toml`), never a second copy of the
@@ -227,12 +297,14 @@ save the settings window just made is never mistaken for an external edit
 and reloaded a second time.
 
 **One caveat.** Changing `model` or `threads` drops the loaded ONNX
-session -- every other setting is free. The dropped session is rebuilt on
-the next utterance, which then pays a one-off reload of the ~1.27 GB model
-(over a second) that no other field's change costs. That drop is deferred to
-the moment the utterance already playing actually finishes, rather than
-applied the instant the change lands, so switching models or thread counts
-mid-article does not cut the current sentence in half.
+session, and so do changing `engine` and, while Pocket TTS is the engine,
+`pocket.precision` -- every other setting is free. The dropped session is
+rebuilt on the next utterance, which then pays a one-off reload (for Kokoro,
+of the ~1.27 GB model, over a second) that no other field's change costs.
+That drop is deferred to the moment the utterance already playing actually
+finishes, rather than applied the instant the change lands, so switching
+models, engines or thread counts mid-article does not cut the current
+sentence in half.
 
 `idle_unload_secs` behaves the other way around from what its name might
 suggest: `0` means the session is *never* unloaded while idle, not that it
@@ -267,6 +339,12 @@ threads = 8             # measured peak; 16 and 24 both regress
 idle_unload_secs = 600  # seconds idle before the session is dropped; 0 = never
 muted = false
 max_chars = 0           # refuse submissions longer than this; 0 = no limit
+engine = "kokoro"       # kokoro | pocket; anything else runs kokoro, with a warning
+
+[pocket]                # read only while engine = "pocket"; see Pocket TTS
+voice = "fenrir"        # a clip in <models>/pocket/voices, without the .wav
+precision = "int8"      # int8 | fp32; anything else runs int8, with a warning
+temperature = 0.3       # 0 or more, lower is steadier; anything else runs 0.3
 
 [cleanup]
 enabled = true          # off leaves every submission exactly as written
@@ -301,7 +379,9 @@ speaking), and picks the file up the moment it parses again.
 A file that parses but says something `sayd` cannot do is applied as the
 nearest thing it *can* do, and says so in the same place: an unrecognised
 `model` runs `fp32` (which is what would have loaded anyway), an unrecognised
-`speed_mode` runs `model` the same way, and `speed` outside `0.5`-`2.0` is
+`speed_mode` runs `model` the same way, as do an unrecognised `engine`
+(Kokoro) and `pocket.precision` (`int8`), a negative or non-finite
+`pocket.temperature` runs at `0.3`, and `speed` outside `0.5`-`2.0` is
 clamped, each with a warning naming the value and what is actually being
 used. As above, your file is left exactly as you
 wrote it -- the corrected value only reaches the disk when you next change a
@@ -831,9 +911,9 @@ are where the destination is stated.
 
 Any OpenAI-compatible server on localhost keeps the original promise
 intact. That is the default, and a default build sends your text nowhere.
-(The [voice download](#models) is the one request a default build can make,
-and only when the button is pressed: it asks huggingface.co for files and
-sends nothing of yours.)
+(The two download buttons, [voices](#models) and [Pocket TTS](#pocket-tts),
+are the only requests a default build can make, and only when pressed: each
+asks huggingface.co for files and sends nothing of yours.)
 
 ### What can go wrong
 
@@ -1003,7 +1083,11 @@ Bus name `sh.sayd.Sayd`, object path `/sh/sayd/Sayd`, interface
 
 `opts` accepts `policy` (`"enqueue"`/`"interrupt"`/`"replace"`/`"front"`),
 `voice` and `speed`; unknown keys and unparseable values are ignored rather
-than rejected.
+than rejected. `voice` is looked up in the engine that will speak. Under
+Pocket TTS, any name without a clip is spoken with `pocket.voice`; under
+Kokoro, a Pocket clip name is spoken with `voice` and a name neither engine
+has is refused. Each substitution is noted once in the daemon's log; see
+[Pocket TTS](#pocket-tts).
 
 `Say`/`SaySelection`/`SayClipboard` return one of three things:
 
@@ -1219,11 +1303,30 @@ for looking at it. Walk this yourself once, after installing:
     and the download row is gone.
 14. At the window's default width, check the **Idle unload** row's
     subtitle -- it is a long sentence ("Seconds of silence before the
-    ~1.27 GB session is dropped; 0 never unloads") and should read in full,
-    wrapping onto more than one line, rather than being truncated with an
-    ellipsis.
+    engine's session is dropped (Kokoro's is ~1.27 GB); 0 never unloads")
+    and should read in full, wrapping onto more than one line, rather than
+    being truncated with an ellipsis.
 15. Restart `sayd` -- every setting from the steps above survives. This is
     M4's stated done-when.
+16. Pocket TTS, fresh install: start `sayd` with `SAYD_MODELS_DIR` pointing
+    at an empty directory, open **Settings…** and find the **Pocket TTS**
+    group. **Download Pocket TTS** says **165 MB** and `huggingface.co`
+    before you press it. Set **Engine** to **Pocket TTS** and press Speak in
+    the **Test** row: it is refused with a message saying to press Download
+    Pocket TTS, and the tray shows no error. Press Download, then Cancel part
+    way: `find "$SAYD_MODELS_DIR" -name '*.part'` prints nothing. Press it
+    again and let it finish -- the row disappears and **Voice clip** lists
+    `fenrir`.
+17. With **Engine** still on **Pocket TTS**, press Speak in the **Test** row
+    again -- no dismiss needed -- and after a pause for loading it speaks in the Fenrir clone, and
+    `say status` reports the Pocket engine. Set **Engine** back to
+    **Kokoro**: the next utterance is in your Kokoro voice again.
+18. Copy a `.wav` of your own into `$SAYD_MODELS_DIR/pocket/voices/`, reopen
+    the window and pick it under **Voice clip** -- the Test row speaks in it.
+    Remove the clip it is set to and reopen: the row reads "no clip in
+    pocket/voices" instead of showing another voice.
+19. Overwrite `fenrir.wav` with another clip, delete the `.onnx` files and
+    download again: your `fenrir.wav` is still your clip.
 
 ## Verify notifications
 
@@ -1373,7 +1476,8 @@ cargo publish -p sayd-misaki-en
 cargo publish -p sayd-g2p        # needs sayd-misaki-en on the index
 cargo publish -p sayd-kokoro
 cargo publish -p sayd-core
-cargo publish -p sayd            # needs sayd-core, sayd-g2p, sayd-kokoro
+cargo publish -p sayd-pocket
+cargo publish -p sayd            # needs sayd-core, sayd-g2p, sayd-kokoro, sayd-pocket
 cargo publish -p sayd-cli
 ```
 
@@ -1382,8 +1486,8 @@ dependencies are actually on the index — `failed to select a version for the
 requirement` is expected at that stage, not a packaging error.
 
 Note that `sayd-g2p` will not build for anyone without espeak-ng, and
-`sayd-kokoro` will build but not run without ONNX Runtime; both say so up
-front in their own READMEs. `sayd` itself is stricter still: without GTK4
+`sayd-kokoro` and `sayd-pocket` will build but not run without ONNX Runtime;
+all three say so up front in their own READMEs. `sayd` itself is stricter still: without GTK4
 and libadwaita development headers present (see
 [Native dependencies](#native-dependencies)) it will not even compile, so
 `cargo publish --dry-run -p sayd` needs them on the publishing machine too,
@@ -1392,4 +1496,6 @@ not just at runtime.
 ## Licence
 
 MIT, except the vendored misaki lexicons in
-[`sayd-misaki-en`](crates/sayd-misaki-en), which are Apache-2.0.
+[`sayd-misaki-en`](crates/sayd-misaki-en), which are Apache-2.0. The Pocket TTS
+weights and the Fenrir voice clip carry their own licences; see
+[Pocket TTS](#pocket-tts).

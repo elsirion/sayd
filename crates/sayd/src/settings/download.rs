@@ -221,6 +221,74 @@ pub fn assets() -> Vec<Asset> {
     out
 }
 
+/// Where the Pocket TTS bundle comes from: `KevinAHM/pocket-tts-onnx`, pinned
+/// to the commit it was verified at rather than `main`, since a third-party
+/// export can change under us. The Kokoro download does not pin.
+pub const POCKET_BASE_URL: &str = "https://huggingface.co/KevinAHM/pocket-tts-onnx/resolve/\
+     58a6d00cf13d239b6748cb0769f35c580a8f606c/onnx/english_2026-04";
+
+/// The measured size of each file in [`crate::pocket_synth::BUNDLE_FILES`]
+/// (from the Hugging Face tree listing at the pinned commit, 2026-11-16).
+/// The names live in one place; a name missing here fails the sizes test.
+fn pocket_size(name: &str) -> u64 {
+    match name {
+        "bundle.json" => 24_381,
+        "tokenizer.model" => 59_339,
+        "bos_before_voice.npy" => 4_224,
+        "text_conditioner.onnx" => 16_388_344,
+        "mimi_encoder.onnx" => 39_768_446,
+        "flow_lm_main_int8.onnx" => 76_341_079,
+        "flow_lm_flow_int8.onnx" => 9_962_530,
+        "mimi_decoder_int8.onnx" => 22_684_077,
+        _ => 0,
+    }
+}
+
+/// Everything a Pocket TTS install fetches: the int8 set. `precision =
+/// "fp32"` needs the three fp32 files (`flow_lm_main.onnx`,
+/// `flow_lm_flow.onnx`, `mimi_decoder.onnx`) installed by hand; the loader
+/// does not fall back to int8, and `bundle_installed` still requires the int8
+/// set, so an fp32-only install is not supported.
+pub fn pocket_assets() -> Vec<Asset> {
+    crate::pocket_synth::BUNDLE_FILES
+        .iter()
+        .map(|&name| Asset {
+            url: format!("{POCKET_BASE_URL}/{name}"),
+            relative: sayd_pocket::bundle_dir(Path::new("")).join(name),
+            expected: pocket_size(name),
+        })
+        .collect()
+}
+
+/// What the Pocket row says while nothing is running.
+pub fn pocket_offer_subtitle() -> String {
+    let total: u64 = pocket_assets().iter().map(|a| a.expected).sum();
+    let host = POCKET_BASE_URL
+        .trim_start_matches("https://")
+        .split('/')
+        .next()
+        .unwrap_or(POCKET_BASE_URL);
+    format!(
+        "{} from {host}: the Pocket TTS model and the Fenrir voice clip",
+        human_bytes(total)
+    )
+}
+
+/// The Pocket twin of [`Outcome::subtitle`], which speaks of Kokoro.
+pub fn pocket_outcome_subtitle(outcome: &Outcome) -> String {
+    match outcome {
+        Outcome::Complete => "Pocket TTS installed".to_string(),
+        Outcome::Cancelled => format!("Cancelled. {}", pocket_offer_subtitle()),
+        Outcome::Failed(e) => format!("Download failed: {e}"),
+    }
+}
+
+/// Whether every Pocket file is on disk: `pocket_synth::bundle_installed`,
+/// the one definition.
+pub fn pocket_complete(models_dir: &Path) -> bool {
+    crate::pocket_synth::bundle_installed(models_dir)
+}
+
 /// A number of bytes as the window says it: `341 MB`.
 ///
 /// Decimal rather than binary units, which is what makes 340,682,781 read as
@@ -377,26 +445,59 @@ pub fn download(
     cancel: &dyn Fn() -> bool,
     report: &mut dyn FnMut(Progress),
 ) -> Outcome {
-    let assets = assets();
+    download_assets(models_dir, &assets(), fetch, cancel, report)
+}
+
+/// [`download`] for the Pocket bundle, then the Fenrir clip: written into the
+/// voices directory if absent (never over a file the user replaced or
+/// edited), since that directory comes into existence with the model.
+pub fn download_pocket(
+    models_dir: &Path,
+    fetch: &dyn Fetch,
+    cancel: &dyn Fn() -> bool,
+    report: &mut dyn FnMut(Progress),
+) -> Outcome {
+    let outcome = download_assets(models_dir, &pocket_assets(), fetch, cancel, report);
+    if outcome != Outcome::Complete {
+        return outcome;
+    }
+    let dir = crate::pocket_synth::voices_dir(models_dir);
+    let clip = dir.join("fenrir.wav");
+    if !clip.exists() {
+        if let Err(e) = std::fs::create_dir_all(&dir)
+            .and_then(|()| std::fs::write(&clip, sayd_pocket::FENRIR_WAV))
+        {
+            return Outcome::Failed(format!("writing {}: {e}", clip.display()));
+        }
+    }
+    outcome
+}
+
+/// Fetch `assets` into `models_dir`, with the semantics [`download`]
+/// documents.
+pub fn download_assets(
+    models_dir: &Path,
+    assets: &[Asset],
+    fetch: &dyn Fetch,
+    cancel: &dyn Fn() -> bool,
+    report: &mut dyn FnMut(Progress),
+) -> Outcome {
     // Corrected as each `Content-Length` arrives: `total` starts as the sum
     // of the measured constants and each file swaps its constant for what
     // the server (or, for a file already on disk, the filesystem) says.
-    let mut total = TOTAL_BYTES;
+    let mut total: u64 = assets.iter().map(|a| a.expected).sum();
     let mut done: u64 = 0;
 
-    if let Err(e) = std::fs::create_dir_all(models_dir.join("voices")) {
-        // `voices/` implies the parent, so one call covers both.
-        return Outcome::Failed(format!(
-            "could not create {}: {e}",
-            models_dir.join("voices").display()
-        ));
-    }
-
-    for asset in &assets {
+    for asset in assets {
         if cancel() {
             return Outcome::Cancelled;
         }
         let dest = models_dir.join(&asset.relative);
+        if let Some(parent) = dest.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                return Outcome::Failed(format!("could not create {}: {e}", parent.display()));
+            }
+        }
         // An existing file of length zero is not a download this function
         // made -- it never renames an empty `.part` into place -- so it is
         // treated as absent rather than as done.
@@ -1147,5 +1248,98 @@ mod tests {
             VOICES.to_vec(),
             "scripts/fetch-models.sh and settings::download disagree about the voices"
         );
+    }
+
+    /// A `Canned` serving every Pocket asset.
+    fn pocket_canned(size: usize) -> Canned {
+        let mut c = Canned::everything(size);
+        for asset in pocket_assets() {
+            c.bodies.insert(asset.url.clone(), vec![b'p'; size]);
+        }
+        c
+    }
+
+    /// The pinned URL, the measured sizes, and int8 only.
+    #[test]
+    fn pocket_assets_are_pinned_and_sized() {
+        assert!(POCKET_BASE_URL.contains("58a6d00cf13d239b6748cb0769f35c580a8f606c"));
+        let assets = pocket_assets();
+        assert_eq!(assets.len(), 8);
+        for a in &assets {
+            assert!(a.url.starts_with(POCKET_BASE_URL), "{}", a.url);
+            assert!(
+                a.relative.starts_with("pocket/english_2026-04"),
+                "{:?}",
+                a.relative
+            );
+        }
+        let sum: u64 = assets.iter().map(|a| a.expected).sum();
+        assert!(assets.iter().all(|a| a.expected > 0), "a size per file");
+        assert_eq!(sum, 165_232_420);
+        assert_eq!(human_bytes(sum), "165 MB");
+        assert_eq!(
+            pocket_offer_subtitle(),
+            "165 MB from huggingface.co: the Pocket TTS model and the Fenrir voice clip"
+        );
+        assert!(!assets
+            .iter()
+            .any(|a| a.name().ends_with("/flow_lm_main.onnx")));
+        assert!(assets
+            .iter()
+            .any(|a| a.name().ends_with("/flow_lm_main_int8.onnx")));
+    }
+
+    /// The Fenrir clip lands once, and is not overwritten afterwards.
+    #[test]
+    fn pocket_download_installs_fenrir_clip_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fetch = pocket_canned(8);
+        let outcome = download_pocket(dir.path(), &fetch, &never(), &mut |_| {});
+        assert_eq!(outcome, Outcome::Complete);
+        for a in pocket_assets() {
+            assert!(dir.path().join(&a.relative).is_file(), "{}", a.name());
+        }
+        assert!(pocket_complete(dir.path()));
+        let clip = crate::pocket_synth::voices_dir(dir.path()).join("fenrir.wav");
+        assert_eq!(std::fs::read(&clip).expect("clip"), sayd_pocket::FENRIR_WAV);
+
+        std::fs::write(&clip, b"mine").expect("edit");
+        let outcome = download_pocket(dir.path(), &fetch, &never(), &mut |_| {});
+        assert_eq!(outcome, Outcome::Complete);
+        assert_eq!(std::fs::read(&clip).expect("clip"), b"mine");
+    }
+
+    /// A cancelled Pocket download is not mistaken for an installed one.
+    #[test]
+    fn a_cancelled_pocket_download_is_not_complete() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fetch = pocket_canned(8);
+        let calls = std::cell::Cell::new(0);
+        let cancel = || {
+            calls.set(calls.get() + 1);
+            calls.get() > 3
+        };
+        let outcome = download_pocket(dir.path(), &fetch, &cancel, &mut |_| {});
+        assert_eq!(outcome, Outcome::Cancelled);
+        assert!(!pocket_complete(dir.path()));
+        assert!(!crate::pocket_synth::voices_dir(dir.path())
+            .join("fenrir.wav")
+            .exists());
+    }
+
+    /// Adding the Pocket download did not move the Kokoro one.
+    #[test]
+    fn kokoro_download_unchanged() {
+        let a = assets();
+        assert_eq!(a.len(), 32);
+        assert_eq!(a[0].relative, PathBuf::from("config.json"));
+        assert_eq!(a[1].relative, PathBuf::from("tokenizer.json"));
+        assert_eq!(a[2].relative, PathBuf::from("model.onnx"));
+        for (i, v) in VOICES.iter().enumerate() {
+            assert_eq!(
+                a[3 + i].relative,
+                PathBuf::from("voices").join(format!("{v}.bin"))
+            );
+        }
     }
 }

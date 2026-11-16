@@ -30,9 +30,9 @@ use gtk4 as gtk;
 use sayd_core::config::Config;
 
 use super::model::{
-    COOLDOWN_MAX, COOLDOWN_MIN, COOLDOWN_STEP, IDLE_UNLOAD_MAX, IDLE_UNLOAD_MIN, IDLE_UNLOAD_STEP,
-    MAX_CHARS_MAX, MAX_CHARS_MIN, MAX_CHARS_STEP, MODELS, SPEED_MAX, SPEED_MIN, SPEED_MODES,
-    SPEED_STEP, THREADS_MAX, THREADS_MIN, THREADS_STEP,
+    COOLDOWN_MAX, COOLDOWN_MIN, COOLDOWN_STEP, ENGINES, IDLE_UNLOAD_MAX, IDLE_UNLOAD_MIN,
+    IDLE_UNLOAD_STEP, MAX_CHARS_MAX, MAX_CHARS_MIN, MAX_CHARS_STEP, MODELS, SPEED_MAX, SPEED_MIN,
+    SPEED_MODES, SPEED_STEP, THREADS_MAX, THREADS_MIN, THREADS_STEP,
 };
 use super::window::{Build, Ui};
 
@@ -101,6 +101,10 @@ pub enum Row {
     },
     Choice {
         title: &'static str,
+        /// Shown under the title while the configured value is one of the
+        /// options; `""` for none. A value the row cannot offer replaces it
+        /// with `unknown`'s wording.
+        subtitle: &'static str,
         options: Options,
         /// How to word the synthetic entry for a configured value this row
         /// does not offer. See `window::Combo` for why that entry exists.
@@ -222,6 +226,7 @@ pub static CLEANUP: Page = Page {
             },
             Row::Choice {
                 title: "URLs",
+                subtitle: "",
                 options: Options::Static(&[
                     ("link", "Say “link”"),
                     ("domain", "Say the domain"),
@@ -423,7 +428,16 @@ pub static ROOT: &[Section] = &[
         description: None,
         rows: &[
             Row::Choice {
+                title: "Engine",
+                subtitle: "",
+                options: Options::Static(&ENGINES),
+                unknown: |e| format!("‘{e}’ — not an engine this build knows"),
+                get: |c| c.engine.clone(),
+                set: |c, v| c.engine = v.to_string(),
+            },
+            Row::Choice {
                 title: "Voice",
+                subtitle: "",
                 options: Options::Discovered(|ui| ui.voices()),
                 // `sayd` already warns about a configured voice with no pack
                 // at startup; saying it again here is what keeps the row from
@@ -452,6 +466,7 @@ pub static ROOT: &[Section] = &[
             },
             Row::Choice {
                 title: "Speed mode",
+                subtitle: "Kokoro only; Pocket TTS always time-stretches",
                 options: Options::Annotated(&SPEED_MODES),
                 unknown: |m| format!("‘{m}’ — not a speed mode this build knows"),
                 get: |c| c.speed_mode.clone(),
@@ -461,13 +476,32 @@ pub static ROOT: &[Section] = &[
         ],
     }),
     Section::Described(Group {
-        title: Some("Engine"),
+        title: Some("Pocket TTS"),
+        description: Some(
+            "Used when Engine is Pocket TTS. The voice is copied from a short .wav clip in \
+             <models>/pocket/voices",
+        ),
+        rows: &[
+            Row::Choice {
+                title: "Voice clip",
+                subtitle: "",
+                options: Options::Discovered(|ui| ui.pocket_voices()),
+                unknown: |v| format!("‘{v}’ — no clip in pocket/voices"),
+                get: |c| c.pocket.voice.clone(),
+                set: |c, v| c.pocket.voice = v.to_string(),
+            },
+            Row::Custom(super::window::pocket_download_row),
+        ],
+    }),
+    Section::Described(Group {
+        title: Some("Performance"),
         description: Some(
             "Changes take effect on the next utterance; switching model reloads the session",
         ),
         rows: &[
             Row::Choice {
                 title: "Model",
+                subtitle: "Kokoro only",
                 options: Options::Annotated(&MODELS),
                 unknown: |m| format!("‘{m}’ — not a model this build knows"),
                 get: |c| c.model.clone(),
@@ -475,7 +509,8 @@ pub static ROOT: &[Section] = &[
             },
             Row::Int {
                 title: "Threads",
-                subtitle: "ONNX Runtime intra-op threads; measured peak at 8",
+                subtitle: "ONNX Runtime intra-op threads; Kokoro's measured peak is 8, \
+                           Pocket TTS uses at most 4",
                 min: THREADS_MIN,
                 max: THREADS_MAX,
                 step: THREADS_STEP,
@@ -486,7 +521,8 @@ pub static ROOT: &[Section] = &[
             },
             Row::Int {
                 title: "Idle unload",
-                subtitle: "Seconds of silence before the ~1.27 GB session is dropped; 0 never unloads",
+                subtitle: "Seconds of silence before the engine's session is dropped (Kokoro's \
+                           is ~1.27 GB); 0 never unloads",
                 min: IDLE_UNLOAD_MIN,
                 max: IDLE_UNLOAD_MAX,
                 step: IDLE_UNLOAD_STEP,
@@ -739,5 +775,58 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The Engine row sits in "Voice and speed" and the Pocket group holds
+    /// the clip dropdown and the download row.
+    #[test]
+    fn schema_has_engine_row_and_pocket_group() {
+        let groups: Vec<&Group> = described_groups().collect();
+        let voice = groups
+            .iter()
+            .find(|g| g.title == Some("Voice and speed"))
+            .expect("voice group");
+        let engine = voice
+            .rows
+            .iter()
+            .find(|r| r.title() == Some("Engine"))
+            .expect("Engine row");
+        let Row::Choice {
+            options: Options::Static(table),
+            get,
+            set,
+            ..
+        } = engine
+        else {
+            panic!("Engine is a static choice");
+        };
+        assert_eq!(*table, &[("kokoro", "Kokoro"), ("pocket", "Pocket TTS")]);
+        let mut cfg = Config::default();
+        assert_eq!(get(&cfg), "kokoro");
+        set(&mut cfg, "pocket");
+        assert_eq!(cfg.engine, "pocket");
+
+        let pocket = groups
+            .iter()
+            .find(|g| g.title == Some("Pocket TTS"))
+            .expect("Pocket TTS group");
+        assert!(pocket
+            .description
+            .is_some_and(|d| d.contains("pocket/voices")));
+        let Some(Row::Choice {
+            options: Options::Discovered(_),
+            get,
+            set,
+            ..
+        }) = pocket.rows.iter().find(|r| r.title() == Some("Voice clip"))
+        else {
+            panic!("Voice clip is a discovered choice");
+        };
+        set(&mut cfg, "mine");
+        assert_eq!(cfg.pocket.voice, "mine");
+        assert_eq!(get(&cfg), "mine");
+        assert!(pocket.rows.iter().any(|r| matches!(r, Row::Custom(_))));
+        // The Kokoro Voice row is still there, untouched.
+        assert!(voice.rows.iter().any(|r| r.title() == Some("Voice")));
     }
 }

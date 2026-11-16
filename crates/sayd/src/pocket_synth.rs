@@ -33,8 +33,6 @@ pub fn voices_dir(models_dir: &Path) -> PathBuf {
 }
 
 /// Voice names (the `*.wav` stems in the voices directory), sorted.
-// Only tests call this until the settings window's Pocket voice list does.
-#[allow(dead_code)]
 pub fn list_pocket_voices(models_dir: &Path) -> Vec<String> {
     let mut v: Vec<String> = std::fs::read_dir(voices_dir(models_dir))
         .into_iter()

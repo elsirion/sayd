@@ -44,6 +44,15 @@ pub const SPEED_MODES: [(&str, &str); 2] = [
     ),
 ];
 
+/// The `engine` values and their labels in the Engine dropdown. `"kokoro"`
+/// is first so it stays [`FALLBACK_ENGINE`], matching `Config::default`.
+pub const ENGINES: [(&str, &str); 2] = [("kokoro", "Kokoro"), ("pocket", "Pocket TTS")];
+
+/// The `pocket.precision` values. No row offers them; the file does.
+/// `"int8"`, the one the download fetches, is first so it stays
+/// [`FALLBACK_POCKET_PRECISION`].
+pub const POCKET_PRECISIONS: [&str; 2] = ["int8", "fp32"];
+
 /// Speed bounds, matching `Engine`'s clamp exactly. Two places enforcing
 /// different bounds would let the window write a value the engine then
 /// silently changed.
@@ -365,6 +374,8 @@ pub struct SettingsModel {
     /// rescan through. Poison-tolerant like every other lock here; see
     /// [`lock`].
     voices: Mutex<Vec<String>>,
+    /// The Pocket clips in `<models>/pocket/voices`; see `voices`.
+    pocket_voices: Mutex<Vec<String>>,
     /// Where the packs live, kept so a rescan looks in the same place the
     /// first scan did rather than re-deriving it -- and so the download has
     /// somewhere to write. One directory, resolved once, by
@@ -390,6 +401,14 @@ pub struct SettingsModel {
     /// from `run_daemon`, which runs on the runtime.
     runtime: Option<tokio::runtime::Handle>,
 }
+
+/// [`download::download`] and [`download::download_pocket`] share this shape.
+type DownloadFn = fn(
+    &std::path::Path,
+    &dyn download::Fetch,
+    &dyn Fn() -> bool,
+    &mut dyn FnMut(download::Progress),
+) -> download::Outcome;
 
 impl SettingsModel {
     pub fn new(store: Arc<ConfigStore>, models_dir: PathBuf, current: Config) -> Self {
@@ -451,6 +470,7 @@ impl SettingsModel {
         SettingsModel {
             shared,
             voices: Mutex::new(list_voices(&models_dir)),
+            pocket_voices: Mutex::new(crate::pocket_synth::list_pocket_voices(&models_dir)),
             models_dir,
             writer,
             rewriter_factory,
@@ -473,6 +493,23 @@ impl SettingsModel {
             let _ = w.join();
         }
         m
+    }
+
+    /// The Pocket voice clips, sorted: the `Voice clip` dropdown's contents.
+    pub fn pocket_voices(&self) -> Vec<String> {
+        lock(&self.pocket_voices).clone()
+    }
+
+    /// [`SettingsModel::rescan_voices`] for the Pocket clips.
+    pub fn rescan_pocket_voices(&self) -> Vec<String> {
+        let fresh = crate::pocket_synth::list_pocket_voices(&self.models_dir);
+        *lock(&self.pocket_voices) = fresh.clone();
+        fresh
+    }
+
+    /// Whether the Pocket model is fully on disk.
+    pub fn pocket_installed(&self) -> bool {
+        download::pocket_complete(&self.models_dir)
     }
 
     /// The dropdown's contents: sorted voice-pack names.
@@ -521,6 +558,23 @@ impl SettingsModel {
         &self,
         cancel: Arc<std::sync::atomic::AtomicBool>,
     ) -> async_channel::Receiver<download::Event> {
+        self.spawn_download(cancel, download::download)
+    }
+
+    /// [`SettingsModel::download_voices`] for the Pocket TTS bundle and the
+    /// Fenrir clip.
+    pub fn download_pocket(
+        &self,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    ) -> async_channel::Receiver<download::Event> {
+        self.spawn_download(cancel, download::download_pocket)
+    }
+
+    fn spawn_download(
+        &self,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+        run_download: DownloadFn,
+    ) -> async_channel::Receiver<download::Event> {
         // Room for a burst of progress reports between two turns of the main
         // loop, plus the outcome behind them. Larger buys nothing: the
         // window only ever draws the newest.
@@ -541,7 +595,7 @@ impl SettingsModel {
                     stop.store(true, Ordering::Relaxed);
                 }
             };
-            let outcome = download::download(&dir, &fetch, &cancelled, &mut report);
+            let outcome = run_download(&dir, &fetch, &cancelled, &mut report);
             let _ = tx.send_blocking(download::Event::Finished(outcome));
         };
         match &self.runtime {
@@ -1135,6 +1189,28 @@ const FALLBACK_MODEL: &str = MODELS[0].0;
 /// cannot-drift reason as [`FALLBACK_MODEL`].
 const FALLBACK_SPEED_MODE: &str = SPEED_MODES[0].0;
 
+/// What an `engine` this build does not know runs as: Kokoro, which is what
+/// `Config::pocket_active` already chooses for any value but `"pocket"`.
+const FALLBACK_ENGINE: &str = ENGINES[0].0;
+
+/// What `sayd_pocket::Precision::from_config` loads for a value it does not
+/// recognise: int8.
+const FALLBACK_POCKET_PRECISION: &str = POCKET_PRECISIONS[0];
+
+fn known_engines() -> String {
+    ENGINES
+        .iter()
+        .map(|(v, _)| *v)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Whether `t` is a temperature Pocket TTS can sample at: finite and not
+/// negative (0 is greedy).
+fn usable_temperature(t: f32) -> bool {
+    t.is_finite() && t >= 0.0
+}
+
 fn known_models() -> String {
     MODELS
         .iter()
@@ -1258,6 +1334,26 @@ fn validate(cfg: &mut Config) -> Result<(), String> {
             known_speed_modes()
         ));
     }
+    if !ENGINES.iter().any(|(v, _)| *v == cfg.engine) {
+        return Err(format!(
+            "'{}' is not an engine this build knows; expected one of {}",
+            cfg.engine,
+            known_engines()
+        ));
+    }
+    if !POCKET_PRECISIONS.contains(&cfg.pocket.precision.as_str()) {
+        return Err(format!(
+            "pocket.precision '{}' is not a precision this build knows; expected one of {}",
+            cfg.pocket.precision,
+            POCKET_PRECISIONS.join(", ")
+        ));
+    }
+    if !usable_temperature(cfg.pocket.temperature) {
+        return Err(format!(
+            "pocket.temperature {} is not a temperature; it must be 0 or more",
+            cfg.pocket.temperature
+        ));
+    }
     // Gated on the same pair `reword_startup_refusal` is gated on, and it
     // has to be the same pair: this exists to keep the window from ever
     // writing a file that function would then refuse to boot from. Turning
@@ -1326,6 +1422,36 @@ pub fn normalize(cfg: &mut Config) -> Vec<String> {
             FALLBACK_SPEED_MODE
         ));
         cfg.speed_mode = FALLBACK_SPEED_MODE.to_string();
+    }
+    // The same for the Pocket TTS fields: each falls back to what would
+    // have run anyway (`Config::pocket_active`, `Precision::from_config`),
+    // and now says so.
+    if !ENGINES.iter().any(|(v, _)| *v == cfg.engine) {
+        warnings.push(format!(
+            "'{}' is not an engine this build knows (expected one of {}); running {} instead",
+            cfg.engine,
+            known_engines(),
+            FALLBACK_ENGINE
+        ));
+        cfg.engine = FALLBACK_ENGINE.to_string();
+    }
+    if !POCKET_PRECISIONS.contains(&cfg.pocket.precision.as_str()) {
+        warnings.push(format!(
+            "pocket.precision '{}' is not a precision this build knows (expected one of {}); \
+             running {} instead",
+            cfg.pocket.precision,
+            POCKET_PRECISIONS.join(", "),
+            FALLBACK_POCKET_PRECISION
+        ));
+        cfg.pocket.precision = FALLBACK_POCKET_PRECISION.to_string();
+    }
+    if !usable_temperature(cfg.pocket.temperature) {
+        let default = sayd_core::config::PocketConfig::default().temperature;
+        warnings.push(format!(
+            "pocket.temperature {} is not a temperature (it must be 0 or more); running at {default}",
+            cfg.pocket.temperature
+        ));
+        cfg.pocket.temperature = default;
     }
     warnings
 }
@@ -2661,6 +2787,50 @@ mod tests {
         engine.shutdown();
     }
 
+    /// Final review I2, the window side: the Pocket TTS fields are refused
+    /// the way `model` is, so the file never claims an engine, precision or
+    /// temperature that is not what runs.
+    #[test]
+    fn unknown_pocket_settings_are_rejected_rather_than_silently_downgraded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let models = models_dir_with(&["af_heart"], dir.path());
+        let (store, engine) = store_in(dir.path());
+        let m = SettingsModel::new(store, models, Config::default());
+
+        let err = m
+            .edit(|c| c.engine = "espeak".into())
+            .expect_err("must be rejected");
+        assert!(
+            err.contains("espeak"),
+            "the rejected value must appear: {err}"
+        );
+        assert_eq!(
+            m.current().engine,
+            "kokoro",
+            "a rejected edit must not stick"
+        );
+
+        let err = m
+            .edit(|c| c.pocket.precision = "int4".into())
+            .expect_err("must be rejected");
+        assert!(
+            err.contains("int4"),
+            "the rejected value must appear: {err}"
+        );
+        assert_eq!(m.current().pocket.precision, "int8");
+
+        for bad in [-0.5, f32::NAN, f32::INFINITY] {
+            let err = m
+                .edit(|c| c.pocket.temperature = bad)
+                .expect_err("must be rejected");
+            assert!(err.contains("pocket.temperature"), "{err}");
+        }
+        assert_eq!(m.current().pocket.temperature, 0.3);
+        m.edit(|c| c.pocket.temperature = 0.0)
+            .expect("0 is greedy sampling, a real temperature");
+        engine.shutdown();
+    }
+
     /// Same shape as `an_unknown_model_is_rejected_rather_than_silently_
     /// downgraded`: the window is about to write the value, so it can refuse
     /// one this build's `KokoroSynthesizer` would not recognise, rather than
@@ -2949,6 +3119,57 @@ mod tests {
             warnings[0].contains(FALLBACK_SPEED_MODE),
             "and what will actually be used: {warnings:?}"
         );
+    }
+
+    /// Final review I2, the file side, for `engine`: an unknown value already
+    /// ran Kokoro (`Config::pocket_active`); now the config says so too, and
+    /// the warning names both values.
+    #[test]
+    fn normalize_names_an_unknown_engine_and_what_will_run_instead() {
+        let mut cfg = Config {
+            engine: "espeak".into(),
+            ..Config::default()
+        };
+        let warnings = normalize(&mut cfg);
+        assert_eq!(cfg.engine, FALLBACK_ENGINE, "the config must say what runs");
+        assert_eq!(warnings.len(), 1, "one field, one warning: {warnings:?}");
+        assert!(warnings[0].contains("espeak"), "{warnings:?}");
+        assert!(warnings[0].contains("running kokoro"), "{warnings:?}");
+    }
+
+    /// The same for `pocket.precision`, which `Precision::from_config` reads
+    /// as int8 when it does not know it.
+    #[test]
+    fn normalize_names_an_unknown_pocket_precision_and_what_will_run_instead() {
+        let mut cfg = Config::default();
+        cfg.pocket.precision = "int4".into();
+        let warnings = normalize(&mut cfg);
+        assert_eq!(cfg.pocket.precision, FALLBACK_POCKET_PRECISION);
+        assert_eq!(
+            FALLBACK_POCKET_PRECISION,
+            Config::default().pocket.precision
+        );
+        assert_eq!(warnings.len(), 1, "one field, one warning: {warnings:?}");
+        assert!(warnings[0].contains("int4"), "{warnings:?}");
+        assert!(warnings[0].contains("running int8"), "{warnings:?}");
+    }
+
+    /// And `pocket.temperature`: a negative or non-finite one (TOML can
+    /// write `nan` and `inf`) runs at the default, with a warning.
+    #[test]
+    fn normalize_replaces_an_unusable_pocket_temperature_with_the_default() {
+        for bad in [-0.5, f32::NAN, f32::NEG_INFINITY] {
+            let mut cfg = Config::default();
+            cfg.pocket.temperature = bad;
+            let warnings = normalize(&mut cfg);
+            assert_eq!(cfg.pocket.temperature, 0.3, "for {bad}");
+            assert_eq!(warnings.len(), 1, "one field, one warning: {warnings:?}");
+            assert!(warnings[0].contains("pocket.temperature"), "{warnings:?}");
+            assert!(warnings[0].contains("running at 0.3"), "{warnings:?}");
+        }
+        let mut cfg = Config::default();
+        cfg.pocket.temperature = 0.0;
+        assert!(normalize(&mut cfg).is_empty(), "0 is a temperature");
     }
 
     /// Finding 9: the engine clamps `speed` on `ApplyConfig` but the file

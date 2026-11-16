@@ -11,3 +11,6 @@ the generation loop.
 > It compiles without either; the failure arrives at runtime. The weights are
 > licensed CC-BY-4.0 (Kyutai; ONNX export by KevinAHM) and are downloaded
 > separately.
+
+The bundled `assets/fenrir.wav` is a clip of Kokoro-82M's `am_fenrir` voice,
+licensed Apache-2.0.
