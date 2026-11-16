@@ -13,6 +13,11 @@ categories = ["multimedia::audio", "accessibility", "command-line-utilities"]
 sayd-core.workspace = true
 sayd-kokoro.workspace = true
 sayd-g2p.workspace = true
+sayd-pocket.workspace = true
+# Reads the reference clips a Pocket voice is cloned from.
+hound = "3"
+# Keys the voice-embedding cache by the clip's bytes.
+sha2 = "0.10"
 cpal = "0.18"
 rtrb = "0.3"
 libc = "0.2"

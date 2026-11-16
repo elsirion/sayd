@@ -12,6 +12,7 @@ mod kokoro_synth;
 mod mpris;
 mod notify;
 mod pipeline;
+mod pocket_synth;
 mod resample;
 mod reword;
 mod ring;
