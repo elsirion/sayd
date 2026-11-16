@@ -550,13 +550,32 @@ impl Engine {
         // only this one submission's voice name -- so nothing should make
         // `say status` report an error for it. The caller still learns the
         // submission was refused, via this method's own `Err`.
-        let voice = opts.voice.as_deref().unwrap_or(&self.cfg.voice);
+        //
+        // Without a voice of its own, a submission takes the default of the
+        // configured engine (`Config::active_voice`), and the message points
+        // at where that engine keeps its voices.
+        //
+        // `unavailable` comes first, with the same never-sticky shape: when
+        // the engine cannot speak at all (Pocket TTS chosen and its model
+        // not downloaded), that is the reason to give, not a voice name, and
+        // the refusal lasts exactly as long as the cause does.
+        if let Some(why) = self.synth.unavailable() {
+            return Err(why);
+        }
+        let voice = opts.voice.as_deref().unwrap_or(self.cfg.active_voice());
         if !self.synth.voice_exists(voice) {
-            return Err(format!(
-                "unknown voice '{voice}'; check the voices installed in the \
-                 daemon's models directory (its voices/ subdirectory has one \
-                 file per installed voice) and pick one of those"
-            ));
+            return Err(if self.cfg.pocket_active() {
+                format!(
+                    "unknown voice '{voice}'; it has no clip at \
+                     pocket/voices/{voice}.wav in the daemon's models directory"
+                )
+            } else {
+                format!(
+                    "unknown voice '{voice}'; check the voices installed in the \
+                     daemon's models directory (its voices/ subdirectory has one \
+                     file per installed voice) and pick one of those"
+                )
+            });
         }
 
         if self.cfg.muted {
@@ -578,7 +597,9 @@ impl Engine {
         let u = Utterance {
             id,
             text: cleaned,
-            voice: opts.voice.unwrap_or_else(|| self.cfg.voice.clone()),
+            voice: opts
+                .voice
+                .unwrap_or_else(|| self.cfg.active_voice().to_string()),
             speed: opts.speed.unwrap_or(self.cfg.speed),
             source: opts.source,
         };
@@ -901,10 +922,11 @@ impl Engine {
         // per utterance via `SayOpts` (see `submit`), and MPRIS's `Rate`/
         // `Metadata` (M3) read these fields directly. With nothing current,
         // the configured defaults are exactly right (that is what the next
-        // utterance will use absent its own override).
+        // utterance will use absent its own override) -- the default of the
+        // configured engine, so `voice` and `engine` agree.
         let (voice, speed) = match self.current.as_ref() {
             Some(c) => (c.voice.clone(), c.speed),
-            None => (self.cfg.voice.clone(), self.cfg.speed),
+            None => (self.cfg.active_voice().to_string(), self.cfg.speed),
         };
         // I2: `state` flips to `Speaking` synchronously in `submit` (and
         // stays there when `Next`/`SkipSentence` discard `current` while the
@@ -1565,6 +1587,133 @@ mod tests {
         assert!(
             matches!(ok, Ok(Submitted::Queued(_))),
             "a following plain submission must still work: {ok:?}"
+        );
+    }
+
+    #[test]
+    fn snapshot_voice_is_the_configured_engines_default() {
+        let pocket = Config {
+            engine: "pocket".into(),
+            ..Config::default()
+        };
+        let e = Engine::new(
+            pocket,
+            Box::new(StubSynthesizer::new()),
+            Box::new(VecSink::new(24_000 * 10)),
+        );
+        let s = e.snapshot();
+        assert_eq!((s.voice.as_str(), s.engine.as_str()), ("fenrir", "pocket"));
+
+        let e = Engine::new(
+            Config::default(),
+            Box::new(StubSynthesizer::new()),
+            Box::new(VecSink::new(24_000 * 10)),
+        );
+        let s = e.snapshot();
+        assert_eq!(
+            (s.voice.as_str(), s.engine.as_str()),
+            ("af_heart", "kokoro")
+        );
+    }
+
+    #[test]
+    fn a_default_utterance_on_pocket_carries_the_pocket_voice() {
+        let pocket = Config {
+            engine: "pocket".into(),
+            ..Config::default()
+        };
+        let mut e = Engine::new(
+            pocket,
+            Box::new(StubSynthesizer::with_known_voices(["fenrir"])),
+            Box::new(VecSink::new(24_000 * 10)),
+        );
+        e.submit("hello there".into(), SayOpts::default())
+            .expect("the Pocket default is checked, not the Kokoro one");
+        e.tick();
+        assert_eq!(e.snapshot().voice, "fenrir");
+    }
+
+    /// A synthesizer that cannot speak at all is refused at submission,
+    /// with its own reason, and the refusal leaves nothing behind: no error
+    /// state, so the moment the cause goes away the next submission is
+    /// taken.
+    #[test]
+    fn an_unavailable_synthesizer_is_refused_without_a_sticky_error() {
+        struct Unavailable;
+        impl crate::synth::Synthesizer for Unavailable {
+            fn phonemize(&mut self, t: &str, _voice: &str) -> String {
+                t.into()
+            }
+            fn fits(&mut self, _: &str) -> bool {
+                true
+            }
+            fn synth(&mut self, _: &str, _: &str, _: f32) -> Result<Vec<f32>, String> {
+                panic!("an unavailable synthesizer is never asked to speak")
+            }
+            fn unload(&mut self) {}
+            fn is_loaded(&self) -> bool {
+                false
+            }
+            fn voice_exists(&self, _: &str) -> bool {
+                false
+            }
+            fn unavailable(&self) -> Option<String> {
+                Some("the model is not installed".into())
+            }
+        }
+        let mut e = Engine::new(
+            Config::default(),
+            Box::new(Unavailable),
+            Box::new(VecSink::new(24_000)),
+        );
+        let named = SayOpts {
+            voice: Some("zz_bogus".into()),
+            ..Default::default()
+        };
+        for opts in [SayOpts::default(), named] {
+            assert_eq!(
+                e.submit("hello.".into(), opts).unwrap_err(),
+                "the model is not installed",
+                "the reason, not an unknown voice"
+            );
+        }
+        e.tick();
+        let s = e.snapshot();
+        assert_eq!(s.state, State::Idle);
+        assert_eq!(s.error, None);
+    }
+
+    #[test]
+    fn unknown_voice_error_names_where_the_configured_engine_looks() {
+        let bogus = || SayOpts {
+            voice: Some("zz_bogus".into()),
+            ..Default::default()
+        };
+        let mut e = Engine::new(
+            Config::default(),
+            Box::new(StubSynthesizer::with_known_voices(["af_heart"])),
+            Box::new(VecSink::new(24_000 * 10)),
+        );
+        assert_eq!(
+            e.submit("hi".into(), bogus()).unwrap_err(),
+            "unknown voice 'zz_bogus'; check the voices installed in the \
+             daemon's models directory (its voices/ subdirectory has one \
+             file per installed voice) and pick one of those"
+        );
+
+        let pocket = Config {
+            engine: "pocket".into(),
+            ..Config::default()
+        };
+        let mut e = Engine::new(
+            pocket,
+            Box::new(StubSynthesizer::with_known_voices(["fenrir"])),
+            Box::new(VecSink::new(24_000 * 10)),
+        );
+        let err = e.submit("hi".into(), bogus()).unwrap_err();
+        assert!(
+            err.contains("no clip at pocket/voices/zz_bogus.wav in the daemon's models directory"),
+            "{err}"
         );
     }
 

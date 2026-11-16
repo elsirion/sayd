@@ -403,6 +403,12 @@ impl SaydIface {
         self.engine.snapshot().voice
     }
 
+    /// `"kokoro"` or `"pocket"`: the engine the config chooses.
+    #[zbus(property)]
+    async fn engine(&self) -> String {
+        self.engine.snapshot().engine
+    }
+
     #[zbus(property)]
     async fn speed(&self) -> f64 {
         self.engine.snapshot().speed as f64
@@ -547,6 +553,22 @@ mod tests {
             "timed out waiting for {label}; snapshot = {:?}",
             engine.snapshot()
         );
+    }
+
+    #[tokio::test]
+    async fn engine_property_reflects_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let i = iface_in(dir.path());
+        assert_eq!(i.engine().await, "kokoro");
+        let cfg = Config {
+            engine: "pocket".into(),
+            ..Config::default()
+        };
+        i.engine.send(Command::ApplyConfig(cfg));
+        wait_for(&i.engine, "the engine change to land", |s| {
+            s.engine == "pocket"
+        });
+        assert_eq!(i.engine().await, "pocket");
     }
 
     #[tokio::test]

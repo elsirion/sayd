@@ -18,6 +18,7 @@ mod reword;
 mod ring;
 mod selection;
 mod settings;
+mod switch_synth;
 mod tray;
 
 use std::collections::HashMap;
@@ -27,7 +28,6 @@ use std::time::{Duration, Instant};
 use sayd_core::audio::AudioSink;
 use sayd_core::config::Config;
 use sayd_core::handle::EngineHandle;
-use sayd_core::synth::Synthesizer;
 use zbus::fdo::{RequestNameFlags, RequestNameReply};
 use zbus::zvariant::OwnedValue;
 
@@ -841,38 +841,28 @@ async fn run_daemon() -> std::process::ExitCode {
         return std::process::ExitCode::FAILURE;
     }
 
-    let synth = match kokoro_synth::KokoroSynthesizer::new(&models_dir(), &cfg) {
+    let kokoro = match kokoro_synth::KokoroSynthesizer::new(&models_dir(), &cfg) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("error: failed to initialize synthesizer: {e}");
             return std::process::ExitCode::FAILURE;
         }
     };
+    // Both engines share the one `ort` environment committed above; only
+    // the one `cfg.engine` chooses is ever loaded.
+    let pocket = pocket_synth::PocketSynthesizer::new(
+        &models_dir(),
+        &pocket_synth::default_cache_dir(),
+        &cfg,
+    );
+    let synth = switch_synth::SwitchingSynthesizer::new(Box::new(kokoro), Box::new(pocket), &cfg)
+        .with_models_dir(&models_dir());
 
-    // M21: a bad *configured* default voice (as opposed to a bad
-    // `--voice` on one submission) is the same footgun wearing a different
-    // hat. `Engine::submit` already rejects it synchronously, submission by
-    // submission, rather than wedging (see `sayd_core::engine`'s M21 doc
-    // comment) -- but that only surfaces once the first utterance is
-    // spoken. Checking here, once, at startup, lets an operator notice a
-    // typo'd config *before* every default-voice submission starts failing
-    // the same way.
-    if !synth.voice_exists(&cfg.voice) {
-        // Points at the settings window whichever of the two shapes this
-        // has. With packs installed, the Voice dropdown lists them and the
-        // fix is picking one; with none installed -- a fresh install, where
-        // this warning fires for the shipped default and there is nothing
-        // to pick -- that same group offers to download them. Naming the
-        // directory as well, because a user who set `SAYD_MODELS_DIR` to
-        // the wrong place needs to see which one is being read.
-        eprintln!(
-            "warning: configured default voice '{}' has no installed voice pack; \
-             every submission that does not override it with its own --voice will \
-             be rejected until this is fixed. The tray's Settings window lists the \
-             packs in {}/voices, and offers to download them if there are none.",
-            cfg.voice,
-            models_dir().display()
-        );
+    // M21: a bad configured default (a typo'd voice, a Pocket model never
+    // downloaded) is reported once, here, rather than only as each
+    // submission is rejected or fails.
+    for w in synth.startup_warnings() {
+        eprintln!("warning: {w}");
     }
     let sink = match open_sink() {
         Ok(s) => s,
@@ -1094,6 +1084,9 @@ async fn run_daemon() -> std::process::ExitCode {
                     }
                     if now.voice != last.voice {
                         let _ = i.voice_changed(ctx).await;
+                    }
+                    if now.engine != last.engine {
+                        let _ = i.engine_changed(ctx).await;
                     }
                     if (now.speed - last.speed).abs() > f32::EPSILON {
                         let _ = i.speed_changed(ctx).await;

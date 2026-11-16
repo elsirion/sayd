@@ -924,7 +924,7 @@ subcommand -- `say stop` stops the daemon rather than speaking the word
 `say status --json` prints machine-readable state, for scripts and status
 bars:
 
-    {"state":"idle","muted":false,"voice":"af_heart","speed":1,
+    {"state":"idle","muted":false,"engine":"kokoro","voice":"af_heart","speed":1,
      "queue_length":0,"remaining_seconds":0.00,"current_text":"","error":""}
 
 ## Narrating a Claude Code session
@@ -1026,6 +1026,7 @@ need ids reliably, submit one utterance at a time and wait for the previous
 |---|---|---|
 | `State` | `s` | `"idle"` / `"speaking"` / `"paused"` / `"error"` |
 | `Muted` | `b` | |
+| `Engine` | `s` | `"kokoro"` / `"pocket"`, as the config chooses |
 | `Voice` | `s` | |
 | `Speed` | `d` | |
 | `QueueLength` | `u` | |

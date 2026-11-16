@@ -11,12 +11,8 @@ use sayd_pocket::{PocketTts, Precision, VoiceEmbedding, VoiceState};
 use sha2::{Digest, Sha256};
 
 /// Sample rate Pocket's voice encoder and decoder work at.
-// Nothing calls this until the engine selection lands.
-#[allow(dead_code)]
 const CLIP_RATE: u32 = 24_000;
 
-// Nothing calls this until the engine selection lands.
-#[allow(dead_code)]
 pub struct PocketSynthesizer {
     models_dir: PathBuf,
     cache_dir: PathBuf,
@@ -32,8 +28,6 @@ pub struct PocketSynthesizer {
 }
 
 /// `<models>/pocket/voices`: one `<name>.wav` reference clip per voice.
-// Nothing calls this until the engine selection lands.
-#[allow(dead_code)]
 pub fn voices_dir(models_dir: &Path) -> PathBuf {
     models_dir.join("pocket").join("voices")
 }
@@ -57,8 +51,6 @@ pub fn list_pocket_voices(models_dir: &Path) -> Vec<String> {
 /// The files of the downloaded (int8) bundle, relative to
 /// `sayd_pocket::bundle_dir`. The one list: the download builds its assets
 /// from it and [`bundle_installed`] checks it.
-// Nothing calls this until the engine selection lands.
-#[allow(dead_code)]
 pub const BUNDLE_FILES: [&str; 8] = [
     "bundle.json",
     "tokenizer.model",
@@ -73,8 +65,6 @@ pub const BUNDLE_FILES: [&str; 8] = [
 /// Whether every file of the downloaded bundle is present and non-empty
 /// below `models_dir`. A directory with only some of them (a cancelled
 /// download) is not installed.
-// Nothing calls this until the engine selection lands.
-#[allow(dead_code)]
 pub fn bundle_installed(models_dir: &Path) -> bool {
     let dir = sayd_pocket::bundle_dir(models_dir);
     BUNDLE_FILES
@@ -83,8 +73,6 @@ pub fn bundle_installed(models_dir: &Path) -> bool {
 }
 
 /// `$XDG_CACHE_HOME/sayd/pocket`, falling back to `~/.cache/sayd/pocket`.
-// Nothing calls this until the engine selection lands.
-#[allow(dead_code)]
 pub fn default_cache_dir() -> PathBuf {
     let base = std::env::var_os("XDG_CACHE_HOME")
         .filter(|s| !s.is_empty())
@@ -96,8 +84,6 @@ pub fn default_cache_dir() -> PathBuf {
 
 /// Decode WAV bytes (16-bit int or 32-bit float, any rate, mono or
 /// multi-channel) to mono f32 at 24 kHz.
-// Nothing calls this until the engine selection lands.
-#[allow(dead_code)]
 fn decode_clip(bytes: &[u8], what: &str) -> Result<Vec<f32>, String> {
     let mut r = hound::WavReader::new(std::io::Cursor::new(bytes))
         .map_err(|e| format!("{what}: not a readable WAV: {e}"))?;
@@ -130,8 +116,6 @@ fn decode_clip(bytes: &[u8], what: &str) -> Result<Vec<f32>, String> {
     Ok(resample_linear(&mono, spec.sample_rate, CLIP_RATE))
 }
 
-// Nothing calls this until the engine selection lands.
-#[allow(dead_code)]
 impl PocketSynthesizer {
     pub fn new(models_dir: &Path, cache_dir: &Path, cfg: &Config) -> PocketSynthesizer {
         PocketSynthesizer {

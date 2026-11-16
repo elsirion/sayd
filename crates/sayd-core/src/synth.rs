@@ -44,6 +44,18 @@ pub trait Synthesizer: Send {
         true
     }
 
+    /// Why nothing at all can be spoken right now, whatever the voice --
+    /// a model that is not on disk, say -- worded for the person who has to
+    /// fix it. Checked cheaply, like `voice_exists`, and for the same
+    /// reason: `Engine::submit` refuses the submission with this message
+    /// instead of letting `synth` fail into a sticky `ErrorKind::Synth`,
+    /// which would outlive the problem (a model downloaded a minute later
+    /// still finds every submission refused until a dismiss). `None`, the
+    /// default, means nothing stands in the way.
+    fn unavailable(&self) -> Option<String> {
+        None
+    }
+
     /// Take new settings that affect how audio is produced.
     ///
     /// Returns `true` if the change requires dropping any loaded model --
@@ -237,6 +249,11 @@ mod tests {
         let s = StubSynthesizer::new();
         assert!(s.voice_exists("af_heart"));
         assert!(s.voice_exists("totally_bogus_name"));
+    }
+
+    #[test]
+    fn a_synthesizer_is_available_unless_it_says_otherwise() {
+        assert_eq!(StubSynthesizer::new().unavailable(), None);
     }
 
     #[test]

@@ -734,6 +734,16 @@ impl Config {
         self.engine == "pocket"
     }
 
+    /// The default voice of the engine `pocket_active` chooses:
+    /// `pocket.voice` for Pocket TTS, `voice` for Kokoro.
+    pub fn active_voice(&self) -> &str {
+        if self.pocket_active() {
+            &self.pocket.voice
+        } else {
+            &self.voice
+        }
+    }
+
     /// `$XDG_CONFIG_HOME/sayd/config.toml`, falling back to `~/.config`.
     pub fn path() -> PathBuf {
         let base = std::env::var_os("XDG_CONFIG_HOME")

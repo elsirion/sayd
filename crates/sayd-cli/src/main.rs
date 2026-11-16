@@ -432,24 +432,37 @@ async fn status(proxy: &zbus::Proxy<'_>, json: bool) -> Result<(), CallError> {
     let map: HashMap<String, OwnedValue> =
         call(async { props.get_all(iface).await.map_err(zbus::Error::from) }).await?;
 
-    let state = prop_string(&map, "State");
-    let muted = prop_bool(&map, "Muted", false);
-    let voice = prop_string(&map, "Voice");
-    let speed = prop_f64(&map, "Speed", 1.0);
-    let queue = prop_u32(&map, "QueueLength", 0);
-    let remaining = prop_f64(&map, "RemainingSeconds", 0.0);
-    let current = prop_string(&map, "CurrentText");
-    let current_id = prop_u32(&map, "CurrentId", 0);
-    let error = prop_string(&map, "Error");
+    print!("{}", render_status(&map, json));
+    Ok(())
+}
+
+/// The `status` output for one `GetAll` reply: a JSON object, or the
+/// human-readable lines. A property an older daemon does not have reads as
+/// empty, and the plain output then leaves its line out.
+fn render_status(map: &HashMap<String, OwnedValue>, json: bool) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let state = prop_string(map, "State");
+    let muted = prop_bool(map, "Muted", false);
+    let engine = prop_string(map, "Engine");
+    let voice = prop_string(map, "Voice");
+    let speed = prop_f64(map, "Speed", 1.0);
+    let queue = prop_u32(map, "QueueLength", 0);
+    let remaining = prop_f64(map, "RemainingSeconds", 0.0);
+    let current = prop_string(map, "CurrentText");
+    let current_id = prop_u32(map, "CurrentId", 0);
+    let error = prop_string(map, "Error");
 
     if json {
         // Hand-built so this crate need not depend on serde.
-        println!(
-            "{{\"state\":\"{}\",\"muted\":{},\"voice\":\"{}\",\"speed\":{},\
+        let _ = writeln!(
+            out,
+            "{{\"state\":\"{}\",\"muted\":{},\"engine\":\"{}\",\"voice\":\"{}\",\"speed\":{},\
              \"queue_length\":{},\"remaining_seconds\":{:.2},\
              \"current_text\":\"{}\",\"current_id\":{},\"error\":\"{}\"}}",
             escape(&state),
             muted,
+            escape(&engine),
             escape(&voice),
             speed,
             queue,
@@ -459,20 +472,27 @@ async fn status(proxy: &zbus::Proxy<'_>, json: bool) -> Result<(), CallError> {
             escape(&error),
         );
     } else {
-        println!("state:     {state}{}", if muted { " (muted)" } else { "" });
-        println!("voice:     {voice} at {speed:.2}x");
-        println!("queue:     {queue} pending, {remaining:.1}s remaining");
+        let _ = writeln!(
+            out,
+            "state:     {state}{}",
+            if muted { " (muted)" } else { "" }
+        );
+        if !engine.is_empty() {
+            let _ = writeln!(out, "engine:    {engine}");
+        }
+        let _ = writeln!(out, "voice:     {voice} at {speed:.2}x");
+        let _ = writeln!(out, "queue:     {queue} pending, {remaining:.1}s remaining");
         if current_id != 0 {
-            println!("current:   id {current_id}");
+            let _ = writeln!(out, "current:   id {current_id}");
         }
         if !current.is_empty() {
-            println!("speaking:  {current}");
+            let _ = writeln!(out, "speaking:  {current}");
         }
         if !error.is_empty() {
-            println!("error:     {error}");
+            let _ = writeln!(out, "error:     {error}");
         }
     }
-    Ok(())
+    out
 }
 
 /// Extract a `String` property from a `GetAll` reply, defaulting to empty
@@ -535,6 +555,30 @@ mod tests {
         let c = Cli::try_parse_from(["say", "hello", "there"]).expect("parses");
         assert!(c.command.is_none());
         assert_eq!(c.text.join(" "), "hello there");
+    }
+
+    fn status_map(engine: Option<&str>) -> HashMap<String, OwnedValue> {
+        let mut m = HashMap::new();
+        m.insert("State".to_string(), OwnedValue::from(Str::from("idle")));
+        m.insert("Voice".to_string(), OwnedValue::from(Str::from("af_heart")));
+        if let Some(e) = engine {
+            m.insert("Engine".to_string(), OwnedValue::from(Str::from(e)));
+        }
+        m
+    }
+
+    #[test]
+    fn status_reports_the_engine_in_both_formats() {
+        let plain = render_status(&status_map(Some("pocket")), false);
+        assert!(plain.contains("\nengine:    pocket\n"), "{plain}");
+        let json = render_status(&status_map(Some("pocket")), true);
+        assert!(json.contains("\"engine\":\"pocket\""), "{json}");
+
+        // An older daemon has no `Engine`: no plain line, an empty field.
+        let plain = render_status(&status_map(None), false);
+        assert!(!plain.contains("engine:"), "{plain}");
+        let json = render_status(&status_map(None), true);
+        assert!(json.contains("\"engine\":\"\""), "{json}");
     }
 
     #[test]
