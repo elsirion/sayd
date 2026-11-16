@@ -209,6 +209,9 @@ pub struct Snapshot {
     /// stays a plain string); this is for in-process callers like the
     /// daemon's recovery loop that need to know *why*, not just *that*.
     pub error_kind: Option<ErrorKind>,
+    /// `"kokoro"` or `"pocket"`, as resolved by `Config::pocket_active`
+    /// (an unknown configured value reads as `"kokoro"`).
+    pub engine: String,
 }
 
 /// The utterance currently being spoken, decomposed into chunks.
@@ -416,7 +419,17 @@ impl Engine {
                 // it reaches -- sees the new config, never a half-applied
                 // one.
                 let muting = cfg.muted && !self.cfg.muted;
+                // A sticky synth error belongs to the engine that produced
+                // it (a missing model file, say). Choosing the other engine
+                // is the user's fix, so dismiss it as an explicit Stop would
+                // rather than leave submissions rejected until they also
+                // press Stop. Device errors are the recovery loop's, not
+                // ours to clear.
+                let engine_flipped = cfg.pocket_active() != self.cfg.pocket_active();
                 self.cfg = cfg;
+                if engine_flipped && self.error_kind == Some(ErrorKind::Synth) {
+                    self.dismiss_error_and_go_idle();
+                }
                 if muting {
                     self.silence();
                 }
@@ -944,6 +957,12 @@ impl Engine {
             queue_heads,
             error: self.error.clone(),
             error_kind: self.error_kind,
+            engine: if self.cfg.pocket_active() {
+                "pocket"
+            } else {
+                "kokoro"
+            }
+            .into(),
         }
     }
 
@@ -3405,6 +3424,39 @@ mod tests {
         assert_eq!(after.state, State::Error, "the error must persist");
         assert!(after.error.is_some(), "the error must persist");
         assert_eq!(after.error_kind, Some(ErrorKind::Synth));
+    }
+
+    #[test]
+    fn switching_engine_clears_a_sticky_synth_error() {
+        let mut e = Engine::new(
+            Config::default(),
+            Box::new(FailingSynth),
+            Box::new(VecSink::new(24_000)),
+        );
+        e.handle(say("Anything."));
+        for _ in 0..20 {
+            e.tick();
+        }
+        assert_eq!(e.snapshot().error_kind, Some(ErrorKind::Synth));
+        assert_eq!(e.snapshot().engine, "kokoro");
+
+        // Not an engine change: the error stays.
+        e.handle(Command::ApplyConfig(Config {
+            speed: 1.5,
+            ..Config::default()
+        }));
+        assert_eq!(e.snapshot().error_kind, Some(ErrorKind::Synth));
+
+        e.handle(Command::ApplyConfig(Config {
+            speed: 1.5,
+            engine: "pocket".into(),
+            ..Config::default()
+        }));
+        let s = e.snapshot();
+        assert_eq!(s.state, State::Idle);
+        assert_eq!(s.error, None);
+        assert_eq!(s.error_kind, None);
+        assert_eq!(s.engine, "pocket");
     }
 
     #[test]

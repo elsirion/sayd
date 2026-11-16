@@ -521,6 +521,7 @@ mod tests {
             error: None,
             queue_heads: Vec::new(),
             error_kind: None,
+            engine: "kokoro".into(),
         }
     }
 

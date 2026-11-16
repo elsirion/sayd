@@ -672,6 +672,38 @@ pub struct Config {
     /// so this has no effect on any call site outside this file, and serde
     /// serialises/deserialises it exactly as it would the bare struct.
     pub reword: Box<RewordConfig>,
+    /// `"kokoro"` | `"pocket"`: which engine speaks. Anything but exactly
+    /// `"pocket"` means Kokoro (see [`Config::pocket_active`]), so a typo or
+    /// a value from a newer build degrades to the engine every prior release
+    /// used instead of refusing the whole file.
+    pub engine: String,
+    /// Boxed for the same reason as `reword`. Inert unless `engine` is
+    /// `"pocket"`; kept when it is not, so switching back and forth does not
+    /// forget the voice.
+    pub pocket: Box<PocketConfig>,
+}
+
+/// Settings for the Pocket TTS engine, read only while `Config::engine` is
+/// `"pocket"`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PocketConfig {
+    /// A Pocket voice name.
+    pub voice: String,
+    /// `"int8"` | `"fp32"`: which weights to load.
+    pub precision: String,
+    /// Sampling temperature; lower is steadier.
+    pub temperature: f32,
+}
+
+impl Default for PocketConfig {
+    fn default() -> Self {
+        PocketConfig {
+            voice: "fenrir".into(),
+            precision: "int8".into(),
+            temperature: 0.3,
+        }
+    }
 }
 
 impl Default for Config {
@@ -689,11 +721,19 @@ impl Default for Config {
             chunking: ChunkConfig::default(),
             notifications: NotificationConfig::default(),
             reword: Box::new(RewordConfig::default()),
+            engine: "kokoro".into(),
+            pocket: Box::new(PocketConfig::default()),
         }
     }
 }
 
 impl Config {
+    /// Whether Pocket TTS is the chosen engine: true only for exactly
+    /// `"pocket"`. Every other value, unknown ones included, is Kokoro.
+    pub fn pocket_active(&self) -> bool {
+        self.engine == "pocket"
+    }
+
     /// `$XDG_CONFIG_HOME/sayd/config.toml`, falling back to `~/.config`.
     pub fn path() -> PathBuf {
         let base = std::env::var_os("XDG_CONFIG_HOME")
@@ -832,6 +872,34 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn engine_defaults_to_kokoro_and_pocket_table_has_spec_defaults() {
+        let c = Config::default();
+        assert_eq!(c.engine, "kokoro");
+        assert_eq!(c.pocket.voice, "fenrir");
+        assert_eq!(c.pocket.precision, "int8");
+        assert_eq!(c.pocket.temperature, 0.3);
+        assert!(!c.pocket_active());
+    }
+
+    #[test]
+    fn pocket_table_round_trips() {
+        let (c, err) =
+            Config::load_str("engine = \"pocket\"\n[pocket]\nvoice = \"x\"\ntemperature = 0.5\n");
+        assert_eq!(err, None);
+        assert!(c.pocket_active());
+        assert_eq!(c.pocket.voice, "x");
+        assert_eq!(c.pocket.temperature, 0.5);
+        assert_eq!(c.pocket.precision, "int8");
+    }
+
+    #[test]
+    fn unknown_engine_means_kokoro() {
+        let (c, err) = Config::load_str("engine = \"espeak\"\n");
+        assert_eq!(err, None);
+        assert!(!c.pocket_active());
+    }
 
     #[test]
     fn defaults_match_the_measured_benchmarks() {

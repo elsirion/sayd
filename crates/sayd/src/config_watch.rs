@@ -710,6 +710,8 @@ fn merge_untouched(seed: &Config, next: &Config, fresh: &Config) -> Config {
             &fresh.notifications,
         ),
         reword: pick(&seed.reword, &next.reword, &fresh.reword),
+        engine: pick(&seed.engine, &next.engine, &fresh.engine),
+        pocket: pick(&seed.pocket, &next.pocket, &fresh.pocket),
     }
 }
 
