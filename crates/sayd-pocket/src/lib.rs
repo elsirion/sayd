@@ -2,7 +2,9 @@
 //! the five ONNX sessions. The tokenizer and generation loop build on these.
 
 pub mod bundle;
+pub mod model;
 pub mod npy;
+pub mod rng;
 pub mod text;
 pub mod tokenizer;
 
@@ -12,6 +14,14 @@ use std::path::{Path, PathBuf};
 use ort::session::Session;
 
 pub use bundle::{Bundle, Dtype, Fill, StateEntry};
+pub use model::{end_on_pause, fade_in, PocketTts, VoiceEmbedding, VoiceState};
+
+/// A 9 s, 24 kHz mono 16-bit WAV of Kokoro-82M's `am_fenrir` voice
+/// (Apache-2.0), for tests and as a ready-made reference clip. Transcript:
+/// "Hey there. I just finished reading through the whole project, and
+/// honestly, it's in pretty good shape. There are a couple of things I'd like
+/// to clean up, but nothing scary."
+pub const FENRIR_WAV: &[u8] = include_bytes!("../assets/fenrir.wav");
 
 /// Directory name of the one bundle this crate understands, below
 /// `<models>/pocket`.
@@ -56,6 +66,12 @@ pub enum Error {
     Npy(String),
     /// A `tokenizer.model` this crate cannot read.
     Tokenizer(String),
+    /// A voice clip or embedding that cannot condition the model.
+    Voice(String),
+    /// A graph returned something other than the bundle describes.
+    Graph(String),
+    /// Voice plus text would overflow the model's fixed-size attention cache.
+    TooLong(String),
 }
 
 impl fmt::Display for Error {
@@ -66,6 +82,9 @@ impl fmt::Display for Error {
             Error::Bundle(m) => write!(f, "bundle.json: {m}"),
             Error::Npy(m) => write!(f, "npy: {m}"),
             Error::Tokenizer(m) => write!(f, "tokenizer.model: {m}"),
+            Error::Voice(m) => write!(f, "voice: {m}"),
+            Error::Graph(m) => write!(f, "onnx graph: {m}"),
+            Error::TooLong(m) => write!(f, "too long: {m}"),
         }
     }
 }

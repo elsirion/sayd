@@ -14,6 +14,9 @@ pub struct Bundle {
     pub conditioning_dim: usize,
     pub max_token_per_chunk: usize,
     pub insert_bos_before_voice: bool,
+    /// Frames to keep generating after the end-of-speech signal; `None`
+    /// (as in english_2026-04) means the package's per-chunk guess.
+    pub model_recommended_frames_after_eos: Option<usize>,
     pub flow_lm_state: Vec<StateEntry>,
     pub mimi_state: Vec<StateEntry>,
 }
@@ -127,6 +130,10 @@ impl Bundle {
             insert_bos_before_voice: field(&v, "insert_bos_before_voice")?
                 .as_bool()
                 .ok_or_else(|| err("`insert_bos_before_voice` is not a bool"))?,
+            model_recommended_frames_after_eos: match v.get("model_recommended_frames_after_eos") {
+                None | Some(Value::Null) => None,
+                Some(_) => Some(uint(&v, "model_recommended_frames_after_eos")?),
+            },
             flow_lm_state: manifest(&v, "flow_lm_state_manifest")?,
             mimi_state: manifest(&v, "mimi_state_manifest")?,
         })
@@ -146,6 +153,7 @@ mod tests {
         assert_eq!(b.latent_dim, 32);
         assert_eq!(b.max_token_per_chunk, 50);
         assert!(b.insert_bos_before_voice);
+        assert_eq!(b.model_recommended_frames_after_eos, None);
         let e = &b.flow_lm_state[0];
         assert_eq!(e.input_name, "state_0");
         assert_eq!(e.shape, [2, 1, 1000, 16, 64]);

@@ -4,7 +4,8 @@
 parameters) inference via ONNX Runtime: text in, 24 kHz mono `f32` samples out.
 
 This crate loads the ONNX bundle (`bundle.json`, `.npy` voice and BOS
-tensors, five ONNX sessions) and, in later releases, runs the generation loop.
+tensors, five ONNX sessions), encodes a voice from a reference clip and runs
+the generation loop.
 
 > **This crate needs ONNX Runtime and model weights that it does not ship.**
 > It compiles without either; the failure arrives at runtime. The weights are

@@ -1,0 +1,49 @@
+{
+ "voice_frames": 40,
+ "sentences": [
+  {
+   "text": "Hello there, friend.",
+   "prepared": "Hello there, friend.",
+   "token_ids": [
+    2994,
+    310,
+    262,
+    260,
+    636,
+    263
+   ],
+   "frames_after_eos": 5,
+   "eos_step": 12,
+   "frames": 17,
+   "latents": "loop_latents_0.npy"
+  },
+  {
+   "text": "The build finished, and every single test passed on the first try.",
+   "prepared": "The build finished, and every single test passed on the first try.",
+   "token_ids": [
+    364,
+    779,
+    260,
+    1548,
+    278,
+    262,
+    269,
+    380,
+    260,
+    1240,
+    1115,
+    823,
+    278,
+    288,
+    265,
+    443,
+    616,
+    263
+   ],
+   "frames_after_eos": 3,
+   "eos_step": 45,
+   "frames": 48,
+   "latents": "loop_latents_1.npy"
+  }
+ ]
+}
