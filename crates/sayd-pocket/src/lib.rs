@@ -3,6 +3,8 @@
 
 pub mod bundle;
 pub mod npy;
+pub mod text;
+pub mod tokenizer;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -52,6 +54,8 @@ pub enum Error {
     Bundle(String),
     /// A `.npy` file this crate cannot read.
     Npy(String),
+    /// A `tokenizer.model` this crate cannot read.
+    Tokenizer(String),
 }
 
 impl fmt::Display for Error {
@@ -61,6 +65,7 @@ impl fmt::Display for Error {
             Error::Io(e) => write!(f, "io: {e}"),
             Error::Bundle(m) => write!(f, "bundle.json: {m}"),
             Error::Npy(m) => write!(f, "npy: {m}"),
+            Error::Tokenizer(m) => write!(f, "tokenizer.model: {m}"),
         }
     }
 }
